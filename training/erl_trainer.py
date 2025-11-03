@@ -361,7 +361,9 @@ class ERLTrainer:
         print(f"✓ Checkpoint saved to {checkpoint_dir}")
 
         # Sync to cloud storage in background (non-blocking)
-        self.cloud_sync.sync_checkpoints(str(checkpoint_dir), background=True)
+        # Exclude replay buffer files - they're handled separately by save_and_upload_buffer()
+        self.cloud_sync.sync_checkpoints(str(checkpoint_dir), background=True,
+                                        exclude_patterns=["replay_buffer"])
         print(f"{'='*60}\n")
 
     def load_checkpoint(self):

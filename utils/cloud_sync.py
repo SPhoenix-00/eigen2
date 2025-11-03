@@ -284,7 +284,7 @@ class CloudSync:
 
         return (pending, completed, failed)
 
-    def upload_directory(self, local_dir: str, cloud_prefix: Optional[str] = None, background: bool = False):
+    def upload_directory(self, local_dir: str, cloud_prefix: Optional[str] = None, background: bool = False, exclude_patterns: list = None):
         """
         Upload an entire directory to cloud storage.
 
@@ -292,6 +292,7 @@ class CloudSync:
             local_dir: Local directory path
             cloud_prefix: Prefix for cloud storage paths
             background: If True, upload files in background threads (non-blocking)
+            exclude_patterns: List of filename patterns to exclude (e.g., ["replay_buffer.pkl"])
         """
         if self.provider == "local":
             return
@@ -303,8 +304,14 @@ class CloudSync:
         if cloud_prefix is None:
             cloud_prefix = f"{self.project_name}/{local_dir}"
 
+        exclude_patterns = exclude_patterns or []
+
         for root, dirs, files in os.walk(local_dir):
             for file in files:
+                # Skip excluded files
+                if any(pattern in file for pattern in exclude_patterns):
+                    continue
+
                 local_path = os.path.join(root, file)
                 relative_path = os.path.relpath(local_path, local_dir)
                 cloud_path = f"{cloud_prefix}/{relative_path}".replace("\\", "/")
@@ -354,13 +361,14 @@ class CloudSync:
             print(f"Warning: Failed to download directory {cloud_prefix}: {e}")
             return False
 
-    def sync_checkpoints(self, checkpoint_dir: str = "checkpoints", background: bool = False):
+    def sync_checkpoints(self, checkpoint_dir: str = "checkpoints", background: bool = False, exclude_patterns: list = None):
         """
         Sync checkpoint directory to cloud storage.
 
         Args:
             checkpoint_dir: Local checkpoint directory
             background: If True, upload in background (non-blocking)
+            exclude_patterns: List of filename patterns to exclude (e.g., ["replay_buffer"])
         """
         print(f"\n{'='*60}")
         if background:
@@ -368,7 +376,8 @@ class CloudSync:
         else:
             print("Syncing checkpoints to cloud storage...")
         print(f"{'='*60}")
-        self.upload_directory(checkpoint_dir, f"{self.project_name}/{checkpoint_dir}", background=background)
+        self.upload_directory(checkpoint_dir, f"{self.project_name}/{checkpoint_dir}",
+                            background=background, exclude_patterns=exclude_patterns)
         if not background:
             print(f"{'='*60}\n")
 
