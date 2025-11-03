@@ -65,7 +65,7 @@ class Config:
     WEIGHT_DECAY = 1e-5
     
     # Replay buffer
-    BUFFER_SIZE = 200000
+    BUFFER_SIZE = 50000  # Reduced from 200k to match actual usage at gen 25
     BATCH_SIZE = 4
     MIN_BUFFER_SIZE = 10000  # Start training after this many transitions
     

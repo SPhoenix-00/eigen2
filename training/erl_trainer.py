@@ -214,24 +214,25 @@ class ERLTrainer:
             return
 
         # Check if buffer is full for the first time and we haven't saved it yet
-        buffer_is_full = (len(self.replay_buffer) == self.replay_buffer.capacity)
-        if buffer_is_full and not self.buffer_saved_on_first_fill:
-            # Check if buffer exists on GCS
-            buffer_path = Config.CHECKPOINT_DIR / "replay_buffer.pkl"
-            buffer_exists_on_cloud = self.cloud_sync.file_exists_on_cloud("replay_buffer.pkl")
-
-            if not buffer_exists_on_cloud:
-                print(f"\n--- Buffer Full for First Time ({len(self.replay_buffer)} transitions) ---")
-                print("  No buffer found on GCS. Queueing initial buffer save+upload...")
-                Config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-                # Save+upload in background (non-blocking)
-                cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
-                self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
-                print("  ✓ Initial buffer save+upload queued")
-                self.buffer_saved_on_first_fill = True
-            else:
-                print("  Buffer exists on GCS. Skipping first-fill save.")
-                self.buffer_saved_on_first_fill = True
+        # DISABLED: Buffer save causes RAM exhaustion during pickle serialization
+        # buffer_is_full = (len(self.replay_buffer) == self.replay_buffer.capacity)
+        # if buffer_is_full and not self.buffer_saved_on_first_fill:
+        #     # Check if buffer exists on GCS
+        #     buffer_path = Config.CHECKPOINT_DIR / "replay_buffer.pkl"
+        #     buffer_exists_on_cloud = self.cloud_sync.file_exists_on_cloud("replay_buffer.pkl")
+        #
+        #     if not buffer_exists_on_cloud:
+        #         print(f"\n--- Buffer Full for First Time ({len(self.replay_buffer)} transitions) ---")
+        #         print("  No buffer found on GCS. Queueing initial buffer save+upload...")
+        #         Config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        #         # Save+upload in background (non-blocking)
+        #         cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
+        #         self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
+        #         print("  ✓ Initial buffer save+upload queued")
+        #         self.buffer_saved_on_first_fill = True
+        #     else:
+        #         print("  Buffer exists on GCS. Skipping first-fill save.")
+        #         self.buffer_saved_on_first_fill = True
 
         print(f"\n--- Training Population (Buffer: {len(self.replay_buffer)}) ---")
         
@@ -340,14 +341,14 @@ class ERLTrainer:
             agent.save(str(agent_path))
         
         # 3. Save the replay buffer every 5 generations (overwrites previous)
-        # Generations 5, 10, 15, 20, 25, etc.
-        # Save+upload happens in background to avoid blocking training
-        if (self.generation + 1) % 5 == 0:
-            buffer_path = checkpoint_dir / "replay_buffer.pkl"
-            cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
-            print(f"  Queueing replay buffer save+upload in background...")
-            self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
-            print(f"  ✓ Buffer save+upload queued ({len(self.replay_buffer)} transitions)")
+        # DISABLED: Buffer save causes RAM exhaustion during pickle serialization (175GB peak)
+        # Buffer remains in memory for training (~20GB), just not persisted to disk
+        # if (self.generation + 1) % 5 == 0:
+        #     buffer_path = checkpoint_dir / "replay_buffer.pkl"
+        #     cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
+        #     print(f"  Queueing replay buffer save+upload in background...")
+        #     self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
+        #     print(f"  ✓ Buffer save+upload queued ({len(self.replay_buffer)} transitions)")
 
         # 4. Save the trainer state
         trainer_state = {
