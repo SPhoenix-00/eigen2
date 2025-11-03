@@ -8,6 +8,8 @@ import torch
 from typing import Dict, Tuple
 from collections import deque
 import pickle
+import gzip
+import os
 
 from utils.config import Config
 
@@ -112,23 +114,46 @@ class ReplayBuffer:
             'total_added': self.total_added
         }
     
-    def save(self, file_path: str):
+    def save(self, file_path: str, compress: bool = True):
         """
-        Saves the buffer's core components to a file using pickle.
-        This is more memory-efficient than pickling 'self'.
+        Saves the buffer's core components to a file using pickle with optional compression.
+
+        Args:
+            file_path: Path to save buffer
+            compress: If True, use gzip compression (reduces size by ~50-70%)
         """
         # Save the core components in a dictionary
         save_data = {
             'capacity': self.capacity,
             'buffer': self.buffer,  # This is the deque
         }
-        
-        print(f"  Saving replay buffer ({len(self.buffer)} transitions) to {file_path}...")
+
+        buffer_size_mb = len(self.buffer) * 3.74  # Approximate MB
+        print(f"  Saving replay buffer ({len(self.buffer)} transitions, ~{buffer_size_mb:.0f} MB) to {file_path}...")
+
+        if compress:
+            print(f"  Using gzip compression...")
+
         try:
-            with open(file_path, 'wb') as f:
-                # Use a high protocol for efficiency
-                pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print("  ✓ Buffer saved.")
+            if compress:
+                with gzip.open(file_path + '.gz', 'wb', compresslevel=6) as f:
+                    pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # Remove uncompressed file if it exists
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                # Rename compressed file to original name
+                os.rename(file_path + '.gz', file_path)
+
+                # Report compression savings
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                compression_ratio = (1 - file_size_mb / buffer_size_mb) * 100
+                print(f"  ✓ Buffer saved: {file_size_mb:.1f} MB ({compression_ratio:.0f}% compression)")
+            else:
+                with open(file_path, 'wb') as f:
+                    pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                print(f"  ✓ Buffer saved: {file_size_mb:.1f} MB (uncompressed)")
+
         except (MemoryError, OverflowError) as e:
             print(f"  ❌ ERROR saving buffer: {e}")
             print("  Buffer is too large to save directly. Saving failed.")
@@ -136,16 +161,31 @@ class ReplayBuffer:
     @staticmethod
     def load(file_path: str) -> 'ReplayBuffer':
         """
-        Loads a ReplayBuffer from a pickled data file.
+        Loads a ReplayBuffer from a pickled data file (auto-detects compression).
         """
         print(f"  Loading replay buffer from {file_path}...")
+
+        # Check file size
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        print(f"  File size: {file_size_mb:.1f} MB")
+
         try:
+            # Try to detect if file is gzip compressed by reading magic bytes
             with open(file_path, 'rb') as f:
-                save_data = pickle.load(f)
-            
+                magic = f.read(2)
+                is_gzipped = (magic == b'\x1f\x8b')
+
+            if is_gzipped:
+                print(f"  Detected gzip compression, decompressing...")
+                with gzip.open(file_path, 'rb') as f:
+                    save_data = pickle.load(f)
+            else:
+                with open(file_path, 'rb') as f:
+                    save_data = pickle.load(f)
+
             # Create a new buffer with the loaded capacity
             new_buffer = ReplayBuffer(capacity=save_data['capacity'])
-            
+
             # Set its internal data
             new_buffer.buffer = save_data['buffer']
             

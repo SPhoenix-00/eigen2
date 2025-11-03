@@ -2,6 +2,8 @@
 
 **Time: 5 minutes**
 
+**Key Feature:** Checkpoints upload in the background while training continues - no GPU time wasted waiting for uploads!
+
 ---
 
 ## Step 1: Create RunPod Instance
@@ -9,8 +11,15 @@
 1. Go to: **https://www.runpod.io/console/gpu-cloud**
 2. Select GPU: **RTX 4090** (or 24GB+ VRAM)
 3. Template: **PyTorch 2.1** (or similar CUDA 12.1+ image)
-4. Disk: **50 GB**
+4. Disk: **250 GB minimum** (replay buffer grows to ~60-80 GB compressed after 25 generations)
 5. Click **"Deploy"**
+
+**Why 250GB?** The replay buffer stores 50,000 transitions by generation 25:
+- Uncompressed: ~183 GB
+- Compressed (auto-enabled): ~60-80 GB
+- Plus system/PyTorch: ~15-20 GB
+- Plus checkpoints/logs: ~1-2 GB
+- **Total: ~80-100 GB used, 250 GB gives comfortable headroom**
 
 ---
 
@@ -100,6 +109,12 @@ nvidia-smi
 # Verify GCS sync (after generation 5)
 # Go to: https://console.cloud.google.com/storage/browser/eigen2-checkpoints-ase0
 ```
+
+**Note on Uploads:** Checkpoints upload in the background (4 parallel threads) while training continues. You'll see:
+- `⏳ Queued for upload:` when files are queued
+- `✓ Uploaded:` when individual files complete
+- `📊 Upload status:` periodic status updates
+- Training never blocks waiting for uploads!
 
 ---
 

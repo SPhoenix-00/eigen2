@@ -225,10 +225,10 @@ class ERLTrainer:
                 print("  No buffer found on GCS. Saving initial buffer...")
                 Config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
                 self.replay_buffer.save(str(buffer_path))
-                # Upload with full cloud path
+                # Upload with full cloud path in background (non-blocking)
                 cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
-                self.cloud_sync.upload_file(str(buffer_path), cloud_path)
-                print("  ✓ Initial buffer saved and uploaded to GCS")
+                self.cloud_sync.upload_file(str(buffer_path), cloud_path, background=True)
+                print("  ✓ Initial buffer saved and queued for upload")
                 self.buffer_saved_on_first_fill = True
             else:
                 print("  Buffer exists on GCS. Skipping first-fill save.")
@@ -353,8 +353,9 @@ class ERLTrainer:
 
         print(f"✓ Checkpoint saved to {checkpoint_dir}")
 
-        # Sync to cloud storage
-        self.cloud_sync.sync_checkpoints(str(checkpoint_dir))
+        # Sync to cloud storage in background (non-blocking)
+        self.cloud_sync.sync_checkpoints(str(checkpoint_dir), background=True)
+        print(f"{'='*60}\n")
 
     def load_checkpoint(self):
         """Loads the entire training state from the checkpoint directory."""
@@ -503,6 +504,11 @@ class ERLTrainer:
             # 5. Save checkpoint periodically
             if (gen + 1) % Config.SAVE_FREQUENCY == 0:
                 self.save_checkpoint()
+
+                # Show upload status
+                pending, completed, failed = self.cloud_sync.get_upload_status()
+                if pending > 0 or completed > 0 or failed > 0:
+                    print(f"\n📊 Upload status: {pending} pending, {completed} completed, {failed} failed")
             
             # Generation time
             gen_time = time.time() - gen_start_time
@@ -520,8 +526,17 @@ class ERLTrainer:
         # Final save
         self.save_checkpoint()
 
-        # Sync logs to cloud
-        self.cloud_sync.sync_logs(str(Config.LOG_DIR))
+        # Sync logs to cloud in background
+        self.cloud_sync.sync_logs(str(Config.LOG_DIR), background=True)
+
+        # Wait for all uploads to complete before finishing
+        print("\n" + "="*60)
+        print("Training complete! Waiting for final uploads...")
+        print("="*60)
+        self.cloud_sync.wait_for_uploads()
+
+        # Shutdown cloud sync
+        self.cloud_sync.shutdown(wait=False)
 
         # Final summary
         print_final_summary(self)

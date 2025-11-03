@@ -6,8 +6,11 @@ Supports AWS S3, Google Cloud Storage, and Azure Blob Storage.
 import os
 import json
 import shutil
+import threading
 from pathlib import Path
 from typing import Optional, Literal
+from concurrent.futures import ThreadPoolExecutor, Future
+from queue import Queue
 
 CloudProvider = Literal["s3", "gcs", "azure", "local"]
 
@@ -22,7 +25,8 @@ class CloudSync:
         provider: CloudProvider = "local",
         bucket_name: Optional[str] = None,
         project_name: str = "eigen2",
-        credentials_path: Optional[str] = None
+        credentials_path: Optional[str] = None,
+        max_workers: int = 4
     ):
         """
         Initialize cloud sync.
@@ -32,12 +36,18 @@ class CloudSync:
             bucket_name: Name of the cloud storage bucket
             project_name: Project identifier for organizing files
             credentials_path: Path to credentials file (for GCS)
+            max_workers: Number of parallel upload threads
         """
         self.provider = provider
         self.bucket_name = bucket_name
         self.project_name = project_name
         self.credentials_path = credentials_path
         self.client = None
+
+        # Background upload thread pool
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="CloudUpload")
+        self.upload_futures = []
+        self._lock = threading.Lock()
 
         if provider != "local":
             self._init_client()
@@ -90,24 +100,14 @@ class CloudSync:
                 print("Falling back to local storage only")
                 self.provider = "local"
 
-    def upload_file(self, local_path: str, cloud_path: Optional[str] = None):
+    def _upload_file_sync(self, local_path: str, cloud_path: str):
         """
-        Upload a file to cloud storage.
+        Internal synchronous upload method (runs in background thread).
 
         Args:
             local_path: Path to local file
-            cloud_path: Path in cloud storage (defaults to same as local)
+            cloud_path: Path in cloud storage
         """
-        if self.provider == "local":
-            return
-
-        if not os.path.exists(local_path):
-            print(f"Warning: File not found: {local_path}")
-            return
-
-        if cloud_path is None:
-            cloud_path = f"{self.project_name}/{local_path}"
-
         try:
             if self.provider == "s3":
                 self.client.upload_file(local_path, self.bucket_name, cloud_path)
@@ -125,6 +125,35 @@ class CloudSync:
 
         except Exception as e:
             print(f"Warning: Failed to upload {local_path}: {e}")
+
+    def upload_file(self, local_path: str, cloud_path: Optional[str] = None, background: bool = False):
+        """
+        Upload a file to cloud storage.
+
+        Args:
+            local_path: Path to local file
+            cloud_path: Path in cloud storage (defaults to same as local)
+            background: If True, upload in background thread (non-blocking)
+        """
+        if self.provider == "local":
+            return
+
+        if not os.path.exists(local_path):
+            print(f"Warning: File not found: {local_path}")
+            return
+
+        if cloud_path is None:
+            cloud_path = f"{self.project_name}/{local_path}"
+
+        if background:
+            # Submit to background thread pool
+            future = self.executor.submit(self._upload_file_sync, local_path, cloud_path)
+            with self._lock:
+                self.upload_futures.append(future)
+            print(f"⏳ Queued for upload: {local_path} → {cloud_path}")
+        else:
+            # Synchronous upload
+            self._upload_file_sync(local_path, cloud_path)
 
     def file_exists_on_cloud(self, filename: str) -> bool:
         """
@@ -198,13 +227,71 @@ class CloudSync:
             print(f"Warning: Failed to download {cloud_path}: {e}")
             return False
 
-    def upload_directory(self, local_dir: str, cloud_prefix: Optional[str] = None):
+    def wait_for_uploads(self, timeout: Optional[float] = None):
+        """
+        Wait for all background uploads to complete.
+
+        Args:
+            timeout: Maximum time to wait in seconds (None = wait forever)
+        """
+        with self._lock:
+            futures = list(self.upload_futures)
+
+        if not futures:
+            return
+
+        print(f"\n⏳ Waiting for {len(futures)} background uploads to complete...")
+
+        completed = 0
+        failed = 0
+        for future in futures:
+            try:
+                future.result(timeout=timeout)
+                completed += 1
+            except Exception as e:
+                failed += 1
+                print(f"Warning: Background upload failed: {e}")
+
+        # Clear completed futures
+        with self._lock:
+            self.upload_futures = [f for f in self.upload_futures if not f.done()]
+
+        print(f"✓ Background uploads complete: {completed} succeeded, {failed} failed")
+
+    def get_upload_status(self):
+        """
+        Get status of background uploads.
+
+        Returns:
+            Tuple of (pending, completed, failed)
+        """
+        with self._lock:
+            futures = list(self.upload_futures)
+
+        pending = 0
+        completed = 0
+        failed = 0
+
+        for future in futures:
+            if future.done():
+                try:
+                    future.result(timeout=0)
+                    completed += 1
+                except:
+                    failed += 1
+            else:
+                pending += 1
+
+        return (pending, completed, failed)
+
+    def upload_directory(self, local_dir: str, cloud_prefix: Optional[str] = None, background: bool = False):
         """
         Upload an entire directory to cloud storage.
 
         Args:
             local_dir: Local directory path
             cloud_prefix: Prefix for cloud storage paths
+            background: If True, upload files in background threads (non-blocking)
         """
         if self.provider == "local":
             return
@@ -221,7 +308,7 @@ class CloudSync:
                 local_path = os.path.join(root, file)
                 relative_path = os.path.relpath(local_path, local_dir)
                 cloud_path = f"{cloud_prefix}/{relative_path}".replace("\\", "/")
-                self.upload_file(local_path, cloud_path)
+                self.upload_file(local_path, cloud_path, background=background)
 
     def download_directory(self, cloud_prefix: str, local_dir: str):
         """
@@ -267,18 +354,23 @@ class CloudSync:
             print(f"Warning: Failed to download directory {cloud_prefix}: {e}")
             return False
 
-    def sync_checkpoints(self, checkpoint_dir: str = "checkpoints"):
+    def sync_checkpoints(self, checkpoint_dir: str = "checkpoints", background: bool = False):
         """
         Sync checkpoint directory to cloud storage.
 
         Args:
             checkpoint_dir: Local checkpoint directory
+            background: If True, upload in background (non-blocking)
         """
         print(f"\n{'='*60}")
-        print("Syncing checkpoints to cloud storage...")
+        if background:
+            print("Queueing checkpoints for background upload...")
+        else:
+            print("Syncing checkpoints to cloud storage...")
         print(f"{'='*60}")
-        self.upload_directory(checkpoint_dir, f"{self.project_name}/{checkpoint_dir}")
-        print(f"{'='*60}\n")
+        self.upload_directory(checkpoint_dir, f"{self.project_name}/{checkpoint_dir}", background=background)
+        if not background:
+            print(f"{'='*60}\n")
 
     def download_checkpoints(self, checkpoint_dir: str = "checkpoints"):
         """
@@ -297,15 +389,28 @@ class CloudSync:
         print(f"{'='*60}\n")
         return success
 
-    def sync_logs(self, log_dir: str = "logs"):
+    def sync_logs(self, log_dir: str = "logs", background: bool = False):
         """
         Sync log directory to cloud storage.
 
         Args:
             log_dir: Local log directory
+            background: If True, upload in background (non-blocking)
         """
         if self.provider != "local":
-            self.upload_directory(log_dir, f"{self.project_name}/{log_dir}")
+            self.upload_directory(log_dir, f"{self.project_name}/{log_dir}", background=background)
+
+    def shutdown(self, wait: bool = True, timeout: Optional[float] = None):
+        """
+        Shutdown the upload thread pool.
+
+        Args:
+            wait: If True, wait for pending uploads to complete
+            timeout: Maximum time to wait in seconds
+        """
+        if wait:
+            self.wait_for_uploads(timeout=timeout)
+        self.executor.shutdown(wait=wait)
 
 
 def get_cloud_sync_from_env() -> CloudSync:
