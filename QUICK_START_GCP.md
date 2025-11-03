@@ -8,14 +8,15 @@
 
 ### Step 1: Create GCS Bucket
 
+✅ **Already created:** `eigen2-checkpoints-ase0`
+
+If you need to create another bucket:
 1. Go to: **https://console.cloud.google.com/storage**
 2. Click **"CREATE BUCKET"**
-3. Name: `eigen2-checkpoints-YOURNAME` (must be unique)
+3. Name must be globally unique
 4. Location: **Region** → `us-central1` (closest to Vast.ai)
 5. Storage class: **Standard**
 6. Click **"CREATE"**
-
-✅ **Write down your bucket name:** `_______________________`
 
 ### Step 2: Create Service Account
 
@@ -66,7 +67,7 @@ Go to: **https://vast.ai/console/create/**
 **Environment Variables:**
 ```
 CLOUD_PROVIDER=gcs
-CLOUD_BUCKET=eigen2-checkpoints-YOURNAME
+CLOUD_BUCKET=eigen2-checkpoints-ase0
 GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
 GITHUB_REPO=https://github.com/YOUR-USERNAME/eigen2.git
 GITHUB_BRANCH=main
@@ -127,7 +128,7 @@ cat checkpoints/trainer_state.json
 
 After 5 generations, check your bucket:
 1. Go to: https://console.cloud.google.com/storage/browser
-2. Click: `eigen2-checkpoints-YOURNAME`
+2. Click: `eigen2-checkpoints-ase0`
 3. Navigate to: `eigen2/checkpoints/`
 4. You should see checkpoint files!
 
@@ -135,7 +136,7 @@ After 5 generations, check your bucket:
 
 ## Complete On-start Script (Copy-Paste Ready)
 
-Replace `YOUR-USERNAME` and `YOURNAME` with your actual values:
+Replace `YOUR-USERNAME` with your GitHub username:
 
 ```bash
 #!/bin/bash
@@ -145,7 +146,7 @@ cd /workspace
 export GITHUB_REPO=https://github.com/YOUR-USERNAME/eigen2.git
 export GITHUB_BRANCH=main
 export CLOUD_PROVIDER=gcs
-export CLOUD_BUCKET=eigen2-checkpoints-YOURNAME
+export CLOUD_BUCKET=eigen2-checkpoints-ase0
 export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
 
 # Clone repository
@@ -209,10 +210,10 @@ No problem! Just:
 gcloud auth activate-service-account --key-file=gcs-credentials.json
 
 # Download checkpoints
-gsutil -m rsync -r gs://eigen2-checkpoints-YOURNAME/eigen2/checkpoints/ ./checkpoints/
+gsutil -m rsync -r gs://eigen2-checkpoints-ase0/eigen2/checkpoints/ ./checkpoints/
 
 # Download logs
-gsutil -m rsync -r gs://eigen2-checkpoints-YOURNAME/eigen2/logs/ ./logs/
+gsutil -m rsync -r gs://eigen2-checkpoints-ase0/eigen2/logs/ ./logs/
 ```
 
 **Method 2: Web Interface**
@@ -258,7 +259,7 @@ cat /workspace/gcs-credentials.json | head
 # Verify bucket name
 echo $CLOUD_BUCKET
 
-# Should output: eigen2-checkpoints-YOURNAME
+# Should output: eigen2-checkpoints-ase0
 # If wrong, update environment variable
 ```
 
@@ -266,7 +267,7 @@ echo $CLOUD_BUCKET
 
 ## Checklist Before Starting
 
-- [ ] GCS bucket created: `eigen2-checkpoints-______`
+- [x] GCS bucket created: `eigen2-checkpoints-ase0`
 - [ ] Service account created with "Storage Object Admin"
 - [ ] Credentials downloaded: `gcs-credentials.json`
 - [ ] Code pushed to GitHub
@@ -278,28 +279,26 @@ echo $CLOUD_BUCKET
 
 ---
 
-## Full Example (Real Values)
-
-Here's what your setup might look like:
+## Full Example (Your Actual Configuration)
 
 **GCS Configuration:**
 ```
-Bucket Name: eigen2-checkpoints-john123
+Bucket Name: eigen2-checkpoints-ase0
 Credentials: gcs-credentials.json
 ```
 
 **GitHub:**
 ```
-Repository: https://github.com/johnsmith/eigen2.git
+Repository: https://github.com/YOUR-USERNAME/eigen2.git
 Branch: main
 ```
 
 **Vast.ai Environment Variables:**
 ```
 CLOUD_PROVIDER=gcs
-CLOUD_BUCKET=eigen2-checkpoints-john123
+CLOUD_BUCKET=eigen2-checkpoints-ase0
 GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
-GITHUB_REPO=https://github.com/johnsmith/eigen2.git
+GITHUB_REPO=https://github.com/YOUR-USERNAME/eigen2.git
 GITHUB_BRANCH=main
 ```
 
@@ -307,10 +306,10 @@ GITHUB_BRANCH=main
 ```bash
 #!/bin/bash
 cd /workspace
-export GITHUB_REPO=https://github.com/johnsmith/eigen2.git
+export GITHUB_REPO=https://github.com/YOUR-USERNAME/eigen2.git
 export GITHUB_BRANCH=main
 export CLOUD_PROVIDER=gcs
-export CLOUD_BUCKET=eigen2-checkpoints-john123
+export CLOUD_BUCKET=eigen2-checkpoints-ase0
 export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
 
 git clone --depth 1 --branch $GITHUB_BRANCH $GITHUB_REPO .
