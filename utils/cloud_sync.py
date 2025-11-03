@@ -400,6 +400,39 @@ class CloudSync:
         if self.provider != "local":
             self.upload_directory(log_dir, f"{self.project_name}/{log_dir}", background=background)
 
+    def save_and_upload_buffer(self, replay_buffer, local_path: str, cloud_path: str):
+        """
+        Save replay buffer to disk and upload in background (non-blocking).
+
+        This runs the entire save+upload operation in a background thread so
+        training can continue immediately.
+
+        Args:
+            replay_buffer: ReplayBuffer instance to save
+            local_path: Local path to save buffer
+            cloud_path: Cloud storage path for upload
+        """
+        def _save_and_upload():
+            """Internal function to run in background thread."""
+            try:
+                # Save buffer to disk (with compression)
+                replay_buffer.save(local_path)
+
+                # Upload to cloud
+                if self.provider != "local":
+                    self._upload_file_sync(local_path, cloud_path)
+
+            except Exception as e:
+                print(f"Warning: Failed to save and upload buffer: {e}")
+
+        # Submit to background thread pool
+        future = self.executor.submit(_save_and_upload)
+        with self._lock:
+            self.upload_futures.append(future)
+
+        buffer_size_mb = len(replay_buffer) * 3.74
+        print(f"⏳ Queued buffer save+upload: {len(replay_buffer)} transitions (~{buffer_size_mb:.0f} MB)")
+
     def shutdown(self, wait: bool = True, timeout: Optional[float] = None):
         """
         Shutdown the upload thread pool.

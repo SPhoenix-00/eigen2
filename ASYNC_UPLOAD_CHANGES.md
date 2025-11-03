@@ -25,6 +25,7 @@ Added async upload infrastructure:
   - `background=False` (default) performs synchronous upload
 
 **New Methods:**
+- `save_and_upload_buffer(replay_buffer, local_path, cloud_path)` - Save buffer to disk + upload in single background operation
 - `wait_for_uploads(timeout)` - Wait for all pending uploads to complete
 - `get_upload_status()` - Returns (pending, completed, failed) tuple
 - `shutdown(wait=True)` - Clean shutdown of upload threads
@@ -39,14 +40,22 @@ Added async upload infrastructure:
 
 Updated to use background uploads:
 
-**Line 357:** Checkpoint sync now non-blocking
+**Line 358:** Checkpoint sync now non-blocking
 ```python
 self.cloud_sync.sync_checkpoints(str(checkpoint_dir), background=True)
 ```
 
-**Line 230:** First-fill buffer upload now non-blocking
+**Lines 340-345:** Every-5-generations buffer save+upload in background
 ```python
-self.cloud_sync.upload_file(str(buffer_path), cloud_path, background=True)
+if (self.generation + 1) % 5 == 0:
+    buffer_path = checkpoint_dir / "replay_buffer.pkl"
+    cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
+    self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
+```
+
+**Lines 223-231:** First-fill buffer save+upload in background
+```python
+self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
 ```
 
 **Lines 508-511:** Added upload status reporting after each checkpoint
@@ -113,20 +122,25 @@ pending, completed, failed = cloud_sync.get_upload_status()
 
 **Estimated Time Savings Per Generation:**
 
-| Item | Size | Sync Upload | Async Upload | Time Saved |
-|------|------|-------------|--------------|------------|
+| Item | Size | Sync Save+Upload | Async Save+Upload | Time Saved |
+|------|------|------------------|-------------------|------------|
 | Population (16 agents) | ~250 MB | 30-60s | 0s (background) | 30-60s |
-| Replay buffer (every 5 gen) | ~500 MB | 60-120s | 0s (background) | 60-120s |
+| Replay buffer (compressed) | 12-75 GB | 60-180s | 0s (background) | 60-180s |
+| Replay buffer save (disk) | - | 30-60s | 0s (background) | 30-60s |
 | Best agent | ~15 MB | 3-5s | 0s (background) | 3-5s |
 
 **Total GPU Time Saved:**
 - Regular generations: ~35-65 seconds per checkpoint
-- Buffer save generations (5, 10, 15, 20, 25): ~95-185 seconds per checkpoint
+- Buffer save generations (5, 10, 15, 20, 25): **~125-305 seconds per checkpoint**
+  - Buffer save to disk: 30-60s
+  - Buffer compression: included in save
+  - Buffer upload: 60-180s
+  - All now happen in background!
 
 **For 25 generations with 5 buffer saves:**
-- Without async: ~13-28 minutes of blocked GPU time
+- Without async: ~18-38 minutes of blocked GPU time
 - With async: ~0 seconds of blocked GPU time
-- **Savings: $2-5 in GPU costs at typical rates**
+- **Savings: $3-7 in GPU costs at typical rates**
 
 ---
 

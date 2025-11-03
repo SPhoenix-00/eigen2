@@ -120,6 +120,41 @@ def main():
 
         # Final wait
         cloud_sync.wait_for_uploads(timeout=120)
+        print()
+
+        # Test 4: Buffer save+upload simulation
+        print("="*60)
+        print("Test 4: Replay buffer save+upload simulation")
+        print("="*60)
+
+        # Create a mock replay buffer
+        from models.replay_buffer import ReplayBuffer
+        import numpy as np
+
+        print("Creating small test buffer...")
+        test_buffer = ReplayBuffer(capacity=100)
+
+        # Add a few test transitions
+        for i in range(50):
+            state = np.random.randn(504, 108, 9).astype(np.float32)
+            action = np.random.randn(108, 2).astype(np.float32)
+            reward = float(np.random.randn())
+            next_state = np.random.randn(504, 108, 9).astype(np.float32)
+            done = bool(i == 49)
+            test_buffer.add(state, action, reward, next_state, done)
+
+        print(f"Buffer has {len(test_buffer)} transitions")
+
+        # Save+upload in background
+        buffer_path = Path(tmpdir) / "test_replay_buffer.pkl"
+        cloud_path = f"{cloud_sync.project_name}/test_async/test_replay_buffer.pkl"
+        cloud_sync.save_and_upload_buffer(test_buffer, str(buffer_path), cloud_path)
+
+        # Simulate training continuing
+        simulate_training_work(5.0)
+
+        # Wait for completion
+        cloud_sync.wait_for_uploads(timeout=120)
 
     # Cleanup
     print("\n" + "="*60)
@@ -132,7 +167,8 @@ def main():
     print("  1. Training continues while files upload")
     print("  2. Multiple files upload in parallel (4 workers)")
     print("  3. No blocking on large checkpoint saves")
-    print("  4. Clean shutdown waits for pending uploads")
+    print("  4. Buffer save+compress+upload happens in background")
+    print("  5. Clean shutdown waits for pending uploads")
 
 if __name__ == "__main__":
     main()

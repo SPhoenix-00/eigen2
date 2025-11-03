@@ -222,13 +222,12 @@ class ERLTrainer:
 
             if not buffer_exists_on_cloud:
                 print(f"\n--- Buffer Full for First Time ({len(self.replay_buffer)} transitions) ---")
-                print("  No buffer found on GCS. Saving initial buffer...")
+                print("  No buffer found on GCS. Queueing initial buffer save+upload...")
                 Config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-                self.replay_buffer.save(str(buffer_path))
-                # Upload with full cloud path in background (non-blocking)
+                # Save+upload in background (non-blocking)
                 cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
-                self.cloud_sync.upload_file(str(buffer_path), cloud_path, background=True)
-                print("  ✓ Initial buffer saved and queued for upload")
+                self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
+                print("  ✓ Initial buffer save+upload queued")
                 self.buffer_saved_on_first_fill = True
             else:
                 print("  Buffer exists on GCS. Skipping first-fill save.")
@@ -319,8 +318,14 @@ class ERLTrainer:
         """Saves the entire training state to a checkpoint directory."""
         checkpoint_dir = Config.CHECKPOINT_DIR
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
+
         print(f"\n--- Saving checkpoint for Generation {self.generation} ---")
+
+        # Check if any buffer saves are still in progress
+        # We want to know status but don't need to wait (they'll finish in background)
+        pending, completed, failed = self.cloud_sync.get_upload_status()
+        if pending > 0:
+            print(f"  Note: {pending} background uploads still in progress (will continue)")
 
         # 1. Save best agent
         if self.best_agent is not None:
@@ -336,11 +341,13 @@ class ERLTrainer:
         
         # 3. Save the replay buffer every 5 generations (overwrites previous)
         # Generations 5, 10, 15, 20, 25, etc.
+        # Save+upload happens in background to avoid blocking training
         if (self.generation + 1) % 5 == 0:
-            print("  Saving replay buffer (this may take a while)...")
             buffer_path = checkpoint_dir / "replay_buffer.pkl"
-            self.replay_buffer.save(str(buffer_path))
-            print(f"  ✓ Replay buffer saved ({len(self.replay_buffer)} transitions)")
+            cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
+            print(f"  Queueing replay buffer save+upload in background...")
+            self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
+            print(f"  ✓ Buffer save+upload queued ({len(self.replay_buffer)} transitions)")
 
         # 4. Save the trainer state
         trainer_state = {
