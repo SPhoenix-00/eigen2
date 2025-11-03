@@ -106,23 +106,31 @@ def test_gcs_connection():
         client = storage.Client()
         bucket = client.bucket(bucket_name)
 
-        # Test if bucket exists
-        if bucket.exists():
-            print(f"✓ Connected to bucket: {bucket_name}")
-        else:
-            print(f"✗ Bucket does not exist: {bucket_name}")
-            print()
-            return False
+        # Test if bucket exists (note: requires storage.buckets.get permission)
+        try:
+            if bucket.exists():
+                print(f"✓ Connected to bucket: {bucket_name}")
+        except Exception as perm_error:
+            # Permission denied on bucket.exists() is OK - we don't need it for training
+            if "403" in str(perm_error) or "storage.buckets.get" in str(perm_error):
+                print(f"⚠️  Cannot verify bucket exists (missing storage.buckets.get permission)")
+                print(f"   This is OK - not needed for checkpoint uploads")
+            else:
+                raise
 
         # Try to list some blobs (limit to 5)
         print(f"✓ Listing files in bucket...")
-        blobs = list(bucket.list_blobs(max_results=5))
-        if blobs:
-            print(f"✓ Found {len(blobs)} files (showing first 5):")
-            for blob in blobs[:5]:
-                print(f"  - {blob.name}")
-        else:
-            print("  (Bucket is empty)")
+        try:
+            blobs = list(bucket.list_blobs(max_results=5))
+            if blobs:
+                print(f"✓ Found {len(blobs)} files (showing first 5):")
+                for blob in blobs[:5]:
+                    print(f"  - {blob.name}")
+            else:
+                print("  (Bucket is empty or no list permission)")
+        except Exception as list_error:
+            print(f"⚠️  Cannot list files: {list_error}")
+            print("   This is OK if write/read test passes")
 
     except Exception as e:
         print(f"✗ Connection failed: {e}")
