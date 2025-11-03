@@ -144,7 +144,7 @@ CLOUD_PROVIDER=local
 ```bash
 #!/bin/bash
 cd /workspace
-export GITHUB_REPO=https://github.com/YOUR-USERNAME/eigen2.git
+export GITHUB_REPO=https://github.com/SPhoenix-00/eigen2.git
 export GITHUB_BRANCH=main
 export CLOUD_PROVIDER=s3
 export CLOUD_BUCKET=my-checkpoints

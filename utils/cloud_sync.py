@@ -316,7 +316,8 @@ def get_cloud_sync_from_env() -> CloudSync:
         CLOUD_PROVIDER: 's3', 'gcs', 'azure', or 'local' (default: 'local')
         CLOUD_BUCKET: Bucket/container name
         CLOUD_PROJECT: Project name (default: 'eigen2')
-        GCS_CREDENTIALS: Path to GCS credentials JSON (for GCS only)
+        GOOGLE_APPLICATION_CREDENTIALS: Path to GCS credentials JSON (for GCS only)
+        GCS_CREDENTIALS: Alternative path to GCS credentials (deprecated, use GOOGLE_APPLICATION_CREDENTIALS)
 
     Returns:
         Configured CloudSync instance
@@ -324,7 +325,8 @@ def get_cloud_sync_from_env() -> CloudSync:
     provider = os.environ.get("CLOUD_PROVIDER", "local").lower()
     bucket_name = os.environ.get("CLOUD_BUCKET")
     project_name = os.environ.get("CLOUD_PROJECT", "eigen2")
-    credentials_path = os.environ.get("GCS_CREDENTIALS")
+    # Check both GOOGLE_APPLICATION_CREDENTIALS (standard) and GCS_CREDENTIALS (legacy)
+    credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GCS_CREDENTIALS")
 
     if provider != "local" and not bucket_name:
         print("Warning: CLOUD_BUCKET not set. Using local storage only.")
