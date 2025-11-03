@@ -92,7 +92,7 @@ class Config:
     
     # Training
     GRADIENT_STEPS_PER_GENERATION = 32
-    GRADIENT_ACCUMULATION_STEPS = 8
+    GRADIENT_ACCUMULATION_STEPS = 6
     
     # ============ Training Parameters ============
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
