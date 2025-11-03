@@ -126,6 +126,43 @@ class CloudSync:
         except Exception as e:
             print(f"Warning: Failed to upload {local_path}: {e}")
 
+    def file_exists_on_cloud(self, filename: str) -> bool:
+        """
+        Check if a file exists in cloud storage.
+
+        Args:
+            filename: Name of file (will be prefixed with project_name/checkpoints/)
+
+        Returns:
+            True if file exists, False otherwise
+        """
+        if self.provider == "local":
+            return False
+
+        cloud_path = f"{self.project_name}/checkpoints/{filename}"
+
+        try:
+            if self.provider == "s3":
+                try:
+                    self.client.head_object(Bucket=self.bucket_name, Key=cloud_path)
+                    return True
+                except:
+                    return False
+
+            elif self.provider == "gcs":
+                blob = self.bucket.blob(cloud_path)
+                return blob.exists()
+
+            elif self.provider == "azure":
+                blob_client = self.container_client.get_blob_client(cloud_path)
+                return blob_client.exists()
+
+        except Exception as e:
+            print(f"Warning: Error checking if file exists: {e}")
+            return False
+
+        return False
+
     def download_file(self, cloud_path: str, local_path: str):
         """
         Download a file from cloud storage.

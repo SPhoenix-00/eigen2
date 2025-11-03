@@ -76,7 +76,7 @@ class Config:
     
     # ============ ERL Parameters ============
     POPULATION_SIZE = 16
-    NUM_GENERATIONS = 20
+    NUM_GENERATIONS = 25
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
     # Selection
@@ -102,7 +102,7 @@ class Config:
     # Checkpointing
     CHECKPOINT_DIR = Path("checkpoints")
     SAVE_FREQUENCY = 1  # Save every N generations (IMPORTANT: Set to 1 for safety!)
-    SAVE_REPLAY_BUFFER = False  # Set to True to save replay buffer (large files!)
+    # Replay buffer is saved every 5 generations and on first fill (if no buffer exists on cloud)
     
     # Logging
     LOG_DIR = Path("logs")

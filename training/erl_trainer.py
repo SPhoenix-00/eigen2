@@ -71,6 +71,9 @@ class ERLTrainer:
         # Cloud sync
         self.cloud_sync = get_cloud_sync_from_env()
 
+        # Track if we've saved buffer on first fill
+        self.buffer_saved_on_first_fill = False
+
         print(f"Training range: days {self.train_start_idx} to {self.train_end_idx}")
         print(f"Validation range: days {self.val_start_idx} to {self.val_end_idx}")
     
@@ -209,7 +212,28 @@ class ERLTrainer:
         if not self.replay_buffer.is_ready():
             print(f"Buffer not ready: {len(self.replay_buffer)} / {Config.MIN_BUFFER_SIZE}")
             return
-        
+
+        # Check if buffer is full for the first time and we haven't saved it yet
+        buffer_is_full = (len(self.replay_buffer) == self.replay_buffer.capacity)
+        if buffer_is_full and not self.buffer_saved_on_first_fill:
+            # Check if buffer exists on GCS
+            buffer_path = Config.CHECKPOINT_DIR / "replay_buffer.pkl"
+            buffer_exists_on_cloud = self.cloud_sync.file_exists_on_cloud("replay_buffer.pkl")
+
+            if not buffer_exists_on_cloud:
+                print(f"\n--- Buffer Full for First Time ({len(self.replay_buffer)} transitions) ---")
+                print("  No buffer found on GCS. Saving initial buffer...")
+                Config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+                self.replay_buffer.save(str(buffer_path))
+                # Upload with full cloud path
+                cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
+                self.cloud_sync.upload_file(str(buffer_path), cloud_path)
+                print("  ✓ Initial buffer saved and uploaded to GCS")
+                self.buffer_saved_on_first_fill = True
+            else:
+                print("  Buffer exists on GCS. Skipping first-fill save.")
+                self.buffer_saved_on_first_fill = True
+
         print(f"\n--- Training Population (Buffer: {len(self.replay_buffer)}) ---")
         
         # Train each agent
@@ -310,8 +334,9 @@ class ERLTrainer:
             agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
             agent.save(str(agent_path))
         
-        # 3. Save the replay buffer (optional - can be large!)
-        if Config.SAVE_REPLAY_BUFFER:
+        # 3. Save the replay buffer every 5 generations (overwrites previous)
+        # Generations 5, 10, 15, 20, 25, etc.
+        if (self.generation + 1) % 5 == 0:
             print("  Saving replay buffer (this may take a while)...")
             buffer_path = checkpoint_dir / "replay_buffer.pkl"
             self.replay_buffer.save(str(buffer_path))
@@ -373,19 +398,18 @@ class ERLTrainer:
             except Exception as e:
                 print(f"❌ Error loading best agent: {e}.")
         
-        # 4. Load Replay Buffer (optional)
-        if Config.SAVE_REPLAY_BUFFER:
-            buffer_path = checkpoint_dir / "replay_buffer.pkl"
-            if buffer_path.exists():
-                try:
-                    self.replay_buffer = ReplayBuffer.load(str(buffer_path))
-                    print(f"✓ Loaded replay buffer (Size: {len(self.replay_buffer)})")
-                except Exception as e:
-                    print(f"❌ Error loading replay buffer: {e}. Starting with empty buffer.")
-            else:
-                print("! Replay buffer not found. Starting with empty buffer.")
+        # 4. Load Replay Buffer (saved every 5 generations)
+        buffer_path = checkpoint_dir / "replay_buffer.pkl"
+        if buffer_path.exists():
+            try:
+                self.replay_buffer = ReplayBuffer.load(str(buffer_path))
+                print(f"✓ Loaded replay buffer (Size: {len(self.replay_buffer)})")
+                # Mark buffer as already saved since we loaded it
+                self.buffer_saved_on_first_fill = True
+            except Exception as e:
+                print(f"❌ Error loading replay buffer: {e}. Starting with empty buffer.")
         else:
-            print("! Replay buffer saving disabled. Starting with empty buffer.")
+            print("! Replay buffer not found locally. Starting with empty buffer.")
         
         # 5. Load Trainer State
         state_path = checkpoint_dir / "trainer_state.json"

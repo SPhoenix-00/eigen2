@@ -77,7 +77,7 @@ GITHUB_BRANCH=main
 ```bash
 #!/bin/bash
 cd /workspace
-git clone --depth 1 https://github.com/YOUR-USERNAME/eigen2.git .
+git clone --depth 1 https://github.com/SPhoenix-00/eigen2.git .
 bash start_vast.sh --resume
 ```
 
