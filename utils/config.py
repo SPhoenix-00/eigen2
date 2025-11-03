@@ -101,7 +101,8 @@ class Config:
     
     # Checkpointing
     CHECKPOINT_DIR = Path("checkpoints")
-    SAVE_FREQUENCY = 5  # Save every N generations
+    SAVE_FREQUENCY = 1  # Save every N generations (IMPORTANT: Set to 1 for safety!)
+    SAVE_REPLAY_BUFFER = False  # Set to True to save replay buffer (large files!)
     
     # Logging
     LOG_DIR = Path("logs")

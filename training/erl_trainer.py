@@ -310,10 +310,13 @@ class ERLTrainer:
             agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
             agent.save(str(agent_path))
         
-        # 3. Save the replay buffer
-        #buffer_path = checkpoint_dir / "replay_buffer.pkl"
-        #self.replay_buffer.save(str(buffer_path))
-        
+        # 3. Save the replay buffer (optional - can be large!)
+        if Config.SAVE_REPLAY_BUFFER:
+            print("  Saving replay buffer (this may take a while)...")
+            buffer_path = checkpoint_dir / "replay_buffer.pkl"
+            self.replay_buffer.save(str(buffer_path))
+            print(f"  ✓ Replay buffer saved ({len(self.replay_buffer)} transitions)")
+
         # 4. Save the trainer state
         trainer_state = {
             'generation': self.generation,
@@ -370,16 +373,19 @@ class ERLTrainer:
             except Exception as e:
                 print(f"❌ Error loading best agent: {e}.")
         
-        # 4. Load Replay Buffer
-        """ buffer_path = checkpoint_dir / "replay_buffer.pkl"
-        if buffer_path.exists():
-            try:
-                self.replay_buffer = ReplayBuffer.load(str(buffer_path))
-                print(f"✓ Loaded replay buffer (Size: {len(self.replay_buffer)})")
-            except Exception as e:
-                print(f"❌ Error loading replay buffer: {e}. Starting with empty buffer.")
+        # 4. Load Replay Buffer (optional)
+        if Config.SAVE_REPLAY_BUFFER:
+            buffer_path = checkpoint_dir / "replay_buffer.pkl"
+            if buffer_path.exists():
+                try:
+                    self.replay_buffer = ReplayBuffer.load(str(buffer_path))
+                    print(f"✓ Loaded replay buffer (Size: {len(self.replay_buffer)})")
+                except Exception as e:
+                    print(f"❌ Error loading replay buffer: {e}. Starting with empty buffer.")
+            else:
+                print("! Replay buffer not found. Starting with empty buffer.")
         else:
-            print("! Replay buffer not found. Starting with empty buffer.") """
+            print("! Replay buffer saving disabled. Starting with empty buffer.")
         
         # 5. Load Trainer State
         state_path = checkpoint_dir / "trainer_state.json"
