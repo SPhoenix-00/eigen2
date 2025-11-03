@@ -62,9 +62,9 @@ class ERLTrainer:
         self.writer = SummaryWriter(log_dir=str(Config.LOG_DIR))
 
         # Initialize Weights & Biases
+        # Note: entity defaults to your personal workspace (eigen2)
         wandb.init(
-            project="eigen2-trading",
-            entity="eigen2",
+            project="eigen2-self",
             name=f"erl-{Config.NUM_GENERATIONS}gen",
             config={
                 "population_size": Config.POPULATION_SIZE,
