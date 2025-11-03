@@ -66,7 +66,7 @@ class Config:
     
     # Replay buffer
     BUFFER_SIZE = 200000
-    BATCH_SIZE = 2  # Small batch size due to GPU memory constraints with LSTM
+    BATCH_SIZE = 8
     MIN_BUFFER_SIZE = 10000  # Start training after this many transitions
     
     # Exploration noise
