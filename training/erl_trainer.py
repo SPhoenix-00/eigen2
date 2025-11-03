@@ -12,6 +12,7 @@ import time
 from torch.utils.tensorboard import SummaryWriter
 import os
 import json
+import wandb
 
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
@@ -59,11 +60,32 @@ class ERLTrainer:
         
         # Logging
         self.writer = SummaryWriter(log_dir=str(Config.LOG_DIR))
+
+        # Initialize Weights & Biases
+        wandb.init(
+            project="eigen2-trading",
+            entity="eigen2",
+            name=f"erl-{Config.NUM_GENERATIONS}gen",
+            config={
+                "population_size": Config.POPULATION_SIZE,
+                "num_generations": Config.NUM_GENERATIONS,
+                "buffer_size": Config.BUFFER_SIZE,
+                "batch_size": Config.BATCH_SIZE,
+                "actor_lr": Config.ACTOR_LR,
+                "critic_lr": Config.CRITIC_LR,
+                "trading_period_days": Config.TRADING_PERIOD_DAYS,
+                "max_holding_period": Config.MAX_HOLDING_PERIOD,
+                "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
+                "num_stocks": Config.NUM_INVESTABLE_STOCKS,
+            },
+            resume="allow"  # Allow resuming from checkpoints
+        )
+
         self.start_generation = 0
         self.generation = 0
         self.best_fitness = float('-inf')
         self.best_agent = None
-        
+
         # Statistics
         self.fitness_history = []
         self.generation_times = []
@@ -259,6 +281,12 @@ class ERLTrainer:
             if agent.agent_id == 0:  # Log first agent as representative
                 self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
                 self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
+
+                # Log to wandb
+                wandb.log({
+                    "train/actor_loss": np.mean(actor_losses),
+                    "train/critic_loss": np.mean(critic_losses),
+                }, step=self.generation)
     
     def evolve_population(self, fitness_scores: List[float]):
         """
@@ -474,6 +502,16 @@ class ERLTrainer:
             self.writer.add_scalar('Fitness/Max', max_fitness, gen)
             self.writer.add_scalar('Fitness/Min', min_fitness, gen)
             self.writer.add_scalar('Fitness/Std', np.std(fitness_scores), gen)
+
+            # Log to wandb
+            wandb.log({
+                "generation": gen,
+                "fitness/mean": mean_fitness,
+                "fitness/max": max_fitness,
+                "fitness/min": min_fitness,
+                "fitness/std": np.std(fitness_scores),
+                "fitness/best_ever": self.best_fitness if hasattr(self, 'best_fitness') else max_fitness,
+            }, step=gen)
             
             # Update best agent
             best_idx = None
@@ -510,6 +548,14 @@ class ERLTrainer:
                 if val_results:
                     self.writer.add_scalar('Validation/Fitness', val_results['fitness'], gen)
                     self.writer.add_scalar('Validation/WinRate', val_results['win_rate'], gen)
+
+                    # Log to wandb
+                    wandb.log({
+                        "validation/fitness": val_results['fitness'],
+                        "validation/win_rate": val_results['win_rate'],
+                        "validation/total_trades": val_results.get('total_trades', 0),
+                        "validation/winning_trades": val_results.get('winning_trades', 0),
+                    }, step=gen)
             
             # 5. Save checkpoint periodically
             if (gen + 1) % Config.SAVE_FREQUENCY == 0:
@@ -532,6 +578,15 @@ class ERLTrainer:
             buffer_stats = self.replay_buffer.get_stats()
             self.writer.add_scalar('Buffer/Size', buffer_stats['size'], gen)
             self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
+
+            # Log to wandb
+            wandb.log({
+                "buffer/size": buffer_stats['size'],
+                "buffer/utilization": buffer_stats['utilization'],
+                "buffer/capacity": buffer_stats['capacity'],
+                "training/generation_time": gen_time,
+                "training/avg_generation_time": np.mean(self.generation_times) if self.generation_times else 0,
+            }, step=gen)
         
         # Final save
         self.save_checkpoint()
@@ -547,6 +602,9 @@ class ERLTrainer:
 
         # Shutdown cloud sync
         self.cloud_sync.shutdown(wait=False)
+
+        # Finish wandb run
+        wandb.finish()
 
         # Final summary
         print_final_summary(self)
