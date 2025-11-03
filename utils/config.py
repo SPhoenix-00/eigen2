@@ -66,7 +66,7 @@ class Config:
     
     # Replay buffer
     BUFFER_SIZE = 200000
-    BATCH_SIZE = 8
+    BATCH_SIZE = 6
     MIN_BUFFER_SIZE = 10000  # Start training after this many transitions
     
     # Exploration noise
@@ -92,7 +92,7 @@ class Config:
     
     # Training
     GRADIENT_STEPS_PER_GENERATION = 32
-    GRADIENT_ACCUMULATION_STEPS = 16
+    GRADIENT_ACCUMULATION_STEPS = 6
     
     # ============ Training Parameters ============
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
