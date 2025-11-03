@@ -19,3 +19,15 @@ logs/
 *.swo
 *~
 .DS_Store
+
+# Environment and secrets
+.env
+*.pem
+*.key
+*credentials*.json
+!.env.example
+
+# Cloud storage cache
+.aws/
+.gcloud/
+.azure/

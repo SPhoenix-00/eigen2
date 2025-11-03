@@ -20,6 +20,7 @@ from models.replay_buffer import ReplayBuffer
 from erl.genetic_ops import create_next_generation
 from utils.config import Config
 from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress
+from utils.cloud_sync import get_cloud_sync_from_env
 
 
 class ERLTrainer:
@@ -66,7 +67,10 @@ class ERLTrainer:
         # Statistics
         self.fitness_history = []
         self.generation_times = []
-        
+
+        # Cloud sync
+        self.cloud_sync = get_cloud_sync_from_env()
+
         print(f"Training range: days {self.train_start_idx} to {self.train_end_idx}")
         print(f"Validation range: days {self.val_start_idx} to {self.val_end_idx}")
     
@@ -321,10 +325,18 @@ class ERLTrainer:
 
         print(f"✓ Checkpoint saved to {checkpoint_dir}")
 
+        # Sync to cloud storage
+        self.cloud_sync.sync_checkpoints(str(checkpoint_dir))
+
     def load_checkpoint(self):
         """Loads the entire training state from the checkpoint directory."""
         checkpoint_dir = Config.CHECKPOINT_DIR
         print(f"\n--- Loading checkpoint from {checkpoint_dir} ---")
+
+        # Try to download from cloud first
+        if not checkpoint_dir.exists() or len(list(checkpoint_dir.glob('*'))) == 0:
+            print("! No local checkpoint found. Attempting to download from cloud...")
+            self.cloud_sync.download_checkpoints(str(checkpoint_dir))
 
         # 1. Check if directory exists
         if not checkpoint_dir.exists():
@@ -477,10 +489,13 @@ class ERLTrainer:
         
         # Final save
         self.save_checkpoint()
-        
+
+        # Sync logs to cloud
+        self.cloud_sync.sync_logs(str(Config.LOG_DIR))
+
         # Final summary
         print_final_summary(self)
-        
+
         self.writer.close()
 
 
