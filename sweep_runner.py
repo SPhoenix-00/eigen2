@@ -6,19 +6,28 @@ Runs hyperparameter optimization experiments locally
 import wandb
 import torch
 import numpy as np
+import random
 from pathlib import Path
 
 from utils.config import Config
 from training.erl_trainer import ERLTrainer
-from data.data_loader import load_stock_data
+from data.loader import StockDataLoader
 
 
-def train_with_config(config_override=None):
+def set_seed(seed: int = 42):
+    """Set random seeds for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train_with_config():
     """
     Run training with W&B sweep configuration.
-
-    Args:
-        config_override: Dictionary of hyperparameters from W&B sweep
+    W&B agent automatically passes parameters via wandb.config
     """
     # Initialize W&B run (will be created by sweep agent)
     run = wandb.init()
@@ -98,7 +107,7 @@ def train_with_config(config_override=None):
     })
 
     print("\n" + "="*70)
-    print("Starting W&B Sweep Run")
+    print("W&B Sweep Run - Project Eigen 2")
     print("="*70)
     print(f"Run ID: {run.id}")
     print(f"Run Name: {run.name}")
@@ -113,30 +122,35 @@ def train_with_config(config_override=None):
     print(f"  Mutation Rate: {Config.MUTATION_RATE}")
     print(f"  Loss Penalty: {Config.LOSS_PENALTY_MULTIPLIER}x")
     print(f"  Max Holding: {Config.MAX_HOLDING_PERIOD} days")
+    print(f"  Generations: {Config.NUM_GENERATIONS}")
+    print(f"  Population: {Config.POPULATION_SIZE}")
     print("="*70 + "\n")
+
+    # Set random seeds
+    set_seed(Config.SEED)
 
     # Validate config
     if not Config.validate():
         print("Configuration validation failed!")
+        wandb.finish()
         return
 
-    # Set random seeds
-    torch.manual_seed(Config.SEED)
-    np.random.seed(Config.SEED)
+    # Load data (matching main.py structure)
+    print("\n" + "="*60)
+    print("Phase 1: Data Loading")
+    print("="*60)
 
-    # Load data
-    print("Loading stock data...")
-    train_data, val_data = load_stock_data(
-        Config.DATA_PATH,
-        Config.CONTEXT_WINDOW_DAYS,
-        Config.TRAIN_TEST_SPLIT
-    )
-    print(f"✓ Loaded {len(train_data)} training samples, {len(val_data)} validation samples")
+    loader = StockDataLoader()
+    data_array, stats = loader.load_and_prepare()
+
+    print("\n" + "="*60)
+    print("Phase 2: ERL Training")
+    print("="*60)
 
     # Create trainer (NO cloud sync for local sweeps)
+    # Pass the loader object, not train/val data
     trainer = ERLTrainer(
-        train_data=train_data,
-        val_data=val_data,
+        loader,
         cloud_sync=None  # Disable cloud sync for local runs
     )
 

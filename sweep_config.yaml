@@ -3,6 +3,10 @@
 
 program: sweep_runner.py
 method: random
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
 project: eigen2-self
 entity: eigen2-self
 

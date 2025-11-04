@@ -1,0 +1,36 @@
+wandb_version: 1
+
+actor_lr:
+  value: 0.00036599159238677047
+batch_size:
+  value: 8
+buffer_size:
+  value: 25000
+critic_lr:
+  value: 0.00021941284338844973
+gamma:
+  value: 0.99
+gradient_accumulation_steps:
+  value: 10
+gradient_steps_per_generation:
+  value: 16
+inaction_penalty:
+  value: 2
+loss_penalty_multiplier:
+  value: 10
+max_holding_period:
+  value: 10
+mutation_rate:
+  value: 0.09476242980868708
+mutation_std:
+  value: 0.04263911307916768
+noise_decay:
+  value: 0.9999
+noise_scale:
+  value: 0.05800546555653011
+num_generations:
+  value: 10
+population_size:
+  value: 8
+tau:
+  value: 0.009566971492975484
