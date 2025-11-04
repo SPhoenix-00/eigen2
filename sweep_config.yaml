@@ -1,0 +1,89 @@
+# W&B Sweep Configuration for Eigen2 Hyperparameter Optimization
+# Run locally while main training runs on RunPod
+
+program: sweep_runner.py
+method: bayes  # Bayesian optimization (most efficient)
+project: eigen2-self
+entity: eigen2
+
+metric:
+  name: fitness/best_ever
+  goal: maximize
+
+# Early stopping - stop unpromising runs early to save compute
+early_terminate:
+  type: hyperband
+  min_iter: 5  # At least 5 generations before stopping
+  eta: 2
+  s: 3
+
+parameters:
+  # Learning rates - critical for performance
+  actor_lr:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 5e-4
+
+  critic_lr:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-3
+
+  # DDPG parameters
+  gamma:
+    values: [0.95, 0.97, 0.99, 0.995]
+
+  tau:
+    distribution: uniform
+    min: 0.001
+    max: 0.01
+
+  # Training intensity
+  gradient_steps_per_generation:
+    values: [16, 32, 64, 96]
+
+  gradient_accumulation_steps:
+    values: [4, 6, 8, 10, 12]
+
+  batch_size:
+    values: [2, 4, 6, 8]
+
+  # Exploration noise
+  noise_scale:
+    distribution: uniform
+    min: 0.05
+    max: 0.2
+
+  noise_decay:
+    values: [0.9995, 0.9997, 0.9999]
+
+  # Genetic algorithm parameters
+  mutation_rate:
+    distribution: uniform
+    min: 0.05
+    max: 0.2
+
+  mutation_std:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 0.05
+
+  # Trading environment parameters
+  loss_penalty_multiplier:
+    values: [5.0, 10.0, 15.0, 20.0]
+
+  inaction_penalty:
+    values: [0.5, 1.0, 2.0, 3.0]
+
+  max_holding_period:
+    values: [10, 15, 20, 25, 30]
+
+  # Fixed parameters for sweep (not tuned)
+  num_generations:
+    value: 10  # Shorter runs for sweep
+
+  population_size:
+    value: 8  # Smaller population for faster iterations
+
+  buffer_size:
+    value: 25000  # Smaller buffer for local runs
