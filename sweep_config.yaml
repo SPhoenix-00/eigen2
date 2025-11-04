@@ -84,7 +84,7 @@ parameters:
 
   # Fixed parameters for sweep (not tuned)
   num_generations:
-    value: 10  # Shorter runs for sweep
+    value: 12  # Shorter runs for sweep
 
   population_size:
     value: 8  # Smaller population for faster iterations
