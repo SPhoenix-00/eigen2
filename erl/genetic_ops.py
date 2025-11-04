@@ -154,72 +154,104 @@ def mutate(agent: DDPGAgent, mutation_rate: float = None,
     
     return mutated
 
-
 def create_next_generation(population: List[DDPGAgent],
                           fitness_scores: List[float]) -> List[DDPGAgent]:
     """
     Create next generation using selection, crossover, and mutation.
-    
-    Args:
-        population: Current population
-        fitness_scores: Fitness for each agent
-        
-    Returns:
-        Next generation population
+    Calculates population segments dynamically using Config.POPULATION_SIZE.
     """
+    pop_size = Config.POPULATION_SIZE
+    
+    # -----------------------------------------------------------------
+    # NEW: Calculate segment sizes dynamically based on POPULATION_SIZE
+    # -----------------------------------------------------------------
+    num_elites = int(pop_size * Config.ELITE_FRAC)
+    num_offspring = int(pop_size * Config.OFFSPRING_FRAC)
+    
+    # Mutants fill the remaining space to guarantee the pop_size is matched
+    num_mutants = pop_size - num_elites - num_offspring
+    
+    if num_elites == 0 and len(population) > 0:
+        # Ensure at least one elite if possible, to allow mutation
+        num_elites = 1
+        # Adjust mutants to compensate
+        if num_mutants > 0:
+            num_mutants -= 1
+        elif num_offspring > 0: # Take from offspring if no mutants
+            num_offspring -= 1
+        
+    # -----------------------------------------------------------------
+    
     next_gen = []
     
     # 1. Elitism: Keep top performers
-    elites = elitism_selection(population, fitness_scores, Config.NUM_PARENTS)
+    # Use the new dynamic 'num_elites'
+    elites = elitism_selection(population, fitness_scores, num_elites)
     next_gen.extend(elites)
     
     print(f"  Elites: {len(elites)} agents (fitness: {[fitness_scores[population.index(e)] for e in elites[:3]]}...)")
     
     # 2. Crossover: Generate offspring
+    # Use the new dynamic 'num_offspring'
     offspring = []
-    for _ in range(Config.NUM_OFFSPRING):
-        # Select two different parents via tournament
-        parent1 = tournament_selection(population, fitness_scores, num_parents=1, tournament_size=3)[0]
+    if num_offspring > 0:
+        for _ in range(num_offspring):
+            # Select two different parents via tournament
+            parent1 = tournament_selection(population, fitness_scores, num_parents=1, tournament_size=3)[0]
+            
+            # Ensure parent2 is different from parent1
+            attempts = 0
+            while attempts < 10:
+                parent2 = tournament_selection(population, fitness_scores, num_parents=1, tournament_size=3)[0]
+                if parent2.agent_id != parent1.agent_id:
+                    break
+                attempts += 1
+            
+            if parent2.agent_id == parent1.agent_id and len(population) > 1:
+                other_agents = [a for a in population if a.agent_id != parent1.agent_id]
+                if other_agents: # Check if other_agents is not empty
+                    parent2 = np.random.choice(other_agents)
+                else: # Fallback if only one unique agent
+                    parent2 = parent1 
+            
+            child = crossover(parent1, parent2)
+            offspring.append(child)
         
-        # Ensure parent2 is different from parent1
-        attempts = 0
-        while attempts < 10:  # Max attempts to find different parent
-            parent2 = tournament_selection(population, fitness_scores, num_parents=1, tournament_size=3)[0]
-            if parent2.agent_id != parent1.agent_id:
-                break
-            attempts += 1
-        
-        # If we couldn't find different parent after 10 tries, just use any other agent
-        if parent2.agent_id == parent1.agent_id and len(population) > 1:
-            other_agents = [a for a in population if a.agent_id != parent1.agent_id]
-            parent2 = np.random.choice(other_agents)
-        
-        child = crossover(parent1, parent2)
-        offspring.append(child)
-    
     next_gen.extend(offspring)
     print(f"  Offspring: {len(offspring)} agents via crossover")
     
     # 3. Mutation: Create mutants from elites
+    # Use the new dynamic 'num_mutants'
     mutants = []
-    for _ in range(Config.NUM_MUTANTS):
-        # Select elite to mutate
-        elite = elites[np.random.randint(len(elites))]
-        mutant = mutate(elite)
-        mutants.append(mutant)
+    if num_mutants > 0 and len(elites) > 0: # Must have mutants to create and elites to mutate from
+        for _ in range(num_mutants):
+            # Select elite to mutate
+            elite = elites[np.random.randint(len(elites))]
+            mutant = mutate(elite)
+            mutants.append(mutant)
     
     next_gen.extend(mutants)
     print(f"  Mutants: {len(mutants)} agents via mutation")
     
+    # --- Fill remaining slots if any due to rounding ---
+    # This is a robust way to ensure size match
+    fill_count = pop_size - len(next_gen)
+    if fill_count > 0 and len(elites) > 0:
+        print(f"  Filling {fill_count} remaining slots with mutants.")
+        for _ in range(fill_count):
+            elite = elites[np.random.randint(len(elites))]
+            mutant = mutate(elite)
+            next_gen.append(mutant)
+
     # Assign new agent IDs
     for i, agent in enumerate(next_gen):
         agent.agent_id = i
     
+    # This assertion will now pass for ANY population size
     assert len(next_gen) == Config.POPULATION_SIZE, \
         f"Population size mismatch: {len(next_gen)} != {Config.POPULATION_SIZE}"
     
     return next_gen
-
 
 # Test genetic operations
 if __name__ == "__main__":

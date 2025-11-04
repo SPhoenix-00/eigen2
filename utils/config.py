@@ -80,9 +80,12 @@ class Config:
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
     # Selection
-    NUM_PARENTS = 8  # Top performers to keep
+    """     NUM_PARENTS = 8  # Top performers to keep
     NUM_OFFSPRING = 6  # Generated via crossover
-    NUM_MUTANTS = 2  # Random mutations
+    NUM_MUTANTS = 2  # Random mutations """
+    ELITE_FRAC = 0.5      # 50% of population
+    OFFSPRING_FRAC = 0.375   # 37.5% of population
+    # MUTANT_FRAC will be the remainder (12.5%)
     
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.3

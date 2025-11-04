@@ -63,7 +63,9 @@ class ERLTrainer:
 
         # Initialize Weights & Biases
         # Note: entity defaults to your personal workspace (eigen2)
-        wandb.init(
+        if wandb.run is None:
+            print("--- Initializing new W&B run (main.py mode) ---")
+            wandb.init(
             project="eigen2-self",
             name=f"erl-{Config.NUM_GENERATIONS}gen",
             config={
@@ -79,7 +81,9 @@ class ERLTrainer:
                 "num_stocks": Config.NUM_INVESTABLE_STOCKS,
             },
             resume="allow"  # Allow resuming from checkpoints
-        )
+            )
+        else:
+            print("--- W&B run already active (sweep_runner.py mode) ---")
 
         self.start_generation = 0
         self.generation = 0
