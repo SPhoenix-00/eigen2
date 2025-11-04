@@ -237,7 +237,10 @@ class ERLTrainer:
     def train_population(self):
         """Train all agents using shared replay buffer with gradient accumulation."""
         if not self.replay_buffer.is_ready():
-            print(f"Buffer not ready: {len(self.replay_buffer)} / {Config.MIN_BUFFER_SIZE}")
+            # Show correct threshold based on sweep vs regular training
+            is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
+            min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
+            print(f"Buffer not ready: {len(self.replay_buffer)} / {min_size}")
             return
 
         # Check if buffer is full for the first time and we haven't saved it yet
@@ -267,7 +270,7 @@ class ERLTrainer:
         for agent in tqdm(self.population, desc="Training agents"):
             actor_losses = []
             critic_losses = []
-            
+
             # Multiple gradient steps per agent
             for step in range(Config.GRADIENT_STEPS_PER_GENERATION):
                 # Gradient accumulation loop
@@ -282,7 +285,10 @@ class ERLTrainer:
                     # Detach from computation graph to prevent memory leak
                     actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
                     critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
-            
+
+                    # Explicitly delete batch tensors to free GPU memory
+                    del batch
+
             # Log agent stats
             if agent.agent_id == 0:  # Log first agent as representative
                 self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
@@ -293,6 +299,14 @@ class ERLTrainer:
                     "train/actor_loss": np.mean(actor_losses),
                     "train/critic_loss": np.mean(critic_losses),
                 }, step=self.generation)
+
+            # Explicitly clear loss lists to free memory
+            del actor_losses
+            del critic_losses
+
+            # Clear GPU cache after each agent to prevent accumulation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     def evolve_population(self, fitness_scores: List[float]):
         """
@@ -444,17 +458,20 @@ class ERLTrainer:
                 print(f"❌ Error loading best agent: {e}.")
         
         # 4. Load Replay Buffer (saved every 5 generations)
+        # NOTE: Buffer saves are disabled to prevent RAM exhaustion.
+        # On resume, we start with an empty buffer to avoid training on stale experiences.
         buffer_path = checkpoint_dir / "replay_buffer.pkl"
         if buffer_path.exists():
+            print(f"! Found old replay buffer at {buffer_path}")
+            print("  (Skipping load - buffer saves disabled, starting fresh to avoid stale data)")
+            # Delete the old buffer file to save disk space
             try:
-                self.replay_buffer = ReplayBuffer.load(str(buffer_path))
-                print(f"✓ Loaded replay buffer (Size: {len(self.replay_buffer)})")
-                # Mark buffer as already saved since we loaded it
-                self.buffer_saved_on_first_fill = True
+                buffer_path.unlink()
+                print("  ✓ Deleted old buffer file")
             except Exception as e:
-                print(f"❌ Error loading replay buffer: {e}. Starting with empty buffer.")
-        else:
-            print("! Replay buffer not found locally. Starting with empty buffer.")
+                print(f"  Warning: Could not delete old buffer: {e}")
+
+        print("✓ Starting with empty replay buffer (will fill from current agents)")
         
         # 5. Load Trainer State
         state_path = checkpoint_dir / "trainer_state.json"

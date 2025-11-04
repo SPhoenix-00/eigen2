@@ -99,7 +99,10 @@ class ReplayBuffer:
     
     def is_ready(self) -> bool:
         """Check if buffer has enough samples for training."""
-        return len(self.buffer) >= Config.MIN_BUFFER_SIZE
+        # Use lower threshold for W&B sweeps to enable DDPG with fewer generations
+        is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
+        min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
+        return len(self.buffer) >= min_size
     
     def clear(self):
         """Clear all transitions from buffer."""

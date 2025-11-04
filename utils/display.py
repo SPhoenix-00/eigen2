@@ -3,6 +3,7 @@ Display utilities for Project Eigen 2
 Pretty printing and progress visualization
 """
 
+import os
 import numpy as np
 from typing import List
 from utils.config import Config
@@ -111,7 +112,10 @@ def print_generation_summary(gen: int, total_gens: int,
     print("\n⚙️  SYSTEM STATUS")
     print("-" * 70)
     print(f"  Replay Buffer:     {buffer_size:>12,} / {Config.BUFFER_SIZE:,}")
-    print(f"  Buffer Ready:      {' '*10}{'✓ Yes' if buffer_size >= 10000 else '✗ No (needs ' + str(10000-buffer_size) + ' more)'}")
+    # Show correct minimum based on sweep vs regular training
+    is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
+    min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
+    print(f"  Buffer Ready:      {' '*10}{'✓ Yes' if buffer_size >= min_size else '✗ No (needs ' + str(min_size-buffer_size) + ' more)'}")
     print(f"  Generation Time:   {gen_time:>11.1f}s")
     print(f"  Avg Gen Time:      {avg_gen_time:>11.1f}s")
     

@@ -183,12 +183,18 @@ class DDPGAgent:
             # Decay noise
             self.noise_scale = max(Config.MIN_NOISE, self.noise_scale * Config.NOISE_DECAY)
         
-        # Return unscaled losses
-        self.actor_loss_history.append(actor_loss.item() * (Config.GRADIENT_ACCUMULATION_STEPS if accumulate else 1))
-        self.critic_loss_history.append(critic_loss.item() * (Config.GRADIENT_ACCUMULATION_STEPS if accumulate else 1))
-        
-        return critic_loss.item() * (Config.GRADIENT_ACCUMULATION_STEPS if accumulate else 1), \
-               actor_loss.item() * (Config.GRADIENT_ACCUMULATION_STEPS if accumulate else 1)
+        # Store losses as Python floats before cleanup
+        critic_loss_value = critic_loss.item() * (Config.GRADIENT_ACCUMULATION_STEPS if accumulate else 1)
+        actor_loss_value = actor_loss.item() * (Config.GRADIENT_ACCUMULATION_STEPS if accumulate else 1)
+
+        self.actor_loss_history.append(actor_loss_value)
+        self.critic_loss_history.append(critic_loss_value)
+
+        # Explicitly delete batch tensors to free GPU memory immediately
+        del states, actions, rewards, next_states, dones
+        del critic_loss, actor_loss
+
+        return critic_loss_value, actor_loss_value
     
     def _soft_update(self, source: nn.Module, target: nn.Module):
         """
