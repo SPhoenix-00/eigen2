@@ -150,7 +150,7 @@ bash start_vast.sh --resume
 
 ### Updated Files:
 1. **[start_vast.sh](start_vast.sh)** - Added GitHub cloning logic
-2. **[QUICK_START_VAST.md](QUICK_START_VAST.md)** - Rewrote for GitHub approach
+2. **[QUICK_START.md](QUICK_START.md)** - Rewrote for GitHub approach
 3. **[README.md](README.md)** - Updated deployment instructions
 
 ### Removed Files:
@@ -281,7 +281,7 @@ git push origin main
 
 **Option 1: Switch to GitHub (Recommended)**
 - Simpler and faster
-- Follow new QUICK_START_VAST.md
+- Follow new QUICK_START.md
 
 **Option 2: Keep Using Docker Hub**
 - Old approach still works
@@ -351,5 +351,5 @@ Build once, clone fresh code each time.
 
 - **GitHub Issues**: Use for code/deployment issues
 - **Vast.ai**: https://vast.ai/faq
-- **Quick Start**: [QUICK_START_VAST.md](QUICK_START_VAST.md)
+- **Quick Start**: [QUICK_START.md](QUICK_START.md)
 - **Full Guide**: [VAST_DEPLOYMENT.md](VAST_DEPLOYMENT.md)

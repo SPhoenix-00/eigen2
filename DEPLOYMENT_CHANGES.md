@@ -46,7 +46,7 @@ Comprehensive deployment guide covering:
 - Cost optimization tips
 - Security best practices
 
-### 6. `QUICK_START_VAST.md`
+### 6. `QUICK_START.md`
 Quick reference card:
 - 5-minute setup guide
 - Common commands

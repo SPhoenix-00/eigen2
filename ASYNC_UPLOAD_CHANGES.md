@@ -85,7 +85,7 @@ Run with: `python test_async_upload.py`
 
 ### 4. **Documentation Updates**
 
-**QUICK_START_RUNPOD.md:**
+**QUICK_START.md:**
 - Added note about background uploads in header
 - Explained upload status messages in monitoring section
 

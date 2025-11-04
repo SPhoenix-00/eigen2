@@ -542,7 +542,7 @@ GITHUB_BRANCH=main
 ## Next Steps
 
 1. ✅ Complete this GCP setup
-2. 📖 Follow [QUICK_START_VAST.md](QUICK_START_VAST.md) for Vast.ai deployment
+2. 📖 Follow [QUICK_START.md](QUICK_START.md) for Vast.ai deployment
 3. 🚀 Start training with automatic checkpoint backup!
 
 **Questions?**

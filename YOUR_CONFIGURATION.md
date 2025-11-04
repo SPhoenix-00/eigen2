@@ -301,6 +301,6 @@ EOF
 ---
 
 **Questions?** See:
-- [QUICK_START_GCP.md](QUICK_START_GCP.md) - Fast deployment guide
+- [QUICK_START.md](QUICK_START.md) - Fast deployment guide
 - [GCP_SETUP_GUIDE.md](GCP_SETUP_GUIDE.md) - Detailed GCP setup
-- [QUICK_START_VAST.md](QUICK_START_VAST.md) - General Vast.ai guide
+- [QUICK_START.md](QUICK_START.md) - General Vast.ai guide
