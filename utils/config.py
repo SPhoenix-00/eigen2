@@ -29,7 +29,7 @@ class Config:
     
     # ============ Environment Parameters ============
     MAX_HOLDING_PERIOD = 20  # Trading days
-    LOSS_PENALTY_MULTIPLIER = 3.0  # Losses penalized 3x
+    LOSS_PENALTY_MULTIPLIER = 1.0  # Losses treated equally to gains (was 3.0, removed penalty to fix zombie agents)
     INACTION_PENALTY = 5.0  # Penalty per day without an open position
     ZERO_TRADES_PENALTY = 10000.0  # Heavy penalty for making NO trades at all
     
@@ -62,7 +62,7 @@ class Config:
     TAU = 0.005  # Soft update parameter
     ACTOR_LR = 1e-4
     CRITIC_LR = 3e-4
-    WEIGHT_DECAY = 1e-5
+    WEIGHT_DECAY = 1e-4
     
     # Replay buffer
     BUFFER_SIZE = 9750  # Maximum buffer size
@@ -71,7 +71,7 @@ class Config:
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     
     # Exploration noise
-    NOISE_SCALE = 0.1
+    NOISE_SCALE = 0.125  # Increased from 0.1 to boost exploration (positive correlation with fitness)
     NOISE_DECAY = 0.9999
     MIN_NOISE = 0.01
     
@@ -91,7 +91,7 @@ class Config:
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.3
     CROSSOVER_ALPHA_MAX = 0.7
-    MUTATION_RATE = 0.1  # Percentage of weights to mutate
+    MUTATION_RATE = 0.15  # Increased from 0.1 to boost evolutionary exploration (positive correlation with fitness)
     MUTATION_STD = 0.01
     
     # Training

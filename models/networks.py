@@ -172,12 +172,14 @@ class Actor(nn.Module):
         self.coefficient_head = nn.Sequential(
             nn.Linear(combined_dim, Config.ACTOR_HIDDEN_DIMS[2]),
             nn.ReLU(),
+            nn.Dropout(0.1),  # Added to combat overfitting
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[2], 1),
         )
-        
+
         self.sale_target_head = nn.Sequential(
             nn.Linear(combined_dim, Config.ACTOR_HIDDEN_DIMS[2]),
             nn.ReLU(),
+            nn.Dropout(0.1),  # Added to combat overfitting
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[2], 1),
             nn.Sigmoid()  # Output in [0, 1], will scale to [MIN, MAX] sale target
         )
@@ -304,6 +306,7 @@ class Critic(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(Config.CRITIC_HIDDEN_DIMS[0], Config.CRITIC_HIDDEN_DIMS[1]),
             nn.ReLU(),
+            nn.Dropout(0.1),  # Added to combat overfitting
             nn.Linear(Config.CRITIC_HIDDEN_DIMS[1], 1)
         )
         
