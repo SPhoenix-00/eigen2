@@ -88,6 +88,24 @@ class ERLTrainer:
         else:
             print("--- W&B run already active (sweep_runner.py mode) ---")
 
+        # Create run-specific checkpoint directory using wandb run name
+        # This prevents parallel runs from overwriting each other's checkpoints
+        self.run_name = wandb.run.name
+        self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Checkpoints will be saved to: {self.checkpoint_dir}")
+
+        # Set unique random seed based on wandb run id
+        # This ensures parallel runs don't have identical behavior
+        run_id_hash = hash(wandb.run.id) % (2**32)  # Convert to 32-bit integer
+        self.seed = run_id_hash
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+        np.random.seed(self.seed)
+        import random
+        random.seed(self.seed)
+        print(f"Random seed set to: {self.seed} (based on run id: {wandb.run.id})")
+
         self.start_generation = 0
         self.generation = 0
         self.best_fitness = float('-inf')
@@ -406,17 +424,20 @@ class ERLTrainer:
         print(f"Validation fitness: {fitness:.2f}")
         print(f"Validation win rate: {episode_info['win_rate']:.1%}")
         print(f"Validation trades: {episode_info['num_trades']}")
-        
+
         return {
             'fitness': fitness,
             'win_rate': episode_info['win_rate'],
             'num_trades': episode_info['num_trades'],
+            'num_wins': episode_info['num_wins'],
+            'num_losses': episode_info['num_losses'],
             'avg_reward_per_trade': episode_info['avg_reward_per_trade']
         }
     
     def save_checkpoint(self):
         """Saves the entire training state to a checkpoint directory."""
-        checkpoint_dir = Config.CHECKPOINT_DIR
+        # Use run-specific checkpoint directory
+        checkpoint_dir = self.checkpoint_dir
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n--- Saving checkpoint for Generation {self.generation} ---")
@@ -468,7 +489,8 @@ class ERLTrainer:
 
     def load_checkpoint(self):
         """Loads the entire training state from the checkpoint directory."""
-        checkpoint_dir = Config.CHECKPOINT_DIR
+        # Use run-specific checkpoint directory
+        checkpoint_dir = self.checkpoint_dir
         print(f"\n--- Loading checkpoint from {checkpoint_dir} ---")
 
         # Try to download from cloud first
@@ -642,8 +664,10 @@ class ERLTrainer:
                     wandb.log({
                         "validation/fitness": val_results['fitness'],
                         "validation/win_rate": val_results['win_rate'],
-                        "validation/total_trades": val_results.get('total_trades', 0),
-                        "validation/winning_trades": val_results.get('winning_trades', 0),
+                        "validation/num_trades": val_results['num_trades'],
+                        "validation/num_wins": val_results['num_wins'],
+                        "validation/num_losses": val_results['num_losses'],
+                        "validation/avg_reward_per_trade": val_results['avg_reward_per_trade'],
                     }, step=gen)
             
             # 5. Save checkpoint periodically

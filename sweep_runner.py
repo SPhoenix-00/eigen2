@@ -126,8 +126,7 @@ def train_with_config():
     print(f"  Population: {Config.POPULATION_SIZE}")
     print("="*70 + "\n")
 
-    # Set random seeds
-    set_seed(Config.SEED)
+    # NOTE: Seed will be set in ERLTrainer based on wandb run id to ensure unique seeds
 
     # Validate config
     if not Config.validate():

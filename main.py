@@ -40,9 +40,8 @@ def main():
     args = parser.parse_args()
     # --------------------------------
 
-    # Set seed for reproducibility
-    set_seed(Config.SEED)
-    print(f"\nRandom seed: {Config.SEED}")
+    # NOTE: Seed will be set AFTER wandb init in ERLTrainer to ensure unique seeds per run
+    # This prevents parallel runs from having identical behavior
 
     # Display configuration
     Config.display()

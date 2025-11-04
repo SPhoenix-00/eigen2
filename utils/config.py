@@ -77,7 +77,7 @@ class Config:
     
     # ============ ERL Parameters ============
     POPULATION_SIZE = 16
-    NUM_GENERATIONS = 25
+    NUM_GENERATIONS = 20
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
     # Selection
