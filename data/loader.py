@@ -16,7 +16,8 @@ from utils.config import Config
 class StockDataLoader:
     """
     Loads and preprocesses stock market data from CSV.
-    Handles nan values, extracts 9-element arrays, and creates sliding windows.
+    Handles nan values, extracts 5 selected features from 9-element arrays, and creates sliding windows.
+    Selected features: close, RSI, MACD_signal, TRIX, diff20DMA
     """
     
     def __init__(self, csv_path: Optional[str] = None):
@@ -57,52 +58,55 @@ class StockDataLoader:
     
     def parse_cell_data(self, cell_value) -> np.ndarray:
         """
-        Parse a single cell containing string-formatted array.
-        
+        Parse a single cell containing string-formatted array and extract selected features.
+
         Args:
             cell_value: String like "[1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0]" or nan
-            
+
         Returns:
-            numpy array of shape (9,) with float values, or array of nans if invalid
+            numpy array of shape (5,) with selected features: [close, RSI, MACD_signal, TRIX, diff20DMA]
+            Original indices: [1, 4, 6, 7, 8] from the 9-element array
         """
         # Handle nan/None values
         if pd.isna(cell_value):
             return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
-        
+
         # Handle empty strings
         if isinstance(cell_value, str) and cell_value.strip() == '':
             return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
-        
+
         try:
             # Parse string as list
             data = ast.literal_eval(cell_value)
-            
+
             # Convert to numpy array
             arr = np.array(data, dtype=np.float32)
-            
-            # Validate length
-            if len(arr) != Config.FEATURES_PER_CELL:
-                print(f"Warning: Expected {Config.FEATURES_PER_CELL} features, got {len(arr)}")
-                # Pad or truncate
-                if len(arr) < Config.FEATURES_PER_CELL:
-                    arr = np.pad(arr, (0, Config.FEATURES_PER_CELL - len(arr)), 
-                                constant_values=np.nan)
-                else:
-                    arr = arr[:Config.FEATURES_PER_CELL]
-            
-            return arr
-            
-        except (ValueError, SyntaxError) as e:
+
+            # Select only the 5 features we want: close, RSI, MACD_signal, TRIX, diff20DMA
+            # Original 9-element array: [open, close, high, low, RSI, MACD, MACD_signal, TRIX, diff20DMA]
+            # Indices we want:           [  0,     1,    2,   3,   4,    5,           6,     7,        8]
+            # Select indices:            [       1,               4,                   6,     7,        8]
+
+            if len(arr) >= 9:
+                # Extract the 5 selected features
+                selected_features = arr[[1, 4, 6, 7, 8]]
+                return selected_features.astype(np.float32)
+            else:
+                # If array is too short, return nans
+                print(f"Warning: Expected at least 9 features, got {len(arr)}")
+                return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
+
+        except (ValueError, SyntaxError, IndexError) as e:
             # If parsing fails, return nans
             return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
     
     def extract_features(self) -> np.ndarray:
         """
         Extract all features from DataFrame into structured array.
-        
+
         Returns:
-            numpy array of shape [num_days, num_columns-1, 9]
-            (excluding date column)
+            numpy array of shape [num_days, num_columns-1, 5]
+            (excluding date column, only 5 selected features)
         """
         if self.df is None:
             raise ValueError("Must call load_csv() first")
@@ -217,8 +221,8 @@ class StockDataLoader:
         train_data = self.data_array[self.train_indices, :, :]
         
         # Compute mean and std per feature, ignoring nans
-        mean = np.nanmean(train_data, axis=0)  # Shape: [num_columns, 9]
-        std = np.nanstd(train_data, axis=0)    # Shape: [num_columns, 9]
+        mean = np.nanmean(train_data, axis=0)  # Shape: [num_columns, 5]
+        std = np.nanstd(train_data, axis=0)    # Shape: [num_columns, 5]
         
         # Handle edge case: if std is 0 (constant feature), set to 1 to avoid division by zero
         std = np.where(std == 0, 1.0, std)

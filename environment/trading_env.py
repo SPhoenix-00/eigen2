@@ -32,13 +32,14 @@ class Position:
 class TradingEnvironment(gym.Env):
     """
     Trading environment for stock market simulation.
-    
-    Observation: Normalized window of market data [context_days, num_columns, 9_features]
+
+    Observation: Normalized window of market data [context_days, num_columns, 5_features]
+    Features: close, RSI, MACD_signal, TRIX, diff20DMA
     Action: [108, 2] array where each stock has [coefficient, sale_target_pct]
     Reward: Cumulative gains/losses from closed positions
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  data_array: np.ndarray,
                  dates: np.ndarray,
                  normalization_stats: dict,
@@ -47,9 +48,9 @@ class TradingEnvironment(gym.Env):
                  trading_end_idx: int = None):
         """
         Initialize trading environment.
-        
+
         Args:
-            data_array: Full market data [num_days, num_columns, 9_features]
+            data_array: Full market data [num_days, num_columns, 5_features]
             dates: Array of date strings
             normalization_stats: Dict with 'mean' and 'std' for normalization
             start_idx: Starting day index (must have context_window_days history)
@@ -102,9 +103,9 @@ class TradingEnvironment(gym.Env):
             dtype=np.float32
         )
         
-        # Observation: [context_window_days, num_columns, 9_features]
+        # Observation: [context_window_days, num_columns, 5_features]
         # Values can be any float (normalized), including nan
-        obs_shape = (Config.CONTEXT_WINDOW_DAYS, 
+        obs_shape = (Config.CONTEXT_WINDOW_DAYS,
                     data_array.shape[1],  # num_columns
                     Config.FEATURES_PER_CELL)
         self.observation_space = spaces.Box(
@@ -223,9 +224,9 @@ class TradingEnvironment(gym.Env):
     def _get_observation(self) -> np.ndarray:
         """
         Get current observation (normalized context window).
-        
+
         Returns:
-            Array of shape [context_window_days, num_columns, 9_features]
+            Array of shape [context_window_days, num_columns, 5_features]
         """
         start_idx = self.current_idx - Config.CONTEXT_WINDOW_DAYS + 1
         end_idx = self.current_idx + 1

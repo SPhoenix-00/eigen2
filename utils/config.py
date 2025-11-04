@@ -14,7 +14,7 @@ class Config:
     INVESTABLE_END_COL = 117  # Column DN (0-indexed, inclusive)
     NUM_INVESTABLE_STOCKS = 108
     TOTAL_COLUMNS = 670
-    FEATURES_PER_CELL = 9  # [open, close, high, low, RSI, MACD, MACD_signal, TRIX, diff20DMA]
+    FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
     CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
     TRAIN_TEST_SPLIT = 0.95  # 95% train, 5% validation (6 months)
@@ -65,9 +65,9 @@ class Config:
     WEIGHT_DECAY = 1e-5
     
     # Replay buffer
-    BUFFER_SIZE = 50000  # Reduced from 200k to match actual usage at gen 25
+    BUFFER_SIZE = 12500  # Maximum buffer size
     BATCH_SIZE = 4
-    MIN_BUFFER_SIZE = 10000  # Start training after this many transitions
+    MIN_BUFFER_SIZE = 5000  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     
     # Exploration noise
