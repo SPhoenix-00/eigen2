@@ -70,7 +70,7 @@ class ERLTrainer:
             print("--- Initializing new W&B run (main.py mode) ---")
             wandb.init(
             project="eigen2-self",
-            name=f"erl-{Config.NUM_GENERATIONS}gen",
+            #name=f"erl-{Config.NUM_GENERATIONS}gen",
             config={
                 "population_size": Config.POPULATION_SIZE,
                 "num_generations": Config.NUM_GENERATIONS,
