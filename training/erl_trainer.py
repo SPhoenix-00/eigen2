@@ -13,6 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import os
 import json
 import wandb
+import gc
 
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
@@ -273,13 +274,14 @@ class ERLTrainer:
                 for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
                     # Sample batch
                     batch = self.replay_buffer.sample(Config.BATCH_SIZE)
-                    
+
                     # Update with gradient accumulation
                     is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
                     critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
-                    
-                    actor_losses.append(actor_loss)
-                    critic_losses.append(critic_loss)
+
+                    # Detach from computation graph to prevent memory leak
+                    actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
+                    critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
             
             # Log agent stats
             if agent.agent_id == 0:  # Log first agent as representative
@@ -591,7 +593,12 @@ class ERLTrainer:
                 "training/generation_time": gen_time,
                 "training/avg_generation_time": np.mean(self.generation_times) if self.generation_times else 0,
             }, step=gen)
-        
+
+            # Clear GPU cache and run garbage collection to prevent memory leaks
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
         # Final save
         self.save_checkpoint()
 
