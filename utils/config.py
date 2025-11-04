@@ -29,8 +29,8 @@ class Config:
     
     # ============ Environment Parameters ============
     MAX_HOLDING_PERIOD = 20  # Trading days
-    LOSS_PENALTY_MULTIPLIER = 10.0  # Losses penalized 10x
-    INACTION_PENALTY = 2.0  # Penalty per day without an open position
+    LOSS_PENALTY_MULTIPLIER = 3.0  # Losses penalized 3x
+    INACTION_PENALTY = 5.0  # Penalty per day without an open position
     ZERO_TRADES_PENALTY = 10000.0  # Heavy penalty for making NO trades at all
     
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
@@ -65,7 +65,7 @@ class Config:
     WEIGHT_DECAY = 1e-5
     
     # Replay buffer
-    BUFFER_SIZE = 12500  # Maximum buffer size
+    BUFFER_SIZE = 11500  # Maximum buffer size
     BATCH_SIZE = 4
     MIN_BUFFER_SIZE = 10000  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
