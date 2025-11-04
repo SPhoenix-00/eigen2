@@ -121,10 +121,10 @@ class CloudSync:
                 with open(local_path, "rb") as data:
                     blob_client.upload_blob(data, overwrite=True)
 
-            print(f"✓ Uploaded: {local_path} → {cloud_path}")
+            # Don't print per-file - will be batched in get_upload_status()
 
         except Exception as e:
-            print(f"Warning: Failed to upload {local_path}: {e}")
+            print(f"⚠️  Upload failed: {local_path}: {e}")
 
     def upload_file(self, local_path: str, cloud_path: Optional[str] = None, background: bool = False):
         """
@@ -150,7 +150,7 @@ class CloudSync:
             future = self.executor.submit(self._upload_file_sync, local_path, cloud_path)
             with self._lock:
                 self.upload_futures.append(future)
-            print(f"⏳ Queued for upload: {local_path} → {cloud_path}")
+            # Don't print per-file - will be batched in sync_checkpoint()
         else:
             # Synchronous upload
             self._upload_file_sync(local_path, cloud_path)
@@ -306,6 +306,7 @@ class CloudSync:
 
         exclude_patterns = exclude_patterns or []
 
+        files_queued = 0
         for root, dirs, files in os.walk(local_dir):
             for file in files:
                 # Skip excluded files
@@ -316,6 +317,12 @@ class CloudSync:
                 relative_path = os.path.relpath(local_path, local_dir)
                 cloud_path = f"{cloud_prefix}/{relative_path}".replace("\\", "/")
                 self.upload_file(local_path, cloud_path, background=background)
+                files_queued += 1
+
+        # Print batch summary instead of per-file messages
+        if files_queued > 0:
+            mode = "queued" if background else "uploaded"
+            print(f"⏳ {files_queued} files {mode} for {local_dir}")
 
     def download_directory(self, cloud_prefix: str, local_dir: str):
         """

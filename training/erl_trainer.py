@@ -24,6 +24,7 @@ from erl.genetic_ops import create_next_generation
 from utils.config import Config
 from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress
 from utils.cloud_sync import get_cloud_sync_from_env
+from utils.memory_profiler import get_profiler, log_memory
 
 
 class ERLTrainer:
@@ -128,7 +129,11 @@ class ERLTrainer:
             end_idx=val_end_idx,
             trading_end_idx=self.val_start_idx + Config.TRADING_PERIOD_DAYS
         )
-    
+
+        # Memory profiling: Take baseline snapshot
+        print("\n🔍 Taking baseline memory snapshot...")
+        log_memory("Trainer initialized (baseline)", show_objects=True)
+
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
                    training: bool = True) -> Tuple[float, Dict]:
@@ -553,7 +558,10 @@ class ERLTrainer:
             
             # 1. Evaluate population (collect experiences)
             fitness_scores, pop_stats = self.evaluate_population()
-            
+
+            # 🔍 Memory tracking after evaluation
+            log_memory(f"Gen {gen+1}: After evaluate_population", show_objects=True)
+
             # Track statistics
             self.fitness_history.append(fitness_scores)
             mean_fitness = np.mean(fitness_scores)
@@ -613,9 +621,15 @@ class ERLTrainer:
             
             # 2. Train agents using replay buffer
             self.train_population()
-            
+
+            # 🔍 Memory tracking after training
+            log_memory(f"Gen {gen+1}: After train_population", show_objects=True)
+
             # 3. Evolve population
             self.evolve_population(fitness_scores)
+
+            # 🔍 Memory tracking after evolution
+            log_memory(f"Gen {gen+1}: After evolve_population", show_objects=True)
             
             # 4. Validate best agent periodically
             if (gen + 1) % Config.LOG_FREQUENCY == 0:
@@ -670,6 +684,12 @@ class ERLTrainer:
                 torch.cuda.empty_cache()
             gc.collect()
 
+            # 🔍 Print memory trend every generation
+            if (gen + 1) % 1 == 0:  # Every generation
+                profiler = get_profiler()
+                profiler.print_generation_trend()
+                profiler.print_memory_growth(baseline_label="Trainer initialized (baseline)")
+
         # Final save
         self.save_checkpoint()
 
@@ -687,6 +707,13 @@ class ERLTrainer:
 
         # Finish wandb run
         wandb.finish()
+
+        # 🔍 Final comprehensive memory analysis
+        print("\n" + "="*70)
+        print("🔍 FINAL MEMORY ANALYSIS")
+        print("="*70)
+        from utils.memory_profiler import print_memory_summary
+        print_memory_summary()
 
         # Final summary
         print_final_summary(self)
