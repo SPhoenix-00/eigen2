@@ -104,36 +104,57 @@ class ERLTrainer:
 
         print(f"Training range: days {self.train_start_idx} to {self.train_end_idx}")
         print(f"Validation range: days {self.val_start_idx} to {self.val_end_idx}")
+
+        # CRITICAL FIX: Create persistent environments to reuse instead of creating new ones each episode
+        # This prevents massive memory leak from creating 16+ environments per generation
+        print("Initializing persistent evaluation environment...")
+        self.eval_env = TradingEnvironment(
+            data_array=self.data_loader.data_array,
+            dates=self.data_loader.dates,
+            normalization_stats=self.normalization_stats,
+            # Use placeholder indices, reset() will update them per episode
+            start_idx=self.train_start_idx,
+            end_idx=self.train_end_idx,
+            trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS
+        )
+
+        print("Initializing persistent validation environment...")
+        val_end_idx = self.val_start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+        self.val_env = TradingEnvironment(
+            data_array=self.data_loader.data_array,
+            dates=self.data_loader.dates,
+            normalization_stats=self.normalization_stats,
+            start_idx=self.val_start_idx,
+            end_idx=val_end_idx,
+            trading_end_idx=self.val_start_idx + Config.TRADING_PERIOD_DAYS
+        )
     
-    def run_episode(self, agent: DDPGAgent, start_idx: int, end_idx: int, 
+    def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
+                   start_idx: int, end_idx: int,
                    training: bool = True) -> Tuple[float, Dict]:
         """
-        Run one episode with an agent.
-        
+        Run one episode with an agent using a persistent environment.
+
         Args:
             agent: Agent to run
+            env: Persistent TradingEnvironment to reuse (critical for memory efficiency)
             start_idx: Starting day index (first day of trading period)
             end_idx: Ending day index (includes settlement period)
             training: Whether this is training (adds to replay buffer)
-            
+
         Returns:
             Tuple of (cumulative_reward, episode_info)
         """
         # Calculate trading end (when model stops opening new positions)
         trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-        
-        # Create environment for this episode
-        env = TradingEnvironment(
-            data_array=self.data_loader.data_array,
-            dates=self.data_loader.dates,
-            normalization_stats=self.normalization_stats,  # Use cached stats
+
+        # CRITICAL FIX: Reset persistent environment with new indices
+        # DO NOT create new TradingEnvironment here - reuse the passed env
+        state, info = env.reset(
             start_idx=start_idx,
             end_idx=end_idx,
             trading_end_idx=trading_end_idx
         )
-        
-        # Reset environment
-        state, info = env.reset()
         cumulative_reward = 0.0
         steps = 0
         
@@ -183,11 +204,7 @@ class ERLTrainer:
             if final_fitness > expected_catastrophic:
                 print(f"WARNING: Inactive agent has fitness {final_fitness}, should be < {expected_catastrophic}")
 
-        # CRITICAL FIX: Explicitly delete environment to free memory (~5-8GB per generation)
-        # Each environment holds reference to 90MB data_array + episode history
-        # Without deletion, Python GC may delay cleanup due to circular references
-        del env
-
+        # NOTE: No need to delete env - we're reusing persistent environments now
         return final_fitness, episode_summary
     
     def evaluate_population(self) -> Tuple[List[float], Dict]:
@@ -214,9 +231,10 @@ class ERLTrainer:
             start_idx = np.random.randint(self.train_start_idx, max_start)
             end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
             
-            # Run episode
+            # Run episode using persistent eval_env (CRITICAL FIX: prevents memory leak)
             fitness, episode_info = self.run_episode(
                 agent=agent,
+                env=self.eval_env,  # Reuse persistent environment instead of creating new ones
                 start_idx=start_idx,
                 end_idx=end_idx,
                 training=True
@@ -238,8 +256,9 @@ class ERLTrainer:
             'agents_with_positive_fitness': int(sum(1 for f in fitness_scores if f > 0)),
         }
 
-        # CRITICAL FIX: Force garbage collection after evaluating all agents
-        # This ensures all 16 environment instances are freed immediately
+        # CRITICAL FIX: Delete large all_episode_stats list and force aggressive GC
+        # The all_episode_stats list is no longer needed after aggregation
+        del all_episode_stats
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -370,9 +389,10 @@ class ERLTrainer:
         else:
             end_idx = self.val_start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
         
-        # Run on validation data
+        # Run on validation data using persistent val_env (CRITICAL FIX: prevents memory leak)
         fitness, episode_info = self.run_episode(
             agent=self.best_agent,
+            env=self.val_env,  # Reuse persistent validation environment
             start_idx=self.val_start_idx,
             end_idx=end_idx,
             training=False

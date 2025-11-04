@@ -114,31 +114,54 @@ class TradingEnvironment(gym.Env):
             dtype=np.float32
         )
     
-    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None,
+             start_idx: Optional[int] = None, end_idx: Optional[int] = None,
+             trading_end_idx: Optional[int] = None) -> Tuple[np.ndarray, dict]:
         """
         Reset environment to start of episode.
-        
+
+        Args:
+            seed: Random seed
+            options: Additional options
+            start_idx: New starting day index (if provided, re-initializes episode window)
+            end_idx: New ending day index (if provided)
+            trading_end_idx: New trading end index (if provided)
+
         Returns:
             Tuple of (observation, info)
         """
         super().reset(seed=seed)
-        
+
+        # CRITICAL FIX: Update episode window if new indices provided
+        # This allows reusing single environment object instead of creating new ones
+        if start_idx is not None:
+            self.start_idx = start_idx
+        if end_idx is not None:
+            self.end_idx = end_idx
+        if trading_end_idx is not None:
+            self.trading_end_idx = trading_end_idx
+
         # Reset to starting position
         self.current_idx = self.start_idx
         self.open_positions = {}
         self.cumulative_reward = 0.0
         self.episode_rewards = []
         self.episode_actions = []
-        
+
         # Reset statistics
         self.num_trades = 0
         self.num_wins = 0
         self.num_losses = 0
-        
+
+        # Reset tracking variables
+        self.total_positions_opened = 0
+        self.days_with_positions = 0
+        self.days_without_positions = 0
+
         # Get initial observation
         obs = self._get_observation()
         info = self._get_info()
-        
+
         return obs, info
     
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
