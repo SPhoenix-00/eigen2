@@ -147,12 +147,10 @@ def train_with_config():
     print("Phase 2: ERL Training")
     print("="*60)
 
-    # Create trainer (NO cloud sync for local sweeps)
-    # Pass the loader object, not train/val data
-    trainer = ERLTrainer(
-        loader,
-        cloud_sync=None  # Disable cloud sync for local runs
-    )
+    # Create trainer
+    # Note: Cloud sync is handled inside ERLTrainer via environment variables
+    # For local sweeps, just don't set CLOUD_PROVIDER env var
+    trainer = ERLTrainer(loader)
 
     # Run training
     try:
