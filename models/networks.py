@@ -18,15 +18,15 @@ class FeatureExtractor(nn.Module):
     Extracts features from multi-column time-series data.
     Uses 1D CNN across features, then LSTM across time.
     """
-    
-    def __init__(self, num_columns: int = 669, num_features: int = 9):
+
+    def __init__(self, num_columns: int = 669, num_features: int = Config.FEATURES_PER_CELL):
         super().__init__()
-        
+
         self.num_columns = num_columns
         self.num_features = num_features
-        
-        # 1D CNN to extract features from the 9 elements per cell
-        # Input: [batch, num_columns, context_days, 9]
+
+        # 1D CNN to extract features from the selected feature elements per cell
+        # Input: [batch, num_columns, context_days, num_features]
         # Process each column's time series independently
         self.conv1 = nn.Conv1d(num_features, Config.CNN_FILTERS, 
                                kernel_size=Config.CNN_KERNEL_SIZE, 
@@ -51,19 +51,19 @@ class FeatureExtractor(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through feature extractor.
-        
+
         Args:
-            x: Input tensor [batch, context_days, num_columns, 9]
-            
+            x: Input tensor [batch, context_days, num_columns, num_features]
+
         Returns:
             Features tensor [batch, num_columns, lstm_output_size]
         """
         batch_size = x.shape[0]
         context_days = x.shape[1]
-        
+
         # Reshape to process each column independently
-        # [batch, context_days, num_columns, 9] -> [batch * num_columns, 9, context_days]
-        x = x.permute(0, 2, 3, 1)  # [batch, num_columns, 9, context_days]
+        # [batch, context_days, num_columns, num_features] -> [batch * num_columns, num_features, context_days]
+        x = x.permute(0, 2, 3, 1)  # [batch, num_columns, num_features, context_days]
         x = x.reshape(batch_size * self.num_columns, self.num_features, context_days)
         
         # CNN across features
