@@ -147,10 +147,10 @@ class ERLTrainer:
             # Store transition in replay buffer (if training)
             if training:
                 self.replay_buffer.add(
-                    state=state,
-                    action=action,
+                    state=state.astype(np.float32),
+                    action=action.astype(np.float32),
                     reward=reward,
-                    next_state=next_state,
+                    next_state=next_state.astype(np.float32),
                     done=float(terminated or truncated)
                 )
             
