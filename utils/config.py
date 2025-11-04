@@ -65,8 +65,8 @@ class Config:
     WEIGHT_DECAY = 1e-4
     
     # Replay buffer
-    BUFFER_SIZE = 9750  # Maximum buffer size
-    BATCH_SIZE = 4
+    BUFFER_SIZE = 15000  # Maximum buffer size
+    BATCH_SIZE = 64
     MIN_BUFFER_SIZE = 9000  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     
