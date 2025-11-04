@@ -9,6 +9,7 @@ import torch.optim as optim
 import numpy as np
 from typing import Tuple, Optional
 import copy
+from collections import deque
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 
@@ -60,8 +61,10 @@ class DDPGAgent:
         self.noise_scale = Config.NOISE_SCALE
         
         # Training statistics
-        self.actor_loss_history = []
-        self.critic_loss_history = []
+        # CRITICAL FIX: Use deque with maxlen to prevent unbounded growth (~10-20MB per gen)
+        # Only last 1000 values are used by get_stats() anyway
+        self.actor_loss_history = deque(maxlen=1000)
+        self.critic_loss_history = deque(maxlen=1000)
         self.update_count = 0
         
     def select_action(self, state: np.ndarray, add_noise: bool = True) -> np.ndarray:
@@ -239,11 +242,20 @@ class DDPGAgent:
     def clone(self) -> 'DDPGAgent':
         """Create a deep copy of this agent."""
         new_agent = DDPGAgent(agent_id=self.agent_id)
-        new_agent.actor.load_state_dict(copy.deepcopy(self.actor.state_dict()))
-        new_agent.actor_target.load_state_dict(copy.deepcopy(self.actor_target.state_dict()))
-        new_agent.critic.load_state_dict(copy.deepcopy(self.critic.state_dict()))
-        new_agent.critic_target.load_state_dict(copy.deepcopy(self.critic_target.state_dict()))
+
+        # CRITICAL FIX: Use state_dict() directly without deepcopy
+        # PyTorch's load_state_dict already creates new tensor copies
+        # Using deepcopy creates temporary duplicates that linger in memory (~3-5GB per gen)
+        new_agent.actor.load_state_dict(self.actor.state_dict())
+        new_agent.actor_target.load_state_dict(self.actor_target.state_dict())
+        new_agent.critic.load_state_dict(self.critic.state_dict())
+        new_agent.critic_target.load_state_dict(self.critic_target.state_dict())
         new_agent.noise_scale = self.noise_scale
+
+        # Clear GPU cache after cloning
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return new_agent
     
     def get_stats(self) -> dict:

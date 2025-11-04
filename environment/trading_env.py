@@ -431,7 +431,7 @@ class TradingEnvironment(gym.Env):
         # Calculate zero trades penalty (will be applied by caller)
         zero_trades_penalty = Config.ZERO_TRADES_PENALTY if self.num_trades == 0 else 0.0
         
-        return {
+        summary = {
             'total_reward': self.cumulative_reward,
             'num_trades': self.num_trades,
             'num_wins': self.num_wins,
@@ -445,6 +445,13 @@ class TradingEnvironment(gym.Env):
             'inaction_penalty_applied': inaction_penalty_total,
             'zero_trades_penalty': zero_trades_penalty,  # Just report it, don't apply here
         }
+
+        # CRITICAL FIX: Clear episode history to prevent memory leak (~15-20GB per generation)
+        # These lists accumulate 145 entries per episode × 16 agents × 13+ gens = massive leak
+        self.episode_rewards.clear()
+        self.episode_actions.clear()
+
+        return summary
 
 
 # Standalone test

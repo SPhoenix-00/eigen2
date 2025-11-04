@@ -14,6 +14,7 @@ import os
 import json
 import wandb
 import gc
+import matplotlib.pyplot as plt
 
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
@@ -181,7 +182,12 @@ class ERLTrainer:
             expected_catastrophic = -10000
             if final_fitness > expected_catastrophic:
                 print(f"WARNING: Inactive agent has fitness {final_fitness}, should be < {expected_catastrophic}")
-        
+
+        # CRITICAL FIX: Explicitly delete environment to free memory (~5-8GB per generation)
+        # Each environment holds reference to 90MB data_array + episode history
+        # Without deletion, Python GC may delay cleanup due to circular references
+        del env
+
         return final_fitness, episode_summary
     
     def evaluate_population(self) -> Tuple[List[float], Dict]:
@@ -231,7 +237,13 @@ class ERLTrainer:
             'avg_win_rate': float(sum(s['win_rate'] for s in all_episode_stats if s['num_trades'] > 0) / len([s for s in all_episode_stats if s['num_trades'] > 0])) if any(s['num_trades'] > 0 for s in all_episode_stats) else 0.0,
             'agents_with_positive_fitness': int(sum(1 for f in fitness_scores if f > 0)),
         }
-        
+
+        # CRITICAL FIX: Force garbage collection after evaluating all agents
+        # This ensures all 16 environment instances are freed immediately
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return (fitness_scores, aggregate_stats)
     
     def train_population(self):
@@ -316,10 +328,24 @@ class ERLTrainer:
             fitness_scores: Fitness for each agent
         """
         print(f"\n--- Evolving Population ---")
-        
+
+        # CRITICAL FIX: Store old population reference before creating new one
+        # This prevents memory leak from lingering agent references (~2-3GB per generation)
+        old_population = self.population
+
         # Create next generation
-        self.population = create_next_generation(self.population, fitness_scores)
-        
+        self.population = create_next_generation(old_population, fitness_scores)
+
+        # CRITICAL FIX: Explicitly delete old agents and force GC
+        # Each agent is ~720MB (4 networks × 45M params × 4 bytes)
+        # Without explicit deletion, circular refs can delay GC for multiple generations
+        for agent in old_population:
+            del agent
+        del old_population
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         print(f"Generation {self.generation} -> {self.generation + 1}")
     
     def validate_best_agent(self) -> Dict:
@@ -544,6 +570,12 @@ class ERLTrainer:
                     break
             
             if best_idx is not None and fitness_scores[best_idx] > self.best_fitness:
+                # CRITICAL FIX: Delete old best_agent before replacing with new one
+                # Prevents accumulation of old agent copies (~720MB each)
+                if self.best_agent is not None:
+                    del self.best_agent
+                    gc.collect()
+
                 self.best_fitness = fitness_scores[best_idx]
                 self.best_agent = self.population[best_idx].clone()
             
@@ -596,6 +628,8 @@ class ERLTrainer:
             # Show progress plot every 5 generations
             if (gen + 1) % 5 == 0:
                 plot_fitness_progress(self.fitness_history)
+                # CRITICAL FIX: Close matplotlib figures to prevent memory leak (~100MB per plot)
+                plt.close('all')
             
             # Buffer stats
             buffer_stats = self.replay_buffer.get_stats()
