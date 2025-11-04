@@ -5,6 +5,7 @@ Pretty printing and progress visualization
 
 import numpy as np
 from typing import List
+from utils.config import Config
 
 
 def plot_fitness_progress(fitness_history: List[List[float]]):
@@ -109,7 +110,7 @@ def print_generation_summary(gen: int, total_gens: int,
     # System section
     print("\n⚙️  SYSTEM STATUS")
     print("-" * 70)
-    print(f"  Replay Buffer:     {buffer_size:>12,} / 200,000")
+    print(f"  Replay Buffer:     {buffer_size:>12,} / {Config.BUFFER_SIZE:,}")
     print(f"  Buffer Ready:      {' '*10}{'✓ Yes' if buffer_size >= 10000 else '✗ No (needs ' + str(10000-buffer_size) + ' more)'}")
     print(f"  Generation Time:   {gen_time:>11.1f}s")
     print(f"  Avg Gen Time:      {avg_gen_time:>11.1f}s")
