@@ -2,9 +2,9 @@
 # Run locally while main training runs on RunPod
 
 program: sweep_runner.py
-method: bayes  # Bayesian optimization (most efficient)
+method: random
 project: eigen2-self
-entity: eigen2
+entity: eigen2-self
 
 metric:
   name: fitness/best_ever
