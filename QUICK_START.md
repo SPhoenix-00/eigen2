@@ -8,10 +8,48 @@ This guide covers deploying Eigen2 training on any GPU provider with automatic c
 
 ## Table of Contents
 
+- [Using tmux for Persistent Sessions](#using-tmux-for-persistent-sessions) ⭐ **Important!**
 - [RunPod Setup](#runpod-setup) ← Recommended, simplest
 - [Vast.ai Setup](#vastai-setup)
 - [GCP Setup](#gcp-setup)
 - [Common Issues](#troubleshooting)
+
+---
+
+## Using tmux for Persistent Sessions
+
+### Why tmux?
+
+**SSH connections to RunPod/cloud instances often disconnect after a few hours.** Using `tmux` allows your training to continue running even when your SSH connection drops. You can reconnect later and reattach to your session.
+
+### Essential tmux Commands
+
+```bash
+# Start a new tmux session named "training"
+tmux new -s training
+
+# Detach from session (keeps it running in background)
+# Press: Ctrl+B, then D
+
+# List all tmux sessions
+tmux ls
+
+# Reattach to session after SSH reconnect
+tmux attach -t training
+
+# Kill a session (if needed)
+tmux kill-session -t training
+```
+
+### Quick tmux Guide
+
+1. **Start session**: `tmux new -s training`
+2. **Run your training**: `python main.py`
+3. **Detach safely**: Press `Ctrl+B`, then press `D`
+4. **Close SSH**: You can now disconnect SSH - training keeps running!
+5. **Reconnect later**: SSH back in, then `tmux attach -t training`
+
+> 💡 **Pro tip**: You can have multiple tmux sessions. Use different names: `tmux new -s eval`, `tmux new -s debug`, etc.
 
 ---
 
@@ -25,6 +63,8 @@ This guide covers deploying Eigen2 training on any GPU provider with automatic c
 ---
 
 ## RunPod Setup
+
+> ⚠️ **Important**: RunPod SSH sessions often disconnect after a few hours. **Always use tmux** (see instructions below) so your training continues even when disconnected!
 
 ### Step 1: Create RunPod Instance
 
@@ -101,10 +141,13 @@ wandb login
 # Paste your API key from: https://wandb.ai/authorize
 ```
 
-### Step 5: Set Environment Variables and Start Training
+### Step 5: Set Environment Variables and Start Training with tmux
 
 ```bash
 cd /workspace
+
+# Start a tmux session (keeps training running if SSH disconnects)
+tmux new -s training
 
 # Set environment variables (REQUIRED!)
 export CLOUD_PROVIDER=gcs
@@ -123,9 +166,16 @@ python main.py
 python main.py --resume
 ```
 
+**After training starts:**
+- Press `Ctrl+B`, then `D` to detach from tmux (training continues in background)
+- You can now safely disconnect SSH
+- To reconnect later: `ssh` back in, then run `tmux attach -t training`
+
 ---
 
 ## Vast.ai Setup
+
+> ⚠️ **Important**: SSH sessions often disconnect after a few hours. **Always use tmux** so your training continues even when disconnected!
 
 ### Step 1: Create Vast.ai Instance
 
@@ -186,16 +236,26 @@ scp gcs-credentials.json root@YOUR-VAST-IP:/workspace/
 wandb login
 ```
 
-### Step 3: Start Training
+### Step 3: Start Training with tmux
 
 ```bash
 cd /workspace
+
+# Start tmux session
+tmux new -s training
+
+# Start training
 python main.py --resume
 ```
+
+**Detach from tmux**: Press `Ctrl+B`, then `D`
+**Reattach later**: `tmux attach -t training`
 
 ---
 
 ## GCP Setup
+
+> 💡 **Tip**: While GCP connections are more stable, it's still recommended to use tmux for long training runs.
 
 ### Step 1: Create GCP VM
 
@@ -246,24 +306,35 @@ blob.download_to_filename('Eigen2_Master(GFIN)_03_training.csv')
 EOF
 ```
 
-### Step 4: Login to W&B and Train
+### Step 4: Login to W&B and Train with tmux
 
 ```bash
 # Login to wandb
 wandb login
 
+# Start tmux session
+tmux new -s training
+
 # Start training
 python main.py
 ```
+
+**Detach from tmux**: Press `Ctrl+B`, then `D`
+**Reattach later**: `tmux attach -t training`
 
 ---
 
 ## Monitor Training
 
-### Check Progress
+### Check Progress (from within tmux)
 
 ```bash
-# Watch logs
+# If you're inside tmux session with running training:
+# Press Ctrl+B, then [ to enter scroll mode
+# Use arrow keys or Page Up/Down to scroll
+# Press Q to exit scroll mode
+
+# Watch logs (in a new window/pane)
 tail -f logs/training.log
 
 # Check current generation
@@ -276,6 +347,24 @@ nvidia-smi
 # Go to: https://wandb.ai/your-username/eigen2-self
 ```
 
+### Check Training from Outside tmux
+
+```bash
+# SSH back into your instance
+ssh root@YOUR_RUNPOD_HOST -p YOUR_PORT
+
+# List tmux sessions
+tmux ls
+
+# Attach to your training session
+tmux attach -t training
+
+# You can also check status without attaching:
+nvidia-smi  # Check if GPU is being used
+ps aux | grep python  # Check if training is running
+tail -f /workspace/logs/training.log  # Follow logs
+```
+
 ### Verify GCS Sync
 
 After first generation, check your bucket:
@@ -286,6 +375,8 @@ After first generation, check your bucket:
 ---
 
 ## Download Results
+
+### Download Checkpoints and Logs
 
 **After training completes:**
 
@@ -300,9 +391,95 @@ gsutil -m rsync -r gs://eigen2-checkpoints-ase0/eigen2/checkpoints/ ./checkpoint
 gsutil -m rsync -r gs://eigen2-checkpoints-ase0/eigen2/logs/ ./logs/
 ```
 
+### Download Metrics to CSV
+
+**Download W&B metrics for analysis:**
+
+```bash
+# Download metrics from last run
+python download_metrics.py
+
+# Download metrics from specific run
+python download_metrics.py breezy-puddle-62
+
+# Download metrics from all runs in project
+python download_metrics.py --all
+```
+
+**Output:**
+- Creates `<run-name>_metrics.csv` in current directory
+- Contains all logged metrics: fitness, win rate, trades, etc.
+- Ready for analysis in Excel, pandas, or other tools
+
+**Example CSV columns:**
+- `generation` - Generation number
+- `fitness/mean` - Mean population fitness
+- `fitness/max` - Maximum fitness in generation
+- `validation/fitness` - Validation performance
+- `validation/win_rate` - Win rate on validation set
+- And many more...
+
 ---
 
 ## Troubleshooting
+
+### tmux Issues
+
+**"session not found"**
+```bash
+# List all sessions to see what exists
+tmux ls
+
+# If no sessions, your training may have stopped
+# Check if Python is still running:
+ps aux | grep python
+```
+
+**"tmux: command not found"**
+```bash
+# Install tmux (RunPod usually has it pre-installed)
+apt update && apt install -y tmux
+```
+
+**Accidentally closed tmux window**
+```bash
+# Don't panic! The session is still running
+# Just reattach:
+tmux attach -t training
+```
+
+**Need to kill stuck training**
+```bash
+# Attach to session
+tmux attach -t training
+
+# Press Ctrl+C to stop training
+
+# Or kill the entire session:
+tmux kill-session -t training
+```
+
+**Multiple sessions confusion**
+```bash
+# List all sessions with details
+tmux ls
+
+# Attach to specific session
+tmux attach -t training
+
+# Kill all sessions (careful!)
+tmux kill-server
+```
+
+**Session keeps the old environment variables**
+```bash
+# Environment variables are set when you create the session
+# If you need to change them:
+# 1. Kill the old session: tmux kill-session -t training
+# 2. Start new session: tmux new -s training
+# 3. Set new variables: export CLOUD_PROVIDER=gcs (etc.)
+# 4. Run training
+```
 
 ### "Can't find training data"
 ```bash
@@ -391,6 +568,24 @@ wandb login
 
 ## Quick Reference
 
+**Essential tmux Commands:**
+```bash
+# Start new session
+tmux new -s training
+
+# Detach (training keeps running)
+Ctrl+B, then D
+
+# List sessions
+tmux ls
+
+# Reattach to session
+tmux attach -t training
+
+# Kill session
+tmux kill-session -t training
+```
+
 **Essential Environment Variables:**
 ```bash
 export CLOUD_PROVIDER=gcs
@@ -398,14 +593,37 @@ export CLOUD_BUCKET=eigen2-checkpoints-ase0
 export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
 ```
 
-**Start Training:**
+**Complete Workflow:**
 ```bash
-# New training
-python main.py
+# 1. SSH into instance
+ssh root@YOUR_RUNPOD_HOST -p YOUR_PORT
 
-# Resume from the last run (reads last_run.json automatically)
-python main.py --resume
+# 2. Start tmux session
+cd /workspace
+tmux new -s training
 
+# 3. Set environment variables
+export CLOUD_PROVIDER=gcs
+export CLOUD_BUCKET=eigen2-checkpoints-ase0
+export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
+
+# 4. Start training
+python main.py              # New training
+python main.py --resume     # Resume from last run
+
+# 5. Detach from tmux
+# Press: Ctrl+B, then D
+
+# 6. Disconnect SSH (training continues!)
+exit
+
+# 7. Later: Reconnect and reattach
+ssh root@YOUR_RUNPOD_HOST -p YOUR_PORT
+tmux attach -t training
+```
+
+**Resume from Specific Run:**
+```bash
 # Resume from a specific older run
 python main.py --resume-run <run-name>
 # Example: python main.py --resume-run azure-thunder-123
@@ -416,14 +634,21 @@ python main.py --resume-run <run-name>
 
 **Monitor:**
 ```bash
-# Logs
+# Check if training is running (without attaching to tmux)
+ps aux | grep python
+nvidia-smi
+
+# View logs
 tail -f logs/training.log
 
-# GPU
-nvidia-smi
+# Attach to tmux to see live output
+tmux attach -t training
 
 # W&B Dashboard
 https://wandb.ai/your-username/eigen2-self
+
+# Download metrics to CSV
+python download_metrics.py
 ```
 
 ---
