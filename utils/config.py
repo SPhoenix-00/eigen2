@@ -72,7 +72,7 @@ class Config:
     
     # Exploration noise
     NOISE_SCALE = 0.125  # Increased from 0.1 to boost exploration (positive correlation with fitness)
-    NOISE_DECAY = 0.9999
+    NOISE_DECAY = 0.99995  # Slowed decay to maintain exploration longer (was 0.9999)
     MIN_NOISE = 0.01
     
     # ============ ERL Parameters ============
@@ -84,15 +84,15 @@ class Config:
     """     NUM_PARENTS = 8  # Top performers to keep
     NUM_OFFSPRING = 6  # Generated via crossover
     NUM_MUTANTS = 2  # Random mutations """
-    ELITE_FRAC = 0.5      # 50% of population
+    ELITE_FRAC = 0.375      # 37.5% of population (was 0.5, reduced to increase diversity)
     OFFSPRING_FRAC = 0.375   # 37.5% of population
-    # MUTANT_FRAC will be the remainder (12.5%)
+    # MUTANT_FRAC will be the remainder (25%, was 12.5% - doubled for more exploration)
     
     # Genetic operators
-    CROSSOVER_ALPHA_MIN = 0.3
-    CROSSOVER_ALPHA_MAX = 0.7
-    MUTATION_RATE = 0.15  # Increased from 0.1 to boost evolutionary exploration (positive correlation with fitness)
-    MUTATION_STD = 0.01
+    CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)
+    CROSSOVER_ALPHA_MAX = 0.8  # Widened range for more diverse offspring (was 0.7)
+    MUTATION_RATE = 0.20  # Increased to combat premature convergence (was 0.15)
+    MUTATION_STD = 0.025  # Increased magnitude to escape local optima (was 0.01)
     
     # Training
     GRADIENT_STEPS_PER_GENERATION = 32
@@ -101,7 +101,8 @@ class Config:
     # ============ Training Parameters ============
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     NUM_WORKERS = 4  # For data loading
-    SEED = 42
+    # NOTE: Random seed is now set dynamically per wandb run in ERLTrainer
+    # This ensures parallel runs have unique, independent behavior
     
     # Checkpointing
     CHECKPOINT_DIR = Path("checkpoints")
