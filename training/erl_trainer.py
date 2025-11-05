@@ -259,7 +259,7 @@ class ERLTrainer:
         """Write last_run.json to root directory for easy resume."""
         last_run_info = {
             'run_name': wandb.run.name,
-            'run_id': wandb.run.id,
+            'run_id': wandb.run.id,  # W&B run ID (from URL)
             'project': 'eigen2-self',
             'timestamp': time.time()
         }

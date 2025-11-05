@@ -5,9 +5,20 @@ This script reads the last run info from last_run.json and downloads all metrics
 from Weights & Biases to a CSV file in the workspace.
 
 Usage:
-    python download_metrics.py                    # Download from last run
-    python download_metrics.py <run-name>         # Download from specific run
-    python download_metrics.py --all              # Download from all runs in project
+    python download_metrics.py                              # Download from last run
+    python download_metrics.py <run-name>                   # Download from specific run by name
+    python download_metrics.py <entity>/<project>/<run-id> # Download using full W&B path
+    python download_metrics.py --all                        # Download from all runs in project
+
+Requirements:
+    - Must be logged in to W&B: wandb login
+    - Or set W&B_ENTITY environment variable: export W&B_ENTITY=your-username
+
+Examples:
+    python download_metrics.py                              # Uses last_run.json
+    python download_metrics.py breezy-puddle-62             # By run name
+    python download_metrics.py username/eigen2-self/abc123  # Full path
+    python download_metrics.py --all                        # All runs
 """
 
 import os
@@ -134,23 +145,48 @@ def download_all_runs_metrics(entity: str, project: str, output_dir: Path = Path
 
 def get_wandb_entity() -> str:
     """
-    Get W&B entity (username) from current login.
+    Get W&B entity (username) from current login or environment.
 
     Returns:
-        W&B username/entity
+        W&B username/entity or None if not found
     """
+    # First check environment variable
+    entity = os.environ.get('W&B_ENTITY') or os.environ.get('WANDB_ENTITY')
+    if entity:
+        return entity
+
+    # Try to get from W&B API
     try:
         api = wandb.Api()
-        # Get the default entity from the API
-        viewer = api.viewer
-        return viewer.get('entity', viewer.get('username', 'unknown'))
-    except:
-        # Fallback: try to get from settings
+        # Try to get the default entity - this is the most reliable way
+        return api.default_entity
+    except AttributeError:
+        # Fallback for older wandb versions
         try:
-            settings = wandb.Settings()
-            return settings.entity or 'unknown'
+            api = wandb.Api()
+            # Get entity from any existing run in the default project
+            runs = list(api.runs("eigen2-self", per_page=1))
+            if runs:
+                return runs[0].entity
         except:
-            return 'unknown'
+            pass
+    except:
+        pass
+
+    # Final fallback: try to get from viewer
+    try:
+        api = wandb.Api()
+        viewer = api.viewer
+        if isinstance(viewer, dict):
+            return viewer.get('entity') or viewer.get('username')
+        elif hasattr(viewer, 'entity'):
+            return viewer.entity
+        elif hasattr(viewer, 'username'):
+            return viewer.username
+    except:
+        pass
+
+    return None
 
 
 def main():
@@ -168,9 +204,13 @@ def main():
             entity = get_wandb_entity()
             project = "eigen2-self"
 
-            if entity == 'unknown':
+            if not entity:
                 print("❌ Error: Could not determine W&B entity.")
-                print("Please run: wandb login")
+                print("\nPlease ensure you're logged in to W&B:")
+                print("  1. Run: wandb login")
+                print("  2. Or set W&B_ENTITY environment variable")
+                print("\nAlternatively, you can manually specify the project:")
+                print("  python download_metrics.py <entity>/<project>/<run-id>")
                 sys.exit(1)
 
             download_all_runs_metrics(entity, project, Path("metrics"))
@@ -181,14 +221,28 @@ def main():
             return
 
         else:
+            # Check if it's a full run path (entity/project/run-id)
+            if '/' in arg and arg.count('/') >= 2:
+                # Full run path provided
+                run_path = arg
+                print(f"Using full run path: {run_path}")
+                download_run_metrics(run_path, Path("."))
+                return
+
             # Specific run name provided
             run_name = arg
             entity = get_wandb_entity()
             project = "eigen2-self"
 
-            if entity == 'unknown':
+            if not entity:
                 print("❌ Error: Could not determine W&B entity.")
-                print("Please run: wandb login")
+                print("\nPlease ensure you're logged in to W&B:")
+                print("  1. Run: wandb login")
+                print("  2. Or set W&B_ENTITY environment variable")
+                print("\nAlternatively, you can manually specify the full run path:")
+                print("  python download_metrics.py <entity>/<project>/<run-id>")
+                print("\nExample:")
+                print("  python download_metrics.py username/eigen2-self/abc123xyz")
                 sys.exit(1)
 
             # Try to find the run by name
@@ -223,18 +277,37 @@ def main():
     # Get W&B entity
     entity = get_wandb_entity()
 
-    if entity == 'unknown':
+    if not entity:
         print("\n❌ Error: Could not determine W&B entity.")
-        print("Please run: wandb login")
+        print("\nPlease ensure you're logged in to W&B:")
+        print("  1. Run: wandb login")
+        print("  2. Enter your API key from: https://wandb.ai/authorize")
+        print("\nOr set the W&B_ENTITY environment variable:")
+        print("  export W&B_ENTITY=your-username")
+        print("\nYou can find your username at: https://wandb.ai/settings")
         sys.exit(1)
 
     # Construct run path
     project = "eigen2-self"
-    wandb_run_id = run_info.get('wandb_run_id')
+    # Get W&B run ID from last_run.json
+    wandb_run_id = run_info.get('run_id')
 
-    if not wandb_run_id:
-        print("❌ Error: No wandb_run_id found in last_run.json")
-        sys.exit(1)
+    if not wandb_run_id or wandb_run_id == 'unknown':
+        print("\n⚠️  No W&B run ID found in last_run.json")
+        print("\nYou can find the run ID in your W&B dashboard URL.")
+        print("For example, if your run URL is:")
+        print("  https://wandb.ai/username/eigen2-self/runs/hf8skifg")
+        print("Then the run ID is: hf8skifg")
+        print(f"\nFor run '{run_info.get('run_name', 'unknown')}', please enter the W&B run ID:")
+
+        try:
+            wandb_run_id = input("Run ID: ").strip()
+            if not wandb_run_id:
+                print("❌ Error: No run ID provided")
+                sys.exit(1)
+        except (KeyboardInterrupt, EOFError):
+            print("\n\n❌ Cancelled by user")
+            sys.exit(1)
 
     run_path = f"{entity}/{project}/{wandb_run_id}"
 
