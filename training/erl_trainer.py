@@ -114,6 +114,19 @@ class ERLTrainer:
         # Statistics
         self.fitness_history = []
         self.generation_times = []
+        self.validation_fitness_history = []  # Track validation fitness for plateau detection
+
+        # Adaptive mutation parameters
+        self.plateau_threshold = 0.02  # Consider plateau if improvement < 2% over window
+        self.plateau_window = 5  # Number of generations to check for plateau
+        self.base_mutation_rate = Config.MUTATION_RATE
+        self.base_mutation_std = Config.MUTATION_STD
+        self.current_mutation_rate = Config.MUTATION_RATE
+        self.current_mutation_std = Config.MUTATION_STD
+        self.mutation_boost_factor = 1.5  # Multiply by this when plateau detected
+        self.max_mutation_rate = 0.4  # Cap mutation rate
+        self.max_mutation_std = 0.05  # Cap mutation std
+        self.plateau_detected = False
 
         # Cloud sync
         self.cloud_sync = get_cloud_sync_from_env()
@@ -239,8 +252,8 @@ class ERLTrainer:
         """
         fitness_scores = []
         all_episode_stats = []
-        
-        print(f"\n--- Generation {self.generation}: Evaluating Population ---")
+
+        print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
         
         for agent in tqdm(self.population, desc="Evaluating agents"):
             # Calculate episode indices
@@ -365,18 +378,24 @@ class ERLTrainer:
     def evolve_population(self, fitness_scores: List[float]):
         """
         Evolve population using genetic algorithm.
-        
+
         Args:
             fitness_scores: Fitness for each agent
         """
         print(f"\n--- Evolving Population ---")
+        print(f"Using adaptive mutation: rate={self.current_mutation_rate:.3f}, std={self.current_mutation_std:.4f}")
 
         # CRITICAL FIX: Store old population reference before creating new one
         # This prevents memory leak from lingering agent references (~2-3GB per generation)
         old_population = self.population
 
-        # Create next generation
-        self.population = create_next_generation(old_population, fitness_scores)
+        # Create next generation with adaptive mutation parameters
+        self.population = create_next_generation(
+            old_population,
+            fitness_scores,
+            mutation_rate=self.current_mutation_rate,
+            mutation_std=self.current_mutation_std
+        )
 
         # CRITICAL FIX: Explicitly delete old agents and force GC
         # Each agent is ~720MB (4 networks × 45M params × 4 bytes)
@@ -388,7 +407,7 @@ class ERLTrainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        print(f"Generation {self.generation} -> {self.generation + 1}")
+        print(f"✓ Evolved to Generation {self.generation + 1}")
     
     def validate_best_agent(self) -> Dict:
         """
@@ -433,14 +452,111 @@ class ERLTrainer:
             'num_losses': episode_info['num_losses'],
             'avg_reward_per_trade': episode_info['avg_reward_per_trade']
         }
-    
+
+    def check_and_adjust_mutation(self, current_val_fitness: float):
+        """
+        Check for fitness plateau and adaptively increase mutation parameters.
+        Plateau is detected if validation fitness doesn't improve by plateau_threshold
+        over the last plateau_window generations.
+        """
+        # Add current fitness to history
+        self.validation_fitness_history.append(current_val_fitness)
+
+        # Need at least plateau_window generations to detect plateau
+        if len(self.validation_fitness_history) < self.plateau_window:
+            return
+
+        # Get fitness values from the plateau window
+        recent_fitness = self.validation_fitness_history[-self.plateau_window:]
+
+        # Calculate improvement: (max - min) / |min| to get relative improvement
+        min_fitness = min(recent_fitness)
+        max_fitness = max(recent_fitness)
+
+        # Handle negative fitness values properly
+        if min_fitness == 0:
+            relative_improvement = float('inf') if max_fitness > 0 else 0
+        else:
+            relative_improvement = abs((max_fitness - min_fitness) / min_fitness)
+
+        # Check if we're in a plateau (improvement below threshold)
+        if relative_improvement < self.plateau_threshold:
+            if not self.plateau_detected:
+                # First time detecting plateau - boost mutation
+                self.plateau_detected = True
+
+                # Increase mutation parameters
+                self.current_mutation_rate = min(
+                    self.current_mutation_rate * self.mutation_boost_factor,
+                    self.max_mutation_rate
+                )
+                self.current_mutation_std = min(
+                    self.current_mutation_std * self.mutation_boost_factor,
+                    self.max_mutation_std
+                )
+
+                print(f"\n{'='*60}")
+                print(f"🔄 PLATEAU DETECTED - Adaptive Mutation Activated")
+                print(f"{'='*60}")
+                print(f"Validation fitness improvement over last {self.plateau_window} gens: {relative_improvement:.2%}")
+                print(f"Threshold: {self.plateau_threshold:.2%}")
+                print(f"\nBoosting mutation parameters:")
+                print(f"  Mutation Rate: {self.base_mutation_rate:.3f} → {self.current_mutation_rate:.3f}")
+                print(f"  Mutation STD:  {self.base_mutation_std:.4f} → {self.current_mutation_std:.4f}")
+                print(f"{'='*60}\n")
+
+                # Log to wandb
+                wandb.log({
+                    "adaptive_mutation/plateau_detected": 1,
+                    "adaptive_mutation/mutation_rate": self.current_mutation_rate,
+                    "adaptive_mutation/mutation_std": self.current_mutation_std,
+                    "adaptive_mutation/relative_improvement": relative_improvement,
+                }, step=self.generation)
+            else:
+                # Already in plateau - just log current status
+                wandb.log({
+                    "adaptive_mutation/plateau_detected": 1,
+                    "adaptive_mutation/mutation_rate": self.current_mutation_rate,
+                    "adaptive_mutation/mutation_std": self.current_mutation_std,
+                    "adaptive_mutation/relative_improvement": relative_improvement,
+                }, step=self.generation)
+        else:
+            # Improvement detected - reset to base if we were in plateau
+            if self.plateau_detected:
+                self.plateau_detected = False
+                self.current_mutation_rate = self.base_mutation_rate
+                self.current_mutation_std = self.base_mutation_std
+
+                print(f"\n{'='*60}")
+                print(f"✓ FITNESS IMPROVING - Resetting Mutation to Baseline")
+                print(f"{'='*60}")
+                print(f"Validation fitness improvement: {relative_improvement:.2%}")
+                print(f"Mutation Rate: {self.current_mutation_rate:.3f}")
+                print(f"Mutation STD:  {self.current_mutation_std:.4f}")
+                print(f"{'='*60}\n")
+
+                wandb.log({
+                    "adaptive_mutation/plateau_detected": 0,
+                    "adaptive_mutation/mutation_rate": self.current_mutation_rate,
+                    "adaptive_mutation/mutation_std": self.current_mutation_std,
+                    "adaptive_mutation/relative_improvement": relative_improvement,
+                }, step=self.generation)
+            else:
+                # Not in plateau, just log status
+                wandb.log({
+                    "adaptive_mutation/plateau_detected": 0,
+                    "adaptive_mutation/mutation_rate": self.current_mutation_rate,
+                    "adaptive_mutation/mutation_std": self.current_mutation_std,
+                    "adaptive_mutation/relative_improvement": relative_improvement,
+                }, step=self.generation)
+
     def save_checkpoint(self):
         """Saves the entire training state to a checkpoint directory."""
         # Use run-specific checkpoint directory
         checkpoint_dir = self.checkpoint_dir
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n--- Saving checkpoint for Generation {self.generation} ---")
+        print(f"\n--- Saving checkpoint for Generation {self.generation + 1} ---")
 
         # Check if any buffer saves are still in progress
         # We want to know status but don't need to wait (they'll finish in background)
@@ -473,7 +589,11 @@ class ERLTrainer:
         # 4. Save the trainer state
         trainer_state = {
             'generation': self.generation,
-            'best_fitness': self.best_fitness
+            'best_fitness': self.best_fitness,
+            'validation_fitness_history': self.validation_fitness_history,
+            'current_mutation_rate': self.current_mutation_rate,
+            'current_mutation_std': self.current_mutation_std,
+            'plateau_detected': self.plateau_detected
         }
         state_path = checkpoint_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -552,12 +672,24 @@ class ERLTrainer:
             try:
                 with open(state_path, 'r') as f:
                     trainer_state = json.load(f)
-                
-                # This is the key part:
+
+                # Load basic training state
                 self.start_generation = trainer_state.get('generation', 0) + 1
                 self.best_fitness = trainer_state.get('best_fitness', float('-inf'))
-                print(f"✓ Resuming from Generation {self.start_generation}")
+
+                # Load adaptive mutation state
+                self.validation_fitness_history = trainer_state.get('validation_fitness_history', [])
+                self.current_mutation_rate = trainer_state.get('current_mutation_rate', Config.MUTATION_RATE)
+                self.current_mutation_std = trainer_state.get('current_mutation_std', Config.MUTATION_STD)
+                self.plateau_detected = trainer_state.get('plateau_detected', False)
+
+                print(f"✓ Completed Generation {self.start_generation} (saved), resuming at Generation {self.start_generation + 1}")
                 print(f"✓ Loaded best fitness: {self.best_fitness:.2f}")
+                print(f"✓ Loaded adaptive mutation state:")
+                print(f"  - Mutation rate: {self.current_mutation_rate:.3f}")
+                print(f"  - Mutation std: {self.current_mutation_std:.4f}")
+                print(f"  - Plateau detected: {self.plateau_detected}")
+                print(f"  - Validation history length: {len(self.validation_fitness_history)}")
             except Exception as e:
                 print(f"❌ Error loading trainer state: {e}. Starting from scratch.")
         else:
@@ -669,7 +801,10 @@ class ERLTrainer:
                         "validation/num_losses": val_results['num_losses'],
                         "validation/avg_reward_per_trade": val_results['avg_reward_per_trade'],
                     }, step=gen)
-            
+
+                    # Check for plateau and adjust mutation adaptively
+                    self.check_and_adjust_mutation(val_results['fitness'])
+
             # 5. Save checkpoint periodically
             if (gen + 1) % Config.SAVE_FREQUENCY == 0:
                 self.save_checkpoint()

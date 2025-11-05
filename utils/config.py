@@ -91,8 +91,10 @@ class Config:
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)
     CROSSOVER_ALPHA_MAX = 0.8  # Widened range for more diverse offspring (was 0.7)
-    MUTATION_RATE = 0.20  # Increased to combat premature convergence (was 0.15)
-    MUTATION_STD = 0.025  # Increased magnitude to escape local optima (was 0.01)
+    MUTATION_RATE = 0.20  # Base mutation rate (adaptive mutation increases this when plateau detected)
+    MUTATION_STD = 0.025  # Base mutation magnitude (adaptive mutation increases this when plateau detected)
+    # NOTE: Adaptive mutation automatically boosts these values by 1.5x when validation fitness
+    # plateaus for 5 consecutive generations (< 2% improvement), helping escape local optima
     
     # Training
     GRADIENT_STEPS_PER_GENERATION = 32

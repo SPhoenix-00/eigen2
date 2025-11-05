@@ -155,10 +155,18 @@ def mutate(agent: DDPGAgent, mutation_rate: float = None,
     return mutated
 
 def create_next_generation(population: List[DDPGAgent],
-                          fitness_scores: List[float]) -> List[DDPGAgent]:
+                          fitness_scores: List[float],
+                          mutation_rate: float = None,
+                          mutation_std: float = None) -> List[DDPGAgent]:
     """
     Create next generation using selection, crossover, and mutation.
     Calculates population segments dynamically using Config.POPULATION_SIZE.
+
+    Args:
+        population: Current population of agents
+        fitness_scores: Fitness scores for each agent
+        mutation_rate: Fraction of weights to mutate. If None, uses Config.MUTATION_RATE
+        mutation_std: Standard deviation of mutation noise. If None, uses Config.MUTATION_STD
     """
     pop_size = Config.POPULATION_SIZE
     
@@ -227,7 +235,7 @@ def create_next_generation(population: List[DDPGAgent],
         for _ in range(num_mutants):
             # Select elite to mutate
             elite = elites[np.random.randint(len(elites))]
-            mutant = mutate(elite)
+            mutant = mutate(elite, mutation_rate=mutation_rate, mutation_std=mutation_std)
             mutants.append(mutant)
     
     next_gen.extend(mutants)
@@ -240,7 +248,7 @@ def create_next_generation(population: List[DDPGAgent],
         print(f"  Filling {fill_count} remaining slots with mutants.")
         for _ in range(fill_count):
             elite = elites[np.random.randint(len(elites))]
-            mutant = mutate(elite)
+            mutant = mutate(elite, mutation_rate=mutation_rate, mutation_std=mutation_std)
             next_gen.append(mutant)
 
     # Assign new agent IDs
