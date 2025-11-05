@@ -484,7 +484,7 @@ class ERLTrainer:
     
     def evolve_population(self, fitness_scores: List[float]):
         """
-        Evolve population using genetic algorithm.
+        Evolve population using genetic algorithm with champion injection.
 
         Args:
             fitness_scores: Fitness for each agent
@@ -503,6 +503,23 @@ class ERLTrainer:
             mutation_rate=self.current_mutation_rate,
             mutation_std=self.current_mutation_std
         )
+
+        # CHAMPION INJECTION: Force the all-time best validation agent back into the population
+        # This ensures the champion gets another chance even if it had poor training fitness
+        if self.best_agent is not None:
+            # Clone the champion and inject it, replacing the worst elite
+            # This puts the champion back into both the breeding pool and elite survivors
+            num_elites = int(len(self.population) * Config.ELITE_FRAC)
+            if num_elites > 0:
+                # Replace the last elite (weakest elite) with the champion
+                champion_clone = self.best_agent.clone()
+                champion_clone.agent_id = num_elites - 1  # Give it the elite slot ID
+
+                # Delete the agent being replaced to prevent memory leak
+                del self.population[num_elites - 1]
+                self.population[num_elites - 1] = champion_clone
+
+                print(f"✓ Champion injected into population (validation fitness: {self.best_validation_fitness:.2f})")
 
         # CRITICAL FIX: Explicitly delete old agents and force GC
         # Each agent is ~720MB (4 networks × 45M params × 4 bytes)
