@@ -143,7 +143,8 @@ def print_final_summary(trainer):
     
     print("\n🏆 BEST RESULTS")
     print("-" * 70)
-    print(f"  Best Fitness:      {trainer.best_fitness:>12.2f}")
+    print(f"  Best Training Fitness:     {trainer.best_fitness:>12.2f}")
+    print(f"  Best Validation Fitness:   {trainer.best_validation_fitness:>12.2f}")
     print(f"  Total Generations: {len(trainer.fitness_history):>12}")
     print(f"  Total Transitions: {trainer.replay_buffer.total_added:>12,}")
     print(f"  Avg Gen Time:      {np.mean(trainer.generation_times):>11.1f}s")

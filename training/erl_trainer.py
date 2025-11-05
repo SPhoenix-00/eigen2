@@ -32,15 +32,17 @@ class ERLTrainer:
     Evolutionary Reinforcement Learning Trainer.
     Manages population, training, and evolution.
     """
-    
-    def __init__(self, data_loader: StockDataLoader):
+
+    def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None):
         """
         Initialize ERL trainer.
-        
+
         Args:
             data_loader: Loaded data with train/val splits
+            resume_run_name: Optional wandb run name to resume from (e.g., "azure-thunder-123")
         """
         self.data_loader = data_loader
+        self.resume_run_name = resume_run_name
         
         # Compute normalization stats ONCE and cache them
         print("Computing and caching normalization statistics...")
@@ -64,36 +66,119 @@ class ERLTrainer:
         # Logging
         self.writer = SummaryWriter(log_dir=str(Config.LOG_DIR))
 
-        # Initialize Weights & Biases
+        # Cloud sync (needed before wandb init for checkpoint downloading)
+        self.cloud_sync = get_cloud_sync_from_env()
+
+        # Initialize Weights & Biases and checkpoint directory
         # Note: entity defaults to your personal workspace (eigen2)
         if wandb.run is None:
-            print("--- Initializing new W&B run (main.py mode) ---")
-            wandb.init(
-            project="eigen2-self",
-            #name=f"erl-{Config.NUM_GENERATIONS}gen",
-            config={
-                "population_size": Config.POPULATION_SIZE,
-                "num_generations": Config.NUM_GENERATIONS,
-                "buffer_size": Config.BUFFER_SIZE,
-                "batch_size": Config.BATCH_SIZE,
-                "actor_lr": Config.ACTOR_LR,
-                "critic_lr": Config.CRITIC_LR,
-                "trading_period_days": Config.TRADING_PERIOD_DAYS,
-                "max_holding_period": Config.MAX_HOLDING_PERIOD,
-                "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
-                "num_stocks": Config.NUM_INVESTABLE_STOCKS,
-            },
-            resume="allow"  # Allow resuming from checkpoints
-            )
+            # If resuming from a specific run, try to load its wandb ID
+            if self.resume_run_name:
+                print(f"--- Resuming W&B run: {self.resume_run_name} ---")
+
+                # Set checkpoint directory based on provided run name
+                self.checkpoint_dir = Config.CHECKPOINT_DIR / self.resume_run_name
+                self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+                # Try to download checkpoint from cloud and extract wandb run ID
+                if not self.checkpoint_dir.exists() or len(list(self.checkpoint_dir.glob('*'))) == 0:
+                    print("! No local checkpoint found. Downloading from cloud...")
+                    self.cloud_sync.download_checkpoints(str(self.checkpoint_dir))
+
+                # Try to load trainer state to get wandb run ID
+                wandb_run_id = None
+                state_path = self.checkpoint_dir / "trainer_state.json"
+                if state_path.exists():
+                    try:
+                        import json
+                        with open(state_path, 'r') as f:
+                            trainer_state = json.load(f)
+                        wandb_run_id = trainer_state.get('wandb_run_id')
+                        print(f"✓ Found wandb run ID: {wandb_run_id}")
+                    except Exception as e:
+                        print(f"⚠ Could not load wandb run ID from checkpoint: {e}")
+
+                # Initialize wandb with the run ID for proper resume
+                if wandb_run_id:
+                    wandb.init(
+                        project="eigen2-self",
+                        id=wandb_run_id,
+                        resume="must",  # Must resume this specific run
+                        config={
+                            "population_size": Config.POPULATION_SIZE,
+                            "num_generations": Config.NUM_GENERATIONS,
+                            "buffer_size": Config.BUFFER_SIZE,
+                            "batch_size": Config.BATCH_SIZE,
+                            "actor_lr": Config.ACTOR_LR,
+                            "critic_lr": Config.CRITIC_LR,
+                            "trading_period_days": Config.TRADING_PERIOD_DAYS,
+                            "max_holding_period": Config.MAX_HOLDING_PERIOD,
+                            "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
+                            "num_stocks": Config.NUM_INVESTABLE_STOCKS,
+                        }
+                    )
+                else:
+                    print("⚠ No wandb run ID found. Creating new run with same name...")
+                    wandb.init(
+                        project="eigen2-self",
+                        name=self.resume_run_name,  # Try to use same name
+                        resume="allow",
+                        config={
+                            "population_size": Config.POPULATION_SIZE,
+                            "num_generations": Config.NUM_GENERATIONS,
+                            "buffer_size": Config.BUFFER_SIZE,
+                            "batch_size": Config.BATCH_SIZE,
+                            "actor_lr": Config.ACTOR_LR,
+                            "critic_lr": Config.CRITIC_LR,
+                            "trading_period_days": Config.TRADING_PERIOD_DAYS,
+                            "max_holding_period": Config.MAX_HOLDING_PERIOD,
+                            "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
+                            "num_stocks": Config.NUM_INVESTABLE_STOCKS,
+                        }
+                    )
+
+                self.run_name = self.resume_run_name  # Use the provided name
+
+                # Update last_run.json with the resumed run info
+                self._write_last_run_file()
+            else:
+                # New training run
+                print("--- Initializing new W&B run (main.py mode) ---")
+                wandb.init(
+                    project="eigen2-self",
+                    #name=f"erl-{Config.NUM_GENERATIONS}gen",
+                    config={
+                        "population_size": Config.POPULATION_SIZE,
+                        "num_generations": Config.NUM_GENERATIONS,
+                        "buffer_size": Config.BUFFER_SIZE,
+                        "batch_size": Config.BATCH_SIZE,
+                        "actor_lr": Config.ACTOR_LR,
+                        "critic_lr": Config.CRITIC_LR,
+                        "trading_period_days": Config.TRADING_PERIOD_DAYS,
+                        "max_holding_period": Config.MAX_HOLDING_PERIOD,
+                        "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
+                        "num_stocks": Config.NUM_INVESTABLE_STOCKS,
+                    },
+                    resume="allow"  # Allow resuming from checkpoints
+                )
+
+                # Create run-specific checkpoint directory using wandb run name
+                self.run_name = wandb.run.name
+                self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
+                self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+                # Write last_run.json for easy resume
+                self._write_last_run_file()
         else:
             print("--- W&B run already active (sweep_runner.py mode) ---")
+            # Create run-specific checkpoint directory using wandb run name
+            self.run_name = wandb.run.name
+            self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create run-specific checkpoint directory using wandb run name
-        # This prevents parallel runs from overwriting each other's checkpoints
-        self.run_name = wandb.run.name
-        self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         print(f"Checkpoints will be saved to: {self.checkpoint_dir}")
+        print(f"W&B run name: {wandb.run.name}")
+        print(f"W&B run ID: {wandb.run.id}")
 
         # Set unique random seed based on wandb run id
         # This ensures parallel runs don't have identical behavior
@@ -108,7 +193,8 @@ class ERLTrainer:
 
         self.start_generation = 0
         self.generation = 0
-        self.best_fitness = float('-inf')
+        self.best_fitness = float('-inf')  # Best training fitness (for logging)
+        self.best_validation_fitness = float('-inf')  # Best validation fitness (for selection)
         self.best_agent = None
 
         # Statistics
@@ -128,9 +214,6 @@ class ERLTrainer:
         self.max_mutation_std = 0.05  # Cap mutation std
         self.plateau_detected = False
 
-        # Cloud sync
-        self.cloud_sync = get_cloud_sync_from_env()
-
         # Track if we've saved buffer on first fill
         self.buffer_saved_on_first_fill = False
 
@@ -138,7 +221,7 @@ class ERLTrainer:
         print(f"Validation range: days {self.val_start_idx} to {self.val_end_idx}")
 
         # CRITICAL FIX: Create persistent environments to reuse instead of creating new ones each episode
-        # This prevents massive memory leak from creating 16+ environments per generation
+        # This prevents massive memory leak from creating POPULATION_SIZE+ environments per generation
         print("Initializing persistent evaluation environment...")
         self.eval_env = TradingEnvironment(
             data_array=self.data_loader.data_array,
@@ -161,9 +244,33 @@ class ERLTrainer:
             trading_end_idx=self.val_start_idx + Config.TRADING_PERIOD_DAYS
         )
 
+        # Automatically load checkpoint if resuming
+        if self.resume_run_name:
+            print("\n" + "="*60)
+            print("Loading checkpoint for resume...")
+            print("="*60)
+            self.load_checkpoint()
+
         # Memory profiling: Take baseline snapshot
         # print("\n🔍 Taking baseline memory snapshot...")
         # log_memory("Trainer initialized (baseline)", show_objects=True)
+
+    def _write_last_run_file(self):
+        """Write last_run.json to root directory for easy resume."""
+        last_run_info = {
+            'run_name': wandb.run.name,
+            'run_id': wandb.run.id,
+            'project': 'eigen2-self',
+            'timestamp': time.time()
+        }
+
+        last_run_file = Path("last_run.json")
+        try:
+            with open(last_run_file, 'w') as f:
+                json.dump(last_run_info, f, indent=2)
+            print(f"✓ Wrote run info to {last_run_file}")
+        except Exception as e:
+            print(f"⚠ Could not write last_run.json: {e}")
 
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
@@ -409,40 +516,36 @@ class ERLTrainer:
 
         print(f"✓ Evolved to Generation {self.generation + 1}")
     
-    def validate_best_agent(self) -> Dict:
+    def validate_agent(self, agent) -> Dict:
         """
-        Validate best agent on validation set.
-        
+        Validate a specific agent on validation set.
+
+        Args:
+            agent: The agent to validate
+
         Returns:
             Validation results
         """
-        if self.best_agent is None:
+        if agent is None:
             return {}
-        
-        print(f"\n--- Validating Best Agent ---")
-        
+
         # Validation uses the validation period
         # end_idx includes settlement period
         total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-        
+
         if self.val_end_idx - self.val_start_idx < Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS:
-            print(f"Warning: Validation set too small, using partial period")
             end_idx = self.val_end_idx
         else:
             end_idx = self.val_start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-        
+
         # Run on validation data using persistent val_env (CRITICAL FIX: prevents memory leak)
         fitness, episode_info = self.run_episode(
-            agent=self.best_agent,
+            agent=agent,
             env=self.val_env,  # Reuse persistent validation environment
             start_idx=self.val_start_idx,
             end_idx=end_idx,
             training=False
         )
-        
-        print(f"Validation fitness: {fitness:.2f}")
-        print(f"Validation win rate: {episode_info['win_rate']:.1%}")
-        print(f"Validation trades: {episode_info['num_trades']}")
 
         return {
             'fitness': fitness,
@@ -452,6 +555,26 @@ class ERLTrainer:
             'num_losses': episode_info['num_losses'],
             'avg_reward_per_trade': episode_info['avg_reward_per_trade']
         }
+
+    def validate_best_agent(self) -> Dict:
+        """
+        Validate best agent on validation set.
+
+        Returns:
+            Validation results
+        """
+        if self.best_agent is None:
+            return {}
+
+        print(f"\n--- Validating Best Agent ---")
+
+        val_results = self.validate_agent(self.best_agent)
+
+        print(f"Validation fitness: {val_results['fitness']:.2f}")
+        print(f"Validation win rate: {val_results['win_rate']:.1%}")
+        print(f"Validation trades: {val_results['num_trades']}")
+
+        return val_results
 
     def check_and_adjust_mutation(self, current_val_fitness: float):
         """
@@ -589,11 +712,14 @@ class ERLTrainer:
         # 4. Save the trainer state
         trainer_state = {
             'generation': self.generation,
-            'best_fitness': self.best_fitness,
+            'best_fitness': self.best_fitness,  # Best training fitness
+            'best_validation_fitness': self.best_validation_fitness,  # Best validation fitness
             'validation_fitness_history': self.validation_fitness_history,
             'current_mutation_rate': self.current_mutation_rate,
             'current_mutation_std': self.current_mutation_std,
-            'plateau_detected': self.plateau_detected
+            'plateau_detected': self.plateau_detected,
+            'wandb_run_id': wandb.run.id,
+            'wandb_run_name': wandb.run.name
         }
         state_path = checkpoint_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -676,6 +802,7 @@ class ERLTrainer:
                 # Load basic training state
                 self.start_generation = trainer_state.get('generation', 0) + 1
                 self.best_fitness = trainer_state.get('best_fitness', float('-inf'))
+                self.best_validation_fitness = trainer_state.get('best_validation_fitness', float('-inf'))
 
                 # Load adaptive mutation state
                 self.validation_fitness_history = trainer_state.get('validation_fitness_history', [])
@@ -684,7 +811,8 @@ class ERLTrainer:
                 self.plateau_detected = trainer_state.get('plateau_detected', False)
 
                 print(f"✓ Completed Generation {self.start_generation} (saved), resuming at Generation {self.start_generation + 1}")
-                print(f"✓ Loaded best fitness: {self.best_fitness:.2f}")
+                print(f"✓ Loaded best training fitness: {self.best_fitness:.2f}")
+                print(f"✓ Loaded best validation fitness: {self.best_validation_fitness:.2f}")
                 print(f"✓ Loaded adaptive mutation state:")
                 print(f"  - Mutation rate: {self.current_mutation_rate:.3f}")
                 print(f"  - Mutation std: {self.current_mutation_std:.4f}")
@@ -741,25 +869,65 @@ class ERLTrainer:
                 "fitness/max": max_fitness,
                 "fitness/min": min_fitness,
                 "fitness/std": np.std(fitness_scores),
-                "fitness/best_ever": self.best_fitness if hasattr(self, 'best_fitness') else max_fitness,
+                "fitness/best_training_ever": self.best_fitness if hasattr(self, 'best_fitness') else max_fitness,
+                "fitness/best_validation_ever": self.best_validation_fitness if hasattr(self, 'best_validation_fitness') else float('-inf'),
             }, step=gen)
-            
-            # Update best agent
-            best_idx = None
-            for i, f in enumerate(fitness_scores):
-                if f == max_fitness:
-                    best_idx = i
-                    break
-            
-            if best_idx is not None and fitness_scores[best_idx] > self.best_fitness:
+
+            # Update best training fitness (for logging only)
+            if max_fitness > self.best_fitness:
+                self.best_fitness = max_fitness
+
+            # Select best agent based on VALIDATION fitness (not training fitness)
+            # Validate ALL agents in the population - training fitness is unreliable due to random windows
+            print(f"\n--- Validating All {len(self.population)} Agents for Best Agent Selection ---")
+
+            best_val_fitness_this_gen = float('-inf')
+            best_val_agent_idx = None
+            validation_results = []
+
+            for idx in range(len(self.population)):
+                print(f"\nValidating agent {idx} (training fitness: {fitness_scores[idx]:.2f})...")
+                val_results = self.validate_agent(self.population[idx])
+                val_fitness = val_results['fitness']
+
+                validation_results.append({
+                    'idx': idx,
+                    'training_fitness': fitness_scores[idx],
+                    'validation_fitness': val_fitness,
+                    'win_rate': val_results['win_rate'],
+                    'num_trades': val_results['num_trades']
+                })
+
+                print(f"  Validation fitness: {val_fitness:.2f}")
+                print(f"  Win rate: {val_results['win_rate']:.1%}")
+                print(f"  Trades: {val_results['num_trades']}")
+
+                # Track best validation fitness in this generation
+                if val_fitness > best_val_fitness_this_gen:
+                    best_val_fitness_this_gen = val_fitness
+                    best_val_agent_idx = idx
+
+            # Print summary showing training vs validation rankings
+            print(f"\n--- Validation Summary ---")
+            validation_results.sort(key=lambda x: x['validation_fitness'], reverse=True)
+            print("Top 5 by Validation Fitness:")
+            for i, result in enumerate(validation_results[:5]):
+                print(f"  {i+1}. Agent {result['idx']:2d}: Val={result['validation_fitness']:>8.2f}, Train={result['training_fitness']:>8.2f}, WR={result['win_rate']:.1%}")
+
+            # Update best agent if we found a better one based on validation
+            if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
+                print(f"\n✓ New best agent found! Validation fitness: {best_val_fitness_this_gen:.2f} (previous: {self.best_validation_fitness:.2f})")
+
                 # CRITICAL FIX: Delete old best_agent before replacing with new one
                 # Prevents accumulation of old agent copies (~720MB each)
                 if self.best_agent is not None:
                     del self.best_agent
                     gc.collect()
 
-                self.best_fitness = fitness_scores[best_idx]
-                self.best_agent = self.population[best_idx].clone()
+                self.best_validation_fitness = best_val_fitness_this_gen
+                self.best_agent = self.population[best_val_agent_idx].clone()
+            else:
+                print(f"\n→ No improvement in validation fitness. Best remains: {self.best_validation_fitness:.2f}")
             
             # Print comprehensive summary
             print_generation_summary(
@@ -768,7 +936,7 @@ class ERLTrainer:
                 fitness_scores=fitness_scores,
                 pop_stats=pop_stats,
                 buffer_size=len(self.replay_buffer),
-                best_fitness=self.best_fitness,
+                best_fitness=self.best_validation_fitness,  # Use validation fitness for "best ever"
                 gen_time=0,  # Will update below
                 avg_gen_time=np.mean(self.generation_times) if self.generation_times else 0
             )
@@ -785,25 +953,29 @@ class ERLTrainer:
             # 🔍 Memory tracking after evolution
             # log_memory(f"Gen {gen+1}: After evolve_population", show_objects=True)
             
-            # 4. Validate best agent periodically
+            # 4. Log validation metrics and check for plateau
             if (gen + 1) % Config.LOG_FREQUENCY == 0:
-                val_results = self.validate_best_agent()
-                if val_results:
-                    self.writer.add_scalar('Validation/Fitness', val_results['fitness'], gen)
-                    self.writer.add_scalar('Validation/WinRate', val_results['win_rate'], gen)
+                # We already validated the best agent during selection, so use those results
+                # Re-validate the current best_agent for logging
+                if self.best_agent is not None:
+                    val_results = self.validate_best_agent()
+                    if val_results:
+                        self.writer.add_scalar('Validation/Fitness', val_results['fitness'], gen)
+                        self.writer.add_scalar('Validation/WinRate', val_results['win_rate'], gen)
 
-                    # Log to wandb
-                    wandb.log({
-                        "validation/fitness": val_results['fitness'],
-                        "validation/win_rate": val_results['win_rate'],
-                        "validation/num_trades": val_results['num_trades'],
-                        "validation/num_wins": val_results['num_wins'],
-                        "validation/num_losses": val_results['num_losses'],
-                        "validation/avg_reward_per_trade": val_results['avg_reward_per_trade'],
-                    }, step=gen)
+                        # Log to wandb
+                        wandb.log({
+                            "validation/fitness": val_results['fitness'],
+                            "validation/win_rate": val_results['win_rate'],
+                            "validation/num_trades": val_results['num_trades'],
+                            "validation/num_wins": val_results['num_wins'],
+                            "validation/num_losses": val_results['num_losses'],
+                            "validation/avg_reward_per_trade": val_results['avg_reward_per_trade'],
+                        }, step=gen)
 
-                    # Check for plateau and adjust mutation adaptively
-                    self.check_and_adjust_mutation(val_results['fitness'])
+                        # Check for plateau and adjust mutation adaptively
+                        # Use the best validation fitness for plateau detection
+                        self.check_and_adjust_mutation(self.best_validation_fitness)
 
             # 5. Save checkpoint periodically
             if (gen + 1) % Config.SAVE_FREQUENCY == 0:

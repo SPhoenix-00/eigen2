@@ -403,8 +403,15 @@ export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
 # New training
 python main.py
 
-# Resume from checkpoint
+# Resume from the last run (reads last_run.json automatically)
 python main.py --resume
+
+# Resume from a specific older run
+python main.py --resume-run <run-name>
+# Example: python main.py --resume-run azure-thunder-123
+
+# Note: Run info is automatically saved to last_run.json for easy resume
+# To see last run: cat last_run.json
 ```
 
 **Monitor:**

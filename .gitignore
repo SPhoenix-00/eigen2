@@ -13,6 +13,7 @@ checkpoints/
 logs/
 *.csv
 *.log
+last_run.json
 .vscode/
 .idea/
 *.swp

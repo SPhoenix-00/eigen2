@@ -34,8 +34,17 @@ def main():
     parser = argparse.ArgumentParser(description="Run Project Eigen 2 ERL Training")
     parser.add_argument(
         '--resume',
-        action='store_true',  # This makes it a True/False flag
-        help='Resume training from the last checkpoint'
+        action='store_true',
+        help='Resume training from the last run (reads from last_run.json). '
+             'This will download checkpoints from GCS and reconnect to the wandb run.'
+    )
+    parser.add_argument(
+        '--resume-run',
+        type=str,
+        default=None,
+        metavar='RUN_NAME',
+        help='Resume training from a specific wandb run (e.g., "azure-thunder-123"). '
+             'Overrides --resume. Useful for resuming older runs.'
     )
     args = parser.parse_args()
     # --------------------------------
@@ -63,13 +72,34 @@ def main():
     print("Phase 2: ERL Training")
     print("="*60)
 
-    # Create trainer
-    trainer = ERLTrainer(loader)
+    # Determine resume run name
+    resume_run_name = None
+    if args.resume_run:
+        # Specific run provided via --resume-run
+        resume_run_name = args.resume_run
+        print(f"Resuming from specific run: {resume_run_name}")
+    elif args.resume:
+        # Resume from last run (read from last_run.json)
+        import json
+        last_run_file = Path("last_run.json")
+        if last_run_file.exists():
+            try:
+                with open(last_run_file, 'r') as f:
+                    last_run_info = json.load(f)
+                resume_run_name = last_run_info.get('run_name')
+                print(f"Resuming from last run: {resume_run_name}")
+            except Exception as e:
+                print(f"⚠ Could not read last_run.json: {e}")
+                print("Starting new training run instead.")
+        else:
+            print("⚠ No last_run.json found. Starting new training run.")
 
-    # --- 2. ADD CHECKPOINT LOADING ---
-    # If the --resume flag was used, load the checkpoint
-    if args.resume:
-        trainer.load_checkpoint()
+    # Create trainer (pass resume_run_name if resuming)
+    trainer = ERLTrainer(loader, resume_run_name=resume_run_name)
+
+    # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---
+    # If resume_run_name was provided, checkpoints are automatically loaded
+    # and wandb run is reconnected during trainer initialization
     # --------------------------------
 
     # Start or resume training
