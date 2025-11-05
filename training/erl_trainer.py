@@ -839,6 +839,21 @@ class ERLTrainer:
                 print(f"❌ Error loading trainer state: {e}. Starting from scratch.")
         else:
             print("! Trainer state file not found. Starting from generation 0.")
+
+        # CHAMPION INJECTION ON RESUME: Inject the loaded best agent into the population
+        # This ensures the validation champion is in the active population when resuming
+        if self.best_agent is not None and len(self.population) > 0:
+            num_elites = int(len(self.population) * Config.ELITE_FRAC)
+            if num_elites > 0:
+                # Clone the champion and inject it, replacing the last elite position
+                champion_clone = self.best_agent.clone()
+                champion_clone.agent_id = num_elites - 1
+
+                # Delete the agent being replaced to prevent memory leak
+                del self.population[num_elites - 1]
+                self.population[num_elites - 1] = champion_clone
+
+                print(f"✓ Champion injected into resumed population (validation fitness: {self.best_validation_fitness:.2f})")
     
     def train(self):
         """Main training loop."""
