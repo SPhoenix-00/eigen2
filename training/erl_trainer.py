@@ -204,7 +204,7 @@ class ERLTrainer:
 
         # Adaptive mutation parameters
         self.plateau_threshold = 0.02  # Consider plateau if improvement < 2% over window
-        self.plateau_window = 5  # Number of generations to check for plateau
+        self.plateau_window = 3  # Number of generations to check for plateau
         self.base_mutation_rate = Config.MUTATION_RATE
         self.base_mutation_std = Config.MUTATION_STD
         self.current_mutation_rate = Config.MUTATION_RATE

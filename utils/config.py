@@ -94,7 +94,7 @@ class Config:
     MUTATION_RATE = 0.20  # Base mutation rate (adaptive mutation increases this when plateau detected)
     MUTATION_STD = 0.025  # Base mutation magnitude (adaptive mutation increases this when plateau detected)
     # NOTE: Adaptive mutation automatically boosts these values by 1.5x when validation fitness
-    # plateaus for 5 consecutive generations (< 2% improvement), helping escape local optima
+    # plateaus for 3 consecutive generations (< 2% improvement), helping escape local optima
     
     # Training
     GRADIENT_STEPS_PER_GENERATION = 32
