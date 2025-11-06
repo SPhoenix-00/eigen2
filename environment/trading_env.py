@@ -45,26 +45,30 @@ class TradingEnvironment(gym.Env):
                  normalization_stats: dict,
                  start_idx: int,
                  end_idx: int,
-                 trading_end_idx: int = None):
+                 trading_end_idx: int = None,
+                 data_array_full: np.ndarray = None):
         """
         Initialize trading environment.
 
         Args:
-            data_array: Full market data [num_days, num_columns, 5_features]
+            data_array: Reduced market data for observations [num_days, num_columns, 5_features]
             dates: Array of date strings
             normalization_stats: Dict with 'mean' and 'std' for normalization
             start_idx: Starting day index (must have context_window_days history)
             end_idx: Ending day index (exclusive) - includes settlement period
             trading_end_idx: Last day new positions can be opened. If None, equals end_idx
+            data_array_full: Full market data for reward calculation [num_days, num_columns, 9_features]
+                            If None, uses data_array (for backward compatibility)
         """
         super().__init__()
-        
-        self.data_array = data_array
+
+        self.data_array = data_array  # For observations (5 features)
+        self.data_array_full = data_array_full if data_array_full is not None else data_array  # For rewards (9 features)
         self.dates = dates
         self.norm_stats = normalization_stats
         self.start_idx = start_idx
         self.end_idx = end_idx
-        
+
         # Trading end is when model stops opening new positions
         # Settlement period allows existing positions to close
         self.trading_end_idx = trading_end_idx if trading_end_idx is not None else end_idx
@@ -293,8 +297,8 @@ class TradingEnvironment(gym.Env):
         # Stock ID in action space is relative to investable stocks (0-107)
         # Need to map to actual column index (10-117)
         actual_col_idx = Config.INVESTABLE_START_COL + max_stock_id
-        stock_data = self.data_array[self.current_idx, actual_col_idx, :]
-        
+        stock_data = self.data_array_full[self.current_idx, actual_col_idx, :]
+
         # Check if stock data is valid (not all nan)
         if np.all(np.isnan(stock_data)):
             # Stock doesn't exist on this day
@@ -305,8 +309,9 @@ class TradingEnvironment(gym.Env):
                 'reason': 'stock_data_invalid'
             })
             return 0.0
-        
-        # Extract close price (index 1)
+
+        # Extract close price (index 1 in full 9-feature dataset)
+        # Full dataset: [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
         entry_price = stock_data[1]  # close price
         
         if np.isnan(entry_price) or entry_price <= 0:
@@ -362,11 +367,11 @@ class TradingEnvironment(gym.Env):
         for stock_id, position in self.open_positions.items():
             # Increment days held
             position.days_held += 1
-            
-            # Get current stock data
+
+            # Get current stock data (use full 9-feature dataset for accurate prices)
             actual_col_idx = Config.INVESTABLE_START_COL + stock_id
-            stock_data = self.data_array[self.current_idx, actual_col_idx, :]
-            
+            stock_data = self.data_array_full[self.current_idx, actual_col_idx, :]
+
             # Check if stock data is valid
             if np.all(np.isnan(stock_data)):
                 # Stock delisted or data missing - force close at last known price
@@ -375,8 +380,9 @@ class TradingEnvironment(gym.Env):
                 should_close = True
             else:
                 # Extract high and close prices
-                day_high = stock_data[2]  # day high
-                close_price = stock_data[1]  # close price
+                # Full dataset: [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
+                day_high = stock_data[2]  # day high (index 2)
+                close_price = stock_data[1]  # close price (index 1)
                 
                 # Check if sale target hit (using day high)
                 if not np.isnan(day_high) and day_high >= position.sale_target_price:
@@ -487,18 +493,19 @@ if __name__ == "__main__":
     # Load data
     loader = StockDataLoader()
     data_array, stats = loader.load_and_prepare()
-    
+
     # Create environment on training data
     # Start after context window, run for 252 days (1 year)
     start_idx = Config.CONTEXT_WINDOW_DAYS
     end_idx = start_idx + 252
-    
+
     env = TradingEnvironment(
         data_array=data_array,
         dates=loader.dates,
         normalization_stats=stats,
         start_idx=start_idx,
-        end_idx=end_idx
+        end_idx=end_idx,
+        data_array_full=loader.data_array_full
     )
     
     print(f"Environment created:")

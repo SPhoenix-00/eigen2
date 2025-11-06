@@ -30,7 +30,10 @@ class StockDataLoader:
         self.csv_path = csv_path or Config.DATA_PATH
         self.df = None
         self.dates = None
-        self.data_array = None  # Shape: [num_days, num_columns, 9_features]
+        # Full dataset for environment (all 9 features: Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA)
+        self.data_array_full = None  # Shape: [num_days, num_columns, 9_features]
+        # Reduced dataset for model training (5 selected features: Close, RSI, MACD_Signal, TRIX, diff20DMA)
+        self.data_array = None  # Shape: [num_days, num_columns, 5_features]
         self.train_indices = None
         self.interim_val_indices = None  # For walk-forward validation during training
         self.val_indices = None  # Holdout set for final validation
@@ -80,6 +83,70 @@ class StockDataLoader:
 
         return self.df
     
+    def parse_cell_data_full(self, cell_value) -> np.ndarray:
+        """
+        Parse a single cell and return ALL 9 features (for environment use).
+
+        Pickle format: Native list with 9 features [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
+        CSV format: String like "[1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0]"
+
+        Args:
+            cell_value: List or string containing feature array, or nan/None
+
+        Returns:
+            numpy array of shape (9,) with all features
+        """
+        # Handle None first
+        if cell_value is None:
+            return np.full(9, np.nan, dtype=np.float32)
+
+        # Handle numpy arrays (from pickle)
+        if isinstance(cell_value, np.ndarray):
+            try:
+                if len(cell_value) >= 9:
+                    return cell_value[:9].astype(np.float32)
+                else:
+                    return np.full(9, np.nan, dtype=np.float32)
+            except (ValueError, IndexError):
+                return np.full(9, np.nan, dtype=np.float32)
+
+        # Handle scalar nan values
+        try:
+            if pd.isna(cell_value):
+                return np.full(9, np.nan, dtype=np.float32)
+        except (ValueError, TypeError):
+            pass
+
+        # Handle native lists (pickle format)
+        if isinstance(cell_value, list):
+            try:
+                arr = np.array(cell_value, dtype=np.float32)
+                if len(arr) >= 9:
+                    return arr[:9].astype(np.float32)
+                else:
+                    return np.full(9, np.nan, dtype=np.float32)
+            except (ValueError, IndexError):
+                return np.full(9, np.nan, dtype=np.float32)
+
+        # Handle empty strings (CSV format)
+        if isinstance(cell_value, str) and cell_value.strip() == '':
+            return np.full(9, np.nan, dtype=np.float32)
+
+        # Handle string-formatted arrays (CSV format)
+        if isinstance(cell_value, str):
+            try:
+                data = ast.literal_eval(cell_value)
+                arr = np.array(data, dtype=np.float32)
+                if len(arr) >= 9:
+                    return arr[:9].astype(np.float32)
+                else:
+                    return np.full(9, np.nan, dtype=np.float32)
+            except (ValueError, SyntaxError, IndexError):
+                return np.full(9, np.nan, dtype=np.float32)
+
+        # Fallback
+        return np.full(9, np.nan, dtype=np.float32)
+
     def parse_cell_data(self, cell_value) -> np.ndarray:
         """
         Parse a single cell containing either a native list (pickle) or string-formatted array (CSV).
@@ -191,33 +258,40 @@ class StockDataLoader:
             self.column_names = list(self.df.columns[start_col:])
             print(f"\nExtracting features from CSV: {num_days} days × {num_columns} columns...")
 
-        # Initialize array
-        self.data_array = np.zeros((num_days, num_columns, Config.FEATURES_PER_CELL),
-                                   dtype=np.float32)
+        # Initialize arrays
+        # Full dataset: all 9 features for environment
+        self.data_array_full = np.zeros((num_days, num_columns, 9), dtype=np.float32)
+        # Reduced dataset: 5 selected features for model training
+        self.data_array = np.zeros((num_days, num_columns, Config.FEATURES_PER_CELL), dtype=np.float32)
 
         # Process each column
         for col_idx in tqdm(range(start_col, self.df.shape[1]), desc="Processing columns"):
             for day_idx in range(num_days):
                 cell_value = self.df.iloc[day_idx, col_idx]
-                # Store in data_array (adjust for start_col offset)
+                # Store full 9 features for environment
+                self.data_array_full[day_idx, col_idx - start_col, :] = self.parse_cell_data_full(cell_value)
+                # Store reduced 5 features for model
                 self.data_array[day_idx, col_idx - start_col, :] = self.parse_cell_data(cell_value)
-        
+
         # Report statistics
+        print(f"\nData extraction complete:")
+        print(f"\nFull dataset (for environment):")
+        print(f"  Shape: {self.data_array_full.shape}")
+        total_values_full = self.data_array_full.size
+        nan_count_full = np.isnan(self.data_array_full).sum()
+        print(f"  NaN values: {nan_count_full:,} ({(nan_count_full / total_values_full) * 100:.2f}%)")
+
+        print(f"\nReduced dataset (for model training):")
+        print(f"  Shape: {self.data_array.shape}")
         total_values = self.data_array.size
         nan_count = np.isnan(self.data_array).sum()
-        nan_percentage = (nan_count / total_values) * 100
-        
-        print(f"\nData extraction complete:")
-        print(f"  Shape: {self.data_array.shape}")
-        print(f"  Total values: {total_values:,}")
-        print(f"  NaN values: {nan_count:,} ({nan_percentage:.2f}%)")
-        print(f"  Valid values: {total_values - nan_count:,} ({100-nan_percentage:.2f}%)")
-        
+        print(f"  NaN values: {nan_count:,} ({(nan_count / total_values) * 100:.2f}%)")
+
         # Check investable stocks specifically
         investable_data = self.data_array[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1, :]
         inv_nan_pct = (np.isnan(investable_data).sum() / investable_data.size) * 100
         print(f"  NaN in investable stocks (columns {Config.INVESTABLE_START_COL}-{Config.INVESTABLE_END_COL}): {inv_nan_pct:.2f}%")
-        
+
         return self.data_array
     
     def create_train_val_split(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

@@ -55,7 +55,8 @@ class AgentEvaluator:
         self.data_loader.load_and_prepare()
 
         # Extract data components
-        self.data_array = self.data_loader.data_array
+        self.data_array = self.data_loader.data_array  # Reduced 5 features for observations
+        self.data_array_full = self.data_loader.data_array_full  # Full 9 features for rewards
         self.dates = self.data_loader.dates
         self.norm_stats = self.data_loader.normalization_stats
         self.train_start = 0
@@ -187,7 +188,8 @@ class AgentEvaluator:
             normalization_stats=self.norm_stats,
             start_idx=start_idx,
             end_idx=end_idx,
-            trading_end_idx=trading_end_idx
+            trading_end_idx=trading_end_idx,
+            data_array_full=self.data_array_full
         )
 
         # Reset environment

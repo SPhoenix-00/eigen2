@@ -245,13 +245,14 @@ class ERLTrainer:
         # This prevents massive memory leak from creating POPULATION_SIZE+ environments per generation
         print("Initializing persistent training/evaluation environment...")
         self.eval_env = TradingEnvironment(
-            data_array=self.data_loader.data_array,
+            data_array=self.data_loader.data_array,  # Reduced 5 features for observations
             dates=self.data_loader.dates,
             normalization_stats=self.normalization_stats,
             # Use placeholder indices, reset() will update them per episode
             start_idx=self.train_start_idx,
             end_idx=self.train_end_idx,
-            trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS
+            trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+            data_array_full=self.data_loader.data_array_full  # Full 9 features for reward calculation
         )
         print("Note: Same environment used for training episodes and validation slices (reset per episode)")
 
@@ -1169,60 +1170,7 @@ class ERLTrainer:
             # 🔍 Memory tracking after training
             # log_memory(f"Gen {gen+1}: After train_population", show_objects=True)
 
-            # 3. Evolve population
-            self.evolve_population(fitness_scores)
-
-            # 🔍 Memory tracking after evolution
-            # log_memory(f"Gen {gen+1}: After evolve_population", show_objects=True)
-            
-            # 4. Log validation metrics and check for plateau
-            if (gen + 1) % Config.LOG_FREQUENCY == 0:
-                # We already validated the best agent during selection, so use those results
-                # Re-validate the current best_agent for logging
-                if self.best_agent is not None:
-                    val_results = self.validate_best_agent()
-                    if val_results:
-                        self.writer.add_scalar('Validation/Fitness', val_results['fitness'], gen)
-                        self.writer.add_scalar('Validation/WinRate', val_results['win_rate'], gen)
-
-                        # Log to wandb
-                        wandb.log({
-                            "validation/fitness": val_results['fitness'],
-                            "validation/win_rate": val_results['win_rate'],
-                            "validation/num_trades": val_results['num_trades'],
-                            "validation/num_wins": val_results['num_wins'],
-                            "validation/num_losses": val_results['num_losses'],
-                            "validation/avg_reward_per_trade": val_results['avg_reward_per_trade'],
-                        }, step=gen)
-
-                        # Check for plateau and adjust mutation adaptively
-                        # Use the best validation fitness for plateau detection
-                        self.check_and_adjust_mutation(self.best_validation_fitness)
-
-            # 5. Save checkpoint periodically
-            if (gen + 1) % Config.SAVE_FREQUENCY == 0:
-                self.save_checkpoint()
-
-                # Show upload status
-                pending, completed, failed = self.cloud_sync.get_upload_status()
-                if pending > 0 or completed > 0 or failed > 0:
-                    print(f"\n📊 Upload status: {pending} pending, {completed} completed, {failed} failed")
-            
-            # Generation time
-            gen_time = time.time() - gen_start_time
-            self.generation_times.append(gen_time)
-            
-            # Show progress plot every 5 generations
-            if (gen + 1) % 5 == 0:
-                plot_fitness_progress(self.fitness_history)
-                # CRITICAL FIX: Close matplotlib figures to prevent memory leak (~100MB per plot)
-                plt.close('all')
-            
-            # Buffer stats
-            buffer_stats = self.replay_buffer.get_stats()
-            self.writer.add_scalar('Buffer/Size', buffer_stats['size'], gen)
-            self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
-
+            # 2b. Log feature importance (computed during training)
             # Get feature importance for logging
             feature_importance = self.get_feature_importance().numpy()
 
@@ -1239,13 +1187,8 @@ class ERLTrainer:
             # Analyze persistent low-importance columns
             low_importance_analysis = self.analyze_persistent_low_importance_columns(feature_importance)
 
-            # Log to wandb
+            # Log feature importance to wandb
             wandb.log({
-                "buffer/size": buffer_stats['size'],
-                "buffer/utilization": buffer_stats['utilization'],
-                "buffer/capacity": buffer_stats['capacity'],
-                "training/generation_time": gen_time,
-                "training/avg_generation_time": np.mean(self.generation_times) if self.generation_times else 0,
                 # Feature importance summary
                 "feature_importance/entropy": entropy,
                 "feature_importance/max": float(feature_importance.max()),
@@ -1308,6 +1251,69 @@ class ERLTrainer:
                                 columns=["Column_Index", "Column_Name", "Current_Importance"]
                             )
                         }, step=gen)
+
+            # 3. Evolve population
+            self.evolve_population(fitness_scores)
+
+            # 🔍 Memory tracking after evolution
+            # log_memory(f"Gen {gen+1}: After evolve_population", show_objects=True)
+            
+            # 4. Log validation metrics and check for plateau
+            if (gen + 1) % Config.LOG_FREQUENCY == 0:
+                # We already validated the best agent during selection, so use those results
+                # Re-validate the current best_agent for logging
+                if self.best_agent is not None:
+                    val_results = self.validate_best_agent()
+                    if val_results:
+                        self.writer.add_scalar('Validation/Fitness', val_results['fitness'], gen)
+                        self.writer.add_scalar('Validation/WinRate', val_results['win_rate'], gen)
+
+                        # Log to wandb
+                        wandb.log({
+                            "validation/fitness": val_results['fitness'],
+                            "validation/win_rate": val_results['win_rate'],
+                            "validation/num_trades": val_results['num_trades'],
+                            "validation/num_wins": val_results['num_wins'],
+                            "validation/num_losses": val_results['num_losses'],
+                            "validation/avg_reward_per_trade": val_results['avg_reward_per_trade'],
+                        }, step=gen)
+
+                        # Check for plateau and adjust mutation adaptively
+                        # Use the best validation fitness for plateau detection
+                        self.check_and_adjust_mutation(self.best_validation_fitness)
+
+            # 5. Save checkpoint periodically
+            if (gen + 1) % Config.SAVE_FREQUENCY == 0:
+                self.save_checkpoint()
+
+                # Show upload status
+                pending, completed, failed = self.cloud_sync.get_upload_status()
+                if pending > 0 or completed > 0 or failed > 0:
+                    print(f"\n📊 Upload status: {pending} pending, {completed} completed, {failed} failed")
+            
+            # Generation time
+            gen_time = time.time() - gen_start_time
+            self.generation_times.append(gen_time)
+            
+            # Show progress plot every 5 generations
+            if (gen + 1) % 5 == 0:
+                plot_fitness_progress(self.fitness_history)
+                # CRITICAL FIX: Close matplotlib figures to prevent memory leak (~100MB per plot)
+                plt.close('all')
+            
+            # Buffer stats and generation time
+            buffer_stats = self.replay_buffer.get_stats()
+            self.writer.add_scalar('Buffer/Size', buffer_stats['size'], gen)
+            self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
+
+            # Log buffer stats and timing to wandb
+            wandb.log({
+                "buffer/size": buffer_stats['size'],
+                "buffer/utilization": buffer_stats['utilization'],
+                "buffer/capacity": buffer_stats['capacity'],
+                "training/generation_time": gen_time,
+                "training/avg_generation_time": np.mean(self.generation_times) if self.generation_times else 0,
+            }, step=gen)
 
             # Clear GPU cache and run garbage collection to prevent memory leaks
             if torch.cuda.is_available():

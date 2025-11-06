@@ -49,6 +49,7 @@ EOF
 ```bash
 wandb login
 # Paste API key from: https://wandb.ai/authorize
+# 7deffe6a4942dc629a3327c7df7be882859d638c
 ```
 
 ### 6. Start Training in tmux
