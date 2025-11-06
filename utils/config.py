@@ -17,7 +17,8 @@ class Config:
     FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
     CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
-    TRAIN_TEST_SPLIT = 0.95  # 95% train, 5% validation (6 months)
+    TRAIN_TEST_SPLIT = 0.95  # 95% train, 5% validation (6 months) - DEPRECATED: now using HOLDOUT_DAYS
+    HOLDOUT_DAYS = 251  # Last 251 rows reserved for final validation only (never used during training)
     
     # ============ Action Space Parameters ============
     NUM_ACTIONS = NUM_INVESTABLE_STOCKS  # 108 stocks

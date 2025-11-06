@@ -148,32 +148,33 @@ class StockDataLoader:
     
     def create_train_val_split(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Split data into train and validation sets (time-series aware).
-        
+        Split data into train and holdout sets (time-series aware).
+
+        Walk-forward validation strategy:
+        - Last HOLDOUT_DAYS rows are reserved as "secret" holdout data (never used during training)
+        - All other rows are available for training and walk-forward validation
+        - Validation uses random slices from training data at each generation
+
         Returns:
-            Tuple of (train_indices, val_indices)
+            Tuple of (train_indices, holdout_indices)
         """
         if self.data_array is None:
             raise ValueError("Must call extract_features() first")
-        
+
         num_days = len(self.data_array)
-        
-        # Calculate split point
-        split_idx = int(num_days * Config.TRAIN_TEST_SPLIT)
-        
-        self.train_indices = np.arange(0, split_idx)
-        self.val_indices = np.arange(split_idx, num_days)
-        
-        print(f"\nTrain/Val Split:")
+
+        # Reserve last HOLDOUT_DAYS for final validation only
+        holdout_start_idx = num_days - Config.HOLDOUT_DAYS
+
+        self.train_indices = np.arange(0, holdout_start_idx)
+        self.val_indices = np.arange(holdout_start_idx, num_days)  # Renamed to holdout_indices conceptually
+
+        print(f"\nData Split (Walk-Forward Validation):")
         print(f"  Total days: {num_days}")
-        print(f"  Train days: {len(self.train_indices)} ({self.dates[0]} to {self.dates[split_idx-1]})")
-        print(f"  Val days: {len(self.val_indices)} ({self.dates[split_idx]} to {self.dates[-1]})")
-        
-        # Ensure we have enough days for context window in validation
-        if len(self.val_indices) < Config.CONTEXT_WINDOW_DAYS:
-            print(f"  WARNING: Validation set has fewer days than context window!")
-            print(f"  Validation will need to use some training data for context.")
-        
+        print(f"  Training/Validation days: {len(self.train_indices)} ({self.dates[0]} to {self.dates[holdout_start_idx-1]})")
+        print(f"  Holdout days (secret): {len(self.val_indices)} ({self.dates[holdout_start_idx]} to {self.dates[-1]})")
+        print(f"  Note: Validation uses random slices from training data each generation")
+
         return self.train_indices, self.val_indices
     
     def get_window(self, end_idx: int) -> Optional[np.ndarray]:

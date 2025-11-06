@@ -55,13 +55,14 @@ class ERLTrainer:
         # Shared replay buffer
         self.replay_buffer = ReplayBuffer()
         
-        # Training environments (one per agent for parallel rollouts)
+        # Training range (excludes holdout set)
         self.train_start_idx = Config.CONTEXT_WINDOW_DAYS
         self.train_end_idx = len(data_loader.train_indices)
-        
-        # Validation environment
-        self.val_start_idx = len(data_loader.train_indices)
-        self.val_end_idx = len(data_loader.data_array)
+
+        # Walk-forward validation slices (generated per generation)
+        # Each generation uses 3 random validation slices from training data
+        # Format: list of (start_idx, end_idx, trading_end_idx) tuples
+        self.current_generation_val_slices = []
         
         # Logging
         self.writer = SummaryWriter(log_dir=str(Config.LOG_DIR))
@@ -218,11 +219,12 @@ class ERLTrainer:
         self.buffer_saved_on_first_fill = False
 
         print(f"Training range: days {self.train_start_idx} to {self.train_end_idx}")
-        print(f"Validation range: days {self.val_start_idx} to {self.val_end_idx}")
+        print(f"Walk-forward validation: 3 random slices per generation from training data")
+        print(f"Holdout set: last {Config.HOLDOUT_DAYS} days (never used during training)")
 
         # CRITICAL FIX: Create persistent environments to reuse instead of creating new ones each episode
         # This prevents massive memory leak from creating POPULATION_SIZE+ environments per generation
-        print("Initializing persistent evaluation environment...")
+        print("Initializing persistent training/evaluation environment...")
         self.eval_env = TradingEnvironment(
             data_array=self.data_loader.data_array,
             dates=self.data_loader.dates,
@@ -232,17 +234,7 @@ class ERLTrainer:
             end_idx=self.train_end_idx,
             trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS
         )
-
-        print("Initializing persistent validation environment...")
-        val_end_idx = self.val_start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-        self.val_env = TradingEnvironment(
-            data_array=self.data_loader.data_array,
-            dates=self.data_loader.dates,
-            normalization_stats=self.normalization_stats,
-            start_idx=self.val_start_idx,
-            end_idx=val_end_idx,
-            trading_end_idx=self.val_start_idx + Config.TRADING_PERIOD_DAYS
-        )
+        print("Note: Same environment used for training episodes and validation slices (reset per episode)")
 
         # Automatically load checkpoint if resuming
         if self.resume_run_name:
@@ -349,7 +341,35 @@ class ERLTrainer:
 
         # NOTE: No need to delete env - we're reusing persistent environments now
         return final_fitness, episode_summary
-    
+
+    def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
+        """
+        Generate 3 random validation slices for the current generation.
+        Each slice consists of:
+        - CONTEXT_WINDOW_DAYS (504) of prior data
+        - TRADING_PERIOD_DAYS (125) where agent can trade
+        - SETTLEMENT_PERIOD_DAYS (20) to close positions
+
+        Returns:
+            List of 3 tuples: (start_idx, end_idx, trading_end_idx)
+        """
+        total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+        max_start = self.train_end_idx - total_days_needed
+
+        if max_start <= self.train_start_idx:
+            raise ValueError(f"Not enough training data for validation slices: need {total_days_needed} days")
+
+        slices = []
+        for _ in range(3):
+            # Random start index from training data
+            start_idx = np.random.randint(self.train_start_idx, max_start)
+            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+            trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+
+            slices.append((start_idx, end_idx, trading_end_idx))
+
+        return slices
+
     def evaluate_population(self) -> Tuple[List[float], Dict]:
         """
         Evaluate all agents in population (fitness scores).
@@ -535,42 +555,63 @@ class ERLTrainer:
     
     def validate_agent(self, agent) -> Dict:
         """
-        Validate a specific agent on validation set.
+        Validate agent using walk-forward validation on 3 random slices.
+
+        Walk-forward validation strategy:
+        - Runs agent on 3 validation slices (same slices for all agents in this generation)
+        - Takes the lowest 2 fitness scores out of 3
+        - Returns the average of those 2 scores as "true validation fitness"
+        - This provides a conservative estimate that's robust to lucky runs
 
         Args:
             agent: The agent to validate
 
         Returns:
-            Validation results
+            Validation results with 'fitness' being the average of lowest 2 scores
         """
         if agent is None:
             return {}
 
-        # Validation uses the validation period
-        # end_idx includes settlement period
-        total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+        if not self.current_generation_val_slices:
+            raise ValueError("No validation slices generated for this generation")
 
-        if self.val_end_idx - self.val_start_idx < Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS:
-            end_idx = self.val_end_idx
-        else:
-            end_idx = self.val_start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+        # Run agent on all 3 validation slices
+        slice_results = []
+        for start_idx, end_idx, _ in self.current_generation_val_slices:
+            fitness, episode_info = self.run_episode(
+                agent=agent,
+                env=self.eval_env,  # Reuse persistent environment
+                start_idx=start_idx,
+                end_idx=end_idx,
+                training=False
+            )
 
-        # Run on validation data using persistent val_env (CRITICAL FIX: prevents memory leak)
-        fitness, episode_info = self.run_episode(
-            agent=agent,
-            env=self.val_env,  # Reuse persistent validation environment
-            start_idx=self.val_start_idx,
-            end_idx=end_idx,
-            training=False
-        )
+            slice_results.append({
+                'fitness': fitness,
+                'win_rate': episode_info['win_rate'],
+                'num_trades': episode_info['num_trades'],
+                'num_wins': episode_info['num_wins'],
+                'num_losses': episode_info['num_losses'],
+                'avg_reward_per_trade': episode_info['avg_reward_per_trade']
+            })
 
+        # Extract fitness scores from all 3 slices
+        fitness_scores = [result['fitness'] for result in slice_results]
+
+        # Sort and take lowest 2 scores (conservative estimate)
+        sorted_fitness = sorted(fitness_scores)
+        lowest_2_avg = np.mean(sorted_fitness[:2])
+
+        # Return aggregated results (average of lowest 2 fitness scores)
+        # Also aggregate other metrics for logging
         return {
-            'fitness': fitness,
-            'win_rate': episode_info['win_rate'],
-            'num_trades': episode_info['num_trades'],
-            'num_wins': episode_info['num_wins'],
-            'num_losses': episode_info['num_losses'],
-            'avg_reward_per_trade': episode_info['avg_reward_per_trade']
+            'fitness': lowest_2_avg,
+            'fitness_all_slices': fitness_scores,  # For debugging
+            'win_rate': np.mean([r['win_rate'] for r in slice_results]),
+            'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),
+            'num_wins': int(np.mean([r['num_wins'] for r in slice_results])),
+            'num_losses': int(np.mean([r['num_losses'] for r in slice_results])),
+            'avg_reward_per_trade': np.mean([r['avg_reward_per_trade'] for r in slice_results])
         }
 
     def validate_best_agent(self) -> Dict:
@@ -911,6 +952,14 @@ class ERLTrainer:
 
             # Select best agent based on VALIDATION fitness (not training fitness)
             # Validate ALL agents in the population - training fitness is unreliable due to random windows
+            print(f"\n--- Generating Walk-Forward Validation Slices for Generation {gen + 1} ---")
+            self.current_generation_val_slices = self.generate_validation_slices()
+            print(f"Generated 3 validation slices (same for all agents this generation):")
+            for i, (start, end, _) in enumerate(self.current_generation_val_slices):
+                start_date = self.data_loader.dates[start] if start < len(self.data_loader.dates) else "N/A"
+                end_date = self.data_loader.dates[end-1] if end-1 < len(self.data_loader.dates) else "N/A"
+                print(f"  Slice {i+1}: days {start}-{end} ({start_date} to {end_date})")
+
             print(f"\n--- Validating All {len(self.population)} Agents for Best Agent Selection ---")
 
             best_val_fitness_this_gen = float('-inf')
@@ -921,6 +970,7 @@ class ERLTrainer:
                 print(f"\nValidating agent {idx} (training fitness: {fitness_scores[idx]:.2f})...")
                 val_results = self.validate_agent(self.population[idx])
                 val_fitness = val_results['fitness']
+                slice_fitnesses = val_results['fitness_all_slices']
 
                 validation_results.append({
                     'idx': idx,
@@ -930,7 +980,8 @@ class ERLTrainer:
                     'num_trades': val_results['num_trades']
                 })
 
-                print(f"  Validation fitness: {val_fitness:.2f}")
+                print(f"  Slice fitnesses: {slice_fitnesses[0]:.2f}, {slice_fitnesses[1]:.2f}, {slice_fitnesses[2]:.2f}")
+                print(f"  Validation fitness (avg of lowest 2): {val_fitness:.2f}")
                 print(f"  Win rate: {val_results['win_rate']:.1%}")
                 print(f"  Trades: {val_results['num_trades']}")
 
