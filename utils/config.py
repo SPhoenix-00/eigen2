@@ -10,10 +10,10 @@ class Config:
     # ============ Data Parameters ============
     DATA_PATH = Path(__file__).parent.parent / "Eigen2_Master_PY_OUTPUT.pkl"
     DATE_COLUMN = 0  # Column A (0-indexed)
-    INVESTABLE_START_COL = 10  # Column K (0-indexed)
-    INVESTABLE_END_COL = 117  # Column DN (0-indexed, inclusive)
+    INVESTABLE_START_COL = 8  # Column I (0-indexed) - Fixed: was 10, but off by 2
+    INVESTABLE_END_COL = 115  # Column DN (0-indexed, inclusive) - Fixed: was 117, adjusted for correct start
     NUM_INVESTABLE_STOCKS = 108
-    TOTAL_COLUMNS = 670
+    TOTAL_COLUMNS = 669  # Fixed: was 670, updated to match actual pickle file
     FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
     CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
