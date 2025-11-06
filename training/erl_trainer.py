@@ -360,21 +360,25 @@ class ERLTrainer:
         Returns:
             List of 3 tuples: (start_idx, end_idx, trading_end_idx)
         """
-        total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+        # NOTE: start_idx is the first day of TRADING (not context)
+        # The environment automatically looks back 504 days from start_idx for context
+        # So we just need to ensure trading + settlement fit within interim validation set
 
-        # Validation slices are drawn from interim validation set
-        # The context window can reach back into training data, but trading happens in interim val set
-        max_start = self.interim_val_end_idx - total_days_needed
-        min_start = self.interim_val_start_idx - Config.CONTEXT_WINDOW_DAYS  # Allow context to come from training
+        # Trading must start at or after interim_val_start_idx
+        min_start = self.interim_val_start_idx
+
+        # Trading + settlement must end before interim_val_end_idx
+        max_start = self.interim_val_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
 
         if max_start < min_start:
-            raise ValueError(f"Not enough interim validation data: need {total_days_needed} days total")
+            raise ValueError(f"Not enough interim validation data: need {Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS} days")
 
         slices = []
         for _ in range(3):
-            # Random start index - context can come from end of training data
-            # But trading period must be entirely within interim validation set
-            start_idx = np.random.randint(min_start, max_start)
+            # Random start index for trading (between interim_val_start and interim_val_end - 145)
+            # Context (504 days before start_idx) will automatically come from training data
+            # Trading + settlement (145 days from start_idx) will be entirely in interim validation set
+            start_idx = np.random.randint(min_start, max_start + 1)
             end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
             trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
 
