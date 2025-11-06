@@ -203,6 +203,10 @@ class AgentEvaluator:
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
+        # IMPORTANT: Extract trades BEFORE calling get_episode_summary()
+        # because get_episode_summary() clears episode_actions to prevent memory leaks
+        trades = self._extract_trades(env.episode_actions, slice_name)
+
         # Get episode summary
         summary = env.get_episode_summary()
 
@@ -211,9 +215,6 @@ class AgentEvaluator:
         fitness -= summary['inaction_penalty_applied']
         if summary['num_trades'] == 0:
             fitness -= summary['zero_trades_penalty']
-
-        # Process trades from episode_actions
-        trades = self._extract_trades(env.episode_actions, slice_name)
 
         return fitness, summary, trades
 
