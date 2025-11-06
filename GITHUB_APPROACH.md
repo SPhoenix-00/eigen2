@@ -79,7 +79,7 @@ export GITHUB_BRANCH=main
 git clone --depth 1 --branch $GITHUB_BRANCH $GITHUB_REPO .
 
 # Wait for training data (upload via scp)
-while [ ! -f "Eigen2_Master(GFIN)_03_training.csv" ]; do
+while [ ! -f "Eigen2_Master_PY_OUTPUT.pkl" ]; do
     echo "Waiting for training data..."
     sleep 10
 done

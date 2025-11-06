@@ -17,7 +17,7 @@ The deployment setup includes:
    - AWS S3 bucket, OR
    - Google Cloud Storage bucket, OR
    - Azure Blob Storage container
-3. **Training Data**: `Eigen2_Master(GFIN)_03_training.csv`
+3. **Training Data**: `Eigen2_Master_PY_OUTPUT.pkl`
 
 ## Cloud Storage Setup
 
@@ -289,7 +289,7 @@ After training completes:
 ### Issue: "Data file not found"
 
 **Solution:**
-- Upload `Eigen2_Master(GFIN)_03_training.csv` to `/workspace/`
+- Upload `Eigen2_Master_PY_OUTPUT.pkl` to `/workspace/`
 - Check file name matches exactly (including parentheses)
 
 ### Issue: Cloud sync not working
@@ -382,7 +382,7 @@ sync.download_directory('eigen2/logs', 'logs')
 ├── main.py
 ├── requirements.txt
 ├── start_vast.sh
-├── Eigen2_Master(GFIN)_03_training.csv
+├── Eigen2_Master_PY_OUTPUT.pkl
 ├── checkpoints/                    # Auto-synced to cloud
 │   ├── best_agent.pth
 │   ├── trainer_state.json

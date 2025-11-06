@@ -8,7 +8,7 @@ from pathlib import Path
 
 class Config:
     # ============ Data Parameters ============
-    DATA_PATH = Path(__file__).parent.parent / "Eigen2_Master(GFIN)_03_training.csv"
+    DATA_PATH = Path(__file__).parent.parent / "Eigen2_Master_PY_OUTPUT.pkl"
     DATE_COLUMN = 0  # Column A (0-indexed)
     INVESTABLE_START_COL = 10  # Column K (0-indexed)
     INVESTABLE_END_COL = 117  # Column DN (0-indexed, inclusive)

@@ -259,7 +259,7 @@ echo "✓ Credentials found"
 
 # Wait for training data
 echo "Waiting for training data..."
-while [ ! -f "Eigen2_Master(GFIN)_03_training.csv" ]; do
+while [ ! -f "Eigen2_Master_PY_OUTPUT.pkl" ]; do
     echo "  Please upload training data CSV to /workspace/"
     sleep 10
 done

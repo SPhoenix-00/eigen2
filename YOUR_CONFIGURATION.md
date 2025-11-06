@@ -60,10 +60,10 @@ git clone --depth 1 --branch $GITHUB_BRANCH $GITHUB_REPO .
 
 # Wait for required files
 echo "Waiting for credentials and training data..."
-while [ ! -f "$GOOGLE_APPLICATION_CREDENTIALS" ] || [ ! -f "Eigen2_Master(GFIN)_03_training.csv" ]; do
+while [ ! -f "$GOOGLE_APPLICATION_CREDENTIALS" ] || [ ! -f "Eigen2_Master_PY_OUTPUT.pkl" ]; do
     echo "Please upload to /workspace/:"
     echo "  - gcs-credentials.json"
-    echo "  - Eigen2_Master(GFIN)_03_training.csv"
+    echo "  - Eigen2_Master_PY_OUTPUT.pkl"
     sleep 10
 done
 
@@ -254,7 +254,7 @@ EOF
 - [ ] Credentials file downloaded: `gcs-credentials.json`
 - [ ] Code pushed to GitHub
 - [ ] GitHub repository URL updated in on-start script
-- [ ] Training data CSV ready: `Eigen2_Master(GFIN)_03_training.csv`
+- [ ] Training data CSV ready: `Eigen2_Master_PY_OUTPUT.pkl`
 - [ ] Vast.ai account created with payment method
 - [ ] Environment variables configured (see above)
 - [ ] On-start script copied (see above)

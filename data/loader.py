@@ -36,98 +36,140 @@ class StockDataLoader:
         self.val_indices = None  # Holdout set for final validation
         
     def load_csv(self) -> pd.DataFrame:
-        """Load CSV file into pandas DataFrame."""
-        print(f"Loading CSV from: {self.csv_path}")
-        self.df = pd.read_csv(self.csv_path, low_memory=False)
-        
-        # Drop rows where date column is NaN (blank rows at end)
-        date_col_name = self.df.columns[Config.DATE_COLUMN]
-        initial_rows = len(self.df)
-        self.df = self.df.dropna(subset=[date_col_name])
-        dropped_rows = initial_rows - len(self.df)
-        if dropped_rows > 0:
-            print(f"Dropped {dropped_rows} blank rows")
-        
-        print(f"Loaded data shape: {self.df.shape}")
-        print(f"Columns: {self.df.shape[1]}, Rows (days): {self.df.shape[0]}")
-        
-        # Extract dates (column A, index 0)
-        self.dates = self.df.iloc[:, Config.DATE_COLUMN].values
-        print(f"Date range: {self.dates[0]} to {self.dates[-1]}")
-        
+        """Load CSV or pickle file into pandas DataFrame."""
+        file_path = Path(self.csv_path)
+
+        # Auto-detect format based on file extension
+        if file_path.suffix == '.pkl':
+            print(f"Loading pickle from: {self.csv_path}")
+            self.df = pd.read_pickle(self.csv_path)
+
+            # For pickle: dates are in the index
+            self.dates = self.df.index.values
+            print(f"Loaded data shape: {self.df.shape}")
+            print(f"Columns: {self.df.shape[1]}, Rows (days): {self.df.shape[0]}")
+            print(f"Date range: {self.dates[0]} to {self.dates[-1]}")
+
+        else:
+            # CSV loading (legacy format)
+            print(f"Loading CSV from: {self.csv_path}")
+            self.df = pd.read_csv(self.csv_path, low_memory=False)
+
+            # Drop rows where date column is NaN (blank rows at end)
+            date_col_name = self.df.columns[Config.DATE_COLUMN]
+            initial_rows = len(self.df)
+            self.df = self.df.dropna(subset=[date_col_name])
+            dropped_rows = initial_rows - len(self.df)
+            if dropped_rows > 0:
+                print(f"Dropped {dropped_rows} blank rows")
+
+            print(f"Loaded data shape: {self.df.shape}")
+            print(f"Columns: {self.df.shape[1]}, Rows (days): {self.df.shape[0]}")
+
+            # Extract dates (column A, index 0)
+            self.dates = self.df.iloc[:, Config.DATE_COLUMN].values
+            print(f"Date range: {self.dates[0]} to {self.dates[-1]}")
+
         return self.df
     
     def parse_cell_data(self, cell_value) -> np.ndarray:
         """
-        Parse a single cell containing string-formatted array and extract selected features.
+        Parse a single cell containing either a native list (pickle) or string-formatted array (CSV).
+
+        Pickle format: Native list with 9 features [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
+        CSV format: String like "[1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0]"
 
         Args:
-            cell_value: String like "[1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0]" or nan
+            cell_value: List or string containing feature array, or nan/None
 
         Returns:
             numpy array of shape (5,) with selected features: [close, RSI, MACD_signal, TRIX, diff20DMA]
-            Original indices: [1, 4, 6, 7, 8] from the 9-element array
+            For pickle format, indices: [1, 4, 6, 7, 8] from the 9-element list
         """
         # Handle nan/None values
-        if pd.isna(cell_value):
+        if pd.isna(cell_value) or cell_value is None:
             return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
 
-        # Handle empty strings
+        # Handle native lists (pickle format)
+        if isinstance(cell_value, list):
+            try:
+                arr = np.array(cell_value, dtype=np.float32)
+
+                # Pickle format: [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
+                # We want: [close, RSI, MACD_signal, TRIX, diff20DMA] at indices [1, 4, 6, 7, 8]
+                if len(arr) >= 9:
+                    selected_features = arr[[1, 4, 6, 7, 8]]
+                    return selected_features.astype(np.float32)
+                else:
+                    return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
+
+            except (ValueError, IndexError):
+                return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
+
+        # Handle empty strings (CSV format)
         if isinstance(cell_value, str) and cell_value.strip() == '':
             return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
 
-        try:
-            # Parse string as list
-            data = ast.literal_eval(cell_value)
+        # Handle string-formatted arrays (CSV format)
+        if isinstance(cell_value, str):
+            try:
+                # Parse string as list
+                data = ast.literal_eval(cell_value)
 
-            # Convert to numpy array
-            arr = np.array(data, dtype=np.float32)
+                # Convert to numpy array
+                arr = np.array(data, dtype=np.float32)
 
-            # Select only the 5 features we want: close, RSI, MACD_signal, TRIX, diff20DMA
-            # Original 9-element array: [open, close, high, low, RSI, MACD, MACD_signal, TRIX, diff20DMA]
-            # Indices we want:           [  0,     1,    2,   3,   4,    5,           6,     7,        8]
-            # Select indices:            [       1,               4,                   6,     7,        8]
+                # Same feature extraction as pickle format
+                if len(arr) >= 9:
+                    selected_features = arr[[1, 4, 6, 7, 8]]
+                    return selected_features.astype(np.float32)
+                else:
+                    print(f"Warning: Expected at least 9 features, got {len(arr)}")
+                    return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
 
-            if len(arr) >= 9:
-                # Extract the 5 selected features
-                selected_features = arr[[1, 4, 6, 7, 8]]
-                return selected_features.astype(np.float32)
-            else:
-                # If array is too short, return nans
-                print(f"Warning: Expected at least 9 features, got {len(arr)}")
+            except (ValueError, SyntaxError, IndexError):
                 return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
 
-        except (ValueError, SyntaxError, IndexError) as e:
-            # If parsing fails, return nans
-            return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
+        # Fallback for unexpected types
+        return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
     
     def extract_features(self) -> np.ndarray:
         """
         Extract all features from DataFrame into structured array.
 
         Returns:
-            numpy array of shape [num_days, num_columns-1, 5]
-            (excluding date column, only 5 selected features)
+            numpy array of shape [num_days, num_columns, 5]
+            For CSV: excludes date column
+            For pickle: all columns (dates are in index)
         """
         if self.df is None:
             raise ValueError("Must call load_csv() first")
-        
+
         num_days = len(self.df)
-        # Exclude date column (column A)
-        num_columns = self.df.shape[1] - 1
-        
-        print(f"\nExtracting features from {num_days} days × {num_columns} columns...")
-        
+        file_path = Path(self.csv_path)
+
+        # Determine column range based on file format
+        if file_path.suffix == '.pkl':
+            # Pickle: dates are in index, all columns are data
+            start_col = 0
+            num_columns = self.df.shape[1]
+            print(f"\nExtracting features from pickle: {num_days} days × {num_columns} columns...")
+        else:
+            # CSV: skip date column (column 0)
+            start_col = 1
+            num_columns = self.df.shape[1] - 1
+            print(f"\nExtracting features from CSV: {num_days} days × {num_columns} columns...")
+
         # Initialize array
-        self.data_array = np.zeros((num_days, num_columns, Config.FEATURES_PER_CELL), 
+        self.data_array = np.zeros((num_days, num_columns, Config.FEATURES_PER_CELL),
                                    dtype=np.float32)
-        
-        # Process each column (skip date column)
-        for col_idx in tqdm(range(1, self.df.shape[1]), desc="Processing columns"):
+
+        # Process each column
+        for col_idx in tqdm(range(start_col, self.df.shape[1]), desc="Processing columns"):
             for day_idx in range(num_days):
                 cell_value = self.df.iloc[day_idx, col_idx]
-                # Store in data_array (col_idx-1 because we skip date column)
-                self.data_array[day_idx, col_idx - 1, :] = self.parse_cell_data(cell_value)
+                # Store in data_array (adjust for start_col offset)
+                self.data_array[day_idx, col_idx - start_col, :] = self.parse_cell_data(cell_value)
         
         # Report statistics
         total_values = self.data_array.size

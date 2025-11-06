@@ -44,7 +44,7 @@ For a complete 25-generation training run:
 | **Operating System** | 10-15 GB | Ubuntu/container base |
 | **PyTorch + CUDA** | 5-8 GB | Deep learning framework |
 | **Python Dependencies** | 1-2 GB | numpy, pandas, etc. |
-| **Training Data CSV** | 0.5 GB | Eigen2_Master(GFIN)_03_training.csv |
+| **Training Data CSV** | 0.5 GB | Eigen2_Master_PY_OUTPUT.pkl |
 | **Replay Buffer (compressed)** | 62-75 GB | At generation 25 |
 | **Population Checkpoints** | 0.25 GB | 16 agents × ~15 MB each |
 | **Best Agent Checkpoint** | 0.015 GB | Single model |
