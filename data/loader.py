@@ -86,9 +86,30 @@ class StockDataLoader:
             numpy array of shape (5,) with selected features: [close, RSI, MACD_signal, TRIX, diff20DMA]
             For pickle format, indices: [1, 4, 6, 7, 8] from the 9-element list
         """
-        # Handle nan/None values
-        if pd.isna(cell_value) or cell_value is None:
+        # Handle None first
+        if cell_value is None:
             return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
+
+        # Handle numpy arrays (from pickle) - check before pd.isna to avoid ambiguous truth value
+        if isinstance(cell_value, np.ndarray):
+            try:
+                # Pickle format: [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
+                # We want: [close, RSI, MACD_signal, TRIX, diff20DMA] at indices [1, 4, 6, 7, 8]
+                if len(cell_value) >= 9:
+                    selected_features = cell_value[[1, 4, 6, 7, 8]]
+                    return selected_features.astype(np.float32)
+                else:
+                    return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
+            except (ValueError, IndexError):
+                return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
+
+        # Handle scalar nan values (use pd.isna for scalars only)
+        try:
+            if pd.isna(cell_value):
+                return np.full(Config.FEATURES_PER_CELL, np.nan, dtype=np.float32)
+        except (ValueError, TypeError):
+            # If pd.isna fails, continue to other checks
+            pass
 
         # Handle native lists (pickle format)
         if isinstance(cell_value, list):
