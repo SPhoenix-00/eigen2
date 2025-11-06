@@ -23,7 +23,7 @@ class StockDataLoader:
     def __init__(self, csv_path: Optional[str] = None):
         """
         Initialize data loader.
-        
+
         Args:
             csv_path: Path to CSV file. If None, uses Config.DATA_PATH
         """
@@ -34,6 +34,13 @@ class StockDataLoader:
         self.train_indices = None
         self.interim_val_indices = None  # For walk-forward validation during training
         self.val_indices = None  # Holdout set for final validation
+        self.normalization_stats = None  # Computed by load_and_prepare()
+
+        # Split point indices (set by create_train_val_split)
+        self.train_end_idx = None
+        self.interim_val_start_idx = None
+        self.interim_val_end_idx = None
+        self.val_start_idx = None
         
     def load_csv(self) -> pd.DataFrame:
         """Load CSV or pickle file into pandas DataFrame."""
@@ -236,6 +243,12 @@ class StockDataLoader:
         self.interim_val_indices = np.arange(interim_val_start_idx, holdout_start_idx)
         self.val_indices = np.arange(holdout_start_idx, num_days)
 
+        # Store split points as attributes for easy access
+        self.train_end_idx = interim_val_start_idx
+        self.interim_val_start_idx = interim_val_start_idx
+        self.interim_val_end_idx = holdout_start_idx
+        self.val_start_idx = holdout_start_idx
+
         print(f"\nData Split (Three-Tier Validation Strategy):")
         print(f"  Total days: {num_days}")
         print(f"  Training days: {len(self.train_indices)} ({self.dates[0]} to {self.dates[interim_val_start_idx-1]})")
@@ -337,30 +350,33 @@ class StockDataLoader:
     def load_and_prepare(self) -> Tuple[np.ndarray, dict]:
         """
         Convenience method to run full data loading pipeline.
-        
+
         Returns:
             Tuple of (data_array, normalization_stats)
         """
         print("="*60)
         print("Data Loading Pipeline")
         print("="*60)
-        
+
         # Load CSV
         self.load_csv()
-        
+
         # Extract features
         self.extract_features()
-        
+
         # Create train/val split
         self.create_train_val_split()
-        
+
         # Compute normalization stats
         stats = self.compute_normalization_stats()
-        
+
+        # Store as attribute for easy access
+        self.normalization_stats = stats
+
         print("\n" + "="*60)
         print("Data loading complete!")
         print("="*60)
-        
+
         return self.data_array, stats
 
 
