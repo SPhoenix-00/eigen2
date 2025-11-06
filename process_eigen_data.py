@@ -433,6 +433,14 @@ def main():
     print(f"Loading {INPUT_FILE}...")
     # Assume first column is the index (e.g., Date)
     df = pd.read_csv(INPUT_FILE, index_col=0)
+    
+    # --- NEW, BETTER CLEANING STEPS ---
+    
+    # 1. Convert all empty strings ("") or whitespace-only strings to NaN
+    #    (This is the "missing link" that makes dropna work)
+    df = df.replace(r'^\s*$', np.nan, regex=True)
+    
+    # 2. NOW, drop all columns that are "all" NaN
     df = df.dropna(axis=1, how='all')
     
     # Force the DataFrame to match the VBA's hard-coded 3922 row-count
@@ -477,17 +485,17 @@ def main():
     # --- FINAL OUTPUTS ---
     VBA_CALC_RAMP_UP_ROWS = 34 # (This is 34 rows, index 0-33)
 
-    # --- NEW STEP: Slice off the top 34 rows FIRST ---
+    # --- STEP 1: Slice off the top 34 rows FIRST ---
     print(f"Slicing off top {VBA_CALC_RAMP_UP_ROWS} rows for all outputs...")
     
     # .iloc[34:] keeps every row *from* the 35th row (index 34) onwards.
     df_sliced = df_final.iloc[VBA_CALC_RAMP_UP_ROWS:]
 
-    # Output 1: Pickle (for Eigen 2 - SLICED FILE)
+    # --- STEP 2: Output to Pickle (for Eigen 2) ---
     print(f"Saving final (sliced) DataFrame to {OUTPUT_FILE_PKL}...")
     df_sliced.to_pickle(OUTPUT_FILE_PKL)
 
-    # Output 2: CSV (for comparison - SLICED FILE)
+    # --- STEP 3: Output to CSV (for comparison) ---
     print(f"Converting sliced lists to strings for CSV export...")
     df_string_output = df_sliced.map(
         lambda x: str(x) if x is not None else ""
@@ -495,6 +503,23 @@ def main():
     
     print(f"Saving comparison CSV to {OUTPUT_FILE_CSV}...")
     df_string_output.to_csv(OUTPUT_FILE_CSV)
+
+    # --- STEP 4: FINAL DEBUG CHECK (Trust, but Verify) ---
+    print("\n--- 🕵️‍♂️ Final Sanity Check ---")
+    
+    # Check 1: Load the PKL file we *just* saved and count its columns.
+    # This is the ultimate proof of what Eigen 2 will receive.
+    try:
+        df_from_pkl = pd.read_pickle(OUTPUT_FILE_PKL)
+        print(f"Columns in {OUTPUT_FILE_PKL} (on disk): {len(df_from_pkl.columns)}")
+    except Exception as e:
+        print(f"Error reading back {OUTPUT_FILE_PKL}: {e}")
+
+    # Check 2: Count the columns in the DataFrame we *prepared* for the CSV.
+    # This must match the PKL count.
+    print(f"Columns in {OUTPUT_FILE_CSV} (in memory): {len(df_string_output.columns)}")
+    print("--------------------------------")
+
 
     print(f"\n✅ Success! All steps complete.")
     print(f"Pickle for Eigen 2 saved to: {OUTPUT_FILE_PKL}")

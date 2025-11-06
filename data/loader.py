@@ -301,18 +301,23 @@ class StockDataLoader:
             raise ValueError("Must call extract_features() and create_train_val_split() first")
         
         print("\nComputing normalization statistics from training data...")
-        
+
         # Get training data
         train_data = self.data_array[self.train_indices, :, :]
-        
+
         # Compute mean and std per feature, ignoring nans
-        mean = np.nanmean(train_data, axis=0)  # Shape: [num_columns, 5]
-        std = np.nanstd(train_data, axis=0)    # Shape: [num_columns, 5]
-        
+        # Suppress expected warnings for columns with all NaN values
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=RuntimeWarning, message='Mean of empty slice')
+            warnings.filterwarnings('ignore', category=RuntimeWarning, message='Degrees of freedom <= 0')
+            mean = np.nanmean(train_data, axis=0)  # Shape: [num_columns, 5]
+            std = np.nanstd(train_data, axis=0)    # Shape: [num_columns, 5]
+
         # Handle edge case: if std is 0 (constant feature), set to 1 to avoid division by zero
         std = np.where(std == 0, 1.0, std)
         std = np.where(np.isnan(std), 1.0, std)  # If all values were nan, set std to 1
-        
+
         # Replace nan means with 0
         mean = np.where(np.isnan(mean), 0.0, mean)
         
