@@ -115,15 +115,18 @@ class AttentionModule(nn.Module):
         if use_cross_attention:
             self.query = nn.Parameter(torch.randn(1, 1, embed_dim))
 
-    def forward(self, x: torch.Tensor, return_attention_weights: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, return_attention_weights: bool = False):
         """
         Args:
             x: [batch, num_columns, embed_dim]
             return_attention_weights: Whether to return attention weights
 
         Returns:
-            Attended features [batch, num_columns, embed_dim] or [batch, 1, embed_dim] for cross-attention
-            Attention weights [batch, num_columns] (only if return_attention_weights=True)
+            If return_attention_weights=True: (output, attention_weights)
+            If return_attention_weights=False: output only
+
+            output: [batch, num_columns, embed_dim] or [batch, 1, embed_dim] for cross-attention
+            attention_weights: [batch, num_columns] (only if return_attention_weights=True)
         """
         if self.use_cross_attention:
             # Cross-attention: single query attends to all columns
@@ -152,7 +155,7 @@ class AttentionModule(nn.Module):
             if return_attention_weights:
                 return output, attn_weights
             else:
-                return output, None
+                return output
         else:
             # Self-attention across columns (original behavior)
             attn_out, attn_weights = self.attention(x, x, x, need_weights=return_attention_weights,
@@ -168,7 +171,7 @@ class AttentionModule(nn.Module):
                 attn_weights = attn_weights.mean(dim=1)  # Average across query positions for self-attention
                 return output, attn_weights
             else:
-                return output, None
+                return output
 
     def _apply_attention_dropout(self, attn_weights: torch.Tensor) -> torch.Tensor:
         """
