@@ -32,7 +32,8 @@ class StockDataLoader:
         self.dates = None
         self.data_array = None  # Shape: [num_days, num_columns, 9_features]
         self.train_indices = None
-        self.val_indices = None
+        self.interim_val_indices = None  # For walk-forward validation during training
+        self.val_indices = None  # Holdout set for final validation
         
     def load_csv(self) -> pd.DataFrame:
         """Load CSV file into pandas DataFrame."""
@@ -146,36 +147,43 @@ class StockDataLoader:
         
         return self.data_array
     
-    def create_train_val_split(self) -> Tuple[np.ndarray, np.ndarray]:
+    def create_train_val_split(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Split data into train and holdout sets (time-series aware).
+        Split data into train, interim validation, and holdout sets (time-series aware).
 
-        Walk-forward validation strategy:
-        - Last HOLDOUT_DAYS rows are reserved as "secret" holdout data (never used during training)
-        - All other rows are available for training and walk-forward validation
-        - Validation uses random slices from training data at each generation
+        Three-tier validation strategy:
+        1. Training data: Used for training episodes only
+        2. Interim validation: Used for walk-forward validation during training (3 random slices per generation)
+        3. Holdout data: Completely secret, used only for final "highlander round" validation
 
         Returns:
-            Tuple of (train_indices, holdout_indices)
+            Tuple of (train_indices, interim_val_indices, holdout_indices)
         """
         if self.data_array is None:
             raise ValueError("Must call extract_features() first")
 
         num_days = len(self.data_array)
 
-        # Reserve last HOLDOUT_DAYS for final validation only
+        # Calculate split points
         holdout_start_idx = num_days - Config.HOLDOUT_DAYS
+        interim_val_start_idx = holdout_start_idx - Config.INTERIM_VALIDATION_DAYS
 
-        self.train_indices = np.arange(0, holdout_start_idx)
-        self.val_indices = np.arange(holdout_start_idx, num_days)  # Renamed to holdout_indices conceptually
+        # Create three distinct ranges
+        self.train_indices = np.arange(0, interim_val_start_idx)
+        self.interim_val_indices = np.arange(interim_val_start_idx, holdout_start_idx)
+        self.val_indices = np.arange(holdout_start_idx, num_days)
 
-        print(f"\nData Split (Walk-Forward Validation):")
+        print(f"\nData Split (Three-Tier Validation Strategy):")
         print(f"  Total days: {num_days}")
-        print(f"  Training/Validation days: {len(self.train_indices)} ({self.dates[0]} to {self.dates[holdout_start_idx-1]})")
+        print(f"  Training days: {len(self.train_indices)} ({self.dates[0]} to {self.dates[interim_val_start_idx-1]})")
+        print(f"  Interim validation days: {len(self.interim_val_indices)} ({self.dates[interim_val_start_idx]} to {self.dates[holdout_start_idx-1]})")
         print(f"  Holdout days (secret): {len(self.val_indices)} ({self.dates[holdout_start_idx]} to {self.dates[-1]})")
-        print(f"  Note: Validation uses random slices from training data each generation")
+        print(f"\nValidation strategy:")
+        print(f"  - Training episodes: Sample from training data only")
+        print(f"  - Walk-forward validation: 3 random slices from interim validation set each generation")
+        print(f"  - Final validation: Holdout set used only for final 'highlander round'")
 
-        return self.train_indices, self.val_indices
+        return self.train_indices, self.interim_val_indices, self.val_indices
     
     def get_window(self, end_idx: int) -> Optional[np.ndarray]:
         """

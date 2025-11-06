@@ -55,12 +55,17 @@ class ERLTrainer:
         # Shared replay buffer
         self.replay_buffer = ReplayBuffer()
         
-        # Training range (excludes holdout set)
+        # Training range (excludes interim validation and holdout sets)
         self.train_start_idx = Config.CONTEXT_WINDOW_DAYS
         self.train_end_idx = len(data_loader.train_indices)
 
+        # Interim validation range (for walk-forward validation during training)
+        # This is separate from training data to ensure genuine out-of-sample validation
+        self.interim_val_start_idx = len(data_loader.train_indices)
+        self.interim_val_end_idx = self.interim_val_start_idx + len(data_loader.interim_val_indices)
+
         # Walk-forward validation slices (generated per generation)
-        # Each generation uses 3 random validation slices from training data
+        # Each generation uses 3 random validation slices from INTERIM validation set
         # Format: list of (start_idx, end_idx, trading_end_idx) tuples
         self.current_generation_val_slices = []
         
@@ -219,8 +224,9 @@ class ERLTrainer:
         self.buffer_saved_on_first_fill = False
 
         print(f"Training range: days {self.train_start_idx} to {self.train_end_idx}")
-        print(f"Walk-forward validation: 3 random slices per generation from training data")
-        print(f"Holdout set: last {Config.HOLDOUT_DAYS} days (never used during training)")
+        print(f"Interim validation range: days {self.interim_val_start_idx} to {self.interim_val_end_idx}")
+        print(f"Walk-forward validation: 3 random slices per generation from interim validation set")
+        print(f"Holdout set: last {Config.HOLDOUT_DAYS} days (completely secret, for final highlander round)")
 
         # CRITICAL FIX: Create persistent environments to reuse instead of creating new ones each episode
         # This prevents massive memory leak from creating POPULATION_SIZE+ environments per generation
@@ -344,25 +350,31 @@ class ERLTrainer:
 
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
         """
-        Generate 3 random validation slices for the current generation.
+        Generate 3 random validation slices for the current generation from INTERIM validation set.
+
         Each slice consists of:
-        - CONTEXT_WINDOW_DAYS (504) of prior data
-        - TRADING_PERIOD_DAYS (125) where agent can trade
-        - SETTLEMENT_PERIOD_DAYS (20) to close positions
+        - CONTEXT_WINDOW_DAYS (504) of prior data (may come from training data for context)
+        - TRADING_PERIOD_DAYS (125) where agent can trade (from interim validation set)
+        - SETTLEMENT_PERIOD_DAYS (20) to close positions (from interim validation set)
 
         Returns:
             List of 3 tuples: (start_idx, end_idx, trading_end_idx)
         """
         total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-        max_start = self.train_end_idx - total_days_needed
 
-        if max_start <= self.train_start_idx:
-            raise ValueError(f"Not enough training data for validation slices: need {total_days_needed} days")
+        # Validation slices are drawn from interim validation set
+        # The context window can reach back into training data, but trading happens in interim val set
+        max_start = self.interim_val_end_idx - total_days_needed
+        min_start = self.interim_val_start_idx - Config.CONTEXT_WINDOW_DAYS  # Allow context to come from training
+
+        if max_start < min_start:
+            raise ValueError(f"Not enough interim validation data: need {total_days_needed} days total")
 
         slices = []
         for _ in range(3):
-            # Random start index from training data
-            start_idx = np.random.randint(self.train_start_idx, max_start)
+            # Random start index - context can come from end of training data
+            # But trading period must be entirely within interim validation set
+            start_idx = np.random.randint(min_start, max_start)
             end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
             trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
 
@@ -383,14 +395,16 @@ class ERLTrainer:
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
         
         for agent in tqdm(self.population, desc="Evaluating agents"):
-            # Calculate episode indices
+            # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
+            # Training episodes must not touch interim validation or holdout sets
             # Need: context (504) + trading (125) + settlement (20) = 649 days total
             total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-            
+
             max_start = self.train_end_idx - total_days_needed
             if max_start <= self.train_start_idx:
                 raise ValueError(f"Not enough training data: need {total_days_needed} days")
-            
+
+            # Random start from training range only (excludes interim val and holdout)
             start_idx = np.random.randint(self.train_start_idx, max_start)
             end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
             

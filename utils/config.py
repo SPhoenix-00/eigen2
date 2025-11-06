@@ -18,7 +18,8 @@ class Config:
     
     CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
     TRAIN_TEST_SPLIT = 0.95  # 95% train, 5% validation (6 months) - DEPRECATED: now using HOLDOUT_DAYS
-    HOLDOUT_DAYS = 251  # Last 251 rows reserved for final validation only (never used during training)
+    INTERIM_VALIDATION_DAYS = 252  # Interim validation set for walk-forward validation during training
+    HOLDOUT_DAYS = 251  # Last 251 rows reserved for final "highlander round" (completely secret)
     
     # ============ Action Space Parameters ============
     NUM_ACTIONS = NUM_INVESTABLE_STOCKS  # 108 stocks
