@@ -5,7 +5,9 @@
       "Bash(git add:*)",
       "Bash(git push:*)",
       "Bash(git commit:*)",
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python evaluate_best_agent.py:*)"
     ],
     "deny": [],
     "ask": []

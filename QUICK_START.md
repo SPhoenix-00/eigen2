@@ -131,6 +131,32 @@ python download_metrics.py
 
 ---
 
+## Evaluate Best Agent
+
+After training completes, evaluate your best agent's trading behavior:
+
+```bash
+# Evaluate last run (uses last_run.json)
+python evaluate_best_agent.py
+
+# Or evaluate a specific run
+python evaluate_best_agent.py --run-name azure-thunder-123
+```
+
+This will:
+- Load the best agent from GCP
+- Evaluate on 3 validation slices
+- Evaluate on first 125 days of holdout period
+- Track every trade with detailed information
+- Export results to `evaluation_results/` directory:
+  - **Text report**: Complete trade-by-trade analysis
+  - **Trades CSV**: Spreadsheet of all trades for analysis
+  - **Summary CSV**: Statistics by evaluation slice
+
+See [EVALUATION_GUIDE.md](EVALUATION_GUIDE.md) for detailed usage and output format.
+
+---
+
 ## Troubleshooting
 
 **GCS connection issues:**
