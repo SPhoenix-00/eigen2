@@ -35,6 +35,7 @@ class StockDataLoader:
         self.interim_val_indices = None  # For walk-forward validation during training
         self.val_indices = None  # Holdout set for final validation
         self.normalization_stats = None  # Computed by load_and_prepare()
+        self.column_names = None  # Column names from DataFrame
 
         # Split point indices (set by create_train_val_split)
         self.train_end_idx = None
@@ -181,11 +182,13 @@ class StockDataLoader:
             # Pickle: dates are in index, all columns are data
             start_col = 0
             num_columns = self.df.shape[1]
+            self.column_names = list(self.df.columns)
             print(f"\nExtracting features from pickle: {num_days} days × {num_columns} columns...")
         else:
             # CSV: skip date column (column 0)
             start_col = 1
             num_columns = self.df.shape[1] - 1
+            self.column_names = list(self.df.columns[start_col:])
             print(f"\nExtracting features from CSV: {num_days} days × {num_columns} columns...")
 
         # Initialize array

@@ -223,6 +223,19 @@ class ERLTrainer:
         # Track if we've saved buffer on first fill
         self.buffer_saved_on_first_fill = False
 
+        # Feature importance tracking (cross-attention weights)
+        self.feature_importance = torch.zeros(669, device=Config.DEVICE)  # Running average [669]
+        self.feature_importance_momentum = 0.99  # EMA momentum
+        self.feature_importance_count = 0  # Track how many updates we've done
+
+        # Feature importance history (per generation)
+        from collections import deque
+        self.feature_importance_history = deque(maxlen=10)  # Store last 10 generations
+
+        # Column names for better logging
+        self.column_names = data_loader.column_names if hasattr(data_loader, 'column_names') and data_loader.column_names else \
+                           [f"col_{i}" for i in range(669)]
+
         print(f"Training range: days {self.train_start_idx} to {self.train_end_idx}")
         print(f"Interim validation range: days {self.interim_val_start_idx} to {self.interim_val_end_idx}")
         print(f"Walk-forward validation: 3 random slices per generation from interim validation set")
@@ -493,6 +506,13 @@ class ERLTrainer:
                     # Update with gradient accumulation
                     is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
                     critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+
+                    # Capture attention weights from actor (after forward pass in update)
+                    # Only capture from first agent to avoid redundant logging
+                    if agent.agent_id == 0:
+                        attention_weights = agent.actor.get_attention_weights()
+                        if attention_weights is not None:
+                            self.update_feature_importance(attention_weights)
 
                     # Detach from computation graph to prevent memory leak
                     actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
@@ -913,7 +933,108 @@ class ERLTrainer:
                 self.population[num_elites - 1] = champion_clone
 
                 print(f"✓ Champion injected into resumed population (validation fitness: {self.best_validation_fitness:.2f})")
-    
+
+    def update_feature_importance(self, attention_weights: torch.Tensor):
+        """
+        Update the running average of feature importance using exponential moving average.
+
+        Args:
+            attention_weights: [batch, 669] attention weights from the actor
+        """
+        if attention_weights is None:
+            return
+
+        # Average across batch dimension to get [669]
+        batch_mean = attention_weights.mean(dim=0)
+
+        # Update running average with momentum
+        if self.feature_importance_count == 0:
+            # First update: initialize with current weights
+            self.feature_importance = batch_mean.detach()
+        else:
+            # EMA update: avg = momentum * avg + (1 - momentum) * new
+            momentum = self.feature_importance_momentum
+            self.feature_importance = (momentum * self.feature_importance +
+                                       (1 - momentum) * batch_mean.detach())
+
+        self.feature_importance_count += 1
+
+    def get_feature_importance(self) -> torch.Tensor:
+        """
+        Get the current feature importance vector.
+
+        Returns:
+            Feature importance [669] - probabilities summing to ~1.0
+        """
+        return self.feature_importance.cpu()
+
+    def analyze_persistent_low_importance_columns(self, current_importance: np.ndarray) -> dict:
+        """
+        Analyze columns that have been persistently below importance thresholds.
+
+        Args:
+            current_importance: Current feature importance [669]
+
+        Returns:
+            Dictionary with analysis results
+        """
+        # Add current importance to history
+        self.feature_importance_history.append(current_importance.copy())
+
+        # Need enough history to analyze persistence
+        history_len = len(self.feature_importance_history)
+
+        # Thresholds (as fractions, e.g., 0.01 = 1%)
+        thresholds = {
+            '<1%': (0.01, 5),   # Less than 1% for past 5 generations
+            '<0.1%': (0.001, 4), # Less than 0.1% for past 4 generations
+            '<0.01%': (0.0001, 3) # Less than 0.01% for past 3 generations
+        }
+
+        results = {}
+
+        for threshold_name, (threshold_val, required_gens) in thresholds.items():
+            if history_len >= required_gens:
+                # Get last N generations
+                recent_history = list(self.feature_importance_history)[-required_gens:]
+
+                # Find columns below threshold in ALL recent generations
+                persistent_low = np.ones(669, dtype=bool)
+                for gen_importance in recent_history:
+                    persistent_low &= (gen_importance < threshold_val)
+
+                # Get indices of persistent low-importance columns
+                persistent_indices = np.where(persistent_low)[0]
+
+                # Create list with both index and column name
+                persistent_cols = []
+                for idx in persistent_indices:
+                    col_name = self.column_names[idx] if idx < len(self.column_names) else f"col_{idx}"
+                    persistent_cols.append({
+                        'index': int(idx),
+                        'name': str(col_name),
+                        'current_importance': float(current_importance[idx])
+                    })
+
+                results[threshold_name] = {
+                    'count': len(persistent_cols),
+                    'columns': persistent_cols
+                }
+            else:
+                # Not enough history yet
+                results[threshold_name] = {
+                    'count': 0,
+                    'columns': [],
+                    'note': f'Need {required_gens} generations, currently at {history_len}'
+                }
+
+        # Count features below thresholds in current generation
+        results['current_below_1pct'] = int(np.sum(current_importance < 0.01))
+        results['current_below_0.1pct'] = int(np.sum(current_importance < 0.001))
+        results['current_below_0.01pct'] = int(np.sum(current_importance < 0.0001))
+
+        return results
+
     def train(self):
         """Main training loop."""
         print("\n" + "="*60)
@@ -1102,6 +1223,22 @@ class ERLTrainer:
             self.writer.add_scalar('Buffer/Size', buffer_stats['size'], gen)
             self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
 
+            # Get feature importance for logging
+            feature_importance = self.get_feature_importance().numpy()
+
+            # Calculate summary statistics for feature importance
+            top_k = 20  # Top 20 most important features
+            top_indices = np.argsort(feature_importance)[-top_k:][::-1]
+            top_values = feature_importance[top_indices]
+
+            # Calculate entropy of feature importance (higher = more distributed attention)
+            # Clip to avoid log(0)
+            fi_clipped = np.clip(feature_importance, 1e-10, 1.0)
+            entropy = -np.sum(fi_clipped * np.log(fi_clipped))
+
+            # Analyze persistent low-importance columns
+            low_importance_analysis = self.analyze_persistent_low_importance_columns(feature_importance)
+
             # Log to wandb
             wandb.log({
                 "buffer/size": buffer_stats['size'],
@@ -1109,7 +1246,68 @@ class ERLTrainer:
                 "buffer/capacity": buffer_stats['capacity'],
                 "training/generation_time": gen_time,
                 "training/avg_generation_time": np.mean(self.generation_times) if self.generation_times else 0,
+                # Feature importance summary
+                "feature_importance/entropy": entropy,
+                "feature_importance/max": float(feature_importance.max()),
+                "feature_importance/mean": float(feature_importance.mean()),
+                "feature_importance/top_1": float(top_values[0]) if len(top_values) > 0 else 0.0,
+                "feature_importance/top_5_sum": float(top_values[:5].sum()) if len(top_values) >= 5 else 0.0,
+                "feature_importance/update_count": self.feature_importance_count,
+                # Current generation thresholds
+                "feature_importance/current_below_1pct": low_importance_analysis['current_below_1pct'],
+                "feature_importance/current_below_0.1pct": low_importance_analysis['current_below_0.1pct'],
+                "feature_importance/current_below_0.01pct": low_importance_analysis['current_below_0.01pct'],
+                # Persistent low-importance counts
+                "feature_importance/persistent_below_1pct_count": low_importance_analysis['<1%']['count'],
+                "feature_importance/persistent_below_0.1pct_count": low_importance_analysis['<0.1%']['count'],
+                "feature_importance/persistent_below_0.01pct_count": low_importance_analysis['<0.01%']['count'],
             }, step=gen)
+
+            # Print persistent low-importance columns
+            print(f"\n--- Feature Importance Analysis (Generation {gen + 1}) ---")
+            print(f"Current generation:")
+            print(f"  Features < 1%: {low_importance_analysis['current_below_1pct']}")
+            print(f"  Features < 0.1%: {low_importance_analysis['current_below_0.1pct']}")
+            print(f"  Features < 0.01%: {low_importance_analysis['current_below_0.01pct']}")
+
+            for threshold_name in ['<1%', '<0.1%', '<0.01%']:
+                threshold_data = low_importance_analysis[threshold_name]
+                print(f"\nPersistently {threshold_name}:")
+                if 'note' in threshold_data:
+                    print(f"  {threshold_data['note']}")
+                else:
+                    print(f"  Count: {threshold_data['count']}")
+                    if threshold_data['count'] > 0 and threshold_data['count'] <= 10:
+                        print(f"  Columns:")
+                        for col in threshold_data['columns']:
+                            print(f"    [{col['index']:3d}] {col['name']}: {col['current_importance']:.6f}")
+                    elif threshold_data['count'] > 10:
+                        print(f"  (Too many to display, showing first 10)")
+                        for col in threshold_data['columns'][:10]:
+                            print(f"    [{col['index']:3d}] {col['name']}: {col['current_importance']:.6f}")
+
+            # Log full feature importance vector as histogram every 5 generations
+            if (gen + 1) % 5 == 0:
+                wandb.log({
+                    "feature_importance/histogram": wandb.Histogram(feature_importance),
+                    "feature_importance/top_20_columns": wandb.Table(
+                        data=[[int(idx), float(val)] for idx, val in zip(top_indices, top_values)],
+                        columns=["Column_Index", "Importance"]
+                    )
+                }, step=gen)
+
+                # Log persistent low-importance columns as tables
+                for threshold_name in ['<1%', '<0.1%', '<0.01%']:
+                    threshold_data = low_importance_analysis[threshold_name]
+                    if threshold_data['count'] > 0 and 'columns' in threshold_data:
+                        table_data = [[col['index'], col['name'], col['current_importance']]
+                                     for col in threshold_data['columns']]
+                        wandb.log({
+                            f"feature_importance/persistent_{threshold_name.replace('<', 'below_').replace('%', 'pct')}": wandb.Table(
+                                data=table_data,
+                                columns=["Column_Index", "Column_Name", "Current_Importance"]
+                            )
+                        }, step=gen)
 
             # Clear GPU cache and run garbage collection to prevent memory leaks
             if torch.cuda.is_available():

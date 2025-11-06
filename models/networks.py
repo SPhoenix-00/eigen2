@@ -92,56 +92,134 @@ class FeatureExtractor(nn.Module):
 class AttentionModule(nn.Module):
     """
     Multi-head attention to learn which stocks/indicators matter.
+    Supports both self-attention and cross-attention modes.
     """
-    
-    def __init__(self, embed_dim: int, num_heads: int = 8):
+
+    def __init__(self, embed_dim: int, num_heads: int = 8, use_cross_attention: bool = False,
+                 attention_dropout: float = 0.1):
         super().__init__()
-        
+
+        self.use_cross_attention = use_cross_attention
+        self.attention_dropout = attention_dropout
+
         self.attention = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
             dropout=0.1,
             batch_first=True
         )
-        
+
         self.norm = nn.LayerNorm(embed_dim)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        # For cross-attention: learnable query vector (the Actor's "brain")
+        if use_cross_attention:
+            self.query = nn.Parameter(torch.randn(1, 1, embed_dim))
+
+    def forward(self, x: torch.Tensor, return_attention_weights: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: [batch, num_columns, embed_dim]
-            
+            return_attention_weights: Whether to return attention weights
+
         Returns:
-            Attended features [batch, num_columns, embed_dim]
+            Attended features [batch, num_columns, embed_dim] or [batch, 1, embed_dim] for cross-attention
+            Attention weights [batch, num_columns] (only if return_attention_weights=True)
         """
-        # Self-attention across columns
-        attn_out, _ = self.attention(x, x, x)
-        
-        # Residual connection + normalization
-        x = self.norm(x + attn_out)
-        
-        return x
+        if self.use_cross_attention:
+            # Cross-attention: single query attends to all columns
+            batch_size = x.shape[0]
+
+            # Expand query for batch
+            query = self.query.expand(batch_size, -1, -1)  # [batch, 1, embed_dim]
+
+            # Cross-attention: Q from query, K and V from input features
+            attn_out, attn_weights = self.attention(query, x, x, need_weights=True, average_attn_weights=True)
+            # attn_out: [batch, 1, embed_dim]
+            # attn_weights: [batch, 1, num_columns] or [batch, num_heads, 1, num_columns]
+
+            # Average across heads if needed and squeeze to [batch, num_columns]
+            if attn_weights.dim() == 4:
+                attn_weights = attn_weights.mean(dim=1)  # Average across heads
+            attn_weights = attn_weights.squeeze(1)  # [batch, num_columns]
+
+            # Apply attention dropout during training
+            if self.training and self.attention_dropout > 0:
+                attn_weights = self._apply_attention_dropout(attn_weights)
+
+            # No residual for cross-attention (query is different from input)
+            output = self.norm(attn_out)
+
+            if return_attention_weights:
+                return output, attn_weights
+            else:
+                return output, None
+        else:
+            # Self-attention across columns (original behavior)
+            attn_out, attn_weights = self.attention(x, x, x, need_weights=return_attention_weights,
+                                                     average_attn_weights=True if return_attention_weights else False)
+
+            # Residual connection + normalization
+            output = self.norm(x + attn_out)
+
+            if return_attention_weights:
+                # Average across heads and reshape to [batch, num_columns]
+                if attn_weights.dim() == 4:
+                    attn_weights = attn_weights.mean(dim=1)
+                attn_weights = attn_weights.mean(dim=1)  # Average across query positions for self-attention
+                return output, attn_weights
+            else:
+                return output, None
+
+    def _apply_attention_dropout(self, attn_weights: torch.Tensor) -> torch.Tensor:
+        """
+        Apply attention dropout: randomly zero out some attention weights and renormalize.
+        This prevents the model from getting stuck in local optima.
+
+        Args:
+            attn_weights: [batch, num_columns] - softmax weights that sum to 1.0
+
+        Returns:
+            Dropped and renormalized weights [batch, num_columns]
+        """
+        # Create dropout mask (1.0 = keep, 0.0 = drop)
+        dropout_mask = torch.bernoulli(torch.full_like(attn_weights, 1.0 - self.attention_dropout))
+
+        # Apply mask
+        masked_weights = attn_weights * dropout_mask
+
+        # Renormalize so they sum to 1.0
+        # Add small epsilon to avoid division by zero
+        weight_sum = masked_weights.sum(dim=1, keepdim=True) + 1e-8
+        renormalized_weights = masked_weights / weight_sum
+
+        return renormalized_weights
 
 
 class Actor(nn.Module):
     """
     Actor network: outputs actions [coefficient, sale_target] for each stock.
+    Uses cross-attention to determine feature importance across all 669 columns.
     """
-    
+
     def __init__(self):
         super().__init__()
-        
+
         # Feature extraction
         self.feature_extractor = FeatureExtractor()
-        
-        # Optional attention
+
+        # Cross-attention for feature importance
         if Config.USE_ATTENTION:
             self.attention = AttentionModule(
                 embed_dim=self.feature_extractor.lstm_output_size,
-                num_heads=Config.ATTENTION_HEADS
+                num_heads=Config.ATTENTION_HEADS,
+                use_cross_attention=True,  # Use cross-attention
+                attention_dropout=0.1
             )
         else:
             self.attention = None
+
+        # Store last attention weights for logging
+        self.last_attention_weights = None
         
         # Separate processing for investable stocks vs context features
         # Investable stocks (columns 10-117 = 108 stocks)
@@ -184,79 +262,92 @@ class Actor(nn.Module):
             nn.Sigmoid()  # Output in [0, 1], will scale to [MIN, MAX] sale target
         )
         
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
+    def forward(self, state: torch.Tensor, return_attention_weights: bool = False) -> torch.Tensor:
         """
         Forward pass.
-        
+
         Args:
             state: [batch, context_days, num_columns, 9]
-            
+            return_attention_weights: Whether to return attention weights for logging
+
         Returns:
             actions: [batch, 108, 2] with [coefficient, sale_target] per stock
+            (optional) attention_weights: [batch, 669] if return_attention_weights=True
         """
         batch_size = state.shape[0]
-        
-        # Extract features
+
+        # Extract features from all columns
         features = self.feature_extractor(state)
-        
-        # Apply attention if enabled
+        # [batch, 669, lstm_output_size]
+
+        # Apply cross-attention if enabled
+        attention_weights = None
         if self.attention is not None:
-            features = self.attention(features)
-        
-        # Split investable stocks from context
+            # Cross-attention: single query attends to all 669 features
+            global_context, attention_weights = self.attention(features, return_attention_weights=True)
+            # global_context: [batch, 1, lstm_output_size]
+            # attention_weights: [batch, 669]
+
+            # Store attention weights for logging
+            self.last_attention_weights = attention_weights.detach()
+
+            # Process global context through context FC
+            global_context = global_context.squeeze(1)  # [batch, lstm_output_size]
+            context_processed = self.context_fc(global_context)  # [batch, ACTOR_HIDDEN_DIMS[1]]
+            context_processed = context_processed.unsqueeze(1)  # [batch, 1, ACTOR_HIDDEN_DIMS[1]]
+        else:
+            # Fallback: pool all features if no attention
+            context_features = torch.mean(features, dim=1)  # [batch, lstm_output_size]
+            context_processed = self.context_fc(context_features).unsqueeze(1)  # [batch, 1, ACTOR_HIDDEN_DIMS[1]]
+
+        # Extract investable stock features (still use raw features for stock-specific processing)
         investable_features = features[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1, :]
         # [batch, 108, lstm_output_size]
-        
-        context_features = torch.cat([
-            features[:, :Config.INVESTABLE_START_COL, :],
-            features[:, Config.INVESTABLE_END_COL+1:, :]
-        ], dim=1)  # [batch, remaining_columns, lstm_output_size]
-        
+
         # Process investable stocks
         investable_processed = self.investable_fc(investable_features)
         # [batch, 108, ACTOR_HIDDEN_DIMS[1]]
-        
-        # Process and pool context features
-        context_processed = self.context_fc(context_features)
-        # [batch, remaining_columns, ACTOR_HIDDEN_DIMS[1]]
-        context_pooled = torch.mean(context_processed, dim=1, keepdim=True)
-        # [batch, 1, ACTOR_HIDDEN_DIMS[1]]
-        context_pooled = context_pooled.expand(-1, Config.NUM_INVESTABLE_STOCKS, -1)
+
+        # Expand context to all stocks
+        context_expanded = context_processed.expand(-1, Config.NUM_INVESTABLE_STOCKS, -1)
         # [batch, 108, ACTOR_HIDDEN_DIMS[1]]
-        
+
         # Combine
-        combined = torch.cat([investable_processed, context_pooled], dim=-1)
+        combined = torch.cat([investable_processed, context_expanded], dim=-1)
         # [batch, 108, combined_dim]
-        
+
         # Output heads
         raw_coefficients = self.coefficient_head(combined).squeeze(-1)
         # [batch, 108]
-        
+
         raw_sale_targets = self.sale_target_head(combined).squeeze(-1)
         # [batch, 108]
-        
+
         # Apply activations
         # Coefficient: >= 1 or 0 (using threshold)
         coefficients = self._apply_coefficient_activation(raw_coefficients)
-        
+
         # Sale target: scale from [0, 1] to [MIN_SALE_TARGET, MAX_SALE_TARGET]
-        sale_targets = (Config.MIN_SALE_TARGET + 
+        sale_targets = (Config.MIN_SALE_TARGET +
                        raw_sale_targets * (Config.MAX_SALE_TARGET - Config.MIN_SALE_TARGET))
-        
+
         # Stack into action tensor
         actions = torch.stack([coefficients, sale_targets], dim=-1)
         # [batch, 108, 2]
-        
-        return actions
+
+        if return_attention_weights:
+            return actions, attention_weights
+        else:
+            return actions
     
     def _apply_coefficient_activation(self, raw: torch.Tensor) -> torch.Tensor:
         """
         Apply activation to ensure coefficient >= 1 or ~0.
         Uses smooth activation for better gradient flow during training.
-        
+
         Args:
             raw: Raw output from network
-            
+
         Returns:
             Activated coefficients
         """
@@ -268,8 +359,17 @@ class Actor(nn.Module):
             torch.exp(raw * 0.5) + 0.5,  # Scale down raw, then exp ensures >= 1 for positive
             torch.sigmoid(raw * 2.0) * 0.1  # Nearly 0 for negative
         )
-        
+
         return coefficients
+
+    def get_attention_weights(self) -> torch.Tensor:
+        """
+        Get the last computed attention weights (feature importance).
+
+        Returns:
+            Attention weights [batch, 669] or None if not available
+        """
+        return self.last_attention_weights
 
 
 class Critic(nn.Module):
