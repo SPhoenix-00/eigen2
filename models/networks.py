@@ -80,8 +80,8 @@ class FeatureExtractor(nn.Module):
         
         lstm_out, _ = self.lstm(x)  # [batch * num_columns, context_days, lstm_output_size]
         
-        # Take last time step output
-        x = lstm_out[:, -1, :]  # [batch * num_columns, lstm_output_size]
+        # Take the AVERAGE of the last 3 time steps
+        x = torch.mean(lstm_out[:, -3:, :], dim=1)  # [batch * num_columns, lstm_output_size]
         
         # Reshape back to separate columns
         x = x.reshape(batch_size, self.num_columns, self.lstm_output_size)
@@ -235,7 +235,7 @@ class Actor(nn.Module):
         self.investable_fc = nn.Sequential(
             nn.Linear(investable_input_dim, Config.ACTOR_HIDDEN_DIMS[0]),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[0], Config.ACTOR_HIDDEN_DIMS[1]),
             nn.ReLU(),
         )
@@ -253,14 +253,14 @@ class Actor(nn.Module):
         self.coefficient_head = nn.Sequential(
             nn.Linear(combined_dim, Config.ACTOR_HIDDEN_DIMS[2]),
             nn.ReLU(),
-            nn.Dropout(0.1),  # Added to combat overfitting
+            nn.Dropout(0.2),  # Added to combat overfitting
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[2], 1),
         )
 
         self.sale_target_head = nn.Sequential(
             nn.Linear(combined_dim, Config.ACTOR_HIDDEN_DIMS[2]),
             nn.ReLU(),
-            nn.Dropout(0.1),  # Added to combat overfitting
+            nn.Dropout(0.2),  # Added to combat overfitting
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[2], 1),
             nn.Sigmoid()  # Output in [0, 1], will scale to [MIN, MAX] sale target
         )
@@ -406,10 +406,10 @@ class Critic(nn.Module):
         self.critic_fc = nn.Sequential(
             nn.Linear(state_dim + action_dim, Config.CRITIC_HIDDEN_DIMS[0]),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.Linear(Config.CRITIC_HIDDEN_DIMS[0], Config.CRITIC_HIDDEN_DIMS[1]),
             nn.ReLU(),
-            nn.Dropout(0.1),  # Added to combat overfitting
+            nn.Dropout(0.2),  # Added to combat overfitting
             nn.Linear(Config.CRITIC_HIDDEN_DIMS[1], 1)
         )
         

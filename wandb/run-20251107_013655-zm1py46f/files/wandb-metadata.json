@@ -1,0 +1,40 @@
+{
+  "os": "Windows-11-10.0.26100-SP0",
+  "python": "CPython 3.13.1",
+  "startedAt": "2025-11-07T06:36:55.923149Z",
+  "program": "c:\\Users\\antoi\\Documents\\GitHub\\eigen2\\test_training.py",
+  "codePath": "test_training.py",
+  "codePathLocal": "test_training.py",
+  "git": {
+    "remote": "https://github.com/SPhoenix-00/eigen2.git",
+    "commit": "84419be383264d3854574f40dc486d8b0cd2230a"
+  },
+  "email": "pj.skirmish@gmail.com",
+  "root": "c:\\Users\\antoi\\Documents\\GitHub\\eigen2",
+  "host": "Bruh",
+  "executable": "C:\\Users\\antoi\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+  "cpu_count": 24,
+  "cpu_count_logical": 32,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "1999227580416",
+      "used": "1806994579456"
+    }
+  },
+  "memory": {
+    "total": "68447875072"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-13745f17-fa09-820c-3ec0-9f4eda3c2b25"
+    }
+  ],
+  "cudaVersion": "13.0",
+  "writerId": "mi9kucfxfcrdgoxua8vih1w8lufco729"
+}

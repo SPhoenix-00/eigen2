@@ -64,7 +64,7 @@ class Config:
     TAU = 0.005  # Soft update parameter
     ACTOR_LR = 1e-4
     CRITIC_LR = 3e-4
-    WEIGHT_DECAY = 1e-4
+    WEIGHT_DECAY = 5e-4
     
     # Replay buffer
     BUFFER_SIZE = 14000  # Maximum buffer size

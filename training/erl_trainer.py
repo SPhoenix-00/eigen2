@@ -403,7 +403,12 @@ class ERLTrainer:
     def evaluate_population(self) -> Tuple[List[float], Dict]:
         """
         Evaluate all agents in population (fitness scores).
-        
+
+        NEW: Multi-slice evaluation for robust fitness signal
+        - Each agent is evaluated on 5 different random training slices
+        - Final fitness = average of the LOWEST 2 scores (conservative, robust estimate)
+        - This prevents "lucky" agents from advancing and selects for consistency
+
         Returns:
             Tuple of (fitness_scores, aggregate_stats)
         """
@@ -411,37 +416,64 @@ class ERLTrainer:
         all_episode_stats = []
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
-        
-        for agent in tqdm(self.population, desc="Evaluating agents"):
-            # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
-            # Training episodes must not touch interim validation or holdout sets
-            # Need: context (504) + trading (125) + settlement (20) = 649 days total
-            total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+        print(f"Multi-slice evaluation: 5 slices per agent, scoring = avg(lowest 2)")
 
-            max_start = self.train_end_idx - total_days_needed
-            if max_start <= self.train_start_idx:
-                raise ValueError(f"Not enough training data: need {total_days_needed} days")
+        for agent_idx, agent in enumerate(tqdm(self.population, desc="Evaluating agents")):
+            # Evaluate agent on 5 different random training slices
+            slice_fitness_scores = []
+            slice_episode_stats = []
 
-            # Random start from training range only (excludes interim val and holdout)
-            start_idx = np.random.randint(self.train_start_idx, max_start)
-            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-            
-            # Run episode using persistent eval_env (CRITICAL FIX: prevents memory leak)
-            fitness, episode_info = self.run_episode(
-                agent=agent,
-                env=self.eval_env,  # Reuse persistent environment instead of creating new ones
-                start_idx=start_idx,
-                end_idx=end_idx,
-                training=True
-            )
-            
-            fitness_scores.append(fitness)
-            all_episode_stats.append(episode_info)
-        
+            for _ in range(5):
+                # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
+                # Training episodes must not touch interim validation or holdout sets
+                # Need: context (504) + trading (125) + settlement (20) = 649 days total
+                total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+
+                max_start = self.train_end_idx - total_days_needed
+                if max_start <= self.train_start_idx:
+                    raise ValueError(f"Not enough training data: need {total_days_needed} days")
+
+                # Random start from training range only (excludes interim val and holdout)
+                start_idx = np.random.randint(self.train_start_idx, max_start)
+                end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+
+                # Run episode using persistent eval_env (CRITICAL FIX: prevents memory leak)
+                fitness, episode_info = self.run_episode(
+                    agent=agent,
+                    env=self.eval_env,  # Reuse persistent environment instead of creating new ones
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    training=True
+                )
+
+                slice_fitness_scores.append(fitness)
+                slice_episode_stats.append(episode_info)
+
+            # Robust scoring: average of lowest 2 scores out of 5
+            sorted_fitness = sorted(slice_fitness_scores)
+            lowest_2_avg = np.mean(sorted_fitness[:2])
+
+            # Log slice breakdown for first 3 agents (transparency)
+            if agent_idx < 3:
+                print(f"\n  Agent {agent_idx} slice fitnesses: {[f'{f:.1f}' for f in slice_fitness_scores]}")
+                print(f"  Sorted: {[f'{f:.1f}' for f in sorted_fitness]}")
+                print(f"  Final score (avg of lowest 2): {lowest_2_avg:.2f}")
+
+            fitness_scores.append(lowest_2_avg)
+
+            # Aggregate episode stats across all 5 slices for this agent
+            agent_aggregate_stats = {
+                'num_trades': int(np.mean([s['num_trades'] for s in slice_episode_stats])),
+                'num_wins': int(np.mean([s['num_wins'] for s in slice_episode_stats])),
+                'num_losses': int(np.mean([s['num_losses'] for s in slice_episode_stats])),
+                'win_rate': np.mean([s['win_rate'] for s in slice_episode_stats]),
+            }
+            all_episode_stats.append(agent_aggregate_stats)
+
         # Ensure fitness_scores are all plain floats
         fitness_scores = [float(f) for f in fitness_scores]
-        
-        # Aggregate statistics
+
+        # Aggregate statistics across all agents
         aggregate_stats = {
             'total_trades': int(sum(s['num_trades'] for s in all_episode_stats)),
             'avg_trades_per_agent': float(sum(s['num_trades'] for s in all_episode_stats) / len(all_episode_stats)),
