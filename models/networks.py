@@ -51,6 +51,10 @@ class FeatureExtractor(nn.Module):
 
         # Enable gradient checkpointing
         self.use_gradient_checkpointing = True
+
+        # Column chunking to prevent OOM with large batch_size * num_columns
+        # Process columns in chunks to keep LSTM batch size manageable
+        self.column_chunk_size = 64  # Process 64 columns at a time (8 batch * 64 = 512 LSTM sequences)
         
     def _cnn_block(self, x: torch.Tensor) -> torch.Tensor:
         """CNN processing block for gradient checkpointing."""
@@ -67,7 +71,10 @@ class FeatureExtractor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through feature extractor with gradient checkpointing.
+        Forward pass through feature extractor with column chunking and gradient checkpointing.
+
+        Column chunking prevents OOM by processing columns in smaller batches instead of all 669 at once.
+        This keeps the effective LSTM batch size manageable (batch_size * chunk_size instead of batch_size * 669).
 
         Args:
             x: Input tensor [batch, context_days, num_columns, num_features]
@@ -78,33 +85,52 @@ class FeatureExtractor(nn.Module):
         batch_size = x.shape[0]
         context_days = x.shape[1]
 
-        # Reshape to process each column independently
-        # [batch, context_days, num_columns, num_features] -> [batch * num_columns, num_features, context_days]
-        x = x.permute(0, 2, 3, 1)  # [batch, num_columns, num_features, context_days]
-        x = x.reshape(batch_size * self.num_columns, self.num_features, context_days)
+        # Process columns in chunks to prevent OOM
+        # Split 669 columns into chunks of 64 (last chunk will be smaller)
+        num_chunks = (self.num_columns + self.column_chunk_size - 1) // self.column_chunk_size
+        chunk_outputs = []
 
-        # CNN across features (with gradient checkpointing during training)
-        if self.training and self.use_gradient_checkpointing:
-            x = checkpoint(self._cnn_block, x, use_reentrant=False)
-        else:
-            x = self._cnn_block(x)
+        for chunk_idx in range(num_chunks):
+            # Get column indices for this chunk
+            start_col = chunk_idx * self.column_chunk_size
+            end_col = min(start_col + self.column_chunk_size, self.num_columns)
+            chunk_size = end_col - start_col
 
-        # Reshape for LSTM: [batch * num_columns, context_days, CNN_FILTERS]
-        x = x.permute(0, 2, 1)
+            # Extract chunk: [batch, context_days, chunk_size, num_features]
+            x_chunk = x[:, :, start_col:end_col, :]
 
-        # LSTM across time (with gradient checkpointing during training)
-        if self.training and self.use_gradient_checkpointing:
-            lstm_out = checkpoint(self._lstm_block, x, use_reentrant=False)
-        else:
-            lstm_out = self._lstm_block(x)
+            # Reshape for CNN: [batch * chunk_size, num_features, context_days]
+            x_chunk = x_chunk.permute(0, 2, 3, 1)  # [batch, chunk_size, num_features, context_days]
+            x_chunk = x_chunk.reshape(batch_size * chunk_size, self.num_features, context_days)
 
-        # Take the AVERAGE of the last 3 time steps
-        x = torch.mean(lstm_out[:, -3:, :], dim=1)  # [batch * num_columns, lstm_output_size]
+            # CNN across features (with gradient checkpointing during training)
+            if self.training and self.use_gradient_checkpointing:
+                x_chunk = checkpoint(self._cnn_block, x_chunk, use_reentrant=False)
+            else:
+                x_chunk = self._cnn_block(x_chunk)
 
-        # Reshape back to separate columns
-        x = x.reshape(batch_size, self.num_columns, self.lstm_output_size)
+            # Reshape for LSTM: [batch * chunk_size, context_days, CNN_FILTERS]
+            x_chunk = x_chunk.permute(0, 2, 1)
 
-        return x
+            # LSTM across time (with gradient checkpointing during training)
+            if self.training and self.use_gradient_checkpointing:
+                lstm_out = checkpoint(self._lstm_block, x_chunk, use_reentrant=False)
+            else:
+                lstm_out = self._lstm_block(x_chunk)
+
+            # Take the AVERAGE of the last 3 time steps
+            x_chunk = torch.mean(lstm_out[:, -3:, :], dim=1)  # [batch * chunk_size, lstm_output_size]
+
+            # Reshape back to separate batch and columns: [batch, chunk_size, lstm_output_size]
+            x_chunk = x_chunk.reshape(batch_size, chunk_size, self.lstm_output_size)
+
+            # Store chunk output
+            chunk_outputs.append(x_chunk)
+
+        # Concatenate all chunks along column dimension: [batch, num_columns, lstm_output_size]
+        output = torch.cat(chunk_outputs, dim=1)
+
+        return output
 
 
 class AttentionModule(nn.Module):
