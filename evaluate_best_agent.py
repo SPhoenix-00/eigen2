@@ -5,11 +5,12 @@ This script:
 1. Loads the best agent from the last run (using last_run.json or specified run name)
 2. Evaluates on 3 validation slices (as done in training)
 3. Evaluates on first 125 days of holdout period
-4. Outputs detailed trade information including:
+4. Evaluates on last 125 days of holdout period (most recent data)
+5. Outputs detailed trade information including:
    - Stock purchased, entry/exit dates, prices
    - Whether it was an active sell or automatic liquidation
-5. Exports results to text file and CSV
-6. Provides summary of fitness, number of trades, and win rate
+6. Exports results to text file and CSV
+7. Provides summary of fitness, number of trades, and win rate
 """
 
 import json
@@ -167,6 +168,32 @@ class AgentEvaluator:
 
         return (start_idx, end_idx, trading_end_idx)
 
+    def get_holdout_end_slice(self) -> Tuple[int, int, int]:
+        """
+        Get the last possible full episode at the very end of the holdout dataset.
+        This tests the agent on the most recent data available.
+
+        Returns:
+            Tuple: (start_idx, end_idx, trading_end_idx)
+        """
+        # End at the last day of data
+        end_idx = self.holdout_end
+
+        # Need 20 days for settlement
+        trading_end_idx = end_idx - Config.SETTLEMENT_PERIOD_DAYS
+
+        # Need 125 days for trading period
+        start_idx = trading_end_idx - Config.TRADING_PERIOD_DAYS
+
+        # Verify we have enough history for context window
+        if start_idx < Config.CONTEXT_WINDOW_DAYS:
+            raise ValueError(
+                f"Not enough data for end slice. Need start_idx >= {Config.CONTEXT_WINDOW_DAYS}, "
+                f"but calculated {start_idx}"
+            )
+
+        return (start_idx, end_idx, trading_end_idx)
+
     def run_episode(self, start_idx: int, end_idx: int, trading_end_idx: int,
                    slice_name: str) -> Tuple[float, Dict, List[Dict]]:
         """
@@ -310,6 +337,32 @@ class AgentEvaluator:
 
         start, end, trading_end = self.get_holdout_slice()
         slice_name = "Holdout"
+        print(f"\n{slice_name}:")
+        print(f"  Period: {self.dates[start]} to {self.dates[end-1]}")
+        print(f"  Trading days: {trading_end - start}, Settlement days: {end - trading_end}")
+
+        fitness, summary, trades = self.run_episode(start, end, trading_end, slice_name)
+
+        # Store results
+        self.all_trades.extend(trades)
+        self.slice_summaries.append({
+            'slice_name': slice_name,
+            'start_date': self.dates[start],
+            'end_date': self.dates[end-1],
+            'fitness': fitness,
+            **summary
+        })
+
+        print(f"  Fitness: {fitness:.2f}")
+        print(f"  Trades: {summary['num_trades']}, Win Rate: {summary['win_rate']*100:.1f}%")
+
+        # Evaluate on holdout end (most recent data)
+        print(f"\n{'='*80}")
+        print("Evaluating on Holdout Period (Last 125 Days - Most Recent Data)...")
+        print("-" * 80)
+
+        start, end, trading_end = self.get_holdout_end_slice()
+        slice_name = "Holdout_End"
         print(f"\n{slice_name}:")
         print(f"  Period: {self.dates[start]} to {self.dates[end-1]}")
         print(f"  Trading days: {trading_end - start}, Settlement days: {end - trading_end}")
