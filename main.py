@@ -3,6 +3,10 @@ Project Eigen 2 - Main Entry Point
 Evolutionary Reinforcement Learning for Stock Trading
 """
 
+import os
+# Fix PyTorch memory fragmentation (must be set before importing torch)
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import argparse
 import torch
 import numpy as np

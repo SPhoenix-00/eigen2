@@ -15,6 +15,11 @@ import json
 import wandb
 import gc
 import matplotlib.pyplot as plt
+import warnings
+
+# Suppress common library warnings for cleaner output
+warnings.filterwarnings('ignore', category=UserWarning, module='gymnasium')
+warnings.filterwarnings('ignore', category=FutureWarning, module='torch.cuda.amp')
 
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
@@ -182,20 +187,18 @@ class ERLTrainer:
             self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"Checkpoints will be saved to: {self.checkpoint_dir}")
-        print(f"W&B run name: {wandb.run.name}")
-        print(f"W&B run ID: {wandb.run.id}")
+        print(f"Checkpoints: {self.checkpoint_dir}")
+        print(f"W&B run: {wandb.run.name} (ID: {wandb.run.id})")
 
         # Set unique random seed based on wandb run id
-        # This ensures parallel runs don't have identical behavior
-        run_id_hash = hash(wandb.run.id) % (2**32)  # Convert to 32-bit integer
+        run_id_hash = hash(wandb.run.id) % (2**32)
         self.seed = run_id_hash
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
         np.random.seed(self.seed)
         import random
         random.seed(self.seed)
-        print(f"Random seed set to: {self.seed} (based on run id: {wandb.run.id})")
+        print(f"Random seed: {self.seed}")
 
         self.start_generation = 0
         self.generation = 0
@@ -236,25 +239,22 @@ class ERLTrainer:
         self.column_names = data_loader.column_names if hasattr(data_loader, 'column_names') and data_loader.column_names else \
                            [f"col_{i}" for i in range(669)]
 
-        print(f"Training range: days {self.train_start_idx} to {self.train_end_idx}")
-        print(f"Interim validation range: days {self.interim_val_start_idx} to {self.interim_val_end_idx}")
-        print(f"Walk-forward validation: 3 random slices per generation from interim validation set")
-        print(f"Holdout set: last {Config.HOLDOUT_DAYS} days (completely secret, for final highlander round)")
+        print(f"Training: days {self.train_start_idx}-{self.train_end_idx}, "
+              f"Validation: days {self.interim_val_start_idx}-{self.interim_val_end_idx}, "
+              f"Holdout: {Config.HOLDOUT_DAYS} days")
+        print(f"Walk-forward: 3 random validation slices/generation")
 
-        # CRITICAL FIX: Create persistent environments to reuse instead of creating new ones each episode
-        # This prevents massive memory leak from creating POPULATION_SIZE+ environments per generation
-        print("Initializing persistent training/evaluation environment...")
+        # Create persistent environment (reused across episodes to prevent memory leaks)
+        print("Initializing environment...")
         self.eval_env = TradingEnvironment(
-            data_array=self.data_loader.data_array,  # Reduced 5 features for observations
+            data_array=self.data_loader.data_array,
             dates=self.data_loader.dates,
             normalization_stats=self.normalization_stats,
-            # Use placeholder indices, reset() will update them per episode
             start_idx=self.train_start_idx,
             end_idx=self.train_end_idx,
             trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
-            data_array_full=self.data_loader.data_array_full  # Full 9 features for reward calculation
+            data_array_full=self.data_loader.data_array_full
         )
-        print("Note: Same environment used for training episodes and validation slices (reset per episode)")
 
         # Automatically load checkpoint if resuming
         if self.resume_run_name:
@@ -348,16 +348,9 @@ class ERLTrainer:
         # This includes ALL penalties (inaction, losses, etc.)
         final_fitness = float(cumulative_reward)
         
-        # Apply zero-trades penalty if no trades were made
+        # Apply zero-trades penalty if no trades were made (silent - penalty speaks for itself)
         if episode_summary['num_trades'] == 0:
             final_fitness -= Config.ZERO_TRADES_PENALTY
-            print(f"WARNING: Agent made 0 trades. Applying penalty of -{Config.ZERO_TRADES_PENALTY}. Final fitness: {final_fitness}")
-        
-        # Validation: inactive agents should have catastrophic negative fitness
-        if episode_summary['num_trades'] == 0:
-            expected_catastrophic = -10000
-            if final_fitness > expected_catastrophic:
-                print(f"WARNING: Inactive agent has fitness {final_fitness}, should be < {expected_catastrophic}")
 
         # NOTE: No need to delete env - we're reusing persistent environments now
         return final_fitness, episode_summary
@@ -452,12 +445,6 @@ class ERLTrainer:
             # Robust scoring: average of lowest 2 scores out of 5
             sorted_fitness = sorted(slice_fitness_scores)
             lowest_2_avg = np.mean(sorted_fitness[:2])
-
-            # Log slice breakdown for first 3 agents (transparency)
-            if agent_idx < 3:
-                print(f"\n  Agent {agent_idx} slice fitnesses: {[f'{f:.1f}' for f in slice_fitness_scores]}")
-                print(f"  Sorted: {[f'{f:.1f}' for f in sorted_fitness]}")
-                print(f"  Final score (avg of lowest 2): {lowest_2_avg:.2f}")
 
             fitness_scores.append(lowest_2_avg)
 
@@ -580,8 +567,7 @@ class ERLTrainer:
         Args:
             fitness_scores: Fitness for each agent
         """
-        print(f"\n--- Evolving Population ---")
-        print(f"Using adaptive mutation: rate={self.current_mutation_rate:.3f}, std={self.current_mutation_std:.4f}")
+        print(f"\n--- Evolving Population (mutation: {self.current_mutation_rate:.3f}) ---")
 
         # CRITICAL FIX: Store old population reference before creating new one
         # This prevents memory leak from lingering agent references (~2-3GB per generation)
@@ -606,23 +592,17 @@ class ERLTrainer:
                 champion_clone = self.best_agent.clone()
                 champion_clone.agent_id = num_elites - 1  # Give it the elite slot ID
 
-                # Delete the agent being replaced to prevent memory leak
                 del self.population[num_elites - 1]
                 self.population[num_elites - 1] = champion_clone
+                print(f"✓ Champion injected (val fitness: {self.best_validation_fitness:.2f})")
 
-                print(f"✓ Champion injected into population (validation fitness: {self.best_validation_fitness:.2f})")
-
-        # CRITICAL FIX: Explicitly delete old agents and force GC
-        # Each agent is ~720MB (4 networks × 45M params × 4 bytes)
-        # Without explicit deletion, circular refs can delay GC for multiple generations
+        # Explicitly delete old agents and force GC
         for agent in old_population:
             del agent
         del old_population
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        print(f"✓ Evolved to Generation {self.generation + 1}")
     
     def validate_agent(self, agent) -> Dict:
         """
@@ -695,14 +675,7 @@ class ERLTrainer:
         if self.best_agent is None:
             return {}
 
-        print(f"\n--- Validating Best Agent ---")
-
         val_results = self.validate_agent(self.best_agent)
-
-        print(f"Validation fitness: {val_results['fitness']:.2f}")
-        print(f"Validation win rate: {val_results['win_rate']:.1%}")
-        print(f"Validation trades: {val_results['num_trades']}")
-
         return val_results
 
     def check_and_adjust_mutation(self, current_val_fitness: float):
@@ -804,17 +777,10 @@ class ERLTrainer:
 
     def save_checkpoint(self):
         """Saves the entire training state to a checkpoint directory."""
-        # Use run-specific checkpoint directory
         checkpoint_dir = self.checkpoint_dir
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n--- Saving checkpoint for Generation {self.generation + 1} ---")
-
-        # Check if any buffer saves are still in progress
-        # We want to know status but don't need to wait (they'll finish in background)
-        pending, completed, failed = self.cloud_sync.get_upload_status()
-        if pending > 0:
-            print(f"  Note: {pending} background uploads still in progress (will continue)")
+        print(f"\n--- Saving Checkpoint (Gen {self.generation + 1}) ---")
 
         # 1. Save best agent
         if self.best_agent is not None:
@@ -854,23 +820,19 @@ class ERLTrainer:
         with open(state_path, 'w') as f:
             json.dump(trainer_state, f, indent=4)
 
-        print(f"✓ Checkpoint saved to {checkpoint_dir}")
-
         # Sync to cloud storage in background (non-blocking)
-        # Exclude replay buffer files - they're handled separately by save_and_upload_buffer()
         self.cloud_sync.sync_checkpoints(str(checkpoint_dir), background=True,
                                         exclude_patterns=["replay_buffer"])
-        print(f"{'='*60}\n")
+        print(f"✓ Saved & syncing to cloud")
 
     def load_checkpoint(self):
         """Loads the entire training state from the checkpoint directory."""
-        # Use run-specific checkpoint directory
         checkpoint_dir = self.checkpoint_dir
-        print(f"\n--- Loading checkpoint from {checkpoint_dir} ---")
+        print(f"\n--- Loading Checkpoint ---")
 
         # Try to download from cloud first
         if not checkpoint_dir.exists() or len(list(checkpoint_dir.glob('*'))) == 0:
-            print("! No local checkpoint found. Attempting to download from cloud...")
+            print("Downloading from cloud...")
             self.cloud_sync.download_checkpoints(str(checkpoint_dir))
 
         # 1. Check if directory exists
@@ -886,40 +848,27 @@ class ERLTrainer:
                     agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
                     if agent_path.exists():
                         agent.load(str(agent_path))
-                    else:
-                        print(f"! Warning: Missing agent file: {agent_path}")
-                print(f"✓ Loaded {len(self.population)} agents from population.")
+                print(f"✓ Loaded {len(self.population)} agents")
             except Exception as e:
-                print(f"❌ Error loading agent population: {e}. Starting with new agents.")
-        else:
-            print("! Population directory not found. Starting with new agents.")
+                print(f"❌ Error loading agents: {e}")
 
         # 3. Load Best Agent
         best_agent_path = checkpoint_dir / "best_agent.pth"
         if best_agent_path.exists():
             try:
-                # Re-initialize best_agent before loading
-                self.best_agent = DDPGAgent(agent_id='best') 
+                self.best_agent = DDPGAgent(agent_id='best')
                 self.best_agent.load(str(best_agent_path))
-                print("✓ Loaded best agent.")
+                print("✓ Loaded best agent")
             except Exception as e:
-                print(f"❌ Error loading best agent: {e}.")
-        
-        # 4. Load Replay Buffer (saved every 5 generations)
-        # NOTE: Buffer saves are disabled to prevent RAM exhaustion.
-        # On resume, we start with an empty buffer to avoid training on stale experiences.
+                print(f"❌ Error loading best agent: {e}")
+
+        # 4. Replay buffer: always start fresh to avoid stale experiences
         buffer_path = checkpoint_dir / "replay_buffer.pkl"
         if buffer_path.exists():
-            print(f"! Found old replay buffer at {buffer_path}")
-            print("  (Skipping load - buffer saves disabled, starting fresh to avoid stale data)")
-            # Delete the old buffer file to save disk space
             try:
-                buffer_path.unlink()
-                print("  ✓ Deleted old buffer file")
+                buffer_path.unlink()  # Delete old buffer
             except Exception as e:
-                print(f"  Warning: Could not delete old buffer: {e}")
-
-        print("✓ Starting with empty replay buffer (will fill from current agents)")
+                pass
         
         # 5. Load Trainer State
         state_path = checkpoint_dir / "trainer_state.json"
@@ -939,33 +888,20 @@ class ERLTrainer:
                 self.current_mutation_std = trainer_state.get('current_mutation_std', Config.MUTATION_STD)
                 self.plateau_detected = trainer_state.get('plateau_detected', False)
 
-                print(f"✓ Completed Generation {self.start_generation} (saved), resuming at Generation {self.start_generation + 1}")
-                print(f"✓ Loaded best training fitness: {self.best_fitness:.2f}")
-                print(f"✓ Loaded best validation fitness: {self.best_validation_fitness:.2f}")
-                print(f"✓ Loaded adaptive mutation state:")
-                print(f"  - Mutation rate: {self.current_mutation_rate:.3f}")
-                print(f"  - Mutation std: {self.current_mutation_std:.4f}")
-                print(f"  - Plateau detected: {self.plateau_detected}")
-                print(f"  - Validation history length: {len(self.validation_fitness_history)}")
+                print(f"✓ Resuming from Gen {self.start_generation} → Gen {self.start_generation + 1}")
+                print(f"✓ Best validation fitness: {self.best_validation_fitness:.2f}")
             except Exception as e:
-                print(f"❌ Error loading trainer state: {e}. Starting from scratch.")
-        else:
-            print("! Trainer state file not found. Starting from generation 0.")
+                print(f"❌ Error loading state: {e}")
 
-        # CHAMPION INJECTION ON RESUME: Inject the loaded best agent into the population
-        # This ensures the validation champion is in the active population when resuming
+        # CHAMPION INJECTION ON RESUME
         if self.best_agent is not None and len(self.population) > 0:
             num_elites = int(len(self.population) * Config.ELITE_FRAC)
             if num_elites > 0:
-                # Clone the champion and inject it, replacing the last elite position
                 champion_clone = self.best_agent.clone()
                 champion_clone.agent_id = num_elites - 1
-
-                # Delete the agent being replaced to prevent memory leak
                 del self.population[num_elites - 1]
                 self.population[num_elites - 1] = champion_clone
-
-                print(f"✓ Champion injected into resumed population (validation fitness: {self.best_validation_fitness:.2f})")
+                print(f"✓ Champion injected into population")
 
     def update_feature_importance(self, attention_weights: torch.Tensor):
         """
@@ -1122,27 +1058,21 @@ class ERLTrainer:
             if max_fitness > self.best_fitness:
                 self.best_fitness = max_fitness
 
-            # Select best agent based on VALIDATION fitness (not training fitness)
-            # Validate ALL agents in the population - training fitness is unreliable due to random windows
-            print(f"\n--- Generating Walk-Forward Validation Slices for Generation {gen + 1} ---")
+            # Generate validation slices for this generation
+            print(f"\n--- Walk-Forward Validation (Generation {gen + 1}) ---")
             self.current_generation_val_slices = self.generate_validation_slices()
-            print(f"Generated 3 validation slices (same for all agents this generation):")
-            for i, (start, end, _) in enumerate(self.current_generation_val_slices):
-                start_date = self.data_loader.dates[start] if start < len(self.data_loader.dates) else "N/A"
-                end_date = self.data_loader.dates[end-1] if end-1 < len(self.data_loader.dates) else "N/A"
-                print(f"  Slice {i+1}: days {start}-{end} ({start_date} to {end_date})")
-
-            print(f"\n--- Validating All {len(self.population)} Agents for Best Agent Selection ---")
+            start, end, _ = self.current_generation_val_slices[0]
+            start_date = self.data_loader.dates[start] if start < len(self.data_loader.dates) else "N/A"
+            end_date = self.data_loader.dates[end-1] if end-1 < len(self.data_loader.dates) else "N/A"
+            print(f"Generated 3 validation slices (e.g., days {start}-{end}: {start_date} to {end_date})")
 
             best_val_fitness_this_gen = float('-inf')
             best_val_agent_idx = None
             validation_results = []
 
-            for idx in range(len(self.population)):
-                print(f"\nValidating agent {idx} (training fitness: {fitness_scores[idx]:.2f})...")
+            for idx in tqdm(range(len(self.population)), desc="Validating agents"):
                 val_results = self.validate_agent(self.population[idx])
                 val_fitness = val_results['fitness']
-                slice_fitnesses = val_results['fitness_all_slices']
 
                 validation_results.append({
                     'idx': idx,
@@ -1151,11 +1081,6 @@ class ERLTrainer:
                     'win_rate': val_results['win_rate'],
                     'num_trades': val_results['num_trades']
                 })
-
-                print(f"  Slice fitnesses: {slice_fitnesses[0]:.2f}, {slice_fitnesses[1]:.2f}, {slice_fitnesses[2]:.2f}")
-                print(f"  Validation fitness (avg of lowest 2): {val_fitness:.2f}")
-                print(f"  Win rate: {val_results['win_rate']:.1%}")
-                print(f"  Trades: {val_results['num_trades']}")
 
                 # Track best validation fitness in this generation
                 if val_fitness > best_val_fitness_this_gen:
@@ -1171,18 +1096,14 @@ class ERLTrainer:
 
             # Update best agent if we found a better one based on validation
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
-                print(f"\n✓ New best agent found! Validation fitness: {best_val_fitness_this_gen:.2f} (previous: {self.best_validation_fitness:.2f})")
-
-                # CRITICAL FIX: Delete old best_agent before replacing with new one
-                # Prevents accumulation of old agent copies (~720MB each)
+                print(f"\n✓ New best! Val fitness: {best_val_fitness_this_gen:.2f} (prev: {self.best_validation_fitness:.2f})")
                 if self.best_agent is not None:
                     del self.best_agent
                     gc.collect()
-
                 self.best_validation_fitness = best_val_fitness_this_gen
                 self.best_agent = self.population[best_val_agent_idx].clone()
             else:
-                print(f"\n→ No improvement in validation fitness. Best remains: {self.best_validation_fitness:.2f}")
+                print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
             
             # Print comprehensive summary
             print_generation_summary(
@@ -1237,29 +1158,6 @@ class ERLTrainer:
                 "feature_importance/persistent_below_0.1pct_count": low_importance_analysis['<0.1%']['count'],
                 "feature_importance/persistent_below_0.01pct_count": low_importance_analysis['<0.01%']['count'],
             }, step=gen)
-
-            # Print persistent low-importance columns
-            print(f"\n--- Feature Importance Analysis (Generation {gen + 1}) ---")
-            print(f"Current generation:")
-            print(f"  Features < 1%: {low_importance_analysis['current_below_1pct']}")
-            print(f"  Features < 0.1%: {low_importance_analysis['current_below_0.1pct']}")
-            print(f"  Features < 0.01%: {low_importance_analysis['current_below_0.01pct']}")
-
-            for threshold_name in ['<1%', '<0.1%', '<0.01%']:
-                threshold_data = low_importance_analysis[threshold_name]
-                print(f"\nPersistently {threshold_name}:")
-                if 'note' in threshold_data:
-                    print(f"  {threshold_data['note']}")
-                else:
-                    print(f"  Count: {threshold_data['count']}")
-                    if threshold_data['count'] > 0 and threshold_data['count'] <= 10:
-                        print(f"  Columns:")
-                        for col in threshold_data['columns']:
-                            print(f"    [{col['index']:3d}] {col['name']}: {col['current_importance']:.6f}")
-                    elif threshold_data['count'] > 10:
-                        print(f"  (Too many to display, showing first 10)")
-                        for col in threshold_data['columns'][:10]:
-                            print(f"    [{col['index']:3d}] {col['name']}: {col['current_importance']:.6f}")
 
             # Log full feature importance vector as histogram every 5 generations
             if (gen + 1) % 5 == 0:
@@ -1317,11 +1215,6 @@ class ERLTrainer:
             # 5. Save checkpoint periodically
             if (gen + 1) % Config.SAVE_FREQUENCY == 0:
                 self.save_checkpoint()
-
-                # Show upload status
-                pending, completed, failed = self.cloud_sync.get_upload_status()
-                if pending > 0 or completed > 0 or failed > 0:
-                    print(f"\n📊 Upload status: {pending} pending, {completed} completed, {failed} failed")
             
             # Generation time
             gen_time = time.time() - gen_start_time

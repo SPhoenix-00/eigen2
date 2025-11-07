@@ -17,6 +17,7 @@ class FeatureExtractor(nn.Module):
     """
     Extracts features from multi-column time-series data.
     Uses 1D CNN across features, then LSTM across time.
+    Gradient checkpointing enabled to reduce memory usage.
     """
 
     def __init__(self, num_columns: int = 669, num_features: int = Config.FEATURES_PER_CELL):
@@ -28,11 +29,11 @@ class FeatureExtractor(nn.Module):
         # 1D CNN to extract features from the selected feature elements per cell
         # Input: [batch, num_columns, context_days, num_features]
         # Process each column's time series independently
-        self.conv1 = nn.Conv1d(num_features, Config.CNN_FILTERS, 
-                               kernel_size=Config.CNN_KERNEL_SIZE, 
+        self.conv1 = nn.Conv1d(num_features, Config.CNN_FILTERS,
+                               kernel_size=Config.CNN_KERNEL_SIZE,
                                padding=Config.CNN_KERNEL_SIZE // 2)
         self.bn1 = nn.BatchNorm1d(Config.CNN_FILTERS)
-        
+
         # LSTM to capture temporal dependencies
         # Input: [batch, num_columns, context_days, CNN_FILTERS]
         self.lstm_input_size = Config.CNN_FILTERS
@@ -44,13 +45,29 @@ class FeatureExtractor(nn.Module):
             bidirectional=Config.LSTM_BIDIRECTIONAL,
             dropout=0.1 if Config.LSTM_LAYERS > 1 else 0.0
         )
-        
+
         # Output size after LSTM
         self.lstm_output_size = Config.LSTM_HIDDEN * (2 if Config.LSTM_BIDIRECTIONAL else 1)
+
+        # Enable gradient checkpointing
+        self.use_gradient_checkpointing = True
         
+    def _cnn_block(self, x: torch.Tensor) -> torch.Tensor:
+        """CNN processing block for gradient checkpointing."""
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        return x
+
+    def _lstm_block(self, x: torch.Tensor) -> torch.Tensor:
+        """LSTM processing block for gradient checkpointing."""
+        x = torch.nan_to_num(x, nan=0.0)
+        lstm_out, _ = self.lstm(x)
+        return lstm_out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through feature extractor.
+        Forward pass through feature extractor with gradient checkpointing.
 
         Args:
             x: Input tensor [batch, context_days, num_columns, num_features]
@@ -65,27 +82,28 @@ class FeatureExtractor(nn.Module):
         # [batch, context_days, num_columns, num_features] -> [batch * num_columns, num_features, context_days]
         x = x.permute(0, 2, 3, 1)  # [batch, num_columns, num_features, context_days]
         x = x.reshape(batch_size * self.num_columns, self.num_features, context_days)
-        
-        # CNN across features
-        x = self.conv1(x)  # [batch * num_columns, CNN_FILTERS, context_days]
-        x = self.bn1(x)
-        x = F.relu(x)
-        
+
+        # CNN across features (with gradient checkpointing during training)
+        if self.training and self.use_gradient_checkpointing:
+            x = checkpoint(self._cnn_block, x, use_reentrant=False)
+        else:
+            x = self._cnn_block(x)
+
         # Reshape for LSTM: [batch * num_columns, context_days, CNN_FILTERS]
         x = x.permute(0, 2, 1)
-        
-        # LSTM across time
-        # Handle NaN values by replacing with zeros (LSTM will learn to ignore)
-        x = torch.nan_to_num(x, nan=0.0)
-        
-        lstm_out, _ = self.lstm(x)  # [batch * num_columns, context_days, lstm_output_size]
-        
+
+        # LSTM across time (with gradient checkpointing during training)
+        if self.training and self.use_gradient_checkpointing:
+            lstm_out = checkpoint(self._lstm_block, x, use_reentrant=False)
+        else:
+            lstm_out = self._lstm_block(x)
+
         # Take the AVERAGE of the last 3 time steps
         x = torch.mean(lstm_out[:, -3:, :], dim=1)  # [batch * num_columns, lstm_output_size]
-        
+
         # Reshape back to separate columns
         x = x.reshape(batch_size, self.num_columns, self.lstm_output_size)
-        
+
         return x
 
 
@@ -202,6 +220,7 @@ class Actor(nn.Module):
     """
     Actor network: outputs actions [coefficient, sale_target] for each stock.
     Uses cross-attention to determine feature importance across all 669 columns.
+    Gradient checkpointing enabled to reduce memory usage.
     """
 
     def __init__(self):
@@ -223,14 +242,14 @@ class Actor(nn.Module):
 
         # Store last attention weights for logging
         self.last_attention_weights = None
-        
+
         # Separate processing for investable stocks vs context features
         # Investable stocks (columns 10-117 = 108 stocks)
         investable_input_dim = self.feature_extractor.lstm_output_size
-        
+
         # Context features (remaining columns pooled)
         context_input_dim = self.feature_extractor.lstm_output_size
-        
+
         # Process investable stocks individually
         self.investable_fc = nn.Sequential(
             nn.Linear(investable_input_dim, Config.ACTOR_HIDDEN_DIMS[0]),
@@ -239,16 +258,16 @@ class Actor(nn.Module):
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[0], Config.ACTOR_HIDDEN_DIMS[1]),
             nn.ReLU(),
         )
-        
+
         # Process context features
         self.context_fc = nn.Sequential(
             nn.Linear(context_input_dim, Config.ACTOR_HIDDEN_DIMS[1]),
             nn.ReLU(),
         )
-        
+
         # Combined processing for each stock
         combined_dim = Config.ACTOR_HIDDEN_DIMS[1] * 2  # Investable + context
-        
+
         # Output heads for each stock
         self.coefficient_head = nn.Sequential(
             nn.Linear(combined_dim, Config.ACTOR_HIDDEN_DIMS[2]),
@@ -264,10 +283,29 @@ class Actor(nn.Module):
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[2], 1),
             nn.Sigmoid()  # Output in [0, 1], will scale to [MIN, MAX] sale target
         )
+
+        # Enable gradient checkpointing
+        self.use_gradient_checkpointing = True
         
+    def _process_investable(self, investable_features: torch.Tensor) -> torch.Tensor:
+        """Process investable stocks (for gradient checkpointing)."""
+        return self.investable_fc(investable_features)
+
+    def _process_context(self, global_context: torch.Tensor) -> torch.Tensor:
+        """Process context features (for gradient checkpointing)."""
+        return self.context_fc(global_context)
+
+    def _process_coefficient_head(self, combined: torch.Tensor) -> torch.Tensor:
+        """Process coefficient head (for gradient checkpointing)."""
+        return self.coefficient_head(combined)
+
+    def _process_sale_target_head(self, combined: torch.Tensor) -> torch.Tensor:
+        """Process sale target head (for gradient checkpointing)."""
+        return self.sale_target_head(combined)
+
     def forward(self, state: torch.Tensor, return_attention_weights: bool = False) -> torch.Tensor:
         """
-        Forward pass.
+        Forward pass with gradient checkpointing.
 
         Args:
             state: [batch, context_days, num_columns, 9]
@@ -294,21 +332,31 @@ class Actor(nn.Module):
             # Store attention weights for logging
             self.last_attention_weights = attention_weights.detach()
 
-            # Process global context through context FC
+            # Process global context through context FC (with checkpointing)
             global_context = global_context.squeeze(1)  # [batch, lstm_output_size]
-            context_processed = self.context_fc(global_context)  # [batch, ACTOR_HIDDEN_DIMS[1]]
+            if self.training and self.use_gradient_checkpointing:
+                context_processed = checkpoint(self._process_context, global_context, use_reentrant=False)
+            else:
+                context_processed = self._process_context(global_context)
             context_processed = context_processed.unsqueeze(1)  # [batch, 1, ACTOR_HIDDEN_DIMS[1]]
         else:
             # Fallback: pool all features if no attention
             context_features = torch.mean(features, dim=1)  # [batch, lstm_output_size]
-            context_processed = self.context_fc(context_features).unsqueeze(1)  # [batch, 1, ACTOR_HIDDEN_DIMS[1]]
+            if self.training and self.use_gradient_checkpointing:
+                context_processed = checkpoint(self._process_context, context_features, use_reentrant=False)
+            else:
+                context_processed = self._process_context(context_features)
+            context_processed = context_processed.unsqueeze(1)  # [batch, 1, ACTOR_HIDDEN_DIMS[1]]
 
         # Extract investable stock features (still use raw features for stock-specific processing)
         investable_features = features[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1, :]
         # [batch, 108, lstm_output_size]
 
-        # Process investable stocks
-        investable_processed = self.investable_fc(investable_features)
+        # Process investable stocks (with checkpointing)
+        if self.training and self.use_gradient_checkpointing:
+            investable_processed = checkpoint(self._process_investable, investable_features, use_reentrant=False)
+        else:
+            investable_processed = self._process_investable(investable_features)
         # [batch, 108, ACTOR_HIDDEN_DIMS[1]]
 
         # Expand context to all stocks
@@ -319,12 +367,13 @@ class Actor(nn.Module):
         combined = torch.cat([investable_processed, context_expanded], dim=-1)
         # [batch, 108, combined_dim]
 
-        # Output heads
-        raw_coefficients = self.coefficient_head(combined).squeeze(-1)
-        # [batch, 108]
-
-        raw_sale_targets = self.sale_target_head(combined).squeeze(-1)
-        # [batch, 108]
+        # Output heads (with checkpointing)
+        if self.training and self.use_gradient_checkpointing:
+            raw_coefficients = checkpoint(self._process_coefficient_head, combined, use_reentrant=False).squeeze(-1)
+            raw_sale_targets = checkpoint(self._process_sale_target_head, combined, use_reentrant=False).squeeze(-1)
+        else:
+            raw_coefficients = self._process_coefficient_head(combined).squeeze(-1)
+            raw_sale_targets = self._process_sale_target_head(combined).squeeze(-1)
 
         # Apply activations
         # Coefficient: >= 1 or 0 (using threshold)
@@ -378,14 +427,15 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     """
     Critic network: estimates Q-value for state-action pair.
+    Gradient checkpointing enabled to reduce memory usage.
     """
-    
+
     def __init__(self):
         super().__init__()
-        
+
         # Feature extraction (shared with actor)
         self.feature_extractor = FeatureExtractor()
-        
+
         # Optional attention
         if Config.USE_ATTENTION:
             self.attention = AttentionModule(
@@ -394,14 +444,14 @@ class Critic(nn.Module):
             )
         else:
             self.attention = None
-        
+
         # Action encoding
         # Actions are [108, 2], flatten to 216
         action_dim = Config.NUM_INVESTABLE_STOCKS * Config.ACTION_DIM
-        
+
         # State features: pool all columns
         state_dim = self.feature_extractor.lstm_output_size
-        
+
         # Critic network
         self.critic_fc = nn.Sequential(
             nn.Linear(state_dim + action_dim, Config.CRITIC_HIDDEN_DIMS[0]),
@@ -412,37 +462,47 @@ class Critic(nn.Module):
             nn.Dropout(0.2),  # Added to combat overfitting
             nn.Linear(Config.CRITIC_HIDDEN_DIMS[1], 1)
         )
+
+        # Enable gradient checkpointing
+        self.use_gradient_checkpointing = True
         
+    def _process_critic_fc(self, x: torch.Tensor) -> torch.Tensor:
+        """Process critic FC layers (for gradient checkpointing)."""
+        return self.critic_fc(x)
+
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass.
-        
+        Forward pass with gradient checkpointing.
+
         Args:
             state: [batch, context_days, num_columns, 9]
             action: [batch, 108, 2]
-            
+
         Returns:
             Q-values: [batch, 1]
         """
         # Extract features
         features = self.feature_extractor(state)
-        
+
         # Apply attention if enabled
         if self.attention is not None:
             features = self.attention(features)
-        
+
         # Pool features across all columns
         state_features = torch.mean(features, dim=1)  # [batch, lstm_output_size]
-        
+
         # Flatten action
         action_flat = action.reshape(action.shape[0], -1)  # [batch, 216]
-        
+
         # Concatenate state and action
         x = torch.cat([state_features, action_flat], dim=-1)
-        
-        # Critic network
-        q_value = self.critic_fc(x)  # [batch, 1]
-        
+
+        # Critic network (with checkpointing)
+        if self.training and self.use_gradient_checkpointing:
+            q_value = checkpoint(self._process_critic_fc, x, use_reentrant=False)
+        else:
+            q_value = self._process_critic_fc(x)
+
         return q_value
 
 
