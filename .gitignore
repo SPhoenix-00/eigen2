@@ -21,6 +21,7 @@ last_run.json
 *~
 .DS_Store
 *.pkl
+wandb/
 
 # Environment and secrets
 .env
