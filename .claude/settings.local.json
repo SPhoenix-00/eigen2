@@ -9,7 +9,10 @@
       "Bash(python -m py_compile:*)",
       "Bash(python evaluate_best_agent.py:*)",
       "Bash(python test_attention.py:*)",
-      "Bash(python test_training.py:*)"
+      "Bash(python test_training.py:*)",
+      "Bash(python3:*)",
+      "Bash(/opt/homebrew/bin/python3:*)",
+      "Bash(./venv/bin/python:*)"
     ],
     "deny": [],
     "ask": []

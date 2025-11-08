@@ -20,7 +20,7 @@ class FeatureExtractor(nn.Module):
     Gradient checkpointing enabled to reduce memory usage.
     """
 
-    def __init__(self, num_columns: int = 669, num_features: int = Config.FEATURES_PER_CELL):
+    def __init__(self, num_columns: int = Config.TOTAL_COLUMNS, num_features: int = Config.FEATURES_PER_CELL):
         super().__init__()
 
         self.num_columns = num_columns
@@ -52,10 +52,6 @@ class FeatureExtractor(nn.Module):
         # Enable gradient checkpointing
         self.use_gradient_checkpointing = True
 
-        # Column chunking to prevent OOM with large batch_size * num_columns
-        # Process columns in chunks to keep LSTM batch size manageable
-        self.column_chunk_size = 64  # Process 64 columns at a time (8 batch * 64 = 512 LSTM sequences)
-        
     def _cnn_block(self, x: torch.Tensor) -> torch.Tensor:
         """CNN processing block for gradient checkpointing."""
         x = self.conv1(x)
@@ -71,10 +67,7 @@ class FeatureExtractor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through feature extractor with column chunking and gradient checkpointing.
-
-        Column chunking prevents OOM by processing columns in smaller batches instead of all 669 at once.
-        This keeps the effective LSTM batch size manageable (batch_size * chunk_size instead of batch_size * 669).
+        Forward pass through feature extractor with gradient checkpointing.
 
         Args:
             x: Input tensor [batch, context_days, num_columns, num_features]
@@ -84,51 +77,32 @@ class FeatureExtractor(nn.Module):
         """
         batch_size = x.shape[0]
         context_days = x.shape[1]
+        num_columns = x.shape[2]
 
-        # Process columns in chunks to prevent OOM
-        # Split 669 columns into chunks of 64 (last chunk will be smaller)
-        num_chunks = (self.num_columns + self.column_chunk_size - 1) // self.column_chunk_size
-        chunk_outputs = []
+        # Reshape for CNN: [batch * num_columns, num_features, context_days]
+        x = x.permute(0, 2, 3, 1)  # [batch, num_columns, num_features, context_days]
+        x = x.reshape(batch_size * num_columns, self.num_features, context_days)
 
-        for chunk_idx in range(num_chunks):
-            # Get column indices for this chunk
-            start_col = chunk_idx * self.column_chunk_size
-            end_col = min(start_col + self.column_chunk_size, self.num_columns)
-            chunk_size = end_col - start_col
+        # CNN across features (with gradient checkpointing during training)
+        if self.training and self.use_gradient_checkpointing:
+            x = checkpoint(self._cnn_block, x, use_reentrant=False)
+        else:
+            x = self._cnn_block(x)
 
-            # Extract chunk: [batch, context_days, chunk_size, num_features]
-            x_chunk = x[:, :, start_col:end_col, :]
+        # Reshape for LSTM: [batch * num_columns, context_days, CNN_FILTERS]
+        x = x.permute(0, 2, 1)
 
-            # Reshape for CNN: [batch * chunk_size, num_features, context_days]
-            x_chunk = x_chunk.permute(0, 2, 3, 1)  # [batch, chunk_size, num_features, context_days]
-            x_chunk = x_chunk.reshape(batch_size * chunk_size, self.num_features, context_days)
+        # LSTM across time (with gradient checkpointing during training)
+        if self.training and self.use_gradient_checkpointing:
+            lstm_out = checkpoint(self._lstm_block, x, use_reentrant=False)
+        else:
+            lstm_out = self._lstm_block(x)
 
-            # CNN across features (with gradient checkpointing during training)
-            if self.training and self.use_gradient_checkpointing:
-                x_chunk = checkpoint(self._cnn_block, x_chunk, use_reentrant=False)
-            else:
-                x_chunk = self._cnn_block(x_chunk)
+        # Take the AVERAGE of the last 3 time steps
+        x = torch.mean(lstm_out[:, -3:, :], dim=1)  # [batch * num_columns, lstm_output_size]
 
-            # Reshape for LSTM: [batch * chunk_size, context_days, CNN_FILTERS]
-            x_chunk = x_chunk.permute(0, 2, 1)
-
-            # LSTM across time (with gradient checkpointing during training)
-            if self.training and self.use_gradient_checkpointing:
-                lstm_out = checkpoint(self._lstm_block, x_chunk, use_reentrant=False)
-            else:
-                lstm_out = self._lstm_block(x_chunk)
-
-            # Take the AVERAGE of the last 3 time steps
-            x_chunk = torch.mean(lstm_out[:, -3:, :], dim=1)  # [batch * chunk_size, lstm_output_size]
-
-            # Reshape back to separate batch and columns: [batch, chunk_size, lstm_output_size]
-            x_chunk = x_chunk.reshape(batch_size, chunk_size, self.lstm_output_size)
-
-            # Store chunk output
-            chunk_outputs.append(x_chunk)
-
-        # Concatenate all chunks along column dimension: [batch, num_columns, lstm_output_size]
-        output = torch.cat(chunk_outputs, dim=1)
+        # Reshape back to separate batch and columns: [batch, num_columns, lstm_output_size]
+        output = x.reshape(batch_size, num_columns, self.lstm_output_size)
 
         return output
 
@@ -245,7 +219,7 @@ class AttentionModule(nn.Module):
 class Actor(nn.Module):
     """
     Actor network: outputs actions [coefficient, sale_target] for each stock.
-    Uses cross-attention to determine feature importance across all 669 columns.
+    Uses cross-attention to determine feature importance across all columns.
     Gradient checkpointing enabled to reduce memory usage.
     """
 
@@ -339,21 +313,21 @@ class Actor(nn.Module):
 
         Returns:
             actions: [batch, 108, 2] with [coefficient, sale_target] per stock
-            (optional) attention_weights: [batch, 669] if return_attention_weights=True
+            (optional) attention_weights: [batch, num_columns] if return_attention_weights=True
         """
         batch_size = state.shape[0]
 
         # Extract features from all columns
         features = self.feature_extractor(state)
-        # [batch, 669, lstm_output_size]
+        # [batch, num_columns, lstm_output_size]
 
         # Apply cross-attention if enabled
         attention_weights = None
         if self.attention is not None:
-            # Cross-attention: single query attends to all 669 features
+            # Cross-attention: single query attends to all features
             global_context, attention_weights = self.attention(features, return_attention_weights=True)
             # global_context: [batch, 1, lstm_output_size]
-            # attention_weights: [batch, 669]
+            # attention_weights: [batch, num_columns]
 
             # Store attention weights for logging
             self.last_attention_weights = attention_weights.detach()
@@ -420,23 +394,23 @@ class Actor(nn.Module):
     
     def _apply_coefficient_activation(self, raw: torch.Tensor) -> torch.Tensor:
         """
-        Apply activation to ensure coefficient >= 1 or ~0.
-        Uses smooth activation for better gradient flow during training.
+        Apply activation allowing smooth coefficient variation from 0 to higher values.
+        Uses Softplus for smooth gradients and better exploration.
+
+        During training: outputs continuous values for gradient flow
+        During inference: will be rounded to integers in select_action()
 
         Args:
             raw: Raw output from network
 
         Returns:
-            Activated coefficients
+            Activated coefficients (continuous, will be rounded to int during action selection)
         """
-        # Smooth activation for better training
-        # Use exponential to map wider range of raw values to [1, inf)
-        # Negative values -> ~0, Positive values -> >= 1
-        coefficients = torch.where(
-            raw > 0,
-            torch.exp(raw * 0.5) + 0.5,  # Scale down raw, then exp ensures >= 1 for positive
-            torch.sigmoid(raw * 2.0) * 0.1  # Nearly 0 for negative
-        )
+        # Softplus: smooth approximation of ReLU with better gradients
+        # Maps raw values to [0, inf) smoothly
+        # Beta=0.5 makes it less steep, allowing wider range of outputs
+        # This encourages the model to explore different coefficient values
+        coefficients = torch.nn.functional.softplus(raw, beta=0.5)
 
         return coefficients
 
@@ -445,7 +419,7 @@ class Actor(nn.Module):
         Get the last computed attention weights (feature importance).
 
         Returns:
-            Attention weights [batch, 669] or None if not available
+            Attention weights [batch, num_columns] or None if not available
         """
         return self.last_attention_weights
 
@@ -542,8 +516,8 @@ if __name__ == "__main__":
     
     # Create dummy input
     batch_size = 4
-    dummy_state = torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL).to(device)
-    
+    dummy_state = torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL).to(device)
+
     print(f"Input state shape: {dummy_state.shape}")
     
     # Test Actor

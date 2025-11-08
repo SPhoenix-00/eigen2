@@ -17,7 +17,7 @@ print(f"\nUsing device: {device}\n")
 
 # Create dummy input
 batch_size = 4
-dummy_state = torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL).to(device)
+dummy_state = torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL).to(device)
 
 print(f"Input state shape: {dummy_state.shape}")
 
@@ -97,7 +97,7 @@ print("\n7. Testing feature importance running average:")
 
 class MockTrainer:
     def __init__(self):
-        self.feature_importance = torch.zeros(669, device=device)
+        self.feature_importance = torch.zeros(Config.TOTAL_COLUMNS, device=device)
         self.feature_importance_momentum = 0.99
         self.feature_importance_count = 0
 
@@ -105,7 +105,7 @@ class MockTrainer:
         if attention_weights is None:
             return
 
-        # Average across batch dimension to get [669]
+        # Average across batch dimension to get [num_columns]
         batch_mean = attention_weights.mean(dim=0)
 
         # Update running average with momentum
@@ -127,7 +127,7 @@ num_updates = 10
 print(f"   Running {num_updates} updates...")
 for i in range(num_updates):
     with torch.no_grad():
-        dummy_state = torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL).to(device)
+        dummy_state = torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL).to(device)
         actions, attn_weights = actor(dummy_state, return_attention_weights=True)
         trainer.update_feature_importance(attn_weights)
 
@@ -144,7 +144,7 @@ dropout_detected = False
 
 for _ in range(num_trials):
     with torch.no_grad():
-        dummy_state = torch.randn(2, Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL).to(device)
+        dummy_state = torch.randn(2, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL).to(device)
         actions, attn_weights = actor(dummy_state, return_attention_weights=True)
 
         # Check if any weights are exactly zero (indicating dropout)

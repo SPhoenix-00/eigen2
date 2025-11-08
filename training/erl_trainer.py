@@ -48,7 +48,13 @@ class ERLTrainer:
         """
         self.data_loader = data_loader
         self.resume_run_name = resume_run_name
-        
+
+        # Load stock names for trade reporting
+        import pandas as pd
+        df = pd.read_pickle(Config.DATA_PATH)
+        all_columns = df.columns.tolist()
+        self.stock_names = all_columns[Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL + 1]
+
         # Compute normalization stats ONCE and cache them
         print("Computing and caching normalization statistics...")
         self.normalization_stats = data_loader.compute_normalization_stats()
@@ -227,7 +233,7 @@ class ERLTrainer:
         self.buffer_saved_on_first_fill = False
 
         # Feature importance tracking (cross-attention weights)
-        self.feature_importance = torch.zeros(669, device=Config.DEVICE)  # Running average [669]
+        self.feature_importance = torch.zeros(Config.TOTAL_COLUMNS, device=Config.DEVICE)  # Running average [num_columns]
         self.feature_importance_momentum = 0.99  # EMA momentum
         self.feature_importance_count = 0  # Track how many updates we've done
 
@@ -237,7 +243,7 @@ class ERLTrainer:
 
         # Column names for better logging
         self.column_names = data_loader.column_names if hasattr(data_loader, 'column_names') and data_loader.column_names else \
-                           [f"col_{i}" for i in range(669)]
+                           [f"col_{i}" for i in range(Config.TOTAL_COLUMNS)]
 
         print(f"Training: days {self.train_start_idx}-{self.train_end_idx}, "
               f"Validation: days {self.interim_val_start_idx}-{self.interim_val_end_idx}, "
@@ -628,6 +634,8 @@ class ERLTrainer:
 
         # Run agent on all 3 validation slices
         slice_results = []
+        all_closed_trades = []  # Collect all closed trades from all slices
+
         for start_idx, end_idx, _ in self.current_generation_val_slices:
             fitness, episode_info = self.run_episode(
                 agent=agent,
@@ -646,12 +654,19 @@ class ERLTrainer:
                 'avg_reward_per_trade': episode_info['avg_reward_per_trade']
             })
 
+            # Collect closed trades from this slice
+            if 'closed_trades' in episode_info and episode_info['closed_trades']:
+                all_closed_trades.extend(episode_info['closed_trades'])
+
         # Extract fitness scores from all 3 slices
         fitness_scores = [result['fitness'] for result in slice_results]
 
         # Sort and take lowest 2 scores (conservative estimate)
         sorted_fitness = sorted(fitness_scores)
         lowest_2_avg = np.mean(sorted_fitness[:2])
+
+        # Select one sample trade (first trade from all validation slices, if any)
+        sample_trade = all_closed_trades[0] if all_closed_trades else None
 
         # Return aggregated results (average of lowest 2 fitness scores)
         # Also aggregate other metrics for logging
@@ -662,8 +677,32 @@ class ERLTrainer:
             'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),
             'num_wins': int(np.mean([r['num_wins'] for r in slice_results])),
             'num_losses': int(np.mean([r['num_losses'] for r in slice_results])),
-            'avg_reward_per_trade': np.mean([r['avg_reward_per_trade'] for r in slice_results])
+            'avg_reward_per_trade': np.mean([r['avg_reward_per_trade'] for r in slice_results]),
+            'sample_trade': sample_trade  # One sample trade for verification
         }
+
+    def _print_sample_trade(self, trade: Dict):
+        """
+        Print a sample trade for verification of stock_id mapping.
+
+        Args:
+            trade: Dictionary containing trade information
+        """
+        stock_id = trade['stock_id']
+        stock_name = self.stock_names[stock_id] if stock_id < len(self.stock_names) else "UNKNOWN"
+
+        entry_date = trade['entry_date']
+        entry_price = trade['entry_price']
+        exit_date = trade['day']
+        exit_price = trade['exit_price']
+        gain_pct = trade['gain_pct']
+        reward = trade['reward']
+
+        print(f"\n--- Sample Trade (Validation) ---")
+        print(f"  Stock ID: {stock_id} → {stock_name}")
+        print(f"  Entry: {entry_date} @ ${entry_price:.2f}")
+        print(f"  Exit:  {exit_date} @ ${exit_price:.2f}")
+        print(f"  Gain: {gain_pct:+.2f}% | Reward: {reward:+.2f}")
 
     def validate_best_agent(self) -> Dict:
         """
@@ -908,12 +947,12 @@ class ERLTrainer:
         Update the running average of feature importance using exponential moving average.
 
         Args:
-            attention_weights: [batch, 669] attention weights from the actor
+            attention_weights: [batch, num_columns] attention weights from the actor
         """
         if attention_weights is None:
             return
 
-        # Average across batch dimension to get [669]
+        # Average across batch dimension to get [num_columns]
         batch_mean = attention_weights.mean(dim=0)
 
         # Update running average with momentum
@@ -933,7 +972,7 @@ class ERLTrainer:
         Get the current feature importance vector.
 
         Returns:
-            Feature importance [669] - probabilities summing to ~1.0
+            Feature importance [num_columns] - probabilities summing to ~1.0
         """
         return self.feature_importance.cpu()
 
@@ -942,7 +981,7 @@ class ERLTrainer:
         Analyze columns that have been persistently below importance thresholds.
 
         Args:
-            current_importance: Current feature importance [669]
+            current_importance: Current feature importance [num_columns]
 
         Returns:
             Dictionary with analysis results
@@ -968,7 +1007,7 @@ class ERLTrainer:
                 recent_history = list(self.feature_importance_history)[-required_gens:]
 
                 # Find columns below threshold in ALL recent generations
-                persistent_low = np.ones(669, dtype=bool)
+                persistent_low = np.ones(Config.TOTAL_COLUMNS, dtype=bool)
                 for gen_importance in recent_history:
                     persistent_low &= (gen_importance < threshold_val)
 
@@ -1102,8 +1141,20 @@ class ERLTrainer:
                     gc.collect()
                 self.best_validation_fitness = best_val_fitness_this_gen
                 self.best_agent = self.population[best_val_agent_idx].clone()
+
+                # Print a sample trade from this best agent
+                best_val_results = validation_results[0]  # Top ranked by validation fitness
+                best_agent_val = self.validate_agent(self.population[best_val_results['idx']])
+                if best_agent_val.get('sample_trade'):
+                    self._print_sample_trade(best_agent_val['sample_trade'])
             else:
                 print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
+
+                # Still print a sample trade from current best agent
+                if self.best_agent is not None:
+                    best_val_results = self.validate_agent(self.best_agent)
+                    if best_val_results.get('sample_trade'):
+                        self._print_sample_trade(best_val_results['sample_trade'])
             
             # Print comprehensive summary
             print_generation_summary(

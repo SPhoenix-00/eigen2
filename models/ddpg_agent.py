@@ -92,11 +92,19 @@ class DDPGAgent:
             if add_noise:
                 noise = np.random.normal(0, self.noise_scale, action.shape)
                 action = action + noise
-                
+
                 # Clip to valid ranges
                 action[:, 0] = np.maximum(action[:, 0], 0)  # Coefficient >= 0
                 action[:, 1] = np.clip(action[:, 1], Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
-        
+
+            # Round coefficients to nearest integer for discrete position sizing
+            # This simplifies the action space while maintaining gradient flow during training
+            action[:, 0] = np.round(action[:, 0])
+
+            # Cap coefficients at 100 to prevent reward explosion
+            # (reward = coefficient × gain_pct, so uncapped coefficients could destabilize training)
+            action[:, 0] = np.clip(action[:, 0], 0, 100)
+
         self.actor.train()
         return action
     
@@ -282,7 +290,7 @@ if __name__ == "__main__":
     
     # Test action selection
     print("\n--- Testing Action Selection ---")
-    dummy_state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL)
+    dummy_state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL)
     
     # Without noise
     action_no_noise = agent.select_action(dummy_state, add_noise=False)
@@ -299,10 +307,10 @@ if __name__ == "__main__":
     print("\n--- Testing Network Update ---")
     batch_size = 4  # Reduced from 32 due to GPU memory constraints
     dummy_batch = {
-        'states': torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL),
+        'states': torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL),
         'actions': torch.randn(batch_size, Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM),
         'rewards': torch.randn(batch_size, 1),
-        'next_states': torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL),
+        'next_states': torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL),
         'dones': torch.zeros(batch_size, 1),
     }
     

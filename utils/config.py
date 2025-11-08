@@ -10,10 +10,10 @@ class Config:
     # ============ Data Parameters ============
     DATA_PATH = Path(__file__).parent.parent / "Eigen2_Master_PY_OUTPUT.pkl"
     DATE_COLUMN = 0  # Column A (0-indexed)
-    INVESTABLE_START_COL = 8  # Column I (0-indexed) - Fixed: was 10, but off by 2
-    INVESTABLE_END_COL = 115  # Column DN (0-indexed, inclusive) - Fixed: was 117, adjusted for correct start
+    INVESTABLE_START_COL = 9  # Column J (0-indexed) - First investable stock: DFAC
+    INVESTABLE_END_COL = 116  # Column DO (0-indexed, inclusive) - Last investable stock: VXX
     NUM_INVESTABLE_STOCKS = 108
-    TOTAL_COLUMNS = 669  # Fixed: was 670, updated to match actual pickle file
+    TOTAL_COLUMNS = 117  # Skinny dataset: only loading first 117 columns (columns 0-116) from the pkl
     FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
     CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
@@ -67,8 +67,8 @@ class Config:
     WEIGHT_DECAY = 5e-4
     
     # Replay buffer
-    BUFFER_SIZE = 14000  # Maximum buffer size
-    BATCH_SIZE = 32
+    BUFFER_SIZE = 55000  # Maximum buffer size
+    BATCH_SIZE = 16
     MIN_BUFFER_SIZE = 9000  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     
@@ -78,7 +78,7 @@ class Config:
     MIN_NOISE = 0.01
     
     # ============ ERL Parameters ============
-    POPULATION_SIZE = 16
+    POPULATION_SIZE = 48
     NUM_GENERATIONS = 20
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
@@ -100,7 +100,7 @@ class Config:
     
     # Training
     GRADIENT_STEPS_PER_GENERATION = 32
-    GRADIENT_ACCUMULATION_STEPS = 2
+    GRADIENT_ACCUMULATION_STEPS = 4
     
     # ============ Training Parameters ============
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

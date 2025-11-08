@@ -452,15 +452,21 @@ class TradingEnvironment(gym.Env):
     def get_episode_summary(self) -> dict:
         """
         Get summary statistics for completed episode.
-        
+
         Returns:
             Dictionary with episode statistics
         """
         inaction_penalty_total = self.days_without_positions * Config.INACTION_PENALTY
-        
+
         # Calculate zero trades penalty (will be applied by caller)
         zero_trades_penalty = Config.ZERO_TRADES_PENALTY if self.num_trades == 0 else 0.0
-        
+
+        # Extract closed trades from episode actions (before clearing)
+        closed_trades = [
+            action for action in self.episode_actions
+            if action.get('action') == 'close'
+        ]
+
         summary = {
             'total_reward': self.cumulative_reward,
             'num_trades': self.num_trades,
@@ -474,6 +480,7 @@ class TradingEnvironment(gym.Env):
             'days_without_positions': self.days_without_positions,
             'inaction_penalty_applied': inaction_penalty_total,
             'zero_trades_penalty': zero_trades_penalty,  # Just report it, don't apply here
+            'closed_trades': closed_trades,  # Include all closed trades for analysis
         }
 
         # CRITICAL FIX: Clear episode history to prevent memory leak (~15-20GB per generation)

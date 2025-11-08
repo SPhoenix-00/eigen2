@@ -236,7 +236,7 @@ class StockDataLoader:
         Returns:
             numpy array of shape [num_days, num_columns, 5]
             For CSV: excludes date column
-            For pickle: all columns (dates are in index)
+            For pickle: only loads first 117 columns (9 context + 108 investable)
         """
         if self.df is None:
             raise ValueError("Must call load_csv() first")
@@ -246,17 +246,21 @@ class StockDataLoader:
 
         # Determine column range based on file format
         if file_path.suffix == '.pkl':
-            # Pickle: dates are in index, all columns are data
+            # Pickle: dates are in index, only load first 117 columns (skinny dataset)
             start_col = 0
-            num_columns = self.df.shape[1]
-            self.column_names = list(self.df.columns)
-            print(f"\nExtracting features from pickle: {num_days} days × {num_columns} columns...")
+            end_col = Config.TOTAL_COLUMNS  # 117 columns
+            num_columns = end_col
+            self.column_names = list(self.df.columns[:end_col])
+            print(f"\nExtracting features from pickle (skinny dataset): {num_days} days × {num_columns} columns...")
+            print(f"  Columns 0-8: context features (9 columns)")
+            print(f"  Columns 9-116: investable stocks (108 columns)")
         else:
-            # CSV: skip date column (column 0)
+            # CSV: skip date column (column 0), only load first 117 data columns
             start_col = 1
-            num_columns = self.df.shape[1] - 1
-            self.column_names = list(self.df.columns[start_col:])
-            print(f"\nExtracting features from CSV: {num_days} days × {num_columns} columns...")
+            end_col = 1 + Config.TOTAL_COLUMNS  # 118 total (date + 117 data)
+            num_columns = Config.TOTAL_COLUMNS
+            self.column_names = list(self.df.columns[start_col:end_col])
+            print(f"\nExtracting features from CSV (skinny dataset): {num_days} days × {num_columns} columns...")
 
         # Initialize arrays
         # Full dataset: all 9 features for environment
@@ -264,8 +268,8 @@ class StockDataLoader:
         # Reduced dataset: 5 selected features for model training
         self.data_array = np.zeros((num_days, num_columns, Config.FEATURES_PER_CELL), dtype=np.float32)
 
-        # Process each column
-        for col_idx in tqdm(range(start_col, self.df.shape[1]), desc="Processing columns"):
+        # Process each column (only up to end_col for skinny dataset)
+        for col_idx in tqdm(range(start_col, start_col + num_columns), desc="Processing columns"):
             for day_idx in range(num_days):
                 cell_value = self.df.iloc[day_idx, col_idx]
                 # Store full 9 features for environment

@@ -24,7 +24,7 @@ print(f"\nUsing device: {device}")
 # Create dummy input
 batch_size = 1
 print(f"\nCreating dummy input on {device}...")
-dummy_state = torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL, device=device)
+dummy_state = torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL, device=device)
 print(f"Input tensor device: {dummy_state.device}")
 print(f"Input state shape: {dummy_state.shape}")
 

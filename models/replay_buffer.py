@@ -301,12 +301,12 @@ if __name__ == "__main__":
     print("\n--- Adding Transitions ---")
     num_transitions = 500
     for i in range(num_transitions):
-        state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL)
+        state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL)
         action = np.random.randn(Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM)
         reward = np.random.randn()
-        next_state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL)
+        next_state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL)
         done = i % 50 == 49  # Every 50th transition is terminal
-        
+
         buffer.add(state, action, reward, next_state, done)
     
     print(f"Added {num_transitions} transitions")
@@ -337,7 +337,7 @@ if __name__ == "__main__":
     print("\n--- Testing Circular Buffer ---")
     initial_size = len(buffer)
     for i in range(600):  # Add more than capacity
-        state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL)
+        state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL)
         action = np.random.randn(Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM)
         reward = 0.0
         next_state = state
@@ -355,10 +355,10 @@ if __name__ == "__main__":
     
     # Add transitions
     for i in range(100):
-        state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL)
+        state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL)
         action = np.random.randn(Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM)
         reward = np.random.randn()
-        next_state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, 669, Config.FEATURES_PER_CELL)
+        next_state = np.random.randn(Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL)
         done = False
         pri_buffer.add(state, action, reward, next_state, done)
     
