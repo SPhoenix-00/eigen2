@@ -67,7 +67,7 @@ class Config:
     WEIGHT_DECAY = 5e-4
     
     # Replay buffer
-    BUFFER_SIZE = 55000  # Maximum buffer size
+    BUFFER_SIZE = 135000  # Maximum buffer size
     BATCH_SIZE = 16
     MIN_BUFFER_SIZE = 9000  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
@@ -78,8 +78,8 @@ class Config:
     MIN_NOISE = 0.01
     
     # ============ ERL Parameters ============
-    POPULATION_SIZE = 48
-    NUM_GENERATIONS = 20
+    POPULATION_SIZE = 31
+    NUM_GENERATIONS = 25
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
     # Selection
