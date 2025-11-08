@@ -1056,6 +1056,7 @@ class ERLTrainer:
             
             print(f"\n{'='*60}")
             print(f"Generation {gen + 1} / {Config.NUM_GENERATIONS}")
+            print(f"Buffer: {len(self.replay_buffer)} / {self.replay_buffer.capacity} ({len(self.replay_buffer)/self.replay_buffer.capacity*100:.1f}%)")
             print(f"{'='*60}")
             
             # 1. Evaluate population (collect experiences)
