@@ -195,8 +195,11 @@ def create_next_generation(population: List[DDPGAgent],
     # 1. Elitism: Keep top performers
     # Use the new dynamic 'num_elites'
     elites = elitism_selection(population, fitness_scores, num_elites)
+    # Mark elites for replay buffer diversity (elites don't contribute to buffer)
+    for elite in elites:
+        elite.is_elite = True
     next_gen.extend(elites)
-    
+
     print(f"  Elites: {len(elites)} agents (fitness: {[fitness_scores[population.index(e)] for e in elites[:3]]}...)")
     
     # 2. Crossover: Generate offspring
@@ -223,8 +226,9 @@ def create_next_generation(population: List[DDPGAgent],
                     parent2 = parent1 
             
             child = crossover(parent1, parent2)
+            child.is_elite = False  # Mark as exploratory for replay buffer diversity
             offspring.append(child)
-        
+
     next_gen.extend(offspring)
     print(f"  Offspring: {len(offspring)} agents via crossover")
     
@@ -236,8 +240,9 @@ def create_next_generation(population: List[DDPGAgent],
             # Select elite to mutate
             elite = elites[np.random.randint(len(elites))]
             mutant = mutate(elite, mutation_rate=mutation_rate, mutation_std=mutation_std)
+            mutant.is_elite = False  # Mark as exploratory for replay buffer diversity
             mutants.append(mutant)
-    
+
     next_gen.extend(mutants)
     print(f"  Mutants: {len(mutants)} agents via mutation")
     
@@ -249,6 +254,7 @@ def create_next_generation(population: List[DDPGAgent],
         for _ in range(fill_count):
             elite = elites[np.random.randint(len(elites))]
             mutant = mutate(elite, mutation_rate=mutation_rate, mutation_std=mutation_std)
+            mutant.is_elite = False  # Mark as exploratory for replay buffer diversity
             next_gen.append(mutant)
 
     # Assign new agent IDs

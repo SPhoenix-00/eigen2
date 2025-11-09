@@ -225,8 +225,8 @@ class ERLTrainer:
         self.current_mutation_rate = Config.MUTATION_RATE
         self.current_mutation_std = Config.MUTATION_STD
         self.mutation_boost_factor = 1.5  # Multiply by this when plateau detected
-        self.max_mutation_rate = 0.4  # Cap mutation rate
-        self.max_mutation_std = 0.05  # Cap mutation std
+        self.max_mutation_rate = 0.8  # Cap mutation rate (doubled to allow plateau boost from 0.40 base)
+        self.max_mutation_std = 0.1  # Cap mutation std (doubled to allow plateau boost from 0.05 base)
         self.plateau_detected = False
 
         # Track if we've saved buffer on first fill
@@ -417,6 +417,11 @@ class ERLTrainer:
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
         print(f"Multi-slice evaluation: 5 slices per agent, scoring = avg(lowest 2)")
 
+        # Count elite vs exploratory agents for logging
+        num_elites = sum(1 for a in self.population if a.is_elite)
+        num_exploratory = len(self.population) - num_elites
+        print(f"Replay buffer diversity: Only {num_exploratory}/{len(self.population)} exploratory agents contribute experiences")
+
         for agent_idx, agent in enumerate(tqdm(self.population, desc="Evaluating agents")):
             # Evaluate agent on 5 different random training slices
             slice_fitness_scores = []
@@ -437,12 +442,13 @@ class ERLTrainer:
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
 
                 # Run episode using persistent eval_env (CRITICAL FIX: prevents memory leak)
+                # Only add to replay buffer if agent is exploratory (not elite) for diversity
                 fitness, episode_info = self.run_episode(
                     agent=agent,
                     env=self.eval_env,  # Reuse persistent environment instead of creating new ones
                     start_idx=start_idx,
                     end_idx=end_idx,
-                    training=True
+                    training=(not agent.is_elite)  # Only exploratory agents contribute to buffer
                 )
 
                 slice_fitness_scores.append(fitness)
@@ -568,7 +574,7 @@ class ERLTrainer:
     
     def evolve_population(self, fitness_scores: List[float]):
         """
-        Evolve population using genetic algorithm with champion injection.
+        Evolve population using genetic algorithm.
 
         Args:
             fitness_scores: Fitness for each agent
@@ -580,27 +586,13 @@ class ERLTrainer:
         old_population = self.population
 
         # Create next generation with adaptive mutation parameters
+        # Elitism is handled by create_next_generation (keeps top ELITE_FRAC agents)
         self.population = create_next_generation(
             old_population,
             fitness_scores,
             mutation_rate=self.current_mutation_rate,
             mutation_std=self.current_mutation_std
         )
-
-        # CHAMPION INJECTION: Force the all-time best validation agent back into the population
-        # This ensures the champion gets another chance even if it had poor training fitness
-        if self.best_agent is not None:
-            # Clone the champion and inject it, replacing the worst elite
-            # This puts the champion back into both the breeding pool and elite survivors
-            num_elites = int(len(self.population) * Config.ELITE_FRAC)
-            if num_elites > 0:
-                # Replace the last elite (weakest elite) with the champion
-                champion_clone = self.best_agent.clone()
-                champion_clone.agent_id = num_elites - 1  # Give it the elite slot ID
-
-                del self.population[num_elites - 1]
-                self.population[num_elites - 1] = champion_clone
-                print(f"✓ Champion injected (val fitness: {self.best_validation_fitness:.2f})")
 
         # Explicitly delete old agents and force GC
         for agent in old_population:
@@ -681,28 +673,32 @@ class ERLTrainer:
             'sample_trade': sample_trade  # One sample trade for verification
         }
 
-    def _print_sample_trade(self, trade: Dict):
+    def _run_evaluation(self):
         """
-        Print a sample trade for verification of stock_id mapping.
-
-        Args:
-            trade: Dictionary containing trade information
+        Run evaluate_best_agent.py as a subprocess to generate detailed trade report.
+        This always overwrites the previous evaluation results.
         """
-        stock_id = trade['stock_id']
-        stock_name = self.stock_names[stock_id] if stock_id < len(self.stock_names) else "UNKNOWN"
+        import subprocess
 
-        entry_date = trade['entry_date']
-        entry_price = trade['entry_price']
-        exit_date = trade['day']
-        exit_price = trade['exit_price']
-        gain_pct = trade['gain_pct']
-        reward = trade['reward']
+        try:
+            # Run evaluation script with current run name
+            result = subprocess.run(
+                ['python', 'evaluate_best_agent.py', '--run-name', self.run_name],
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
 
-        print(f"\n--- Sample Trade (Validation) ---")
-        print(f"  Stock ID: {stock_id} → {stock_name}")
-        print(f"  Entry: {entry_date} @ ${entry_price:.2f}")
-        print(f"  Exit:  {exit_date} @ ${exit_price:.2f}")
-        print(f"  Gain: {gain_pct:+.2f}% | Reward: {reward:+.2f}")
+            if result.returncode == 0:
+                print("  ✓ Evaluation complete - results saved to evaluation_summary.txt and evaluation_trades.csv")
+            else:
+                print(f"  ⚠ Evaluation script failed with code {result.returncode}")
+                if result.stderr:
+                    print(f"  Error: {result.stderr[:200]}")  # Print first 200 chars of error
+        except subprocess.TimeoutExpired:
+            print("  ⚠ Evaluation script timed out after 5 minutes")
+        except Exception as e:
+            print(f"  ⚠ Could not run evaluation: {e}")
 
     def validate_best_agent(self) -> Dict:
         """
@@ -932,16 +928,6 @@ class ERLTrainer:
             except Exception as e:
                 print(f"❌ Error loading state: {e}")
 
-        # CHAMPION INJECTION ON RESUME
-        if self.best_agent is not None and len(self.population) > 0:
-            num_elites = int(len(self.population) * Config.ELITE_FRAC)
-            if num_elites > 0:
-                champion_clone = self.best_agent.clone()
-                champion_clone.agent_id = num_elites - 1
-                del self.population[num_elites - 1]
-                self.population[num_elites - 1] = champion_clone
-                print(f"✓ Champion injected into population")
-
     def update_feature_importance(self, attention_weights: torch.Tensor):
         """
         Update the running average of feature importance using exponential moving average.
@@ -1101,10 +1087,11 @@ class ERLTrainer:
             # Generate validation slices for this generation
             print(f"\n--- Walk-Forward Validation (Generation {gen + 1}) ---")
             self.current_generation_val_slices = self.generate_validation_slices()
-            start, end, _ = self.current_generation_val_slices[0]
-            start_date = self.data_loader.dates[start] if start < len(self.data_loader.dates) else "N/A"
-            end_date = self.data_loader.dates[end-1] if end-1 < len(self.data_loader.dates) else "N/A"
-            print(f"Generated 3 validation slices (e.g., days {start}-{end}: {start_date} to {end_date})")
+            print(f"Generated 3 validation slices:")
+            for i, (start, end, _) in enumerate(self.current_generation_val_slices, 1):
+                start_date = self.data_loader.dates[start] if start < len(self.data_loader.dates) else "N/A"
+                end_date = self.data_loader.dates[end-1] if end-1 < len(self.data_loader.dates) else "N/A"
+                print(f"  Slice {i}: days {start}-{end}: {start_date} to {end_date}")
 
             best_val_fitness_this_gen = float('-inf')
             best_val_agent_idx = None
@@ -1143,19 +1130,15 @@ class ERLTrainer:
                 self.best_validation_fitness = best_val_fitness_this_gen
                 self.best_agent = self.population[best_val_agent_idx].clone()
 
-                # Print a sample trade from this best agent
-                best_val_results = validation_results[0]  # Top ranked by validation fitness
-                best_agent_val = self.validate_agent(self.population[best_val_results['idx']])
-                if best_agent_val.get('sample_trade'):
-                    self._print_sample_trade(best_agent_val['sample_trade'])
+                # Save checkpoint immediately to update best_agent.pth
+                print("  Saving checkpoint with new best agent...")
+                self.save_checkpoint()
+
+                # Run full evaluation on best agent
+                print("  Running full evaluation (evaluate_best_agent.py)...")
+                self._run_evaluation()
             else:
                 print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
-
-                # Still print a sample trade from current best agent
-                if self.best_agent is not None:
-                    best_val_results = self.validate_agent(self.best_agent)
-                    if best_val_results.get('sample_trade'):
-                        self._print_sample_trade(best_val_results['sample_trade'])
             
             # Print comprehensive summary
             print_generation_summary(

@@ -402,7 +402,7 @@ class TradingEnvironment(gym.Env):
             if should_close:
                 # Calculate gain/loss
                 gain_pct = ((exit_price - position.entry_price) / position.entry_price) * 100.0
-                
+
                 # Calculate reward
                 if gain_pct >= 0:
                     reward = position.coefficient * gain_pct
@@ -410,7 +410,11 @@ class TradingEnvironment(gym.Env):
                 else:
                     reward = -Config.LOSS_PENALTY_MULTIPLIER * position.coefficient * abs(gain_pct)
                     self.num_losses += 1
-                
+
+                # Apply forced exit penalty if exit was due to max_holding_period
+                if reason == 'max_holding_period':
+                    reward -= Config.FORCED_EXIT_PENALTY
+
                 total_reward += reward
                 self.num_trades += 1
                 

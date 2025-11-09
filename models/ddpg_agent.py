@@ -25,12 +25,13 @@ class DDPGAgent:
     def __init__(self, agent_id: int = 0):
         """
         Initialize DDPG agent.
-        
+
         Args:
             agent_id: Unique identifier for this agent (used in population)
         """
         self.agent_id = agent_id
         self.device = Config.DEVICE
+        self.is_elite = False  # Track if this agent is an elite (for replay buffer diversity)
         
         # Actor networks
         self.actor = Actor().to(self.device)
@@ -259,6 +260,7 @@ class DDPGAgent:
         new_agent.critic.load_state_dict(self.critic.state_dict())
         new_agent.critic_target.load_state_dict(self.critic_target.state_dict())
         new_agent.noise_scale = self.noise_scale
+        new_agent.is_elite = self.is_elite  # Preserve elite status
 
         # Clear GPU cache after cloning
         if torch.cuda.is_available():

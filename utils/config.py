@@ -32,7 +32,8 @@ class Config:
     # ============ Environment Parameters ============
     MAX_HOLDING_PERIOD = 20  # Trading days
     LOSS_PENALTY_MULTIPLIER = 1.0  # Losses treated equally to gains (was 3.0, removed penalty to fix zombie agents)
-    INACTION_PENALTY = 5.0  # Penalty per day without an open position
+    INACTION_PENALTY = 20.0  # Penalty per day without an open position (quadrupled from original 5.0)
+    FORCED_EXIT_PENALTY = 10.0  # Penalty for forced exits due to max_holding_period (equal to original inaction penalty)
     ZERO_TRADES_PENALTY = 10000.0  # Heavy penalty for making NO trades at all
     
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
@@ -79,24 +80,25 @@ class Config:
     
     # ============ ERL Parameters ============
     POPULATION_SIZE = 31
-    NUM_GENERATIONS = 25
+    NUM_GENERATIONS = 100
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
     # Selection
     """     NUM_PARENTS = 8  # Top performers to keep
     NUM_OFFSPRING = 6  # Generated via crossover
     NUM_MUTANTS = 2  # Random mutations """
-    ELITE_FRAC = 0.375      # 37.5% of population (was 0.5, reduced to increase diversity)
+    ELITE_FRAC = 0.125      # 12.5% of population (reduced from 0.375 for higher diversity)
     OFFSPRING_FRAC = 0.375   # 37.5% of population
-    # MUTANT_FRAC will be the remainder (25%, was 12.5% - doubled for more exploration)
+    # MUTANT_FRAC will be the remainder (50%, massively increased for exploration)
     
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)
     CROSSOVER_ALPHA_MAX = 0.8  # Widened range for more diverse offspring (was 0.7)
-    MUTATION_RATE = 0.20  # Base mutation rate (adaptive mutation increases this when plateau detected)
-    MUTATION_STD = 0.025  # Base mutation magnitude (adaptive mutation increases this when plateau detected)
+    MUTATION_RATE = 0.40  # Base mutation rate (doubled from 0.20 for aggressive exploration)
+    MUTATION_STD = 0.05  # Base mutation magnitude (doubled from 0.025 for aggressive exploration)
     # NOTE: Adaptive mutation automatically boosts these values by 1.5x when validation fitness
     # plateaus for 3 consecutive generations (< 2% improvement), helping escape local optima
+    # Max caps are set in ERLTrainer (0.8 for rate, 0.1 for std) to allow further increases
     
     # Training
     GRADIENT_STEPS_PER_GENERATION = 32
