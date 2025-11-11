@@ -179,7 +179,7 @@ class AgentEvaluator:
         # End at the last day of data
         end_idx = self.holdout_end
 
-        # Need 20 days for settlement
+        # Need settlement period (30 days) for position liquidation
         trading_end_idx = end_idx - Config.SETTLEMENT_PERIOD_DAYS
 
         # Need 125 days for trading period
@@ -240,8 +240,12 @@ class AgentEvaluator:
         summary = env.get_episode_summary()
 
         # Calculate fitness (same as in training)
+        # IMPORTANT: total_reward already includes ALL penalties:
+        # - Inaction penalty (applied during step)
+        # - Forced exit penalty (applied when max_holding_period reached)
+        # - Loss penalties (applied during position close)
+        # Only the zero-trades penalty needs to be applied here
         fitness = summary['total_reward']
-        fitness -= summary['inaction_penalty_applied']
         if summary['num_trades'] == 0:
             fitness -= summary['zero_trades_penalty']
 
@@ -286,6 +290,9 @@ class AgentEvaluator:
                         'exit_price': action['exit_price'],
                         'days_held': action['days_held'],
                         'gain_pct': action['gain_pct'],
+                        'base_reward': action.get('base_reward', action['reward']),  # Fallback for old logs
+                        'loss_penalty': action.get('loss_penalty', 0.0),
+                        'forced_exit_penalty': action.get('forced_exit_penalty', 0.0),
                         'reward': action['reward'],
                         'exit_reason': action['reason'],
                         'is_win': action['gain_pct'] >= 0,
@@ -470,7 +477,12 @@ class AgentEvaluator:
                 f.write(f"  Exit:  {trade['exit_date']} @ ${trade['exit_price']:.2f}\n")
                 f.write(f"  Days Held: {trade['days_held']}\n")
                 f.write(f"  Gain/Loss: {trade['gain_pct']:.2f}%\n")
-                f.write(f"  Reward: {trade['reward']:.2f}\n")
+                f.write(f"  Base Reward: {trade['base_reward']:.2f}\n")
+                if trade['loss_penalty'] > 0:
+                    f.write(f"    - Loss Penalty: -{trade['loss_penalty']:.2f}\n")
+                if trade['forced_exit_penalty'] > 0:
+                    f.write(f"    - Forced Exit Penalty: -{trade['forced_exit_penalty']:.2f}\n")
+                f.write(f"  Final Reward: {trade['reward']:.2f}\n")
                 f.write(f"  Coefficient: {trade['coefficient']:.2f}\n")
                 f.write(f"  Target: {trade['sale_target_pct']:.1f}% (${trade['sale_target_price']:.2f})\n")
                 f.write(f"  Exit Type: {'Active Sell (Target Hit)' if trade['is_active_sell'] else 'Auto Liquidation (' + trade['exit_reason'] + ')'}\n")
@@ -492,7 +504,8 @@ class AgentEvaluator:
             'slice', 'stock_ticker', 'stock_id',
             'entry_date', 'entry_price',
             'exit_date', 'exit_price',
-            'days_held', 'gain_pct', 'reward',
+            'days_held', 'gain_pct',
+            'base_reward', 'loss_penalty', 'forced_exit_penalty', 'reward',
             'coefficient', 'sale_target_pct', 'sale_target_price',
             'exit_reason', 'is_active_sell', 'is_auto_liquidation', 'is_win'
         ]

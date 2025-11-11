@@ -12,7 +12,8 @@
       "Bash(python test_training.py:*)",
       "Bash(python3:*)",
       "Bash(/opt/homebrew/bin/python3:*)",
-      "Bash(./venv/bin/python:*)"
+      "Bash(./venv/bin/python:*)",
+      "Bash(python:*)"
     ],
     "deny": [],
     "ask": []

@@ -365,10 +365,13 @@ class ERLTrainer:
         """
         Generate 3 random validation slices for the current generation from INTERIM validation set.
 
+        NEW: Divides interim validation period into 3 equal segments and samples one slice from each.
+        This ensures diversity across different market conditions in the validation period.
+
         Each slice consists of:
         - CONTEXT_WINDOW_DAYS (504) of prior data (may come from training data for context)
         - TRADING_PERIOD_DAYS (125) where agent can trade (from interim validation set)
-        - SETTLEMENT_PERIOD_DAYS (20) to close positions (from interim validation set)
+        - SETTLEMENT_PERIOD_DAYS (30) to close positions (from interim validation set)
 
         Returns:
             List of 3 tuples: (start_idx, end_idx, trading_end_idx)
@@ -386,12 +389,19 @@ class ERLTrainer:
         if max_start < min_start:
             raise ValueError(f"Not enough interim validation data: need {Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS} days")
 
+        # Divide the validation range into 3 equal segments
+        total_range = max_start - min_start + 1
+        segment_size = total_range // 3
+
         slices = []
-        for _ in range(3):
-            # Random start index for trading (between interim_val_start and interim_val_end - 145)
-            # Context (504 days before start_idx) will automatically come from training data
-            # Trading + settlement (145 days from start_idx) will be entirely in interim validation set
-            start_idx = np.random.randint(min_start, max_start + 1)
+        for segment_idx in range(3):
+            # Calculate segment boundaries
+            segment_start = min_start + (segment_idx * segment_size)
+            # For the last segment, extend to max_start to avoid rounding issues
+            segment_end = max_start + 1 if segment_idx == 2 else min_start + ((segment_idx + 1) * segment_size)
+
+            # Sample one random start index from this segment
+            start_idx = np.random.randint(segment_start, segment_end)
             end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
             trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
 
@@ -430,7 +440,7 @@ class ERLTrainer:
             for _ in range(5):
                 # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
                 # Training episodes must not touch interim validation or holdout sets
-                # Need: context (504) + trading (125) + settlement (20) = 649 days total
+                # Need: context (504) + trading (125) + settlement (30) = 659 days total
                 total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
 
                 max_start = self.train_end_idx - total_days_needed

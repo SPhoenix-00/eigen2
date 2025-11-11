@@ -21,7 +21,7 @@ Config.NUM_PARENTS = 2
 Config.NUM_OFFSPRING = 1
 Config.NUM_MUTANTS = 1
 Config.TRADING_PERIOD_DAYS = 50  # Short for testing (instead of 125)
-Config.SETTLEMENT_PERIOD_DAYS = 20  # Keep normal
+Config.SETTLEMENT_PERIOD_DAYS = 30  # Updated to match new MAX_HOLDING_PERIOD of 30
 Config.EPISODE_LENGTH = 50  # For backward compatibility
 Config.GRADIENT_STEPS_PER_GENERATION = 5  # Few gradient steps
 

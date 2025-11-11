@@ -119,8 +119,8 @@ For each trade, you'll see:
 ✅ **Coefficient**: Agent's confidence/position size
 ✅ **Target**: Agent's target gain percentage
 ✅ **Exit Type**:
-  - **Active Sell (target_hit)**: Agent sold at target price ✨
-  - **Auto Liquidation (max_holding_period)**: Held for 20 days, force closed
+  - **Active Sell (target_hit)**: Agent sold at target price during liquidation window (days 21-30) ✨
+  - **Auto Liquidation (max_holding_period)**: Held for 30 days (20-day mandatory hold + 10-day liquidation window), force closed
   - **Auto Liquidation (stock_delisted)**: Stock data unavailable, force closed
 ✅ **Win/Loss**: Boolean flag for easy filtering
 
@@ -132,7 +132,7 @@ For each trade, you'll see:
 Each slice consists of:
 - **504 days of context** (2 years) - for agent to observe market
 - **125 days of trading** - where agent can open new positions
-- **20 days of settlement** - to close remaining positions
+- **30 days of settlement** - to close remaining positions (20-day mandatory hold + 10-day liquidation window)
 
 Slices are randomly sampled from the **interim validation set** (the same data used during training for walk-forward validation).
 

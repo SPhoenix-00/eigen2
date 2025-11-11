@@ -357,13 +357,18 @@ class TradingEnvironment(gym.Env):
     def _update_positions(self) -> float:
         """
         Update all open positions and close if necessary.
-        
+
+        NEW LOGIC:
+        - Agent MUST hold for MIN_HOLDING_PERIOD (20 days) - no selling before day 20
+        - After day 20, agent has LIQUIDATION_WINDOW (10 days) to exit (days 21-30)
+        - At day 30 (MAX_HOLDING_PERIOD), position is forcibly liquidated
+
         Returns:
             Total reward from closed positions
         """
         total_reward = 0.0
         positions_to_close = []
-        
+
         for stock_id, position in self.open_positions.items():
             # Increment days held
             position.days_held += 1
@@ -383,42 +388,55 @@ class TradingEnvironment(gym.Env):
                 # Full dataset: [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
                 day_high = stock_data[2]  # day high (index 2)
                 close_price = stock_data[1]  # close price (index 1)
-                
-                # Check if sale target hit (using day high)
-                if not np.isnan(day_high) and day_high >= position.sale_target_price:
-                    exit_price = position.sale_target_price
-                    reason = 'target_hit'
-                    should_close = True
-                # Check if max holding period reached
-                elif position.days_held >= Config.MAX_HOLDING_PERIOD:
-                    exit_price = close_price if not np.isnan(close_price) else position.entry_price
-                    reason = 'max_holding_period'
-                    should_close = True
-                else:
+
+                # NEW LOGIC: Check holding period constraints
+                # 1. Before MIN_HOLDING_PERIOD (days 1-20): Cannot sell, continue holding
+                if position.days_held < Config.MIN_HOLDING_PERIOD:
                     should_close = False
                     exit_price = None
                     reason = None
+                # 2. During liquidation window (days 21-29): Can sell if target hit
+                elif position.days_held < Config.MAX_HOLDING_PERIOD:
+                    # Check if sale target hit (using day high)
+                    if not np.isnan(day_high) and day_high >= position.sale_target_price:
+                        exit_price = position.sale_target_price
+                        reason = 'target_hit'
+                        should_close = True
+                    else:
+                        should_close = False
+                        exit_price = None
+                        reason = None
+                # 3. At MAX_HOLDING_PERIOD (day 30): Force liquidation
+                else:
+                    exit_price = close_price if not np.isnan(close_price) else position.entry_price
+                    reason = 'max_holding_period'
+                    should_close = True
             
             if should_close:
                 # Calculate gain/loss
                 gain_pct = ((exit_price - position.entry_price) / position.entry_price) * 100.0
 
-                # Calculate reward
+                # Calculate base reward (before penalties)
                 if gain_pct >= 0:
-                    reward = position.coefficient * gain_pct
+                    base_reward = position.coefficient * gain_pct
                     self.num_wins += 1
+                    loss_penalty = 0.0
                 else:
-                    reward = -Config.LOSS_PENALTY_MULTIPLIER * position.coefficient * abs(gain_pct)
+                    base_reward = position.coefficient * gain_pct  # Negative
+                    # Apply loss penalty multiplier
+                    loss_penalty = (Config.LOSS_PENALTY_MULTIPLIER - 1.0) * position.coefficient * abs(gain_pct)
                     self.num_losses += 1
 
                 # Apply forced exit penalty if exit was due to max_holding_period
-                if reason == 'max_holding_period':
-                    reward -= Config.FORCED_EXIT_PENALTY
+                forced_exit_penalty = Config.FORCED_EXIT_PENALTY if reason == 'max_holding_period' else 0.0
+
+                # Final reward = base_reward - loss_penalty - forced_exit_penalty
+                reward = base_reward - loss_penalty - forced_exit_penalty
 
                 total_reward += reward
                 self.num_trades += 1
-                
-                # Log closure
+
+                # Log closure with penalty breakdown
                 self.episode_actions.append({
                     'day': self.dates[self.current_idx],
                     'action': 'close',
@@ -428,6 +446,9 @@ class TradingEnvironment(gym.Env):
                     'exit_price': exit_price,
                     'days_held': position.days_held,
                     'gain_pct': gain_pct,
+                    'base_reward': base_reward,
+                    'loss_penalty': loss_penalty,
+                    'forced_exit_penalty': forced_exit_penalty,
                     'reward': reward,
                     'reason': reason
                 })

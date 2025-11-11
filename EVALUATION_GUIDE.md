@@ -73,12 +73,12 @@ The script will:
 Generates 3 random slices from the interim validation set, each consisting of:
 - **504 days of context** (2 years) - for the agent to observe market conditions
 - **125 days of trading** - where the agent can open new positions
-- **20 days of settlement** - to close remaining positions
+- **30 days of settlement** - to close remaining positions (min 20-day hold + 10-day liquidation window)
 
 For each slice, the agent makes trading decisions and all trades are tracked.
 
 ### 4. Holdout Evaluation
-Takes the first 125 days (+20 settlement) from the completely unseen holdout set and evaluates the agent's performance.
+Takes the first 125 days (+30 settlement) from the completely unseen holdout set and evaluates the agent's performance.
 
 ### 5. Report Generation
 Creates three output files in the `evaluation_results/` directory:
@@ -228,8 +228,8 @@ Where:
 
 ### Trade Exit Types
 
-1. **Active Sell (target_hit)**: The stock hit the agent's target price and was sold for profit
-2. **Auto Liquidation (max_holding_period)**: Position held for 20 days (max) and automatically closed
+1. **Active Sell (target_hit)**: The stock hit the agent's target price during the liquidation window (days 21-30) and was sold for profit
+2. **Auto Liquidation (max_holding_period)**: Position held for 30 days (max: 20-day mandatory hold + 10-day liquidation window) and automatically closed
 3. **Auto Liquidation (stock_delisted)**: Stock data became unavailable and position was force-closed
 
 ### Win Rate
