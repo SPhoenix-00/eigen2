@@ -13,7 +13,8 @@
       "Bash(python3:*)",
       "Bash(/opt/homebrew/bin/python3:*)",
       "Bash(./venv/bin/python:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(PYTHONPATH=/Users/asellam/Documents/GitHub/eigen2:$PYTHONPATH ./venv/bin/python:*)"
     ],
     "deny": [],
     "ask": []

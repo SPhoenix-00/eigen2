@@ -245,12 +245,16 @@ class TradingEnvironment(gym.Env):
     
     def _process_action(self, action: np.ndarray) -> float:
         """
-        Process the action and open new position if valid.
+        Process the action and open new positions for all qualifying stocks.
         Only opens positions during trading period.
-        
+
+        NEW LOGIC: Evaluates ALL 108 stocks independently. Any stock with coefficient
+        >= COEFFICIENT_THRESHOLD will trigger a "buy" action, allowing the agent to
+        open multiple positions in a single day and learn true portfolio diversification.
+
         Args:
             action: Array [108, 2] with [coefficient, sale_target] per stock
-            
+
         Returns:
             Reward from this action (always 0.0 for opening positions)
         """
@@ -263,96 +267,102 @@ class TradingEnvironment(gym.Env):
                 'reason': 'settlement_period'
             })
             return 0.0
-        
+
         # Extract coefficients and sale targets
         coefficients = action[:, 0]
         sale_targets = action[:, 1]
-        
-        # Find stock with highest coefficient
-        max_stock_id = np.argmax(coefficients)
-        max_coefficient = coefficients[max_stock_id]
-        
-        # Check if action is valid (coefficient > threshold and >= 1.0)
-        if max_coefficient < Config.COEFFICIENT_THRESHOLD or max_coefficient < Config.MIN_COEFFICIENT:
-            # No action taken
+
+        # Track if any positions were opened this step
+        positions_opened_this_step = 0
+
+        # Loop through ALL 108 stocks and evaluate each independently
+        for stock_id in range(Config.NUM_INVESTABLE_STOCKS):
+            coefficient = coefficients[stock_id]
+            sale_target = sale_targets[stock_id]
+
+            # Check if this stock's coefficient meets the threshold
+            if coefficient < Config.COEFFICIENT_THRESHOLD:
+                continue  # Skip this stock, coefficient too low
+
+            # Check if we already have a position in this stock
+            if stock_id in self.open_positions:
+                # Cannot open duplicate position - log and skip
+                self.episode_actions.append({
+                    'day': self.dates[self.current_idx],
+                    'action': 'blocked',
+                    'stock_id': stock_id,
+                    'reason': 'position_already_open'
+                })
+                continue
+
+            # Get stock data for this day
+            # Stock ID in action space is relative to investable stocks (0-107)
+            # Need to map to actual column index (10-117)
+            actual_col_idx = Config.INVESTABLE_START_COL + stock_id
+            stock_data = self.data_array_full[self.current_idx, actual_col_idx, :]
+
+            # Check if stock data is valid (not all nan)
+            if np.all(np.isnan(stock_data)):
+                # Stock doesn't exist on this day - log and skip
+                self.episode_actions.append({
+                    'day': self.dates[self.current_idx],
+                    'action': 'blocked',
+                    'stock_id': stock_id,
+                    'reason': 'stock_data_invalid'
+                })
+                continue
+
+            # Extract close price (index 1 in full 9-feature dataset)
+            # Full dataset: [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
+            entry_price = stock_data[1]  # close price
+
+            if np.isnan(entry_price) or entry_price <= 0:
+                # Invalid entry price - log and skip
+                self.episode_actions.append({
+                    'day': self.dates[self.current_idx],
+                    'action': 'blocked',
+                    'stock_id': stock_id,
+                    'reason': 'invalid_entry_price'
+                })
+                continue
+
+            # Validate and clip sale target
+            sale_target = np.clip(sale_target, Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
+
+            # All checks passed - open position for this stock
+            position = Position(
+                stock_id=stock_id,
+                entry_price=entry_price,
+                coefficient=coefficient,
+                sale_target_pct=sale_target,
+                days_held=0,
+                entry_day_idx=self.current_idx,
+                entry_date=self.dates[self.current_idx]
+            )
+
+            self.open_positions[stock_id] = position
+            self.total_positions_opened += 1
+            positions_opened_this_step += 1
+
+            self.episode_actions.append({
+                'day': self.dates[self.current_idx],
+                'action': 'open',
+                'stock_id': stock_id,
+                'entry_price': entry_price,
+                'coefficient': coefficient,
+                'sale_target_pct': sale_target,
+                'sale_target_price': position.sale_target_price
+            })
+
+        # If no positions were opened, log that no action was taken
+        if positions_opened_this_step == 0:
             self.episode_actions.append({
                 'day': self.dates[self.current_idx],
                 'action': 'none',
-                'reason': 'coefficient_too_low'
+                'reason': 'no_stocks_above_threshold'
             })
-            return 0.0
-        
-        # Check if we already have a position in this stock
-        if max_stock_id in self.open_positions:
-            # Cannot open duplicate position
-            self.episode_actions.append({
-                'day': self.dates[self.current_idx],
-                'action': 'blocked',
-                'stock_id': max_stock_id,
-                'reason': 'position_already_open'
-            })
-            return 0.0
-        
-        # Get stock data for this day
-        # Stock ID in action space is relative to investable stocks (0-107)
-        # Need to map to actual column index (10-117)
-        actual_col_idx = Config.INVESTABLE_START_COL + max_stock_id
-        stock_data = self.data_array_full[self.current_idx, actual_col_idx, :]
 
-        # Check if stock data is valid (not all nan)
-        if np.all(np.isnan(stock_data)):
-            # Stock doesn't exist on this day
-            self.episode_actions.append({
-                'day': self.dates[self.current_idx],
-                'action': 'blocked',
-                'stock_id': max_stock_id,
-                'reason': 'stock_data_invalid'
-            })
-            return 0.0
-
-        # Extract close price (index 1 in full 9-feature dataset)
-        # Full dataset: [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
-        entry_price = stock_data[1]  # close price
-        
-        if np.isnan(entry_price) or entry_price <= 0:
-            # Invalid entry price
-            self.episode_actions.append({
-                'day': self.dates[self.current_idx],
-                'action': 'blocked',
-                'stock_id': max_stock_id,
-                'reason': 'invalid_entry_price'
-            })
-            return 0.0
-        
-        # Validate sale target
-        sale_target = sale_targets[max_stock_id]
-        sale_target = np.clip(sale_target, Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
-        
-        # Open position
-        position = Position(
-            stock_id=max_stock_id,
-            entry_price=entry_price,
-            coefficient=max_coefficient,
-            sale_target_pct=sale_target,
-            days_held=0,
-            entry_day_idx=self.current_idx,
-            entry_date=self.dates[self.current_idx]
-        )
-        
-        self.open_positions[max_stock_id] = position
-        self.total_positions_opened += 1
-        
-        self.episode_actions.append({
-            'day': self.dates[self.current_idx],
-            'action': 'open',
-            'stock_id': max_stock_id,
-            'entry_price': entry_price,
-            'coefficient': max_coefficient,
-            'sale_target_pct': sale_target,
-            'sale_target_price': position.sale_target_price
-        })
-        
-        return 0.0  # No immediate reward for opening position
+        return 0.0  # No immediate reward for opening positions
     
     def _update_positions(self) -> float:
         """
