@@ -39,7 +39,7 @@ class Config:
     LOSS_PENALTY_MULTIPLIER = 1.0  # Losses treated equally to gains (was 3.0, removed penalty to fix zombie agents)
     INACTION_PENALTY = 20.0  # Penalty per day without an open position (quadrupled from original 5.0)
     FORCED_EXIT_PENALTY = 100.0  # Penalty for forced exits due to max_holding_period (equal to original inaction penalty)
-    ZERO_TRADES_PENALTY = 10000.0  # Heavy penalty for making NO trades at all
+    ZERO_TRADES_PENALTY = 100000.0  # Heavy penalty for making NO trades at all
 
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
     SETTLEMENT_PERIOD_DAYS = 30  # Additional days to close remaining positions (must be >= MAX_HOLDING_PERIOD)

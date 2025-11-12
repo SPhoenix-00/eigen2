@@ -394,23 +394,22 @@ class Actor(nn.Module):
     
     def _apply_coefficient_activation(self, raw: torch.Tensor) -> torch.Tensor:
         """
-        Apply activation allowing smooth coefficient variation from 0 to higher values.
-        Uses Softplus for smooth gradients and better exploration.
+        Apply activation to normalize coefficient to [0, 1] range.
+        Uses sigmoid for bounded output, allowing agent to learn when NOT to trade.
 
         During training: outputs continuous values for gradient flow
-        During inference: will be rounded to integers in select_action()
+        During inference: will be compared against threshold in trading logic
 
         Args:
             raw: Raw output from network
 
         Returns:
-            Activated coefficients (continuous, will be rounded to int during action selection)
+            Activated coefficients normalized to [0, 1] range
         """
-        # Softplus: smooth approximation of ReLU with better gradients
-        # Maps raw values to [0, inf) smoothly
-        # Beta=0.5 makes it less steep, allowing wider range of outputs
-        # This encourages the model to explore different coefficient values
-        coefficients = torch.nn.functional.softplus(raw, beta=0.5)
+        # Sigmoid: maps raw values to [0, 1] smoothly
+        # This allows the agent to learn that values below COEFFICIENT_THRESHOLD
+        # should not trigger trades, giving it the option to not trade
+        coefficients = torch.sigmoid(raw)
 
         return coefficients
 
