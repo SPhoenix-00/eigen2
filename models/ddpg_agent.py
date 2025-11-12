@@ -55,8 +55,8 @@ class DDPGAgent:
             weight_decay=Config.WEIGHT_DECAY
         )
 
-        self.actor_scaler = GradScaler()
-        self.critic_scaler = GradScaler()
+        self.actor_scaler = GradScaler('cuda')
+        self.critic_scaler = GradScaler('cuda')
         
         # Exploration noise
         self.noise_scale = Config.NOISE_SCALE
