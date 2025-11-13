@@ -44,6 +44,9 @@ class Config:
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
     SETTLEMENT_PERIOD_DAYS = 30  # Additional days to close remaining positions (must be >= MAX_HOLDING_PERIOD)
     EPISODE_LENGTH = TRADING_PERIOD_DAYS  # For backward compatibility
+
+    # Observation noise for regularization (prevents overfitting during training)
+    OBSERVATION_NOISE_STD = 0.01  # Standard deviation of Gaussian noise added to observations during training
     
     # ============ Model Architecture ============
     # Feature extraction
