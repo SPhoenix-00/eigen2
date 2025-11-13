@@ -65,11 +65,9 @@ class ERLTrainer:
         
         # Shared replay buffer (ON-DISK)
         self.replay_buffer = OnDiskReplayBuffer(
-            capacity=1000000,  # <-- Set your 1M capacity!
-            storage_path="erl_buffer_storage" # <-- Name of the folder
+            capacity=Config.BUFFER_SIZE,
+            storage_path="erl_buffer_storage"
         )
-        # Update config to reflect the *actual* capacity for logging
-        Config.BUFFER_SIZE = self.replay_buffer.capacity
         
         # Training range (excludes interim validation and holdout sets)
         self.train_start_idx = Config.CONTEXT_WINDOW_DAYS
@@ -928,12 +926,10 @@ class ERLTrainer:
             try:
                 # Pass the *same* storage_path you used in __init__
                 self.replay_buffer = OnDiskReplayBuffer.load(
-                    str(buffer_path), 
-                    storage_path="erl_buffer_storage" 
+                    str(buffer_path),
+                    storage_path="erl_buffer_storage"
                 )
                 print("✓ Loaded on-disk replay buffer metadata")
-                # Update config to reflect loaded buffer's capacity
-                Config.BUFFER_SIZE = self.replay_buffer.capacity
             except Exception as e:
                 print(f"❌ Error loading buffer: {e}")
                 self.replay_buffer = OnDiskReplayBuffer(
