@@ -5,8 +5,76 @@ Pretty printing and progress visualization
 
 import os
 import numpy as np
-from typing import List
+from typing import List, Optional
 from utils.config import Config
+import psutil
+import torch
+import shutil
+
+
+class ResourceTracker:
+    """Tracks system resource usage throughout training."""
+
+    def __init__(self, disk_path: str = "/workspace"):
+        """
+        Initialize resource tracker.
+
+        Args:
+            disk_path: Path to monitor for disk usage (default: /workspace for RunPod)
+        """
+        self.disk_path = disk_path
+        # Fall back to current directory if /workspace doesn't exist
+        if not os.path.exists(disk_path):
+            self.disk_path = os.getcwd()
+
+        self.peak_vram_gb = 0.0
+        self.peak_ram_gb = 0.0
+        self.peak_disk_gb = 0.0
+
+    def update(self):
+        """Update peak resource usage statistics."""
+        # Track VRAM (GPU memory)
+        if torch.cuda.is_available():
+            vram_used = torch.cuda.max_memory_allocated() / (1024**3)  # Convert to GB
+            self.peak_vram_gb = max(self.peak_vram_gb, vram_used)
+
+        # Track system RAM
+        ram_info = psutil.virtual_memory()
+        ram_used_gb = ram_info.used / (1024**3)  # Convert to GB
+        self.peak_ram_gb = max(self.peak_ram_gb, ram_used_gb)
+
+        # Track disk usage
+        disk_info = shutil.disk_usage(self.disk_path)
+        disk_used_gb = disk_info.used / (1024**3)  # Convert to GB
+        self.peak_disk_gb = max(self.peak_disk_gb, disk_used_gb)
+
+    def get_current_stats(self) -> dict:
+        """Get current resource usage statistics."""
+        stats = {
+            'peak_vram_gb': self.peak_vram_gb,
+            'peak_ram_gb': self.peak_ram_gb,
+            'peak_disk_gb': self.peak_disk_gb,
+        }
+
+        # Add current values for reference
+        if torch.cuda.is_available():
+            stats['current_vram_gb'] = torch.cuda.memory_allocated() / (1024**3)
+
+        ram_info = psutil.virtual_memory()
+        stats['current_ram_gb'] = ram_info.used / (1024**3)
+
+        disk_info = shutil.disk_usage(self.disk_path)
+        stats['current_disk_gb'] = disk_info.used / (1024**3)
+
+        return stats
+
+    def reset_peaks(self):
+        """Reset peak tracking (useful for per-generation tracking)."""
+        self.peak_vram_gb = 0.0
+        self.peak_ram_gb = 0.0
+        self.peak_disk_gb = 0.0
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
 
 def plot_fitness_progress(fitness_history: List[List[float]]):
@@ -51,16 +119,17 @@ def plot_fitness_progress(fitness_history: List[List[float]]):
     print("="*60)
 
 
-def print_generation_summary(gen: int, total_gens: int, 
+def print_generation_summary(gen: int, total_gens: int,
                              fitness_scores: List[float],
                              pop_stats: dict,
                              buffer_size: int,
                              best_fitness: float,
                              gen_time: float,
-                             avg_gen_time: float):
+                             avg_gen_time: float,
+                             resource_stats: Optional[dict] = None):
     """
     Print a comprehensive summary of the generation.
-    
+
     Args:
         gen: Current generation number
         total_gens: Total number of generations
@@ -70,6 +139,7 @@ def print_generation_summary(gen: int, total_gens: int,
         best_fitness: Best fitness ever achieved
         gen_time: Time taken for this generation
         avg_gen_time: Average time per generation
+        resource_stats: Optional dictionary with resource usage statistics
     """
     mean_fitness = np.mean(fitness_scores)
     max_fitness = np.max(fitness_scores)
@@ -126,7 +196,16 @@ def print_generation_summary(gen: int, total_gens: int,
     
     print(f"  Remaining Gens:    {remaining:>12}")
     print(f"  ETA:               {eta_minutes:>11.1f}m  ({eta_hours:.1f}h)")
-    
+
+    # Add one-line resource summary if provided
+    if resource_stats:
+        print("\n💻 RESOURCE USAGE")
+        print("-" * 70)
+        print(f"  Peak VRAM: {resource_stats['peak_vram_gb']:.1f}GB  |  "
+              f"Peak RAM: {resource_stats['peak_ram_gb']:.1f}GB  |  "
+              f"Peak Disk: {resource_stats['peak_disk_gb']:.1f}GB  |  "
+              f"Avg Gen Time: {avg_gen_time:.1f}s")
+
     print("\n" + "="*70)
 
 

@@ -27,7 +27,7 @@ from models.ddpg_agent import DDPGAgent
 from models.replay_buffer import ReplayBuffer, OnDiskReplayBuffer
 from erl.genetic_ops import create_next_generation
 from utils.config import Config
-from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress
+from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress, ResourceTracker
 from utils.cloud_sync import get_cloud_sync_from_env
 # from utils.memory_profiler import get_profiler, log_memory  # Memory profiling disabled
 
@@ -247,6 +247,9 @@ class ERLTrainer:
         # Column names for better logging
         self.column_names = data_loader.column_names if hasattr(data_loader, 'column_names') and data_loader.column_names else \
                            [f"col_{i}" for i in range(Config.TOTAL_COLUMNS)]
+
+        # Initialize resource tracker
+        self.resource_tracker = ResourceTracker(disk_path="/workspace")
 
         print(f"Training: days {self.train_start_idx}-{self.train_end_idx}, "
               f"Validation: days {self.interim_val_start_idx}-{self.interim_val_end_idx}, "
@@ -1075,14 +1078,21 @@ class ERLTrainer:
         for gen in range(self.start_generation, Config.NUM_GENERATIONS):
             self.generation = gen  # Keep this to track the *current* gen
             gen_start_time = time.time()
-            
+
+            # Reset peak memory stats for this generation
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
             print(f"\n{'='*60}")
             print(f"Generation {gen + 1} / {Config.NUM_GENERATIONS}")
             print(f"Buffer: {len(self.replay_buffer)} / {self.replay_buffer.capacity} ({len(self.replay_buffer)/self.replay_buffer.capacity*100:.1f}%)")
             print(f"{'='*60}")
-            
+
             # 1. Evaluate population (collect experiences)
             fitness_scores, pop_stats = self.evaluate_population()
+
+            # Update resource tracker after evaluation
+            self.resource_tracker.update()
 
             # 🔍 Memory tracking after evaluation
             # log_memory(f"Gen {gen+1}: After evaluate_population", show_objects=True)
@@ -1176,20 +1186,11 @@ class ERLTrainer:
             else:
                 print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
             
-            # Print comprehensive summary
-            print_generation_summary(
-                gen=gen,
-                total_gens=Config.NUM_GENERATIONS,
-                fitness_scores=fitness_scores,
-                pop_stats=pop_stats,
-                buffer_size=len(self.replay_buffer),
-                best_fitness=self.best_validation_fitness,  # Use validation fitness for "best ever"
-                gen_time=0,  # Will update below
-                avg_gen_time=np.mean(self.generation_times) if self.generation_times else 0
-            )
-            
             # 2. Train agents using replay buffer
             self.train_population()
+
+            # Update resource tracker after training
+            self.resource_tracker.update()
 
             # 🔍 Memory tracking after training
             # log_memory(f"Gen {gen+1}: After train_population", show_objects=True)
@@ -1256,6 +1257,9 @@ class ERLTrainer:
             # 3. Evolve population
             self.evolve_population(fitness_scores)
 
+            # Update resource tracker after evolution
+            self.resource_tracker.update()
+
             # 🔍 Memory tracking after evolution
             # log_memory(f"Gen {gen+1}: After evolve_population", show_objects=True)
             
@@ -1290,25 +1294,45 @@ class ERLTrainer:
             # Generation time
             gen_time = time.time() - gen_start_time
             self.generation_times.append(gen_time)
-            
+
+            # Get final resource stats for this generation
+            self.resource_tracker.update()
+            resource_stats = self.resource_tracker.get_current_stats()
+
+            # Print comprehensive generation summary with resource stats
+            print_generation_summary(
+                gen=gen,
+                total_gens=Config.NUM_GENERATIONS,
+                fitness_scores=fitness_scores,
+                pop_stats=pop_stats,
+                buffer_size=len(self.replay_buffer),
+                best_fitness=self.best_validation_fitness,  # Use validation fitness for "best ever"
+                gen_time=gen_time,
+                avg_gen_time=np.mean(self.generation_times) if self.generation_times else 0,
+                resource_stats=resource_stats
+            )
+
             # Show progress plot every 5 generations
             if (gen + 1) % 5 == 0:
                 plot_fitness_progress(self.fitness_history)
                 # CRITICAL FIX: Close matplotlib figures to prevent memory leak (~100MB per plot)
                 plt.close('all')
-            
+
             # Buffer stats and generation time
             buffer_stats = self.replay_buffer.get_stats()
             self.writer.add_scalar('Buffer/Size', buffer_stats['size'], gen)
             self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
 
-            # Log buffer stats and timing to wandb
+            # Log buffer stats, timing, and resource usage to wandb
             wandb.log({
                 "buffer/size": buffer_stats['size'],
                 "buffer/utilization": buffer_stats['utilization'],
                 "buffer/capacity": buffer_stats['capacity'],
                 "training/generation_time": gen_time,
                 "training/avg_generation_time": np.mean(self.generation_times) if self.generation_times else 0,
+                "resources/peak_vram_gb": resource_stats['peak_vram_gb'],
+                "resources/peak_ram_gb": resource_stats['peak_ram_gb'],
+                "resources/peak_disk_gb": resource_stats['peak_disk_gb'],
             }, step=gen)
 
             # Clear GPU cache and run garbage collection to prevent memory leaks
