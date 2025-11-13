@@ -651,13 +651,14 @@ class ERLTrainer:
             )
 
             # CRITICAL FIX: Create validation gradient for agents that don't trade
-            # If agent made 0 trades, modify fitness based on max_coefficient
+            # If agent made 0 trades, add max_coefficient bonus to reduce penalty
             # This creates a gradient that rewards agents who get "closer" to the threshold
             if episode_info['num_trades'] == 0:
                 max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
-                # Base penalty is -100, but add max_coefficient as a gradient
-                # Agent with max_coeff=0.9 gets -99.1, agent with max_coeff=0.2 gets -99.8
-                fitness = -100.0 + max_coeff
+                # Add max_coefficient as a bonus (reduces the harsh zero-trades penalty slightly)
+                # Agent with max_coeff=0.9 gets better score than agent with max_coeff=0.2
+                # The bonus is small relative to ZERO_TRADES_PENALTY, but creates gradient
+                fitness = fitness + max_coeff
 
             slice_results.append({
                 'fitness': fitness,

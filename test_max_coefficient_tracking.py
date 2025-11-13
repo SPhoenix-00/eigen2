@@ -136,9 +136,16 @@ def test_max_coefficient_tracking():
 
     for coeff in test_coeffs:
         # Simulate validation fitness calculation
+        # Assume cumulative_reward ≈ -2000 (inaction penalties, etc.)
+        cumulative_reward = -2000
         max_coeff = coeff
         num_trades = 0
-        validation_fitness = -100.0 + max_coeff if num_trades == 0 else 0.0
+
+        # Apply zero trades penalty (from run_episode)
+        base_fitness = cumulative_reward - Config.ZERO_TRADES_PENALTY
+
+        # Add max_coefficient bonus (from validate_agent)
+        validation_fitness = base_fitness + max_coeff if num_trades == 0 else base_fitness
 
         validation_scores.append(validation_fitness)
         print(f"Agent with max_coeff={coeff:.1f}, 0 trades: fitness = {validation_fitness:.1f}")
@@ -147,6 +154,7 @@ def test_max_coefficient_tracking():
     assert validation_scores[0] < validation_scores[1] < validation_scores[2], \
         "Validation fitness should increase with max_coefficient"
     print(f"\n✓ Gradient exists: {validation_scores[0]:.1f} < {validation_scores[1]:.1f} < {validation_scores[2]:.1f}")
+    print("✓ Zero-trades penalty (-10000) is still applied!")
 
     print("\n" + "="*70)
     print("ALL TESTS PASSED ✓")

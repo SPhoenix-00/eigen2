@@ -18,13 +18,21 @@ Implemented a **gradient based on max coefficient** during validation episodes:
 ### Formula
 When `num_trades == 0`:
 ```python
-validation_fitness = -100.0 + max_coefficient_during_episode
+# Step 1: Apply zero-trades penalty (in run_episode)
+base_fitness = cumulative_reward - ZERO_TRADES_PENALTY  # -10,000 penalty
+
+# Step 2: Add max_coefficient bonus (in validate_agent)
+validation_fitness = base_fitness + max_coefficient_during_episode
 ```
 
 ### Examples
-- Agent with max_coeff = 0.2 → Fitness = **-99.8**
-- Agent with max_coeff = 0.5 → Fitness = **-99.5**
-- Agent with max_coeff = 0.9 → Fitness = **-99.1** ✓ Best score (closest to threshold)
+Assuming cumulative_reward ≈ -2000 (from inaction penalties):
+- Base fitness = -2000 - 10000 = **-12000**
+- Agent with max_coeff = 0.2 → Fitness = **-11999.8**
+- Agent with max_coeff = 0.5 → Fitness = **-11999.5**
+- Agent with max_coeff = 0.9 → Fitness = **-11999.1** ✓ Best score (closest to threshold)
+
+The zero-trades penalty remains intact, but the max_coefficient creates a small gradient for selection.
 
 ## Implementation Changes
 
@@ -62,13 +70,14 @@ self.max_coefficient_during_episode = max(
 
 #### Modified validation fitness calculation:
 ```python
-# In validate_agent() (lines 653-660)
+# In validate_agent() (lines 653-661)
 # CRITICAL FIX: Create validation gradient for agents that don't trade
 if episode_info['num_trades'] == 0:
     max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
-    # Base penalty is -100, but add max_coefficient as a gradient
-    # Agent with max_coeff=0.9 gets -99.1, agent with max_coeff=0.2 gets -99.8
-    fitness = -100.0 + max_coeff
+    # Add max_coefficient as a bonus (reduces the harsh zero-trades penalty slightly)
+    # Agent with max_coeff=0.9 gets better score than agent with max_coeff=0.2
+    # The bonus is small relative to ZERO_TRADES_PENALTY, but creates gradient
+    fitness = fitness + max_coeff
 ```
 
 ### 3. Configuration Changes ([utils/config.py](utils/config.py))
@@ -91,7 +100,8 @@ Created comprehensive test suite in [test_max_coefficient_tracking.py](test_max_
 ✓ Test Case 4: Validation gradient formula
 
 Gradient verification:
-  -99.8 < -99.5 < -99.1 ✓
+  -11999.8 < -11999.5 < -11999.1 ✓
+  Zero-trades penalty (-10000) is still applied! ✓
 ```
 
 All tests passed successfully!
@@ -100,16 +110,17 @@ All tests passed successfully!
 
 ### Before Fix (Flat Landscape)
 ```
-Agent A (max_coeff=0.2, 0 trades): -10100.0
-Agent B (max_coeff=0.9, 0 trades): -10100.0
+Agent A (max_coeff=0.2, 0 trades): ~-12000
+Agent B (max_coeff=0.9, 0 trades): ~-12000
 → No selection pressure, random selection
 ```
 
 ### After Fix (Gradient)
 ```
-Agent A (max_coeff=0.2, 0 trades): -99.8
-Agent B (max_coeff=0.9, 0 trades): -99.1
+Agent A (max_coeff=0.2, 0 trades): -11999.8
+Agent B (max_coeff=0.9, 0 trades): -11999.1
 → Evolution prefers Agent B (closer to threshold)
+→ Zero-trades penalty still enforced (~-12000 total)
 ```
 
 ## Expected Evolutionary Behavior
@@ -150,8 +161,9 @@ The population should evolve through stages:
 ## Notes
 
 - The gradient is **only applied during validation**, not during training fitness evaluation
-- The `-100.0` base penalty is intentionally harsh to keep non-trading agents below trading agents
-- The max coefficient naturally ranges from 0.0 to typically ~2.0, providing good gradient resolution
+- The **ZERO_TRADES_PENALTY (-10,000)** is still fully applied - this fix doesn't remove it
+- The max_coefficient bonus (0.0 to ~2.0) creates a small but meaningful gradient
+- The gradient is relative to the large penalty, so non-trading agents are still heavily penalized
 - This fix maintains backward compatibility - agents that trade normally are unaffected
 
 ## Next Steps
