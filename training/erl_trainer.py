@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='torch.cuda.amp
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
 from models.ddpg_agent import DDPGAgent
-from models.replay_buffer import ReplayBuffer
+from models.replay_buffer import ReplayBuffer, OnDiskReplayBuffer
 from erl.genetic_ops import create_next_generation
 from utils.config import Config
 from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress
@@ -63,8 +63,13 @@ class ERLTrainer:
         print(f"Initializing population of {Config.POPULATION_SIZE} agents...")
         self.population = [DDPGAgent(agent_id=i) for i in range(Config.POPULATION_SIZE)]
         
-        # Shared replay buffer
-        self.replay_buffer = ReplayBuffer()
+        # Shared replay buffer (ON-DISK)
+        self.replay_buffer = OnDiskReplayBuffer(
+            capacity=1000000,  # <-- Set your 1M capacity!
+            storage_path="erl_buffer_storage" # <-- Name of the folder
+        )
+        # Update config to reflect the *actual* capacity for logging
+        Config.BUFFER_SIZE = self.replay_buffer.capacity
         
         # Training range (excludes interim validation and holdout sets)
         self.train_start_idx = Config.CONTEXT_WINDOW_DAYS
@@ -853,14 +858,11 @@ class ERLTrainer:
             agent.save(str(agent_path))
         
         # 3. Save the replay buffer every 5 generations (overwrites previous)
-        # DISABLED: Buffer save causes RAM exhaustion during pickle serialization (175GB peak)
-        # Buffer remains in memory for training (~20GB), just not persisted to disk
-        # if (self.generation + 1) % 5 == 0:
-        #     buffer_path = checkpoint_dir / "replay_buffer.pkl"
-        #     cloud_path = f"{self.cloud_sync.project_name}/checkpoints/replay_buffer.pkl"
-        #     print(f"  Queueing replay buffer save+upload in background...")
-        #     self.cloud_sync.save_and_upload_buffer(self.replay_buffer, str(buffer_path), cloud_path)
-        #     print(f"  ✓ Buffer save+upload queued ({len(self.replay_buffer)} transitions)")
+        if (self.generation + 1) % 5 == 0:
+            buffer_path = checkpoint_dir / "replay_buffer.pkl"
+            print(f"  Saving on-disk buffer metadata ({len(self.replay_buffer)} paths)...")
+            self.replay_buffer.save(str(buffer_path))
+            # The main cloud_sync (line 1175) will now pick up this small file.
 
         # 4. Save the trainer state
         trainer_state = {
@@ -924,9 +926,24 @@ class ERLTrainer:
         buffer_path = checkpoint_dir / "replay_buffer.pkl"
         if buffer_path.exists():
             try:
-                buffer_path.unlink()  # Delete old buffer
+                # Pass the *same* storage_path you used in __init__
+                self.replay_buffer = OnDiskReplayBuffer.load(
+                    str(buffer_path), 
+                    storage_path="erl_buffer_storage" 
+                )
+                print("✓ Loaded on-disk replay buffer metadata")
+                # Update config to reflect loaded buffer's capacity
+                Config.BUFFER_SIZE = self.replay_buffer.capacity
             except Exception as e:
-                pass
+                print(f"❌ Error loading buffer: {e}")
+                self.replay_buffer = OnDiskReplayBuffer(
+                    capacity=Config.BUFFER_SIZE, # Will use the 1M from __init__
+                    storage_path="erl_buffer_storage"
+                )
+        else:
+            print("! No replay buffer checkpoint found. Using new on-disk buffer.")
+            # self.replay_buffer is already a new OnDisk buffer from __init__
+            # so no action is needed here.
         
         # 5. Load Trainer State
         state_path = checkpoint_dir / "trainer_state.json"

@@ -12,7 +12,7 @@ import gzip
 import os
 
 from utils.config import Config
-
+from pathlib import Path
 
 class ReplayBuffer:
     """
@@ -375,3 +375,212 @@ if __name__ == "__main__":
     print("Updated priorities based on TD-errors")
     
     print("\n✓ Replay buffer tests complete!")
+
+class OnDiskReplayBuffer:
+    """
+    Circular replay buffer that stores transitions on disk to save RAM.
+    The in-memory buffer holds only file paths.
+    """
+    
+    def __init__(self, capacity: int = None, storage_path: str = "buffer_storage"):
+        """
+        Initialize on-disk replay buffer.
+        
+        Args:
+            capacity: Maximum number of transitions. Uses Config.BUFFER_SIZE if None.
+            storage_path: Directory to store transition files.
+        """
+        self.capacity = capacity or Config.BUFFER_SIZE
+        self.storage_path = Path(storage_path)
+        
+        # Create storage directory if it doesn't exist
+        self.storage_path.mkdir(parents=True, exist_ok=True)
+        
+        # Deque now stores file paths (strings)
+        self.buffer = deque(maxlen=self.capacity)
+        
+        # Statistics
+        self.total_added = 0
+        
+        print(f"OnDiskReplayBuffer initialized. Capacity: {self.capacity}, Storage: {self.storage_path}")
+
+    def add(self, state: np.ndarray, action: np.ndarray, reward: float, 
+            next_state: np.ndarray, done: bool):
+        """
+        Save a transition to disk and add its path to the buffer.
+        """
+        transition = {
+            'state': state,
+            'action': action,
+            'reward': reward,
+            'next_state': next_state,
+            'done': done
+        }
+        
+        # Get a unique file path for this transition
+        file_id = self.total_added
+        file_path = self.storage_path / f"transition_{file_id}.pkl.gz"
+        
+        # Check if buffer is full and we need to remove an old file
+        old_path_to_remove = None
+        if len(self.buffer) == self.capacity:
+            # Get path of the oldest file (which deque will pop)
+            old_path_to_remove = self.buffer[0] 
+
+        try:
+            # Save the new transition file (low compression for speed)
+            with gzip.open(file_path, 'wb', compresslevel=1) as f:
+                pickle.dump(transition, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            # Add the new path to the buffer
+            self.buffer.append(str(file_path))
+            
+            # If an old file was popped, delete it from disk
+            if old_path_to_remove:
+                try:
+                    os.remove(old_path_to_remove)
+                except OSError:
+                    pass # File might already be gone
+
+            self.total_added += 1
+
+        except Exception as e:
+            print(f"❌ ERROR saving on-disk transition {file_path}: {e}")
+    
+    def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        """
+        Sample a random batch by loading transitions from disk.
+        """
+        if len(self.buffer) < batch_size:
+            raise ValueError(f"Not enough samples in buffer: {len(self.buffer)} < {batch_size}")
+        
+        # 1. Sample random indices from the deque
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        
+        # 2. Get the file paths for those indices
+        batch_paths = [self.buffer[i] for i in indices]
+        
+        # 3. Load transitions from disk
+        batch_transitions = []
+        for path in batch_paths:
+            try:
+                with gzip.open(path, 'rb') as f:
+                    batch_transitions.append(pickle.load(f))
+            except Exception as e:
+                # This can happen if a file is corrupted or mid-write
+                continue
+        
+        if not batch_transitions:
+            return self.sample(batch_size) # Recurse if all samples failed
+        
+        # 4. Stack into tensors
+        try:
+            states = np.stack([t['state'] for t in batch_transitions])
+            actions = np.stack([t['action'] for t in batch_transitions])
+            rewards = np.array([t['reward'] for t in batch_transitions]).reshape(-1, 1)
+            next_states = np.stack([t['next_state'] for t in batch_transitions])
+            dones = np.array([t['done'] for t in batch_transitions]).reshape(-1, 1)
+        except Exception as e:
+            print(f"❌ ERROR stacking transitions: {e}. Retrying sample.")
+            return self.sample(batch_size) # Data might be corrupted, try again
+
+        # 5. Convert to PyTorch tensors and move to GPU
+        return {
+            'states': torch.FloatTensor(states).to(Config.DEVICE),
+            'actions': torch.FloatTensor(actions).to(Config.DEVICE),
+            'rewards': torch.FloatTensor(rewards).to(Config.DEVICE),
+            'next_states': torch.FloatTensor(next_states).to(Config.DEVICE),
+            'dones': torch.FloatTensor(dones).to(Config.DEVICE)
+        }
+    
+    def __len__(self) -> int:
+        return len(self.buffer)
+    
+    def is_ready(self) -> bool:
+        is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
+        min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
+        return len(self.buffer) >= min_size
+    
+    def clear(self):
+        print("Clearing OnDiskReplayBuffer and deleting files...")
+        for path in list(self.buffer): # Iterate copy
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self.buffer.clear()
+        print("Buffer cleared.")
+    
+    def get_stats(self) -> dict:
+        return {
+            'size': len(self.buffer),
+            'capacity': self.capacity,
+            'utilization': len(self.buffer) / self.capacity,
+            'total_added': self.total_added
+        }
+
+    def save(self, file_path: str):
+        """
+        Saves the buffer's metadata (path deque, capacity, counter) to a file.
+        This is very fast and uses minimal RAM.
+        """
+        print(f"  Saving on-disk buffer metadata to {file_path}...")
+        save_data = {
+            'capacity': self.capacity,
+            'buffer': self.buffer,  # The deque of file paths
+            'total_added': self.total_added,
+            'storage_path': str(self.storage_path) # Save storage path for verification
+        }
+        try:
+            with gzip.open(file_path, 'wb', compresslevel=1) as f:
+                pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"  ✓ Buffer metadata saved ({len(self.buffer)} paths).")
+        except Exception as e:
+            print(f"  ❌ ERROR saving buffer metadata: {e}")
+
+    @staticmethod
+    def load(file_path: str, storage_path_override: str = None) -> 'OnDiskReplayBuffer':
+        """
+        Loads a ReplayBuffer's metadata from a file.
+        Verifies that the storage_path still exists.
+        """
+        print(f"  Loading on-disk buffer metadata from {file_path}...")
+        try:
+            with gzip.open(file_path, 'rb') as f:
+                save_data = pickle.load(f)
+            
+            # Use override path if provided, else use saved path
+            storage_path = storage_path_override or save_data.get('storage_path', 'buffer_storage')
+
+            new_buffer = OnDiskReplayBuffer(
+                capacity=save_data['capacity'], 
+                storage_path=storage_path
+            )
+            new_buffer.buffer = save_data['buffer']
+            new_buffer.total_added = save_data.get('total_added', len(new_buffer.buffer))
+            
+            print(f"  ✓ Buffer metadata loaded (size: {len(new_buffer.buffer)}).")
+            
+            # Verify that the files and storage path still exist
+            if len(new_buffer.buffer) > 0:
+                first_path_str = new_buffer.buffer[0]
+                first_path = Path(first_path_str)
+                
+                # Check if path in metadata matches expected storage path
+                if not first_path.is_relative_to(new_buffer.storage_path):
+                     print(f"  ⚠️ WARNING: Path mismatch!")
+                     print(f"  Buffer metadata path: {first_path.parent}")
+                     print(f"  Trainer storage_path: {new_buffer.storage_path}")
+                     print(f"  This may fail if files were moved. Make sure 'storage_path' is correct.")
+
+                if not first_path.exists():
+                    print(f"  ⚠️ WARNING: Transition file {first_path_str} not found on disk.")
+                    print(f"  If you moved your project, ensure the '{storage_path}' folder was moved too.")
+                else:
+                    print("  ✓ Verified transition files seem to exist.")
+            
+            return new_buffer
+        except Exception as e:
+            print(f"  ❌ ERROR loading buffer metadata: {e}")
+            print("  Could not load. Creating a new empty one.")
+            return OnDiskReplayBuffer(capacity=Config.BUFFER_SIZE, storage_path=storage_path_override or 'buffer_storage')
