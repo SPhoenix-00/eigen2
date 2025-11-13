@@ -98,9 +98,10 @@ class DDPGAgent:
                 action[:, 0] = np.maximum(action[:, 0], 0)  # Coefficient >= 0
                 action[:, 1] = np.clip(action[:, 1], Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
 
-            # Round coefficients to nearest integer for discrete position sizing
-            # This simplifies the action space while maintaining gradient flow during training
-            action[:, 0] = np.round(action[:, 0])
+            # !!! CRITICAL FIX: DO NOT ROUND HERE !!!
+            # This operation is non-differentiable and breaks the DDPG gradient.
+            # It causes the agent to overfit to the training noise.
+            # action[:, 0] = np.round(action[:, 0]) # <-- DELETED
 
             # Cap coefficients at 100 to prevent reward explosion
             # (reward = coefficient × gain_pct, so uncapped coefficients could destabilize training)

@@ -27,7 +27,7 @@ class Config:
     MIN_COEFFICIENT = 1.0  # Minimum position size (or 0 for no action)
     MIN_SALE_TARGET = 10.0  # Minimum 10% gain target
     MAX_SALE_TARGET = 50.0  # Maximum 50% gain target
-    COEFFICIENT_THRESHOLD = 0.9  # Threshold for opening position (stock must score >= this)
+    COEFFICIENT_THRESHOLD = 1.0  # Threshold for opening position (stock must score >= this)
     
     # ============ Environment Parameters ============
     # Holding period structure: agent must hold for MIN_HOLDING_PERIOD,
@@ -37,8 +37,8 @@ class Config:
     MAX_HOLDING_PERIOD = MIN_HOLDING_PERIOD + LIQUIDATION_WINDOW  # 30 total days
 
     LOSS_PENALTY_MULTIPLIER = 1.0  # Losses treated equally to gains (was 3.0, removed penalty to fix zombie agents)
-    INACTION_PENALTY = 20.0  # Penalty per day without an open position (quadrupled from original 5.0)
-    FORCED_EXIT_PENALTY = 100.0  # Penalty for forced exits due to max_holding_period (equal to original inaction penalty)
+    INACTION_PENALTY = 2.0  # Penalty per day without an open position (reduced from 20.0 to smooth landscape)
+    FORCED_EXIT_PENALTY = 25.0  # Penalty for forced exits due to max_holding_period (reduced from 100.0)
     ZERO_TRADES_PENALTY = 10000.0  # Heavy penalty for making NO trades at all
 
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
@@ -100,8 +100,8 @@ class Config:
     """     NUM_PARENTS = 8  # Top performers to keep
     NUM_OFFSPRING = 6  # Generated via crossover
     NUM_MUTANTS = 2  # Random mutations """
-    ELITE_FRAC = 0.125      # 12.5% of population (reduced from 0.375 for higher diversity)
-    OFFSPRING_FRAC = 0.375   # 37.5% of population
+    ELITE_FRAC = 0.25       # 25% of population
+    OFFSPRING_FRAC = 0.25   # 25% of population
     # MUTANT_FRAC will be the remainder (50%, massively increased for exploration)
     
     # Genetic operators

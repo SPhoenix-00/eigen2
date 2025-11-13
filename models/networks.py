@@ -398,8 +398,8 @@ class Actor(nn.Module):
     
     def _apply_coefficient_activation(self, raw: torch.Tensor) -> torch.Tensor:
         """
-        Apply activation to normalize coefficient to [0, 1] range.
-        Uses sigmoid for bounded output, allowing agent to learn when NOT to trade.
+        Apply activation to output continuous position size multiplier.
+        Uses ReLU for unbounded positive output [0, inf).
 
         During training: outputs continuous values for gradient flow
         During inference: will be compared against threshold in trading logic
@@ -408,12 +408,12 @@ class Actor(nn.Module):
             raw: Raw output from network
 
         Returns:
-            Activated coefficients normalized to [0, 1] range
+            Activated coefficients as position size multipliers [0, inf)
         """
-        # Sigmoid: maps raw values to [0, 1] smoothly
-        # This allows the agent to learn that values below COEFFICIENT_THRESHOLD
-        # should not trigger trades, giving it the option to not trade
-        coefficients = torch.sigmoid(raw)
+        # ReLU: maps raw values to [0, inf) for position size multiplier
+        # Values below COEFFICIENT_THRESHOLD (1.0) will not trigger trades
+        # Values >= COEFFICIENT_THRESHOLD will scale position size (discrete sizing with cap at 100)
+        coefficients = F.relu(raw)
 
         return coefficients
 
