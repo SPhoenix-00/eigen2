@@ -33,6 +33,7 @@ class FeatureExtractor(nn.Module):
                                kernel_size=Config.CNN_KERNEL_SIZE,
                                padding=Config.CNN_KERNEL_SIZE // 2)
         self.bn1 = nn.BatchNorm1d(Config.CNN_FILTERS)
+        self.dropout_conv = nn.Dropout(Config.DROPOUT_2D_RATE)
 
         # LSTM to capture temporal dependencies
         # Input: [batch, num_columns, context_days, CNN_FILTERS]
@@ -57,6 +58,7 @@ class FeatureExtractor(nn.Module):
         x = self.conv1(x)
         x = self.bn1(x)
         x = F.relu(x)
+        x = self.dropout_conv(x)
         return x
 
     def _lstm_block(self, x: torch.Tensor) -> torch.Tensor:
@@ -254,15 +256,17 @@ class Actor(nn.Module):
         self.investable_fc = nn.Sequential(
             nn.Linear(investable_input_dim, Config.ACTOR_HIDDEN_DIMS[0]),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(Config.DROPOUT_RATE),
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[0], Config.ACTOR_HIDDEN_DIMS[1]),
             nn.ReLU(),
+            nn.Dropout(Config.DROPOUT_RATE),
         )
 
         # Process context features
         self.context_fc = nn.Sequential(
             nn.Linear(context_input_dim, Config.ACTOR_HIDDEN_DIMS[1]),
             nn.ReLU(),
+            nn.Dropout(Config.DROPOUT_RATE),
         )
 
         # Combined processing for each stock
@@ -272,14 +276,14 @@ class Actor(nn.Module):
         self.coefficient_head = nn.Sequential(
             nn.Linear(combined_dim, Config.ACTOR_HIDDEN_DIMS[2]),
             nn.ReLU(),
-            nn.Dropout(0.2),  # Added to combat overfitting
+            nn.Dropout(Config.DROPOUT_RATE_HEADS),
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[2], 1),
         )
 
         self.sale_target_head = nn.Sequential(
             nn.Linear(combined_dim, Config.ACTOR_HIDDEN_DIMS[2]),
             nn.ReLU(),
-            nn.Dropout(0.2),  # Added to combat overfitting
+            nn.Dropout(Config.DROPOUT_RATE_HEADS),
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[2], 1),
             nn.Sigmoid()  # Output in [0, 1], will scale to [MIN, MAX] sale target
         )
@@ -455,10 +459,10 @@ class Critic(nn.Module):
         self.critic_fc = nn.Sequential(
             nn.Linear(state_dim + action_dim, Config.CRITIC_HIDDEN_DIMS[0]),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(Config.DROPOUT_RATE),
             nn.Linear(Config.CRITIC_HIDDEN_DIMS[0], Config.CRITIC_HIDDEN_DIMS[1]),
             nn.ReLU(),
-            nn.Dropout(0.2),  # Added to combat overfitting
+            nn.Dropout(Config.DROPOUT_RATE),
             nn.Linear(Config.CRITIC_HIDDEN_DIMS[1], 1)
         )
 

@@ -46,7 +46,8 @@ class TradingEnvironment(gym.Env):
                  start_idx: int,
                  end_idx: int,
                  trading_end_idx: int = None,
-                 data_array_full: np.ndarray = None):
+                 data_array_full: np.ndarray = None,
+                 is_training: bool = True):
         """
         Initialize trading environment.
 
@@ -59,6 +60,7 @@ class TradingEnvironment(gym.Env):
             trading_end_idx: Last day new positions can be opened. If None, equals end_idx
             data_array_full: Full market data for reward calculation [num_days, num_columns, 9_features]
                             If None, uses data_array (for backward compatibility)
+            is_training: If True, applies observation noise for regularization
         """
         super().__init__()
 
@@ -68,6 +70,7 @@ class TradingEnvironment(gym.Env):
         self.norm_stats = normalization_stats
         self.start_idx = start_idx
         self.end_idx = end_idx
+        self.is_training = is_training  # Flag to control observation noise
 
         # Trading end is when model stops opening new positions
         # Settlement period allows existing positions to close
@@ -97,6 +100,9 @@ class TradingEnvironment(gym.Env):
         self.num_trades = 0
         self.num_wins = 0
         self.num_losses = 0
+
+        # Track max coefficient during episode (for validation gradient)
+        self.max_coefficient_during_episode = 0.0
         
         # Define action and observation spaces
         # Action: [108 stocks, 2 values (coefficient, sale_target)]
@@ -119,6 +125,15 @@ class TradingEnvironment(gym.Env):
             dtype=np.float32
         )
     
+    def set_training_mode(self, is_training: bool):
+        """
+        Set whether environment is in training mode.
+
+        Args:
+            is_training: If True, applies observation noise for regularization
+        """
+        self.is_training = is_training
+
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None,
              start_idx: Optional[int] = None, end_idx: Optional[int] = None,
              trading_end_idx: Optional[int] = None) -> Tuple[np.ndarray, dict]:
@@ -162,6 +177,9 @@ class TradingEnvironment(gym.Env):
         self.total_positions_opened = 0
         self.days_with_positions = 0
         self.days_without_positions = 0
+
+        # Reset max coefficient tracking
+        self.max_coefficient_during_episode = 0.0
 
         # Get initial observation
         obs = self._get_observation()
@@ -229,18 +247,29 @@ class TradingEnvironment(gym.Env):
         """
         Get current observation (normalized context window).
 
+        Applies Gaussian noise during training as a regularization technique
+        to prevent overfitting. This encourages the agent to learn robust,
+        generalized patterns rather than memorizing exact values.
+
         Returns:
             Array of shape [context_window_days, num_columns, 5_features]
         """
         start_idx = self.current_idx - Config.CONTEXT_WINDOW_DAYS + 1
         end_idx = self.current_idx + 1
-        
+
         # Extract window
         window = self.data_array[start_idx:end_idx, :, :]
-        
+
         # Normalize
         normalized = (window - self.norm_stats['mean']) / self.norm_stats['std']
-        
+
+        # Add observation noise for regularization during training
+        # This prevents the agent from overfitting to exact values and forces
+        # it to learn more robust, "fuzzy" decision rules that generalize better
+        if self.is_training:
+            noise = np.random.normal(0.0, Config.OBSERVATION_NOISE_STD, normalized.shape)
+            normalized = normalized + noise
+
         return normalized.astype(np.float32)
     
     def _process_action(self, action: np.ndarray) -> float:
@@ -271,6 +300,11 @@ class TradingEnvironment(gym.Env):
         # Extract coefficients and sale targets
         coefficients = action[:, 0]
         sale_targets = action[:, 1]
+
+        # Track max coefficient during episode (for validation gradient)
+        # Update with the maximum coefficient from this action
+        max_coeff_this_step = float(np.max(coefficients))
+        self.max_coefficient_during_episode = max(self.max_coefficient_during_episode, max_coeff_this_step)
 
         # Track if any positions were opened this step
         positions_opened_this_step = 0
@@ -516,6 +550,7 @@ class TradingEnvironment(gym.Env):
             'inaction_penalty_applied': inaction_penalty_total,
             'zero_trades_penalty': zero_trades_penalty,  # Just report it, don't apply here
             'closed_trades': closed_trades,  # Include all closed trades for analysis
+            'max_coefficient_during_episode': self.max_coefficient_during_episode,  # For validation gradient
         }
 
         # CRITICAL FIX: Clear episode history to prevent memory leak (~15-20GB per generation)

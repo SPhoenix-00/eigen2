@@ -70,7 +70,9 @@ class ChampionEvaluator:
             data_array=self.data_loader.data_array,
             dates=self.data_loader.dates,
             normalization_stats=self.normalization_stats,
-            train_mode=False
+            start_idx=Config.CONTEXT_WINDOW_DAYS,
+            end_idx=total_days,
+            is_training=False
         )
 
         # Create training evaluation environment
@@ -78,7 +80,9 @@ class ChampionEvaluator:
             data_array=self.data_loader.data_array,
             dates=self.data_loader.dates,
             normalization_stats=self.normalization_stats,
-            train_mode=False
+            start_idx=Config.CONTEXT_WINDOW_DAYS,
+            end_idx=self.train_end_idx,
+            is_training=False
         )
 
         print("✓ Environments ready")

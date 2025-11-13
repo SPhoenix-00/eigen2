@@ -208,7 +208,7 @@ class AgentEvaluator:
         Returns:
             Tuple of (fitness, summary_stats, trade_list)
         """
-        # Create environment
+        # Create environment (evaluation mode - no observation noise)
         env = TradingEnvironment(
             data_array=self.data_array,
             dates=self.dates,
@@ -216,7 +216,8 @@ class AgentEvaluator:
             start_idx=start_idx,
             end_idx=end_idx,
             trading_end_idx=trading_end_idx,
-            data_array_full=self.data_array_full
+            data_array_full=self.data_array_full,
+            is_training=False
         )
 
         # Reset environment

@@ -309,6 +309,9 @@ class ERLTrainer:
         # Calculate trading end (when model stops opening new positions)
         trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
 
+        # Set environment training mode (affects observation noise for regularization)
+        env.set_training_mode(training)
+
         # CRITICAL FIX: Reset persistent environment with new indices
         # DO NOT create new TradingEnvironment here - reuse the passed env
         state, info = env.reset(
@@ -646,6 +649,15 @@ class ERLTrainer:
                 end_idx=end_idx,
                 training=False
             )
+
+            # CRITICAL FIX: Create validation gradient for agents that don't trade
+            # If agent made 0 trades, modify fitness based on max_coefficient
+            # This creates a gradient that rewards agents who get "closer" to the threshold
+            if episode_info['num_trades'] == 0:
+                max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
+                # Base penalty is -100, but add max_coefficient as a gradient
+                # Agent with max_coeff=0.9 gets -99.1, agent with max_coeff=0.2 gets -99.8
+                fitness = -100.0 + max_coeff
 
             slice_results.append({
                 'fitness': fitness,
