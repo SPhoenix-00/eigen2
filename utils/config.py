@@ -24,7 +24,7 @@ class Config:
     # ============ Action Space Parameters ============
     NUM_ACTIONS = NUM_INVESTABLE_STOCKS  # 108 stocks
     ACTION_DIM = 2  # [coefficient, sale_target]
-    MIN_COEFFICIENT = 1.0  # Minimum position size (or 0 for no action)
+    MIN_COEFFICIENT = 0.9  # Minimum position size (or 0 for no action)
     MIN_SALE_TARGET = 10.0  # Minimum 10% gain target
     MAX_SALE_TARGET = 50.0  # Maximum 50% gain target
     COEFFICIENT_THRESHOLD = 1.0  # Threshold for opening position (stock must score >= this)
@@ -92,7 +92,7 @@ class Config:
     MIN_NOISE = 0.01
     
     # ============ ERL Parameters ============
-    POPULATION_SIZE = 31
+    POPULATION_SIZE = 32
     NUM_GENERATIONS = 100
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
