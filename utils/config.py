@@ -119,7 +119,10 @@ class Config:
     
     # ============ Training Parameters ============
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    NUM_WORKERS = 4  # For data loading
+    NUM_WORKERS = 4  # For data loading (deprecated, kept for compatibility)
+    NUM_DATALOADER_WORKERS = 4  # Number of background workers for async batch loading
+    # With 4 workers, batches are prepared in parallel while GPU trains
+    # Higher = more CPU usage but better GPU utilization
     # NOTE: Random seed is now set dynamically per wandb run in ERLTrainer
     # This ensures parallel runs have unique, independent behavior
     

@@ -10,6 +10,8 @@ from collections import deque
 import pickle
 import gzip
 import os
+from torch.utils.data import IterableDataset
+import time
 
 from utils.config import Config
 from pathlib import Path
@@ -376,32 +378,34 @@ if __name__ == "__main__":
     
     print("\n✓ Replay buffer tests complete!")
 
-class OnDiskReplayBuffer:
+class OnDiskReplayBuffer(IterableDataset):
     """
     Circular replay buffer that stores transitions on disk to save RAM.
     The in-memory buffer holds only file paths.
+    Implements IterableDataset for asynchronous batch loading with DataLoader.
     """
-    
+
     def __init__(self, capacity: int = None, storage_path: str = "buffer_storage"):
         """
         Initialize on-disk replay buffer.
-        
+
         Args:
             capacity: Maximum number of transitions. Uses Config.BUFFER_SIZE if None.
             storage_path: Directory to store transition files.
         """
+        super().__init__()
         self.capacity = capacity or Config.BUFFER_SIZE
         self.storage_path = Path(storage_path)
-        
+
         # Create storage directory if it doesn't exist
         self.storage_path.mkdir(parents=True, exist_ok=True)
-        
+
         # Deque now stores file paths (strings)
         self.buffer = deque(maxlen=self.capacity)
-        
+
         # Statistics
         self.total_added = 0
-        
+
         print(f"OnDiskReplayBuffer initialized. Capacity: {self.capacity}, Storage: {self.storage_path}")
 
     def add(self, state: np.ndarray, action: np.ndarray, reward: float, 
@@ -450,16 +454,22 @@ class OnDiskReplayBuffer:
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """
         Sample a random batch by loading transitions from disk.
+
+        Note: When used with DataLoader, this runs in background worker processes.
+        The tensors are created on CPU, then transferred to GPU after pin_memory.
+
+        Returns:
+            Dictionary of tensors, or None if sampling failed.
         """
         if len(self.buffer) < batch_size:
             raise ValueError(f"Not enough samples in buffer: {len(self.buffer)} < {batch_size}")
-        
+
         # 1. Sample random indices from the deque
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        
+
         # 2. Get the file paths for those indices
         batch_paths = [self.buffer[i] for i in indices]
-        
+
         # 3. Load transitions from disk
         batch_transitions = []
         for path in batch_paths:
@@ -468,11 +478,13 @@ class OnDiskReplayBuffer:
                     batch_transitions.append(pickle.load(f))
             except Exception as e:
                 # This can happen if a file is corrupted or mid-write
+                # Don't recurse - let caller handle retry
                 continue
-        
+
+        # Return None if we couldn't load any transitions
         if not batch_transitions:
-            return self.sample(batch_size) # Recurse if all samples failed
-        
+            return None
+
         # 4. Stack into tensors
         try:
             states = np.stack([t['state'] for t in batch_transitions])
@@ -481,18 +493,74 @@ class OnDiskReplayBuffer:
             next_states = np.stack([t['next_state'] for t in batch_transitions])
             dones = np.array([t['done'] for t in batch_transitions]).reshape(-1, 1)
         except Exception as e:
-            print(f"❌ ERROR stacking transitions: {e}. Retrying sample.")
-            return self.sample(batch_size) # Data might be corrupted, try again
+            # Data corrupted - return None and let caller retry
+            print(f"❌ ERROR stacking transitions: {e}")
+            return None
 
-        # 5. Convert to PyTorch tensors and move to GPU
+        # 5. Convert to PyTorch tensors (on CPU in worker processes)
+        # DataLoader with pin_memory will automatically transfer to GPU efficiently
         return {
-            'states': torch.FloatTensor(states).to(Config.DEVICE),
-            'actions': torch.FloatTensor(actions).to(Config.DEVICE),
-            'rewards': torch.FloatTensor(rewards).to(Config.DEVICE),
-            'next_states': torch.FloatTensor(next_states).to(Config.DEVICE),
-            'dones': torch.FloatTensor(dones).to(Config.DEVICE)
+            'states': torch.FloatTensor(states),
+            'actions': torch.FloatTensor(actions),
+            'rewards': torch.FloatTensor(rewards),
+            'next_states': torch.FloatTensor(next_states),
+            'dones': torch.FloatTensor(dones)
         }
-    
+
+    def __iter__(self):
+        """
+        Iterator for PyTorch DataLoader. Yields batches infinitely.
+        This enables asynchronous prefetching - background workers prepare batches
+        while GPU is busy training, eliminating I/O wait time.
+
+        Implements robust retry logic to handle corrupted files without infinite recursion.
+        """
+        MAX_RETRIES = 10  # Max retries per batch before giving up
+
+        while True:
+            # Wait if buffer is not ready
+            if not self.is_ready():
+                time.sleep(0.1)
+                continue
+
+            # Try to sample a batch with retry logic
+            batch = None
+            retry_count = 0
+
+            while batch is None and retry_count < MAX_RETRIES:
+                try:
+                    # Sample batch (this is the slow disk I/O operation)
+                    # When used with DataLoader workers, this runs in parallel with GPU training
+                    batch = self.sample(Config.BATCH_SIZE)
+
+                    if batch is None:
+                        # sample() returned None due to corrupted files
+                        retry_count += 1
+                        if retry_count < MAX_RETRIES:
+                            # Wait a bit and try different samples
+                            time.sleep(0.05)
+                        else:
+                            # Too many failures - skip this batch
+                            print(f"⚠️ WARNING: Failed to load batch after {MAX_RETRIES} attempts. Skipping...")
+                            break
+
+                except Exception as e:
+                    # Handle any unexpected errors
+                    retry_count += 1
+                    if retry_count < MAX_RETRIES:
+                        print(f"⚠️ Warning: Error sampling batch (attempt {retry_count}/{MAX_RETRIES}): {e}")
+                        time.sleep(0.1)
+                    else:
+                        print(f"❌ ERROR: Failed to load batch after {MAX_RETRIES} attempts: {e}")
+                        break
+
+            # Only yield if we got a valid batch
+            if batch is not None:
+                yield batch
+            else:
+                # All retries failed - wait before trying again
+                time.sleep(0.5)
+
     def __len__(self) -> int:
         return len(self.buffer)
     

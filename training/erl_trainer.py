@@ -29,6 +29,7 @@ from erl.genetic_ops import create_next_generation
 from utils.config import Config
 from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress, ResourceTracker
 from utils.cloud_sync import get_cloud_sync_from_env
+from torch.utils.data import DataLoader
 # from utils.memory_profiler import get_profiler, log_memory  # Memory profiling disabled
 
 
@@ -68,7 +69,12 @@ class ERLTrainer:
             capacity=Config.BUFFER_SIZE,
             storage_path="erl_buffer_storage"
         )
-        
+
+        # Create DataLoader for asynchronous batch prefetching
+        # Background workers prepare batches in parallel while GPU trains
+        # This eliminates the GPU waiting for disk I/O
+        self._create_dataloader()
+
         # Training range (excludes interim validation and holdout sets)
         self.train_start_idx = Config.CONTEXT_WINDOW_DAYS
         self.train_end_idx = len(data_loader.train_indices)
@@ -296,6 +302,23 @@ class ERLTrainer:
         except Exception as e:
             print(f"⚠ Could not write last_run.json: {e}")
 
+    def _create_dataloader(self):
+        """
+        Create or recreate DataLoader for the replay buffer.
+        Called during __init__ and after loading checkpoints.
+        """
+        print(f"Creating DataLoader with {Config.NUM_DATALOADER_WORKERS} background workers...")
+        self.replay_dataloader = DataLoader(
+            self.replay_buffer,
+            batch_size=None,  # Already batched by __iter__
+            num_workers=Config.NUM_DATALOADER_WORKERS,
+            pin_memory=True,  # Faster GPU transfer
+            prefetch_factor=2,  # Each worker prefetches 2 batches ahead
+            persistent_workers=True  # Keep workers alive between epochs
+        )
+        # Reset iterator when creating new DataLoader
+        self.batch_iterator = None
+
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
                    training: bool = True) -> Tuple[float, Dict]:
@@ -511,13 +534,24 @@ class ERLTrainer:
         return (fitness_scores, aggregate_stats)
     
     def train_population(self):
-        """Train all agents using shared replay buffer with gradient accumulation."""
+        """Train all agents using shared replay buffer with gradient accumulation.
+
+        Uses asynchronous DataLoader for batch prefetching:
+        - Background CPU workers load and decompress batches from disk
+        - Batches are queued in RAM before GPU needs them
+        - GPU never waits for I/O - significant speedup
+        """
         if not self.replay_buffer.is_ready():
             # Show correct threshold based on sweep vs regular training
             is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
             min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
             print(f"Buffer not ready: {len(self.replay_buffer)} / {min_size}")
             return
+
+        # Initialize batch iterator if not already created
+        if self.batch_iterator is None:
+            print("Starting DataLoader workers for async batch prefetching...")
+            self.batch_iterator = iter(self.replay_dataloader)
 
         # Check if buffer is full for the first time and we haven't saved it yet
         # DISABLED: Buffer save causes RAM exhaustion during pickle serialization
@@ -551,8 +585,12 @@ class ERLTrainer:
             for step in range(Config.GRADIENT_STEPS_PER_GENERATION):
                 # Gradient accumulation loop
                 for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
-                    # Sample batch
-                    batch = self.replay_buffer.sample(Config.BATCH_SIZE)
+                    # Get next batch from DataLoader (already prefetched by workers)
+                    # This is FAST - batch is already in RAM, loaded asynchronously
+                    batch_cpu = next(self.batch_iterator)
+
+                    # Move batch to GPU (fast transfer thanks to pin_memory)
+                    batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
 
                     # Update with gradient accumulation
                     is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
@@ -925,6 +963,7 @@ class ERLTrainer:
 
         # 4. Replay buffer: always start fresh to avoid stale experiences
         buffer_path = checkpoint_dir / "replay_buffer.pkl"
+        buffer_loaded = False
         if buffer_path.exists():
             try:
                 # Pass the *same* storage_path you used in __init__
@@ -933,16 +972,26 @@ class ERLTrainer:
                     storage_path="erl_buffer_storage"
                 )
                 print("✓ Loaded on-disk replay buffer metadata")
+                buffer_loaded = True
             except Exception as e:
                 print(f"❌ Error loading buffer: {e}")
                 self.replay_buffer = OnDiskReplayBuffer(
                     capacity=Config.BUFFER_SIZE, # Will use the 1M from __init__
                     storage_path="erl_buffer_storage"
                 )
+                buffer_loaded = True
         else:
             print("! No replay buffer checkpoint found. Using new on-disk buffer.")
             # self.replay_buffer is already a new OnDisk buffer from __init__
             # so no action is needed here.
+
+        # CRITICAL: Recreate DataLoader after loading buffer
+        # The DataLoader created in __init__ points to the old empty buffer
+        # We must recreate it to point to the loaded buffer
+        if buffer_loaded:
+            print("Recreating DataLoader for loaded buffer...")
+            self._create_dataloader()
+            print("✓ DataLoader recreated and ready")
         
         # 5. Load Trainer State
         state_path = checkpoint_dir / "trainer_state.json"
