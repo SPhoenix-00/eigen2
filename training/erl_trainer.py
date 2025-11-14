@@ -63,17 +63,6 @@ class ERLTrainer:
         # Initialize population
         print(f"Initializing population of {Config.POPULATION_SIZE} agents...")
         self.population = [DDPGAgent(agent_id=i) for i in range(Config.POPULATION_SIZE)]
-        
-        # Shared replay buffer (ON-DISK)
-        self.replay_buffer = OnDiskReplayBuffer(
-            capacity=Config.BUFFER_SIZE,
-            storage_path="erl_buffer_storage"
-        )
-
-        # Create DataLoader for asynchronous batch prefetching
-        # Background workers prepare batches in parallel while GPU trains
-        # This eliminates the GPU waiting for disk I/O
-        self._create_dataloader()
 
         # Training range (excludes interim validation and holdout sets)
         self.train_start_idx = Config.CONTEXT_WINDOW_DAYS
@@ -204,6 +193,20 @@ class ERLTrainer:
 
         print(f"Checkpoints: {self.checkpoint_dir}")
         print(f"W&B run: {wandb.run.name} (ID: {wandb.run.id})")
+
+        # Create replay buffer with storage INSIDE checkpoint directory
+        # This ensures buffer files are synced to cloud along with checkpoints
+        buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
+        print(f"Buffer storage: {buffer_storage_path}")
+        self.replay_buffer = OnDiskReplayBuffer(
+            capacity=Config.BUFFER_SIZE,
+            storage_path=buffer_storage_path
+        )
+
+        # Create DataLoader for asynchronous batch prefetching
+        # Background workers prepare batches in parallel while GPU trains
+        # This eliminates the GPU waiting for disk I/O
+        self._create_dataloader()
 
         # Set unique random seed based on wandb run id
         run_id_hash = hash(wandb.run.id) % (2**32)
@@ -961,29 +964,34 @@ class ERLTrainer:
             except Exception as e:
                 print(f"❌ Error loading best agent: {e}")
 
-        # 4. Replay buffer: always start fresh to avoid stale experiences
+        # 4. Replay buffer: Load from checkpoint (both metadata and files)
+        # Buffer storage is now INSIDE checkpoint dir, so it gets synced automatically
         buffer_path = checkpoint_dir / "replay_buffer.pkl"
+        buffer_storage_path = str(checkpoint_dir / "buffer_storage")
         buffer_loaded = False
+
         if buffer_path.exists():
             try:
-                # Pass the *same* storage_path you used in __init__
+                # Load buffer with correct storage path (inside checkpoint dir)
                 self.replay_buffer = OnDiskReplayBuffer.load(
                     str(buffer_path),
-                    storage_path="erl_buffer_storage"
+                    storage_path_override=buffer_storage_path
                 )
-                print("✓ Loaded on-disk replay buffer metadata")
+                print(f"✓ Loaded on-disk replay buffer metadata ({len(self.replay_buffer)} transitions)")
                 buffer_loaded = True
             except Exception as e:
                 print(f"❌ Error loading buffer: {e}")
+                print("  Creating new empty buffer...")
                 self.replay_buffer = OnDiskReplayBuffer(
-                    capacity=Config.BUFFER_SIZE, # Will use the 1M from __init__
-                    storage_path="erl_buffer_storage"
+                    capacity=Config.BUFFER_SIZE,
+                    storage_path=buffer_storage_path
                 )
                 buffer_loaded = True
         else:
-            print("! No replay buffer checkpoint found. Using new on-disk buffer.")
-            # self.replay_buffer is already a new OnDisk buffer from __init__
-            # so no action is needed here.
+            print("! No replay buffer checkpoint found.")
+            print(f"  Buffer will be in: {buffer_storage_path}")
+            # Buffer was already created in __init__ with correct path
+            # No action needed
 
         # CRITICAL: Recreate DataLoader after loading buffer
         # The DataLoader created in __init__ points to the old empty buffer
