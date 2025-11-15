@@ -839,27 +839,39 @@ class ERLTrainer:
                 agent_idx = task_idx // 3  # Each agent has 3 slices
 
                 try:
-                    fitness, episode_info = future.result()
-                    fitness_by_agent[agent_idx].append((fitness, episode_info))
+                    fitness, episode_info, transitions = future.result()
+                    fitness_by_agent[agent_idx].append((fitness, episode_info, transitions))
                 except Exception as e:
                     print(f"\n⚠ Worker failed for agent {agent_idx}: {e}")
                     # Use penalty fitness for failed episodes
                     fitness_by_agent[agent_idx].append((-10000.0, {
                         'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
-                    }))
+                    }, []))
 
         # Aggregate results (same logic as sequential version)
         fitness_scores = []
         all_episode_stats = []
 
         for agent_slices in fitness_by_agent:
-            slice_fitness = [f for f, _ in agent_slices]
-            slice_stats = [info for _, info in agent_slices]
+            slice_fitness = [f for f, _, _ in agent_slices]
+            slice_stats = [info for _, info, _ in agent_slices]
+            slice_transitions = [trans for _, _, trans in agent_slices]
 
             # Robust scoring: average of lowest 2 out of 3
             sorted_fitness = sorted(slice_fitness)
             lowest_2_avg = np.mean(sorted_fitness[:2])
             fitness_scores.append(lowest_2_avg)
+
+            # Add transitions to the main replay buffer
+            for transitions in slice_transitions:
+                for t in transitions:
+                    self.replay_buffer.add(
+                        state=t['state'],
+                        action=t['action'],
+                        reward=t['reward'],
+                        next_state=t['next_state'],
+                        done=t['done']
+                    )
 
             # Aggregate stats
             agent_stats = {
