@@ -48,7 +48,7 @@ def _run_episode_worker(args):
         args: Tuple of (agent_state, env_config, start_idx, end_idx, training, seed)
 
     Returns:
-        Tuple of (fitness, episode_info)
+        Tuple of (fitness, episode_info, transitions)
     """
     agent_state, env_config, start_idx, end_idx, training, seed = args
 
@@ -75,6 +75,7 @@ def _run_episode_worker(args):
 
     cumulative_reward = 0.0
     steps = 0
+    transitions = []
 
     while True:
         # Select action (no noise for evaluation)
@@ -82,6 +83,16 @@ def _run_episode_worker(args):
 
         # Take step
         next_state, reward, terminated, truncated, info = env.step(action)
+
+        # Collect transitions if training
+        if training:
+            transitions.append({
+                'state': state.astype(np.float32),
+                'action': action.astype(np.float32),
+                'reward': reward,
+                'next_state': next_state.astype(np.float32),
+                'done': float(terminated or truncated)
+            })
 
         cumulative_reward += reward
         steps += 1
@@ -99,7 +110,7 @@ def _run_episode_worker(args):
     if episode_summary['num_trades'] == 0:
         final_fitness -= Config.ZERO_TRADES_PENALTY
 
-    return final_fitness, episode_summary
+    return final_fitness, episode_summary, transitions
 
 
 class ERLTrainer:
