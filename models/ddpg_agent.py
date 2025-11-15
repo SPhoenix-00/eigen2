@@ -10,8 +10,7 @@ import numpy as np
 from typing import Tuple, Optional
 import copy
 from collections import deque
-from torch.amp import autocast
-from torch.cuda.amp import GradScaler
+from torch.amp import autocast, GradScaler
 
 from models.networks import Actor, Critic
 from utils.config import Config
@@ -55,8 +54,8 @@ class DDPGAgent:
             weight_decay=Config.WEIGHT_DECAY
         )
 
-        self.actor_scaler = GradScaler()
-        self.critic_scaler = GradScaler()
+        self.actor_scaler = GradScaler('cuda')
+        self.critic_scaler = GradScaler('cuda')
         
         # Exploration noise
         self.noise_scale = Config.NOISE_SCALE
