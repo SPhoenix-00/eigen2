@@ -17,6 +17,8 @@ import gc
 import matplotlib.pyplot as plt
 import warnings
 from gymnasium.vector import AsyncVectorEnv
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 
 # Suppress common library warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='gymnasium')
@@ -355,7 +357,8 @@ class ERLTrainer:
 
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
-                   training: bool = True) -> Tuple[float, Dict]:
+                   training: bool = True,
+                   collect_transitions: bool = False):
         """
         Run one episode with an agent using a persistent environment.
 
@@ -365,9 +368,11 @@ class ERLTrainer:
             start_idx: Starting day index (first day of trading period)
             end_idx: Ending day index (includes settlement period)
             training: Whether this is training (adds to replay buffer)
+            collect_transitions: If True, returns transitions list for batch processing
 
         Returns:
-            Tuple of (cumulative_reward, episode_info)
+            If collect_transitions=False: Tuple of (cumulative_reward, episode_info)
+            If collect_transitions=True: Tuple of (cumulative_reward, episode_info, transitions_list)
         """
         # Calculate trading end (when model stops opening new positions)
         trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
@@ -384,31 +389,39 @@ class ERLTrainer:
         )
         cumulative_reward = 0.0
         steps = 0
-        
+        transitions = [] if collect_transitions else None
+
         # Run episode
         while True:
             # Select action
             action = agent.select_action(state, add_noise=training)
-            
+
             # Take step
             next_state, reward, terminated, truncated, info = env.step(action)
-            
-            # Store transition in replay buffer (if training)
+
+            # Store transition
             if training:
-                self.replay_buffer.add(
-                    state=state.astype(np.float32),
-                    action=action.astype(np.float32),
-                    reward=reward,
-                    next_state=next_state.astype(np.float32),
-                    done=float(terminated or truncated)
+                transition = (
+                    state.astype(np.float32),
+                    action.astype(np.float32),
+                    reward,
+                    next_state.astype(np.float32),
+                    float(terminated or truncated)
                 )
-            
+
+                if collect_transitions:
+                    # Collect in memory for batch write later
+                    transitions.append(transition)
+                else:
+                    # Write directly to buffer (slow!)
+                    self.replay_buffer.add(*transition)
+
             cumulative_reward += reward
             steps += 1
-            
+
             # Move to next state
             state = next_state
-            
+
             if terminated or truncated:
                 break
         
@@ -425,7 +438,11 @@ class ERLTrainer:
             final_fitness -= Config.ZERO_TRADES_PENALTY
 
         # NOTE: No need to delete env - we're reusing persistent environments now
-        return final_fitness, episode_summary
+        # BACKWARDS COMPATIBLE: Only return transitions if requested
+        if collect_transitions:
+            return final_fitness, episode_summary, transitions
+        else:
+            return final_fitness, episode_summary
 
     def run_vectorized_episodes(self, agent: DDPGAgent, episode_configs: List[Tuple[int, int, int]],
                                training: bool = True) -> List[Tuple[float, Dict]]:
@@ -615,32 +632,47 @@ class ERLTrainer:
         print(f"Replay buffer diversity: Only {num_exploratory}/{len(self.population)} exploratory agents contribute experiences")
 
         for agent in tqdm(self.population, desc="Evaluating agents"):
-            # Prepare 5 random training slices for this agent
-            episode_configs = []
-            total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-            max_start = self.train_end_idx - total_days_needed
-
-            if max_start <= self.train_start_idx:
-                raise ValueError(f"Not enough training data: need {total_days_needed} days")
+            # Evaluate agent on 5 different random training slices
+            # OPTIMIZATION: Collect transitions in memory, then batch-write to buffer
+            # This avoids 20,000+ individual gzip file writes (10x speedup!)
+            slice_fitness_scores = []
+            slice_episode_stats = []
+            all_transitions = []  # Collect all transitions from all slices
 
             for _ in range(5):
+                # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
+                total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                max_start = self.train_end_idx - total_days_needed
+
+                if max_start <= self.train_start_idx:
+                    raise ValueError(f"Not enough training data: need {total_days_needed} days")
+
                 # Random start from training range only (excludes interim val and holdout)
                 start_idx = np.random.randint(self.train_start_idx, max_start)
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-                trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-                episode_configs.append((start_idx, end_idx, trading_end_idx))
 
-            # Run all 5 slices in parallel using AsyncVectorEnv (5 CPU cores simultaneously)
-            # Only add to replay buffer if agent is exploratory (not elite) for diversity
-            results = self.run_vectorized_episodes(
-                agent=agent,
-                episode_configs=episode_configs,
-                training=(not agent.is_elite)
-            )
+                # Run episode - collect transitions in memory if this is an exploratory agent
+                should_collect = not agent.is_elite
+                fitness, episode_info, transitions = self.run_episode(
+                    agent=agent,
+                    env=self.eval_env,
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    training=should_collect,
+                    collect_transitions=should_collect  # Batch mode for exploratory agents
+                )
 
-            # Extract fitness scores and episode stats
-            slice_fitness_scores = [fitness for fitness, _ in results]
-            slice_episode_stats = [info for _, info in results]
+                slice_fitness_scores.append(fitness)
+                slice_episode_stats.append(episode_info)
+
+                # Collect transitions for batch write
+                if transitions:
+                    all_transitions.extend(transitions)
+
+            # BATCH WRITE: Write all transitions at once (much faster than individual writes!)
+            if all_transitions:
+                for transition in all_transitions:
+                    self.replay_buffer.add(*transition)
 
             # Robust scoring: average of lowest 2 scores out of 5
             sorted_fitness = sorted(slice_fitness_scores)
@@ -827,18 +859,19 @@ class ERLTrainer:
         if not self.current_generation_val_slices:
             raise ValueError("No validation slices generated for this generation")
 
-        # Run all 3 validation slices in parallel using AsyncVectorEnv (3 CPU cores simultaneously)
-        results = self.run_vectorized_episodes(
-            agent=agent,
-            episode_configs=self.current_generation_val_slices,
-            training=False
-        )
-
-        # Process results
+        # Run agent on all 3 validation slices
+        # NOTE: Using serial episodes - AsyncVectorEnv overhead is too high
         slice_results = []
         all_closed_trades = []  # Collect all closed trades from all slices
 
-        for fitness, episode_info in results:
+        for start_idx, end_idx, _ in self.current_generation_val_slices:
+            fitness, episode_info = self.run_episode(
+                agent=agent,
+                env=self.eval_env,  # Reuse persistent environment
+                start_idx=start_idx,
+                end_idx=end_idx,
+                training=False
+            )
             # CRITICAL FIX: Create validation gradient for agents that don't trade
             # If agent made 0 trades, add max_coefficient bonus to reduce penalty
             # This creates a gradient that rewards agents who get "closer" to the threshold
