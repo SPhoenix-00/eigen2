@@ -408,7 +408,7 @@ class OnDiskReplayBuffer(IterableDataset):
 
         print(f"OnDiskReplayBuffer initialized. Capacity: {self.capacity}, Storage: {self.storage_path}")
 
-    def add(self, state: np.ndarray, action: np.ndarray, reward: float, 
+    def add(self, state: np.ndarray, action: np.ndarray, reward: float,
             next_state: np.ndarray, done: bool):
         """
         Save a transition to disk and add its path to the buffer.
@@ -420,25 +420,25 @@ class OnDiskReplayBuffer(IterableDataset):
             'next_state': next_state,
             'done': done
         }
-        
+
         # Get a unique file path for this transition
         file_id = self.total_added
         file_path = self.storage_path / f"transition_{file_id}.pkl.gz"
-        
+
         # Check if buffer is full and we need to remove an old file
         old_path_to_remove = None
         if len(self.buffer) == self.capacity:
             # Get path of the oldest file (which deque will pop)
-            old_path_to_remove = self.buffer[0] 
+            old_path_to_remove = self.buffer[0]
 
         try:
             # Save the new transition file (low compression for speed)
             with gzip.open(file_path, 'wb', compresslevel=1) as f:
                 pickle.dump(transition, f, protocol=pickle.HIGHEST_PROTOCOL)
-            
+
             # Add the new path to the buffer
             self.buffer.append(str(file_path))
-            
+
             # If an old file was popped, delete it from disk
             if old_path_to_remove:
                 try:
@@ -450,6 +450,81 @@ class OnDiskReplayBuffer(IterableDataset):
 
         except Exception as e:
             print(f"❌ ERROR saving on-disk transition {file_path}: {e}")
+
+    def add_batch(self, transitions: list):
+        """
+        Efficiently add multiple transitions at once using parallel writes.
+        Much faster than calling add() sequentially for large batches.
+
+        Args:
+            transitions: List of transition dicts with keys: state, action, reward, next_state, done
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        if not transitions:
+            return
+
+        num_transitions = len(transitions)
+        print(f"  Adding {num_transitions} transitions to on-disk buffer...")
+
+        # Thread-safe counter for file IDs
+        lock = threading.Lock()
+
+        def write_transition(transition):
+            """Write a single transition to disk (runs in thread pool)"""
+            with lock:
+                file_id = self.total_added
+                self.total_added += 1
+                file_path = self.storage_path / f"transition_{file_id}.pkl.gz"
+
+            try:
+                # Write to disk (this is the slow I/O operation)
+                with gzip.open(file_path, 'wb', compresslevel=1) as f:
+                    pickle.dump(transition, f, protocol=pickle.HIGHEST_PROTOCOL)
+                return str(file_path), True
+            except Exception as e:
+                print(f"❌ ERROR saving transition {file_path}: {e}")
+                return None, False
+
+        # Write all transitions in parallel using thread pool
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(write_transition, transitions))
+
+        # Add successful paths to buffer and track failed writes
+        successful_paths = []
+        for path, success in results:
+            if success and path:
+                successful_paths.append(path)
+
+        # Add all paths to buffer (this is fast - just appending to deque)
+        # Determine how many old files to remove
+        num_to_remove = max(0, len(self.buffer) + len(successful_paths) - self.capacity)
+        old_paths_to_remove = []
+
+        if num_to_remove > 0:
+            # Collect paths to remove before modifying buffer
+            old_paths_to_remove = [self.buffer[i] for i in range(num_to_remove)]
+
+        # Add new paths
+        for path in successful_paths:
+            self.buffer.append(path)
+
+        # Delete old files from disk in parallel
+        if old_paths_to_remove:
+            def delete_file(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                executor.map(delete_file, old_paths_to_remove)
+
+        elapsed = time.time() - start_time
+        rate = num_transitions / elapsed if elapsed > 0 else 0
+        print(f"  ✓ Added {len(successful_paths)}/{num_transitions} transitions in {elapsed:.2f}s ({rate:.0f} trans/s)")
     
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """

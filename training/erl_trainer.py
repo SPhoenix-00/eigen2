@@ -866,23 +866,11 @@ class ERLTrainer:
         for agent_slices in fitness_by_agent:
             slice_fitness = [f for f, _, _ in agent_slices]
             slice_stats = [info for _, info, _ in agent_slices]
-            slice_transitions = [trans for _, _, trans in agent_slices]
 
             # Robust scoring: average of lowest 2 out of 3
             sorted_fitness = sorted(slice_fitness)
             lowest_2_avg = np.mean(sorted_fitness[:2])
             fitness_scores.append(lowest_2_avg)
-
-            # Add transitions to the main replay buffer
-            for transitions in slice_transitions:
-                for t in transitions:
-                    self.replay_buffer.add(
-                        state=t['state'],
-                        action=t['action'],
-                        reward=t['reward'],
-                        next_state=t['next_state'],
-                        done=t['done']
-                    )
 
             # Aggregate stats
             agent_stats = {
@@ -896,6 +884,21 @@ class ERLTrainer:
         # Ensure fitness_scores are all plain floats
         fitness_scores = [float(f) for f in fitness_scores]
 
+        # Add all transitions to replay buffer using efficient batch add
+        print(f"\n--- Adding transitions to replay buffer ---")
+        all_transitions = []
+        for agent_idx, agent_slices in enumerate(fitness_by_agent):
+            # Only add transitions from exploratory agents (not elites)
+            if not self.population[agent_idx].is_elite:
+                for _, _, transitions in agent_slices:
+                    all_transitions.extend(transitions)
+
+        if all_transitions:
+            # Use batch add for much faster disk writes
+            self.replay_buffer.add_batch(all_transitions)
+        else:
+            print("  No exploratory agents - skipping buffer update")
+
         # Aggregate statistics across all agents
         aggregate_stats = {
             'total_trades': int(sum(s['num_trades'] for s in all_episode_stats)),
@@ -908,6 +911,7 @@ class ERLTrainer:
 
         # Clean up
         del all_episode_stats
+        del all_transitions
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
