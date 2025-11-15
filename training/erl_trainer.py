@@ -827,7 +827,9 @@ class ERLTrainer:
 
         fitness_by_agent = [[] for _ in range(len(self.population))]
 
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # CRITICAL: Use 'spawn' method for CUDA compatibility on macOS/Linux
+        # Fork method doesn't work with CUDA after initialization
+        with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context('spawn')) as executor:
             # Submit all tasks
             futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
