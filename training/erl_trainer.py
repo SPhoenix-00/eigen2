@@ -116,22 +116,12 @@ class ERLTrainer:
 
                 # Initialize wandb with the run ID for proper resume
                 if wandb_run_id:
+                    # CRITICAL: When resume="must", wandb does NOT allow config updates
+                    # Config is already saved in the cloud, so don't pass it again
                     wandb.init(
                         project="eigen2-self",
                         id=wandb_run_id,
                         resume="must",  # Must resume this specific run
-                        config={
-                            "population_size": Config.POPULATION_SIZE,
-                            "num_generations": Config.NUM_GENERATIONS,
-                            "buffer_size": Config.BUFFER_SIZE,
-                            "batch_size": Config.BATCH_SIZE,
-                            "actor_lr": Config.ACTOR_LR,
-                            "critic_lr": Config.CRITIC_LR,
-                            "trading_period_days": Config.TRADING_PERIOD_DAYS,
-                            "max_holding_period": Config.MAX_HOLDING_PERIOD,
-                            "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
-                            "num_stocks": Config.NUM_INVESTABLE_STOCKS,
-                        }
                     )
                 else:
                     print("⚠ No wandb run ID found. Creating new run with same name...")
@@ -194,6 +184,19 @@ class ERLTrainer:
 
         print(f"Checkpoints: {self.checkpoint_dir}")
         print(f"W&B run: {wandb.run.name} (ID: {wandb.run.id})")
+
+        # CRITICAL: Define metric step relationships for proper wandb resume
+        # This tells wandb which metric to use as the x-axis for each metric group
+        # Without this, resumed runs can have broken graphs
+        wandb.define_metric("generation")
+        wandb.define_metric("train/*", step_metric="generation")
+        wandb.define_metric("fitness/*", step_metric="generation")
+        wandb.define_metric("validation/*", step_metric="generation")
+        wandb.define_metric("buffer/*", step_metric="generation")
+        wandb.define_metric("training/*", step_metric="generation")
+        wandb.define_metric("resources/*", step_metric="generation")
+        wandb.define_metric("adaptive_mutation/*", step_metric="generation")
+        wandb.define_metric("feature_importance/*", step_metric="generation")
 
         # Create replay buffer with storage INSIDE checkpoint directory
         # This ensures buffer files are synced to cloud along with checkpoints
@@ -729,7 +732,7 @@ class ERLTrainer:
                 wandb.log({
                     "train/actor_loss": np.mean(actor_losses),
                     "train/critic_loss": np.mean(critic_losses),
-                }, step=self.generation)
+                })
 
             # Explicitly clear loss lists to free memory
             del actor_losses
@@ -947,7 +950,7 @@ class ERLTrainer:
                     "adaptive_mutation/mutation_rate": self.current_mutation_rate,
                     "adaptive_mutation/mutation_std": self.current_mutation_std,
                     "adaptive_mutation/relative_improvement": relative_improvement,
-                }, step=self.generation)
+                })
             else:
                 # Already in plateau - just log current status
                 wandb.log({
@@ -955,7 +958,7 @@ class ERLTrainer:
                     "adaptive_mutation/mutation_rate": self.current_mutation_rate,
                     "adaptive_mutation/mutation_std": self.current_mutation_std,
                     "adaptive_mutation/relative_improvement": relative_improvement,
-                }, step=self.generation)
+                })
         else:
             # Improvement detected - reset to base if we were in plateau
             if self.plateau_detected:
@@ -976,7 +979,7 @@ class ERLTrainer:
                     "adaptive_mutation/mutation_rate": self.current_mutation_rate,
                     "adaptive_mutation/mutation_std": self.current_mutation_std,
                     "adaptive_mutation/relative_improvement": relative_improvement,
-                }, step=self.generation)
+                })
             else:
                 # Not in plateau, just log status
                 wandb.log({
@@ -984,7 +987,7 @@ class ERLTrainer:
                     "adaptive_mutation/mutation_rate": self.current_mutation_rate,
                     "adaptive_mutation/mutation_std": self.current_mutation_std,
                     "adaptive_mutation/relative_improvement": relative_improvement,
-                }, step=self.generation)
+                })
 
     def save_checkpoint(self):
         """Saves the entire training state to a checkpoint directory."""
@@ -1287,7 +1290,7 @@ class ERLTrainer:
                 "fitness/std": np.std(fitness_scores),
                 "fitness/best_training_ever": self.best_fitness if hasattr(self, 'best_fitness') else max_fitness,
                 "fitness/best_validation_ever": self.best_validation_fitness if hasattr(self, 'best_validation_fitness') else float('-inf'),
-            }, step=gen)
+            })
 
             # Update best training fitness (for logging only)
             if max_fitness > self.best_fitness:
@@ -1392,7 +1395,7 @@ class ERLTrainer:
                 "feature_importance/persistent_below_1pct_count": low_importance_analysis['<1%']['count'],
                 "feature_importance/persistent_below_0.1pct_count": low_importance_analysis['<0.1%']['count'],
                 "feature_importance/persistent_below_0.01pct_count": low_importance_analysis['<0.01%']['count'],
-            }, step=gen)
+            })
 
             # Log full feature importance vector as histogram every 5 generations
             if (gen + 1) % 5 == 0:
@@ -1402,7 +1405,7 @@ class ERLTrainer:
                         data=[[int(idx), float(val)] for idx, val in zip(top_indices, top_values)],
                         columns=["Column_Index", "Importance"]
                     )
-                }, step=gen)
+                })
 
                 # Log persistent low-importance columns as tables
                 for threshold_name in ['<1%', '<0.1%', '<0.01%']:
@@ -1415,7 +1418,7 @@ class ERLTrainer:
                                 data=table_data,
                                 columns=["Column_Index", "Column_Name", "Current_Importance"]
                             )
-                        }, step=gen)
+                        })
 
             # 3. Evolve population
             self.evolve_population(fitness_scores)
@@ -1444,7 +1447,7 @@ class ERLTrainer:
                             "validation/num_wins": val_results['num_wins'],
                             "validation/num_losses": val_results['num_losses'],
                             "validation/avg_reward_per_trade": val_results['avg_reward_per_trade'],
-                        }, step=gen)
+                        })
 
                         # Check for plateau and adjust mutation adaptively
                         # Use the best validation fitness for plateau detection
@@ -1496,7 +1499,7 @@ class ERLTrainer:
                 "resources/peak_vram_gb": resource_stats['peak_vram_gb'],
                 "resources/peak_ram_gb": resource_stats['peak_ram_gb'],
                 "resources/peak_disk_gb": resource_stats['peak_disk_gb'],
-            }, step=gen)
+            })
 
             # Clear GPU cache and run garbage collection to prevent memory leaks
             if torch.cuda.is_available():
