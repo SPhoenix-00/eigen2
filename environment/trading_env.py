@@ -472,7 +472,8 @@ class TradingEnvironment(gym.Env):
                     self.num_losses += 1
 
                 # Apply forced exit penalty if exit was due to max_holding_period
-                forced_exit_penalty = Config.FORCED_EXIT_PENALTY if reason == 'max_holding_period' else 0.0
+                # Penalty is now proportional: coefficient * penalty_pct (e.g., 5% of entry amount)
+                forced_exit_penalty = (position.coefficient * Config.FORCED_EXIT_PENALTY_PCT) if reason == 'max_holding_period' else 0.0
 
                 # Final reward = base_reward - loss_penalty - forced_exit_penalty
                 reward = base_reward - loss_penalty - forced_exit_penalty

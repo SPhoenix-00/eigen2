@@ -38,7 +38,7 @@ class Config:
 
     LOSS_PENALTY_MULTIPLIER = 1.0  # Losses treated equally to gains (was 3.0, removed penalty to fix zombie agents)
     INACTION_PENALTY = 2.0  # Penalty per day without an open position (reduced from 20.0 to smooth landscape)
-    FORCED_EXIT_PENALTY = 25.0  # Penalty for forced exits due to max_holding_period (reduced from 100.0)
+    FORCED_EXIT_PENALTY_PCT = 5.0  # Penalty for forced exits as % of entry amount (coefficient * penalty_pct)
     ZERO_TRADES_PENALTY = 10000.0  # Heavy penalty for making NO trades at all
 
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
