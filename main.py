@@ -43,6 +43,14 @@ class TeeLogger:
         self.terminal.flush()
         self.log_file.flush()
 
+    def isatty(self):
+        """Check if the terminal is a TTY (needed by wandb and other libraries)."""
+        return self.terminal.isatty()
+
+    def fileno(self):
+        """Return the file descriptor (needed by some libraries)."""
+        return self.terminal.fileno()
+
     def close(self):
         """Close the log file."""
         self.log_file.close()
