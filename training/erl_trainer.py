@@ -43,14 +43,15 @@ def _run_episode_worker(args):
     1. Reconstruct the agent from CPU state dicts
     2. Create its own environment instance
     3. Run the episode independently
+    4. Write transitions directly to disk (parallel I/O)
 
     Args:
-        args: Tuple of (agent_state, env_config, start_idx, end_idx, training, seed)
+        args: Tuple of (agent_state, env_config, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start)
 
     Returns:
-        Tuple of (fitness, episode_info, transitions)
+        Tuple of (fitness, episode_info, transition_file_paths)
     """
-    agent_state, env_config, start_idx, end_idx, training, seed = args
+    agent_state, env_config, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start = args
 
     # Set worker-specific seed for reproducibility
     np.random.seed(seed)
@@ -75,31 +76,66 @@ def _run_episode_worker(args):
 
     cumulative_reward = 0.0
     steps = 0
-    transitions = []
+    transition_file_paths = []
 
-    while True:
-        # Select action (no noise for evaluation)
-        action = agent.select_action(state, add_noise=training)
+    # Write transitions directly to disk during episode (parallel I/O)
+    if training and buffer_storage_path:
+        from pathlib import Path
+        import pickle
+        import gzip
 
-        # Take step
-        next_state, reward, terminated, truncated, info = env.step(action)
+        storage_path = Path(buffer_storage_path)
+        file_id = file_id_start
 
-        # Collect transitions if training
-        if training:
-            transitions.append({
+        while True:
+            # Select action
+            action = agent.select_action(state, add_noise=training)
+
+            # Take step
+            next_state, reward, terminated, truncated, info = env.step(action)
+
+            # Write transition directly to disk (parallel I/O across all workers)
+            transition = {
                 'state': state.astype(np.float32),
                 'action': action.astype(np.float32),
                 'reward': reward,
                 'next_state': next_state.astype(np.float32),
                 'done': float(terminated or truncated)
-            })
+            }
 
-        cumulative_reward += reward
-        steps += 1
-        state = next_state
+            file_path = storage_path / f"transition_{file_id}.pkl.gz"
+            try:
+                # Check if file already exists (can happen if resuming after crash mid-generation)
+                if file_path.exists():
+                    # Skip to next ID to avoid overwriting
+                    file_id += 1
+                    file_path = storage_path / f"transition_{file_id}.pkl.gz"
 
-        if terminated or truncated:
-            break
+                with gzip.open(file_path, 'wb', compresslevel=1) as f:
+                    pickle.dump(transition, f, protocol=pickle.HIGHEST_PROTOCOL)
+                transition_file_paths.append(str(file_path))
+                file_id += 1
+            except Exception as e:
+                print(f"⚠ Worker failed to write transition {file_path}: {e}")
+
+            cumulative_reward += reward
+            steps += 1
+            state = next_state
+
+            if terminated or truncated:
+                break
+    else:
+        # No training mode or no buffer - just run episode without saving transitions
+        while True:
+            action = agent.select_action(state, add_noise=training)
+            next_state, reward, terminated, truncated, info = env.step(action)
+
+            cumulative_reward += reward
+            steps += 1
+            state = next_state
+
+            if terminated or truncated:
+                break
 
     # Get episode summary
     episode_summary = env.get_episode_summary()
@@ -110,7 +146,7 @@ def _run_episode_worker(args):
     if episode_summary['num_trades'] == 0:
         final_fitness -= Config.ZERO_TRADES_PENALTY
 
-    return final_fitness, episode_summary, transitions
+    return final_fitness, episode_summary, transition_file_paths
 
 
 class ERLTrainer:
@@ -804,7 +840,11 @@ class ERLTrainer:
             'data_array_full': self.data_loader.data_array_full
         }
 
-        # Prepare all evaluation tasks
+        # Prepare all evaluation tasks with file ID allocation
+        # Pre-allocate file IDs for each worker to avoid conflicts
+        buffer_storage_path = str(self.replay_buffer.storage_path)
+        file_id_counter = self.replay_buffer.total_added  # Start from current total
+
         tasks = []
         for agent_idx, agent in enumerate(self.population):
             # Extract agent state (CPU tensors only)
@@ -823,13 +863,20 @@ class ERLTrainer:
                 # Create unique seed for this task for reproducibility
                 task_seed = self.seed + agent_idx * 1000 + slice_idx
 
+                # Allocate file IDs for this episode (estimate ~150 transitions per episode)
+                # Workers will write transitions with IDs starting from file_id_start
+                file_id_start = file_id_counter
+                file_id_counter += 200  # Reserve 200 IDs per episode (generous estimate)
+
                 tasks.append((
                     agent_state,
                     env_config,
                     start_idx,
                     end_idx,
                     not agent.is_elite,  # training flag
-                    task_seed
+                    task_seed,
+                    buffer_storage_path if not agent.is_elite else None,  # Only exploratory agents write
+                    file_id_start
                 ))
 
         # Execute in parallel
@@ -840,6 +887,8 @@ class ERLTrainer:
 
         # CRITICAL: Use 'spawn' method for CUDA compatibility on macOS/Linux
         # Fork method doesn't work with CUDA after initialization
+        all_transition_file_paths = []  # Collect all file paths written by workers
+
         with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context('spawn')) as executor:
             # Submit all tasks
             futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
@@ -850,22 +899,29 @@ class ERLTrainer:
                 agent_idx = task_idx // 3  # Each agent has 3 slices
 
                 try:
-                    fitness, episode_info, transitions = future.result()
-                    fitness_by_agent[agent_idx].append((fitness, episode_info, transitions))
+                    fitness, episode_info, transition_file_paths = future.result()
+                    fitness_by_agent[agent_idx].append((fitness, episode_info))
+
+                    # Collect transition file paths from exploratory agents
+                    if transition_file_paths:
+                        all_transition_file_paths.extend(transition_file_paths)
+
                 except Exception as e:
                     print(f"\n⚠ Worker failed for agent {agent_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     # Use penalty fitness for failed episodes
                     fitness_by_agent[agent_idx].append((-10000.0, {
                         'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
-                    }, []))
+                    }))
 
         # Aggregate results (same logic as sequential version)
         fitness_scores = []
         all_episode_stats = []
 
         for agent_slices in fitness_by_agent:
-            slice_fitness = [f for f, _, _ in agent_slices]
-            slice_stats = [info for _, info, _ in agent_slices]
+            slice_fitness = [f for f, _ in agent_slices]
+            slice_stats = [info for _, info in agent_slices]
 
             # Robust scoring: average of lowest 2 out of 3
             sorted_fitness = sorted(slice_fitness)
@@ -884,18 +940,31 @@ class ERLTrainer:
         # Ensure fitness_scores are all plain floats
         fitness_scores = [float(f) for f in fitness_scores]
 
-        # Add all transitions to replay buffer using efficient batch add
-        print(f"\n--- Adding transitions to replay buffer ---")
-        all_transitions = []
-        for agent_idx, agent_slices in enumerate(fitness_by_agent):
-            # Only add transitions from exploratory agents (not elites)
-            if not self.population[agent_idx].is_elite:
-                for _, _, transitions in agent_slices:
-                    all_transitions.extend(transitions)
+        # Add transition file paths to replay buffer (transitions already written to disk by workers!)
+        print(f"\n--- Adding {len(all_transition_file_paths)} transitions to replay buffer ---")
+        if all_transition_file_paths:
+            # Transitions were written to disk during parallel evaluation - just add paths to buffer
+            print(f"  Transitions already written to disk by workers (parallel I/O)")
+            for file_path in all_transition_file_paths:
+                self.replay_buffer.buffer.append(file_path)
 
-        if all_transitions:
-            # Use batch add for much faster disk writes
-            self.replay_buffer.add_batch(all_transitions)
+            # Update total_added counter
+            self.replay_buffer.total_added = file_id_counter
+
+            # Handle buffer overflow - remove oldest files if we exceeded capacity
+            if len(self.replay_buffer.buffer) > self.replay_buffer.capacity:
+                num_to_remove = len(self.replay_buffer.buffer) - self.replay_buffer.capacity
+                print(f"  Buffer overflow: removing {num_to_remove} oldest transitions")
+
+                import os
+                for _ in range(num_to_remove):
+                    old_path = self.replay_buffer.buffer.popleft()
+                    try:
+                        os.remove(old_path)
+                    except OSError:
+                        pass
+
+            print(f"  ✓ Buffer updated: {len(self.replay_buffer)} transitions")
         else:
             print("  No exploratory agents - skipping buffer update")
 
@@ -911,7 +980,7 @@ class ERLTrainer:
 
         # Clean up
         del all_episode_stats
-        del all_transitions
+        del all_transition_file_paths
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
