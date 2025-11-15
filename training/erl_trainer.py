@@ -326,7 +326,7 @@ class ERLTrainer:
         # Reset iterator when creating new DataLoader
         self.batch_iterator = None
 
-    def _make_env(self, start_idx: int, end_idx: int, training_end_idx: int):
+    def _make_env(self, start_idx: int, end_idx: int, training_end_idx: int, is_training: bool):
         """
         Factory function to create a trading environment.
         Used for AsyncVectorEnv to create parallel environment instances.
@@ -335,6 +335,7 @@ class ERLTrainer:
             start_idx: Starting day index
             end_idx: Ending day index
             training_end_idx: Last day new positions can be opened
+            is_training: Whether environment is in training mode
 
         Returns:
             Callable that creates a TradingEnvironment
@@ -347,7 +348,8 @@ class ERLTrainer:
                 start_idx=start_idx,
                 end_idx=end_idx,
                 trading_end_idx=training_end_idx,
-                data_array_full=self.data_loader.data_array_full
+                data_array_full=self.data_loader.data_array_full,
+                is_training=is_training
             )
         return _init
 
@@ -441,23 +443,21 @@ class ERLTrainer:
         num_envs = len(episode_configs)
 
         # Create environment makers for each configuration
-        env_fns = [self._make_env(start_idx, end_idx, trading_end_idx)
+        # Pass is_training flag to environment constructor
+        env_fns = [self._make_env(start_idx, end_idx, trading_end_idx, training)
                    for start_idx, end_idx, trading_end_idx in episode_configs]
 
         # Create vectorized environment
         vec_env = AsyncVectorEnv(env_fns)
 
-        # Set training mode for all environments
-        for env in vec_env.envs:
-            env.set_training_mode(training)
-
         # Reset all environments
-        states, _ = vec_env.reset()
+        states, infos = vec_env.reset()
 
         # Initialize tracking
         cumulative_rewards = np.zeros(num_envs)
         steps = np.zeros(num_envs, dtype=int)
         dones = np.zeros(num_envs, dtype=bool)
+        final_infos = [None] * num_envs  # Store final info for each env
 
         # Run episodes until all are done
         while not dones.all():
@@ -465,7 +465,7 @@ class ERLTrainer:
             actions = agent.select_action(states, add_noise=training)
 
             # Step all environments in parallel
-            next_states, rewards, terminateds, truncateds, _ = vec_env.step(actions)
+            next_states, rewards, terminateds, truncateds, infos = vec_env.step(actions)
 
             # Store transitions in replay buffer (if training)
             if training:
@@ -479,10 +479,27 @@ class ERLTrainer:
                             done=float(terminateds[i] or truncateds[i])
                         )
 
-            # Update tracking
-            cumulative_rewards += rewards * (~dones)  # Only add if not done
-            steps += ~dones
-            dones |= (terminateds | truncateds)
+            # Update tracking and capture final info when episode ends
+            for i in range(num_envs):
+                if not dones[i]:
+                    cumulative_rewards[i] += rewards[i]
+                    steps[i] += 1
+                    # Check if this episode just finished
+                    if terminateds[i] or truncateds[i]:
+                        dones[i] = True
+                        # Capture episode summary from info dict
+                        # AsyncVectorEnv returns episode_summary as a dict where each value is an array
+                        # We need to extract the value for this environment index
+                        if isinstance(infos, dict) and 'episode_summary' in infos:
+                            summary_dict = infos['episode_summary']
+                            # Extract values for this environment index
+                            final_infos[i] = {
+                                k: v[i].item() if hasattr(v[i], 'item') else v[i]
+                                for k, v in summary_dict.items()
+                                if not k.startswith('_')  # Skip the boolean mask keys
+                            }
+                        else:
+                            final_infos[i] = {}
 
             # Move to next state
             states = next_states
@@ -490,9 +507,25 @@ class ERLTrainer:
         # Collect results from all environments
         results = []
         for i in range(num_envs):
-            # Get episode summary from environment
-            episode_summary = vec_env.envs[i].get_episode_summary()
-            episode_summary['steps'] = int(steps[i])
+            # Get episode summary from captured final info
+            episode_summary = final_infos[i] if final_infos[i] is not None else {}
+
+            # Ensure it's a dict and has required keys
+            if not isinstance(episode_summary, dict):
+                episode_summary = {}
+
+            # Add steps count if not already present
+            if 'steps' not in episode_summary:
+                episode_summary['steps'] = int(steps[i])
+
+            # Ensure required keys exist with defaults
+            episode_summary.setdefault('num_trades', 0)
+            episode_summary.setdefault('num_wins', 0)
+            episode_summary.setdefault('num_losses', 0)
+            episode_summary.setdefault('win_rate', 0.0)
+            episode_summary.setdefault('avg_reward_per_trade', 0.0)
+            episode_summary.setdefault('max_coefficient_during_episode', 0.0)
+            episode_summary.setdefault('closed_trades', [])
 
             # Calculate final fitness
             final_fitness = float(cumulative_rewards[i])
