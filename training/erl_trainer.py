@@ -16,7 +16,6 @@ import wandb
 import gc
 import matplotlib.pyplot as plt
 import warnings
-from gymnasium.vector import AsyncVectorEnv
 
 # Suppress common library warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='gymnasium')
@@ -323,31 +322,6 @@ class ERLTrainer:
         # Reset iterator when creating new DataLoader
         self.batch_iterator = None
 
-    def _make_env(self, start_idx: int, end_idx: int, training_end_idx: int):
-        """
-        Factory function to create a trading environment.
-        Used for AsyncVectorEnv to create parallel environment instances.
-
-        Args:
-            start_idx: Starting day index
-            end_idx: Ending day index
-            training_end_idx: Last day new positions can be opened
-
-        Returns:
-            Callable that creates a TradingEnvironment
-        """
-        def _init():
-            return TradingEnvironment(
-                data_array=self.data_loader.data_array,
-                dates=self.data_loader.dates,
-                normalization_stats=self.normalization_stats,
-                start_idx=start_idx,
-                end_idx=end_idx,
-                trading_end_idx=training_end_idx,
-                data_array_full=self.data_loader.data_array_full
-            )
-        return _init
-
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
                    training: bool = True) -> Tuple[float, Dict]:
@@ -422,91 +396,6 @@ class ERLTrainer:
         # NOTE: No need to delete env - we're reusing persistent environments now
         return final_fitness, episode_summary
 
-    def run_vectorized_episodes(self, agent: DDPGAgent, episode_configs: List[Tuple[int, int, int]],
-                               training: bool = True) -> List[Tuple[float, Dict]]:
-        """
-        Run multiple episodes in parallel using AsyncVectorEnv for CPU parallelization.
-
-        Args:
-            agent: Agent to run
-            episode_configs: List of (start_idx, end_idx, trading_end_idx) tuples
-            training: Whether this is training (adds to replay buffer)
-
-        Returns:
-            List of (cumulative_reward, episode_info) for each episode
-        """
-        num_envs = len(episode_configs)
-
-        # Create environment makers for each configuration
-        env_fns = [self._make_env(start_idx, end_idx, trading_end_idx)
-                   for start_idx, end_idx, trading_end_idx in episode_configs]
-
-        # Create vectorized environment
-        vec_env = AsyncVectorEnv(env_fns)
-
-        # Set training mode for all environments
-        for env in vec_env.envs:
-            env.set_training_mode(training)
-
-        # Reset all environments
-        states, _ = vec_env.reset()
-
-        # Initialize tracking
-        cumulative_rewards = np.zeros(num_envs)
-        steps = np.zeros(num_envs, dtype=int)
-        dones = np.zeros(num_envs, dtype=bool)
-
-        # Run episodes until all are done
-        while not dones.all():
-            # Get actions for all environments in parallel (batched inference on GPU)
-            actions = agent.select_action(states, add_noise=training)
-
-            # Step all environments in parallel
-            next_states, rewards, terminateds, truncateds, _ = vec_env.step(actions)
-
-            # Store transitions in replay buffer (if training)
-            if training:
-                for i in range(num_envs):
-                    if not dones[i]:
-                        self.replay_buffer.add(
-                            state=states[i].astype(np.float32),
-                            action=actions[i].astype(np.float32),
-                            reward=rewards[i],
-                            next_state=next_states[i].astype(np.float32),
-                            done=float(terminateds[i] or truncateds[i])
-                        )
-
-            # Update tracking
-            cumulative_rewards += rewards * (~dones)  # Only add if not done
-            steps += ~dones
-            dones |= (terminateds | truncateds)
-
-            # Move to next state
-            states = next_states
-
-        # Collect results from all environments
-        results = []
-        for i in range(num_envs):
-            # Get episode summary from environment
-            episode_summary = vec_env.envs[i].get_episode_summary()
-            episode_summary['steps'] = int(steps[i])
-
-            # Calculate final fitness
-            final_fitness = float(cumulative_rewards[i])
-
-            # Apply zero-trades penalty if no trades were made
-            if episode_summary['num_trades'] == 0:
-                final_fitness -= Config.ZERO_TRADES_PENALTY
-
-            results.append((final_fitness, episode_summary))
-
-        # Clean up vectorized environment
-        vec_env.close()
-        del vec_env
-        gc.collect()
-
-        return results
-
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
         """
         Generate 3 random validation slices for the current generation from INTERIM validation set.
@@ -578,33 +467,37 @@ class ERLTrainer:
         num_exploratory = len(self.population) - num_elites
         print(f"Replay buffer diversity: Only {num_exploratory}/{len(self.population)} exploratory agents contribute experiences")
 
-        for agent in tqdm(self.population, desc="Evaluating agents"):
-            # Prepare 5 random training slices for this agent
-            episode_configs = []
-            total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-            max_start = self.train_end_idx - total_days_needed
-
-            if max_start <= self.train_start_idx:
-                raise ValueError(f"Not enough training data: need {total_days_needed} days")
+        for agent_idx, agent in enumerate(tqdm(self.population, desc="Evaluating agents")):
+            # Evaluate agent on 5 different random training slices
+            slice_fitness_scores = []
+            slice_episode_stats = []
 
             for _ in range(5):
+                # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
+                # Training episodes must not touch interim validation or holdout sets
+                # Need: context (504) + trading (125) + settlement (30) = 659 days total
+                total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+
+                max_start = self.train_end_idx - total_days_needed
+                if max_start <= self.train_start_idx:
+                    raise ValueError(f"Not enough training data: need {total_days_needed} days")
+
                 # Random start from training range only (excludes interim val and holdout)
                 start_idx = np.random.randint(self.train_start_idx, max_start)
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-                trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-                episode_configs.append((start_idx, end_idx, trading_end_idx))
 
-            # Run all 5 slices in parallel using AsyncVectorEnv (5 CPU cores simultaneously)
-            # Only add to replay buffer if agent is exploratory (not elite) for diversity
-            results = self.run_vectorized_episodes(
-                agent=agent,
-                episode_configs=episode_configs,
-                training=(not agent.is_elite)
-            )
+                # Run episode using persistent eval_env (CRITICAL FIX: prevents memory leak)
+                # Only add to replay buffer if agent is exploratory (not elite) for diversity
+                fitness, episode_info = self.run_episode(
+                    agent=agent,
+                    env=self.eval_env,  # Reuse persistent environment instead of creating new ones
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    training=(not agent.is_elite)  # Only exploratory agents contribute to buffer
+                )
 
-            # Extract fitness scores and episode stats
-            slice_fitness_scores = [fitness for fitness, _ in results]
-            slice_episode_stats = [info for _, info in results]
+                slice_fitness_scores.append(fitness)
+                slice_episode_stats.append(episode_info)
 
             # Robust scoring: average of lowest 2 scores out of 5
             sorted_fitness = sorted(slice_fitness_scores)
@@ -791,18 +684,19 @@ class ERLTrainer:
         if not self.current_generation_val_slices:
             raise ValueError("No validation slices generated for this generation")
 
-        # Run all 3 validation slices in parallel using AsyncVectorEnv (3 CPU cores simultaneously)
-        results = self.run_vectorized_episodes(
-            agent=agent,
-            episode_configs=self.current_generation_val_slices,
-            training=False
-        )
-
-        # Process results
+        # Run agent on all 3 validation slices
         slice_results = []
         all_closed_trades = []  # Collect all closed trades from all slices
 
-        for fitness, episode_info in results:
+        for start_idx, end_idx, _ in self.current_generation_val_slices:
+            fitness, episode_info = self.run_episode(
+                agent=agent,
+                env=self.eval_env,  # Reuse persistent environment
+                start_idx=start_idx,
+                end_idx=end_idx,
+                training=False
+            )
+
             # CRITICAL FIX: Create validation gradient for agents that don't trade
             # If agent made 0 trades, add max_coefficient bonus to reduce penalty
             # This creates a gradient that rewards agents who get "closer" to the threshold

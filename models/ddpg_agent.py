@@ -71,47 +71,32 @@ class DDPGAgent:
     def select_action(self, state: np.ndarray, add_noise: bool = True) -> np.ndarray:
         """
         Select action using current policy.
-
+        
         Args:
-            state: State observation, either:
-                - Single: [context_days, num_columns, 9]
-                - Batch: [batch_size, context_days, num_columns, 9]
+            state: State observation [context_days, num_columns, 9]
             add_noise: Whether to add exploration noise
-
+            
         Returns:
-            Action, either:
-                - Single: [108, 2]
-                - Batch: [batch_size, 108, 2]
+            Action [108, 2]
         """
         self.actor.eval()
-
+        
         with torch.no_grad():
-            # Handle both batched and single observations
-            is_batched = len(state.shape) == 4  # [batch, context, cols, features]
-
-            if is_batched:
-                # Already batched, just convert to tensor
-                state_tensor = torch.FloatTensor(state).to(self.device)
-            else:
-                # Single observation, add batch dimension
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-
-            # Get action from actor (batch-compatible)
+            # Convert to tensor and add batch dimension
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            
+            # Get action from actor
             action = self.actor(state_tensor)
-            action = action.cpu().numpy()
-
-            # Remove batch dimension if input was single
-            if not is_batched:
-                action = action.squeeze(0)
-
+            action = action.squeeze(0).cpu().numpy()
+            
             # Add exploration noise if training
             if add_noise:
                 noise = np.random.normal(0, self.noise_scale, action.shape)
                 action = action + noise
 
-                # Clip to valid ranges (handles both batched and single)
-                action[..., 0] = np.maximum(action[..., 0], 0)  # Coefficient >= 0
-                action[..., 1] = np.clip(action[..., 1], Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
+                # Clip to valid ranges
+                action[:, 0] = np.maximum(action[:, 0], 0)  # Coefficient >= 0
+                action[:, 1] = np.clip(action[:, 1], Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
 
             # !!! CRITICAL FIX: DO NOT ROUND HERE !!!
             # This operation is non-differentiable and breaks the DDPG gradient.
@@ -120,7 +105,7 @@ class DDPGAgent:
 
             # Cap coefficients at 100 to prevent reward explosion
             # (reward = coefficient × gain_pct, so uncapped coefficients could destabilize training)
-            action[..., 0] = np.clip(action[..., 0], 0, 100)
+            action[:, 0] = np.clip(action[:, 0], 0, 100)
 
         self.actor.train()
         return action
