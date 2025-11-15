@@ -231,14 +231,16 @@ class TradingEnvironment(gym.Env):
         terminated = self.current_idx >= self.end_idx
         truncated = False
         
-        # 6. Get observation and info
-        obs = self._get_observation() if not terminated else self._get_observation()
-        info = self._get_info()
-
-        # 7. Include episode summary in info when terminated (for AsyncVectorEnv)
-        if terminated:
-            info['episode_summary'] = self.get_episode_summary()
-
+        # 6. Get observation and info (if not terminated)
+        if not terminated:
+            obs = self._get_observation()
+            info = self._get_info()
+        else:
+            # Episode ended, return final state and info from last valid index
+            self.current_idx = self.end_idx - 1  # Go back to last valid index for info
+            obs = self._get_observation()
+            info = self._get_info()
+        
         return obs, step_reward, terminated, truncated, info
     
     def _get_observation(self) -> np.ndarray:
