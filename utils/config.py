@@ -26,7 +26,7 @@ class Config:
     ACTION_DIM = 2  # [coefficient, sale_target]
     MIN_SALE_TARGET = 10.0  # Minimum 10% gain target
     MAX_SALE_TARGET = 50.0  # Maximum 50% gain target
-    COEFFICIENT_THRESHOLD = 0.8  # Threshold for opening position (stock must score >= this)
+    COEFFICIENT_THRESHOLD = 1.0  # Threshold for opening position (stock must score >= this)
     
     # ============ Environment Parameters ============
     # Holding period structure: agent must hold for MIN_HOLDING_PERIOD,
