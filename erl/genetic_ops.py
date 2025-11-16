@@ -156,6 +156,7 @@ def mutate(agent: DDPGAgent, mutation_rate: float = None,
 
 def create_next_generation(population: List[DDPGAgent],
                           fitness_scores: List[float],
+                          elite_scores: List[float] = None,
                           mutation_rate: float = None,
                           mutation_std: float = None) -> List[DDPGAgent]:
     """
@@ -164,21 +165,30 @@ def create_next_generation(population: List[DDPGAgent],
 
     Args:
         population: Current population of agents
-        fitness_scores: Fitness scores for each agent
+        fitness_scores: Training fitness scores (used for tournament selection)
+        elite_scores: Validation fitness scores for elite selection. If None, uses fitness_scores
         mutation_rate: Fraction of weights to mutate. If None, uses Config.MUTATION_RATE
         mutation_std: Standard deviation of mutation noise. If None, uses Config.MUTATION_STD
+
+    Note:
+        - Training fitness (fitness_scores): Used for tournament selection to maintain diversity
+        - Validation fitness (elite_scores): Used for selecting elites to prevent overfitting
+        - DDPG weight updates use training data from the replay buffer (separate process)
     """
     pop_size = Config.POPULATION_SIZE
-    
+
+    # Use validation scores (elite_scores) for elitism, or fall back to training fitness
+    scores_for_elites = elite_scores if elite_scores is not None else fitness_scores
+
     # -----------------------------------------------------------------
     # NEW: Calculate segment sizes dynamically based on POPULATION_SIZE
     # -----------------------------------------------------------------
     num_elites = int(pop_size * Config.ELITE_FRAC)
     num_offspring = int(pop_size * Config.OFFSPRING_FRAC)
-    
+
     # Mutants fill the remaining space to guarantee the pop_size is matched
     num_mutants = pop_size - num_elites - num_offspring
-    
+
     if num_elites == 0 and len(population) > 0:
         # Ensure at least one elite if possible, to allow mutation
         num_elites = 1
@@ -187,20 +197,20 @@ def create_next_generation(population: List[DDPGAgent],
             num_mutants -= 1
         elif num_offspring > 0: # Take from offspring if no mutants
             num_offspring -= 1
-        
+
     # -----------------------------------------------------------------
-    
+
     next_gen = []
-    
-    # 1. Elitism: Keep top performers
+
+    # 1. Elitism: Keep top performers based on elite_scores (combined train+val)
     # Use the new dynamic 'num_elites'
-    elites = elitism_selection(population, fitness_scores, num_elites)
+    elites = elitism_selection(population, scores_for_elites, num_elites)
     # Mark elites for replay buffer diversity (elites don't contribute to buffer)
     for elite in elites:
         elite.is_elite = True
     next_gen.extend(elites)
 
-    print(f"  Elites: {len(elites)} agents (fitness: {[fitness_scores[population.index(e)] for e in elites[:3]]}...)")
+    print(f"  Elites: {len(elites)} agents (elite_scores: {[scores_for_elites[population.index(e)] for e in elites[:3]]}...)")
     
     # 2. Crossover: Generate offspring
     # Use the new dynamic 'num_offspring'

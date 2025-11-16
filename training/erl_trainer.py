@@ -1083,12 +1083,18 @@ class ERLTrainer:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     
-    def evolve_population(self, fitness_scores: List[float]):
+    def evolve_population(self, fitness_scores: List[float], validation_scores: List[float] = None):
         """
         Evolve population using genetic algorithm.
 
         Args:
-            fitness_scores: Fitness for each agent
+            fitness_scores: Training fitness for each agent (used for tournament selection)
+            validation_scores: Validation fitness for elite selection (if None, uses fitness_scores)
+
+        Note:
+            - Training fitness is used by DDPG for gradient updates (done in train_population)
+            - Validation fitness is used by GA for selecting elites (prevents overfitting)
+            - Tournament selection uses training fitness to maintain exploration diversity
         """
         print(f"\n--- Evolving Population (mutation: {self.current_mutation_rate:.3f}) ---")
 
@@ -1096,11 +1102,16 @@ class ERLTrainer:
         # This prevents memory leak from lingering agent references (~2-3GB per generation)
         old_population = self.population
 
+        # Use validation scores for elite selection if provided, otherwise fall back to training fitness
+        elite_scores = validation_scores if validation_scores is not None else fitness_scores
+
         # Create next generation with adaptive mutation parameters
-        # Elitism is handled by create_next_generation (keeps top ELITE_FRAC agents)
+        # Elitism uses validation fitness for robustness and generalization
+        # Tournament selection uses training fitness to maintain exploration
         self.population = create_next_generation(
             old_population,
             fitness_scores,
+            elite_scores=elite_scores,
             mutation_rate=self.current_mutation_rate,
             mutation_std=self.current_mutation_std
         )
@@ -1703,10 +1714,13 @@ class ERLTrainer:
                     best_val_fitness_this_gen = val_fitness
                     best_val_agent_idx = idx
 
+            # Extract validation scores for elite selection (sorted by agent index)
+            validation_scores = [result['validation_fitness'] for result in sorted(validation_results, key=lambda x: x['idx'])]
+
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
             validation_results.sort(key=lambda x: x['validation_fitness'], reverse=True)
-            print("Top 5 by Validation Fitness:")
+            print("Top 5 by Validation Fitness (used for elite selection):")
             for i, result in enumerate(validation_results[:5]):
                 print(f"  {i+1}. Agent {result['idx']:2d}: Val={result['validation_fitness']:>8.2f}, Train={result['training_fitness']:>8.2f}, WR={result['win_rate']:.1%}")
 
@@ -1797,8 +1811,11 @@ class ERLTrainer:
                             )
                         }, step=gen)
 
-            # 3. Evolve population
-            self.evolve_population(fitness_scores)
+            # 3. Evolve population using validation fitness for elite selection
+            # Note: We pass both training fitness and validation scores
+            # - training fitness: used for tournament selection and DDPG gradient updates
+            # - validation scores: used for elite selection (ensures robust generalization)
+            self.evolve_population(fitness_scores, validation_scores)
 
             # Update resource tracker after evolution
             self.resource_tracker.update()
