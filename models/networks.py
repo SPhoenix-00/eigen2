@@ -276,7 +276,7 @@ class Actor(nn.Module):
             nn.ReLU(),
             nn.Dropout(Config.DROPOUT_RATE_HEADS),
             nn.Linear(Config.ACTOR_HIDDEN_DIMS[2], 1),
-            nn.Sigmoid()  # Output in [0, 1], will scale to [MIN, MAX] sale target
+            # No Sigmoid - use direct clipping for full range access
         )
 
         # Enable gradient checkpointing
@@ -297,7 +297,7 @@ class Actor(nn.Module):
         Solution:
         - Initialize final layers with larger weights (gain=5.0) for more variance
         - Initialize coefficient bias to positive value to prevent all-negative outputs
-        - Initialize sale target bias close to 0 for balanced Sigmoid outputs
+        - Initialize sale target bias to center of range [10%, 50%] for balanced outputs
         """
         import torch.nn.init as init
 
@@ -311,15 +311,16 @@ class Actor(nn.Module):
         # Target: raw outputs around 0.5 after ReLU, creating diversity around threshold
         init.constant_(coef_final_layer.bias, 0.5)
 
-        # Sale target head: final linear layer before Sigmoid (index -2, since -1 is Sigmoid)
-        sale_final_layer = self.sale_target_head[-2]
+        # Sale target head: final linear layer (index -1, no Sigmoid anymore)
+        sale_final_layer = self.sale_target_head[-1]
 
         # Initialize with larger weights for more variance
         init.xavier_normal_(sale_final_layer.weight, gain=5.0)
 
-        # Initialize bias to ~0 for balanced Sigmoid outputs (will center around 0.5)
-        # This maps to 30% after scaling, providing room for diversity in both directions
-        init.constant_(sale_final_layer.bias, 0.0)
+        # Initialize bias to center of range [10%, 50%] for balanced outputs
+        # This allows equal opportunity to explore higher and lower sale targets
+        center_value = (Config.MIN_SALE_TARGET + Config.MAX_SALE_TARGET) / 2.0
+        init.constant_(sale_final_layer.bias, center_value)
 
     def _process_investable(self, investable_features: torch.Tensor) -> torch.Tensor:
         """Process investable stocks (for gradient checkpointing)."""
@@ -390,9 +391,10 @@ class Actor(nn.Module):
         # Coefficient: >= 1 or 0 (using threshold)
         coefficients = self._apply_coefficient_activation(raw_coefficients)
 
-        # Sale target: scale from [0, 1] to [MIN_SALE_TARGET, MAX_SALE_TARGET]
-        sale_targets = (Config.MIN_SALE_TARGET +
-                       raw_sale_targets * (Config.MAX_SALE_TARGET - Config.MIN_SALE_TARGET))
+        # Sale target: clip to [MIN_SALE_TARGET, MAX_SALE_TARGET] for full range access
+        sale_targets = torch.clamp(raw_sale_targets,
+                                   Config.MIN_SALE_TARGET,
+                                   Config.MAX_SALE_TARGET)
 
         # Stack into action tensor
         actions = torch.stack([coefficients, sale_targets], dim=-1)
