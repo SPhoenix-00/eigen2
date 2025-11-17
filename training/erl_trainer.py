@@ -1887,8 +1887,9 @@ class ERLTrainer:
 
                         # Replace worst agent with champion
                         old_fitness = fitness_scores[worst_idx]
-                        del self.population[worst_idx]  # Free memory
+                        old_agent = self.population[worst_idx]
                         self.population[worst_idx] = champion_copy
+                        del old_agent  # Free memory
 
                         print(f"   Agent {worst_idx}: Fitness {old_fitness:.2f} → HoF Champion")
 
