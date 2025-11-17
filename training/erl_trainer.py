@@ -28,6 +28,7 @@ from environment.trading_env import TradingEnvironment
 from models.ddpg_agent import DDPGAgent
 from models.replay_buffer import ReplayBuffer, OnDiskReplayBuffer
 from erl.genetic_ops import create_next_generation
+from erl.hall_of_fame import HallOfFame
 from utils.config import Config
 from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress, ResourceTracker
 from utils.cloud_sync import get_cloud_sync_from_env
@@ -310,6 +311,10 @@ class ERLTrainer:
         print(f"Checkpoints: {self.checkpoint_dir}")
         print(f"W&B run: {wandb.run.name} (ID: {wandb.run.id})")
 
+        # Initialize Hall of Fame (now that checkpoint_dir is set)
+        print("Initializing Hall of Fame (capacity: 10)...")
+        self.hall_of_fame = HallOfFame(capacity=10, checkpoint_dir=self.checkpoint_dir)
+
         # Create replay buffer with storage INSIDE checkpoint directory
         # This ensures buffer files are synced to cloud along with checkpoints
         buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
@@ -356,6 +361,10 @@ class ERLTrainer:
         self.max_mutation_rate = 0.8  # Cap mutation rate (doubled to allow plateau boost from 0.40 base)
         self.max_mutation_std = 0.1  # Cap mutation std (doubled to allow plateau boost from 0.05 base)
         self.plateau_detected = False
+
+        # Hall of Fame - Archive of best agents by validation score
+        # Will be properly initialized after checkpoint_dir is set (below)
+        self.hall_of_fame = None
 
         # Track if we've saved buffer on first fill
         self.buffer_saved_on_first_fill = False
@@ -1417,6 +1426,12 @@ class ERLTrainer:
         with open(state_path, 'w') as f:
             json.dump(trainer_state, f, indent=4)
 
+        # 5. Save Hall of Fame
+        if self.hall_of_fame is not None and len(self.hall_of_fame) > 0:
+            self.hall_of_fame.save()
+            hof_stats = self.hall_of_fame.get_stats()
+            print(f"  Saved Hall of Fame ({hof_stats['size']} champions)")
+
         # Sync to cloud storage in background (non-blocking)
         self.cloud_sync.sync_checkpoints(str(checkpoint_dir), background=True,
                                         exclude_patterns=["replay_buffer"])
@@ -1518,6 +1533,19 @@ class ERLTrainer:
                 print(f"✓ Best validation fitness: {self.best_validation_fitness:.2f}")
             except Exception as e:
                 print(f"❌ Error loading state: {e}")
+
+        # 6. Load Hall of Fame
+        try:
+            self.hall_of_fame.load()
+            hof_stats = self.hall_of_fame.get_stats()
+            if hof_stats['size'] > 0:
+                print(f"✓ Loaded Hall of Fame: {hof_stats['size']} champions")
+                print(f"  Best HoF score: {hof_stats['best_score']:.2f}, "
+                      f"Range: {hof_stats['worst_score']:.2f}-{hof_stats['best_score']:.2f}")
+            else:
+                print("! No Hall of Fame found (starting fresh)")
+        except Exception as e:
+            print(f"⚠ Could not load Hall of Fame: {e}")
 
     def update_feature_importance(self, attention_weights: torch.Tensor):
         """
@@ -1742,7 +1770,37 @@ class ERLTrainer:
                 self._run_evaluation()
             else:
                 print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
-            
+
+            # --- Hall of Fame Admission Logic ---
+            # Check if best agent from this generation qualifies for HoF
+            if best_val_agent_idx is not None:
+                if self.hall_of_fame.should_admit(best_val_fitness_this_gen):
+                    best_agent_this_gen = self.population[best_val_agent_idx]
+                    was_added = self.hall_of_fame.add(
+                        best_agent_this_gen,
+                        best_val_fitness_this_gen,
+                        gen
+                    )
+                    if was_added:
+                        hof_stats = self.hall_of_fame.get_stats()
+                        print(f"\n⭐ Hall of Fame admission! Agent {best_val_agent_idx} (Val: {best_val_fitness_this_gen:.2f})")
+                        print(f"   HoF size: {hof_stats['size']}/{self.hall_of_fame.capacity}, "
+                              f"Worst: {hof_stats['worst_score']:.2f}, Best: {hof_stats['best_score']:.2f}")
+
+            # Log Hall of Fame metrics after admission check
+            hof_stats = self.hall_of_fame.get_stats()
+            self.writer.add_scalar('HallOfFame/Size', hof_stats['size'], gen)
+            self.writer.add_scalar('HallOfFame/BestScore', hof_stats['best_score'], gen)
+            self.writer.add_scalar('HallOfFame/WorstScore', hof_stats['worst_score'], gen)
+            self.writer.add_scalar('HallOfFame/MeanScore', hof_stats['mean_score'], gen)
+            wandb.log({
+                "hall_of_fame/size": hof_stats['size'],
+                "hall_of_fame/best_score": hof_stats['best_score'],
+                "hall_of_fame/worst_score": hof_stats['worst_score'],
+                "hall_of_fame/mean_score": hof_stats['mean_score'],
+                "hall_of_fame/std_score": hof_stats['std_score'],
+            }, step=gen)
+
             # 2. Train agents using replay buffer
             self.train_population()
 
@@ -1810,6 +1868,33 @@ class ERLTrainer:
                                 columns=["Column_Index", "Column_Name", "Current_Importance"]
                             )
                         }, step=gen)
+
+            # --- Hall of Fame Injection Logic ---
+            # Inject champions from HoF to replace worst performers BEFORE evolution
+            # This forces new mutants to beat historical best strategies
+            if len(self.hall_of_fame) > 0:
+                num_to_inject = min(3, len(self.population))  # Inject up to 3 agents
+
+                # Find indices of worst performers (by training fitness)
+                worst_indices = np.argsort(fitness_scores)[:num_to_inject]
+
+                # Sample random champions from Hall of Fame
+                hof_champions = self.hall_of_fame.sample_random(k=num_to_inject)
+
+                if len(hof_champions) > 0:
+                    print(f"\n🏆 Hall of Fame Injection: Replacing {len(hof_champions)} worst agents with champions")
+                    for i, (worst_idx, champion) in enumerate(zip(worst_indices, hof_champions)):
+                        # Clone the champion and assign it a new agent ID
+                        champion_copy = champion.clone()
+                        champion_copy.agent_id = worst_idx
+                        champion_copy.is_elite = False  # Not an elite in current gen yet
+
+                        # Replace worst agent with champion
+                        old_fitness = fitness_scores[worst_idx]
+                        del self.population[worst_idx]  # Free memory
+                        self.population[worst_idx] = champion_copy
+
+                        print(f"   Agent {worst_idx}: Fitness {old_fitness:.2f} → HoF Champion")
 
             # 3. Evolve population using validation fitness for elite selection
             # Note: We pass both training fitness and validation scores
