@@ -321,10 +321,6 @@ class Actor(nn.Module):
         # This maps to 30% after scaling, providing room for diversity in both directions
         init.constant_(sale_final_layer.bias, 0.0)
 
-        print(f"[Model Init] Output heads initialized:")
-        print(f"  Coefficient head: bias={coef_final_layer.bias.item():.3f}, weight_std={coef_final_layer.weight.std().item():.3f}")
-        print(f"  Sale target head: bias={sale_final_layer.bias.item():.3f}, weight_std={sale_final_layer.weight.std().item():.3f}")
-
     def _process_investable(self, investable_features: torch.Tensor) -> torch.Tensor:
         """Process investable stocks (for gradient checkpointing)."""
         return self.investable_fc(investable_features)
