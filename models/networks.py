@@ -281,7 +281,50 @@ class Actor(nn.Module):
 
         # Enable gradient checkpointing
         self.use_gradient_checkpointing = True
-        
+
+        # CRITICAL FIX: Initialize output heads with proper weights and biases
+        # This prevents dead ReLU and low variance issues
+        self._initialize_output_heads()
+
+    def _initialize_output_heads(self):
+        """
+        Initialize output heads with proper weights and biases.
+
+        Fixes two critical issues:
+        1. Dead ReLU: Coefficient head was outputting all negative values
+        2. Low variance: Both heads had extremely low output variance
+
+        Solution:
+        - Initialize final layers with larger weights (gain=5.0) for more variance
+        - Initialize coefficient bias to positive value to prevent all-negative outputs
+        - Initialize sale target bias close to 0 for balanced Sigmoid outputs
+        """
+        import torch.nn.init as init
+
+        # Coefficient head: final linear layer (index -1)
+        coef_final_layer = self.coefficient_head[-1]
+
+        # Initialize with larger weights for more variance
+        init.xavier_normal_(coef_final_layer.weight, gain=5.0)
+
+        # CRITICAL: Initialize bias to POSITIVE value to prevent all-negative outputs
+        # Target: raw outputs around 0.5 after ReLU, creating diversity around threshold
+        init.constant_(coef_final_layer.bias, 0.5)
+
+        # Sale target head: final linear layer before Sigmoid (index -2, since -1 is Sigmoid)
+        sale_final_layer = self.sale_target_head[-2]
+
+        # Initialize with larger weights for more variance
+        init.xavier_normal_(sale_final_layer.weight, gain=5.0)
+
+        # Initialize bias to ~0 for balanced Sigmoid outputs (will center around 0.5)
+        # This maps to 30% after scaling, providing room for diversity in both directions
+        init.constant_(sale_final_layer.bias, 0.0)
+
+        print(f"[Model Init] Output heads initialized:")
+        print(f"  Coefficient head: bias={coef_final_layer.bias.item():.3f}, weight_std={coef_final_layer.weight.std().item():.3f}")
+        print(f"  Sale target head: bias={sale_final_layer.bias.item():.3f}, weight_std={sale_final_layer.weight.std().item():.3f}")
+
     def _process_investable(self, investable_features: torch.Tensor) -> torch.Tensor:
         """Process investable stocks (for gradient checkpointing)."""
         return self.investable_fc(investable_features)
