@@ -221,7 +221,8 @@ class AttentionModule(nn.Module):
 class Actor(nn.Module):
     """
     Actor network: outputs actions [coefficient, sale_target] for each stock.
-    Uses cross-attention to determine feature importance across all columns.
+    Uses self-attention where each stock attends to all columns (market indicators + other stocks).
+    This allows each stock to develop its own unique representation based on what it finds relevant.
     Gradient checkpointing enabled to reduce memory usage.
     """
 
@@ -231,12 +232,12 @@ class Actor(nn.Module):
         # Feature extraction
         self.feature_extractor = FeatureExtractor()
 
-        # Cross-attention for feature importance
+        # Self-attention for feature importance (each stock attends to all columns)
         if Config.USE_ATTENTION:
             self.attention = AttentionModule(
                 embed_dim=self.feature_extractor.lstm_output_size,
                 num_heads=Config.ATTENTION_HEADS,
-                use_cross_attention=True,  # Use cross-attention
+                use_cross_attention=False,  # Use self-attention for stock-specific learning
                 attention_dropout=0.1
             )
         else:
@@ -245,14 +246,10 @@ class Actor(nn.Module):
         # Store last attention weights for logging
         self.last_attention_weights = None
 
-        # Separate processing for investable stocks vs context features
-        # Investable stocks (columns 10-117 = 108 stocks)
+        # Process investable stocks individually
+        # Each stock will have attended features from self-attention
         investable_input_dim = self.feature_extractor.lstm_output_size
 
-        # Context features (remaining columns pooled)
-        context_input_dim = self.feature_extractor.lstm_output_size
-
-        # Process investable stocks individually
         self.investable_fc = nn.Sequential(
             nn.Linear(investable_input_dim, Config.ACTOR_HIDDEN_DIMS[0]),
             nn.ReLU(),
@@ -262,15 +259,9 @@ class Actor(nn.Module):
             nn.Dropout(Config.DROPOUT_RATE),
         )
 
-        # Process context features
-        self.context_fc = nn.Sequential(
-            nn.Linear(context_input_dim, Config.ACTOR_HIDDEN_DIMS[1]),
-            nn.ReLU(),
-            nn.Dropout(Config.DROPOUT_RATE),
-        )
-
-        # Combined processing for each stock
-        combined_dim = Config.ACTOR_HIDDEN_DIMS[1] * 2  # Investable + context
+        # No separate context processing - self-attention provides stock-specific context
+        # Combined dim is just the investable features (no concatenation)
+        combined_dim = Config.ACTOR_HIDDEN_DIMS[1]  # Just investable features
 
         # Output heads for each stock
         self.coefficient_head = nn.Sequential(
@@ -294,10 +285,6 @@ class Actor(nn.Module):
     def _process_investable(self, investable_features: torch.Tensor) -> torch.Tensor:
         """Process investable stocks (for gradient checkpointing)."""
         return self.investable_fc(investable_features)
-
-    def _process_context(self, global_context: torch.Tensor) -> torch.Tensor:
-        """Process context features (for gradient checkpointing)."""
-        return self.context_fc(global_context)
 
     def _process_coefficient_head(self, combined: torch.Tensor) -> torch.Tensor:
         """Process coefficient head (for gradient checkpointing)."""
@@ -325,51 +312,32 @@ class Actor(nn.Module):
         features = self.feature_extractor(state)
         # [batch, num_columns, lstm_output_size]
 
-        # Apply cross-attention if enabled
+        # Apply self-attention if enabled (each column attends to all columns)
         attention_weights = None
         if self.attention is not None:
-            # Cross-attention: single query attends to all features
-            global_context, attention_weights = self.attention(features, return_attention_weights=True)
-            # global_context: [batch, 1, lstm_output_size]
-            # attention_weights: [batch, num_columns]
+            # Self-attention: each column attends to all other columns
+            attended_features, attention_weights = self.attention(features, return_attention_weights=True)
+            # attended_features: [batch, num_columns, lstm_output_size]
+            # attention_weights: [batch, num_columns] (averaged attention for logging)
 
             # Store attention weights for logging
             self.last_attention_weights = attention_weights.detach()
 
-            # Process global context through context FC (with checkpointing)
-            global_context = global_context.squeeze(1)  # [batch, lstm_output_size]
-            if self.training and self.use_gradient_checkpointing:
-                context_processed = checkpoint(self._process_context, global_context, use_reentrant=False)
-            else:
-                context_processed = self._process_context(global_context)
-            context_processed = context_processed.unsqueeze(1)  # [batch, 1, ACTOR_HIDDEN_DIMS[1]]
+            # Extract investable stock features (now with attention-enriched representations)
+            investable_features = attended_features[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1, :]
         else:
-            # Fallback: pool all features if no attention
-            context_features = torch.mean(features, dim=1)  # [batch, lstm_output_size]
-            if self.training and self.use_gradient_checkpointing:
-                context_processed = checkpoint(self._process_context, context_features, use_reentrant=False)
-            else:
-                context_processed = self._process_context(context_features)
-            context_processed = context_processed.unsqueeze(1)  # [batch, 1, ACTOR_HIDDEN_DIMS[1]]
+            # Fallback: use raw features if no attention
+            investable_features = features[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1, :]
 
-        # Extract investable stock features (still use raw features for stock-specific processing)
-        investable_features = features[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1, :]
         # [batch, 108, lstm_output_size]
 
         # Process investable stocks (with checkpointing)
         if self.training and self.use_gradient_checkpointing:
-            investable_processed = checkpoint(self._process_investable, investable_features, use_reentrant=False)
+            combined = checkpoint(self._process_investable, investable_features, use_reentrant=False)
         else:
-            investable_processed = self._process_investable(investable_features)
+            combined = self._process_investable(investable_features)
         # [batch, 108, ACTOR_HIDDEN_DIMS[1]]
-
-        # Expand context to all stocks
-        context_expanded = context_processed.expand(-1, Config.NUM_INVESTABLE_STOCKS, -1)
-        # [batch, 108, ACTOR_HIDDEN_DIMS[1]]
-
-        # Combine
-        combined = torch.cat([investable_processed, context_expanded], dim=-1)
-        # [batch, 108, combined_dim]
+        # Each stock now has its own unique representation based on what IT attended to
 
         # Output heads (with checkpointing)
         if self.training and self.use_gradient_checkpointing:

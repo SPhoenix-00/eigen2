@@ -21,7 +21,9 @@
       "Bash(dir /b /o-d evaluation_results 2)",
       "Bash(nul)",
       "Bash(findstr:*)",
-      "Bash(more:*)"
+      "Bash(more:*)",
+      "Bash(dir:*)",
+      "Bash(set:*)"
     ],
     "deny": [],
     "ask": []
