@@ -362,10 +362,6 @@ class ERLTrainer:
         self.max_mutation_std = 0.1  # Cap mutation std (doubled to allow plateau boost from 0.05 base)
         self.plateau_detected = False
 
-        # Hall of Fame - Archive of best agents by validation score
-        # Will be properly initialized after checkpoint_dir is set (below)
-        self.hall_of_fame = None
-
         # Track if we've saved buffer on first fill
         self.buffer_saved_on_first_fill = False
 
