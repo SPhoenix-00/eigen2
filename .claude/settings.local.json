@@ -17,7 +17,11 @@
       "Bash(PYTHONPATH=/Users/asellam/Documents/GitHub/eigen2:$PYTHONPATH ./venv/bin/python:*)",
       "Bash(env)",
       "Bash(./venv/bin/pip install:*)",
-      "Bash(=5.9.0 -q)"
+      "Bash(=5.9.0 -q)",
+      "Bash(dir /b /o-d evaluation_results 2)",
+      "Bash(nul)",
+      "Bash(findstr:*)",
+      "Bash(more:*)"
     ],
     "deny": [],
     "ask": []
