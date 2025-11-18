@@ -2092,7 +2092,13 @@ class ERLTrainer:
 
             # Update best agent if we found a better one based on validation
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
-                print(f"\n✓ New best! Val fitness: {best_val_fitness_this_gen:.2f} (prev: {self.best_validation_fitness:.2f})")
+                # Verify this is indeed the top agent in sorted results
+                top_agent_idx = validation_results[0]['idx']
+                if best_val_agent_idx != top_agent_idx:
+                    print(f"\n⚠ WARNING: best_val_agent_idx ({best_val_agent_idx}) != top sorted agent ({top_agent_idx})")
+                    print(f"   This indicates a bug in best agent selection!")
+
+                print(f"\n✓ New best! Agent {best_val_agent_idx} with Val fitness: {best_val_fitness_this_gen:.2f} (prev: {self.best_validation_fitness:.2f})")
                 if self.best_agent is not None:
                     del self.best_agent
                     gc.collect()
