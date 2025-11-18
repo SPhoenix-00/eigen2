@@ -23,7 +23,8 @@
       "Bash(findstr:*)",
       "Bash(more:*)",
       "Bash(dir:*)",
-      "Bash(set:*)"
+      "Bash(set:*)",
+      "Bash(git show:*)"
     ],
     "deny": [],
     "ask": []

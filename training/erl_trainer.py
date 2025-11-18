@@ -36,23 +36,45 @@ from torch.utils.data import DataLoader
 # from utils.memory_profiler import get_profiler, log_memory  # Memory profiling disabled
 
 
+# Global variable to store shared env_config in worker processes
+_worker_env_config = None
+
+
+def _init_worker(env_config):
+    """
+    Initializer function for worker processes.
+
+    This is called once per worker when the ProcessPoolExecutor starts.
+    Stores the env_config in a global variable so it doesn't need to be
+    pickled with every task (significant performance improvement).
+
+    Args:
+        env_config: Environment configuration dict with data arrays
+    """
+    global _worker_env_config
+    _worker_env_config = env_config
+
+
 def _run_episode_worker(args):
     """
     Worker function for parallel episode execution.
 
     This function runs in a separate process, so it must:
     1. Reconstruct the agent from CPU state dicts
-    2. Create its own environment instance
+    2. Create its own environment instance (using global env_config)
     3. Run the episode independently
     4. Write transitions directly to disk (parallel I/O)
 
     Args:
-        args: Tuple of (agent_state, env_config, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start)
+        args: Tuple of (agent_state, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start)
+              Note: env_config is accessed from global _worker_env_config (set by initializer)
 
     Returns:
         Tuple of (fitness, episode_info, transition_file_paths)
     """
-    agent_state, env_config, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start = args
+    global _worker_env_config
+    agent_state, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start = args
+    env_config = _worker_env_config
 
     # Set worker-specific seed for reproducibility
     np.random.seed(seed)
@@ -572,9 +594,9 @@ class ERLTrainer:
                 # Create unique seed for this task
                 task_seed = self.seed + agent_idx * 1000 + slice_idx
 
+                # Note: env_config is passed via initializer, not in task tuple
                 tasks.append((
                     agent_state,
-                    env_config,
                     start_idx,
                     end_idx,
                     False,  # training=False, don't add to buffer
@@ -589,7 +611,14 @@ class ERLTrainer:
 
         fitness_by_agent = [[] for _ in range(len(loaded_agents))]
 
-        with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context('spawn')) as executor:
+        # Use initializer to pass env_config once per worker (not once per task)
+        # This significantly reduces serialization overhead
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=mp.get_context('spawn'),
+            initializer=_init_worker,
+            initargs=(env_config,)
+        ) as executor:
             futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
             for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating heroes"):
@@ -1105,9 +1134,9 @@ class ERLTrainer:
                 file_id_start = file_id_counter
                 file_id_counter += 200  # Reserve 200 IDs per episode (generous estimate)
 
+                # Note: env_config is passed via initializer, not in task tuple
                 tasks.append((
                     agent_state,
-                    env_config,
                     start_idx,
                     end_idx,
                     not agent.is_elite,  # training flag
@@ -1126,7 +1155,15 @@ class ERLTrainer:
         # Fork method doesn't work with CUDA after initialization
         all_transition_file_paths = []  # Collect all file paths written by workers
 
-        with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context('spawn')) as executor:
+        # Use initializer to pass env_config once per worker (not once per task)
+        # This significantly reduces serialization overhead, especially in consistency mode
+        # where we have 160 tasks (32 agents x 5 episodes) vs 96 in normal mode
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=mp.get_context('spawn'),
+            initializer=_init_worker,
+            initargs=(env_config,)
+        ) as executor:
             # Submit all tasks
             futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
