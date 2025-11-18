@@ -40,6 +40,11 @@ class Config:
     FORCED_EXIT_PENALTY_PCT = 0.03  # 3% penalty on position size (entry_price * coefficient)
     ZERO_TRADES_PENALTY = 100.0  # Heavy penalty for making NO trades at all
 
+    # Win rate bonus - rewards consistent winning
+    WIN_RATE_BONUS_THRESHOLD = 75.0  # Win rate % above which bonus kicks in
+    WIN_RATE_BONUS_MIN_TRADES = 20   # Minimum trades required for bonus to apply
+    # Bonus formula: (win_rate% - threshold)^2, e.g., 76% = 1pt, 100% = 625pt
+
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
     SETTLEMENT_PERIOD_DAYS = 30  # Additional days to close remaining positions (must be >= MAX_HOLDING_PERIOD)
     EPISODE_LENGTH = TRADING_PERIOD_DAYS  # For backward compatibility
@@ -102,6 +107,15 @@ class Config:
     ELITE_FRAC = 0.25       # 25% of population
     OFFSPRING_FRAC = 0.25   # 25% of population
     # MUTANT_FRAC will be the remainder (50%, massively increased for exploration)
+
+    # Heroes mode - when loading pre-trained agents from Hall of Fame
+    # Uses higher elite fraction since these agents are already well-trained
+    HEROES_ELITE_FRAC = 0.50    # 50% elites (16 agents) - preserve more proven performers
+    HEROES_OFFSPRING_FRAC = 0.375  # 37.5% offspring (12 agents) - blend elite genetics
+    # HEROES_MUTANT_FRAC = 0.125 (remainder: 4 agents) - minimal random exploration
+
+    # Consistency mode - loss magnification for training on consistency
+    CONSISTENCY_LOSS_MULTIPLIER = 1.25  # Magnify losses by 25% to penalize inconsistency
     
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)

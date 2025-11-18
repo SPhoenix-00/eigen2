@@ -158,7 +158,8 @@ def create_next_generation(population: List[DDPGAgent],
                           fitness_scores: List[float],
                           elite_scores: List[float] = None,
                           mutation_rate: float = None,
-                          mutation_std: float = None) -> List[DDPGAgent]:
+                          mutation_std: float = None,
+                          heroes_mode: bool = False) -> List[DDPGAgent]:
     """
     Create next generation using selection, crossover, and mutation.
     Calculates population segments dynamically using Config.POPULATION_SIZE.
@@ -169,6 +170,7 @@ def create_next_generation(population: List[DDPGAgent],
         elite_scores: Validation fitness scores for elite selection. If None, uses fitness_scores
         mutation_rate: Fraction of weights to mutate. If None, uses Config.MUTATION_RATE
         mutation_std: Standard deviation of mutation noise. If None, uses Config.MUTATION_STD
+        heroes_mode: If True, use heroes mode fractions (more elites, fewer mutants)
 
     Note:
         - Training fitness (fitness_scores): Used for tournament selection to maintain diversity
@@ -181,10 +183,15 @@ def create_next_generation(population: List[DDPGAgent],
     scores_for_elites = elite_scores if elite_scores is not None else fitness_scores
 
     # -----------------------------------------------------------------
-    # NEW: Calculate segment sizes dynamically based on POPULATION_SIZE
+    # Calculate segment sizes dynamically based on POPULATION_SIZE
+    # Use heroes mode fractions if in heroes mode (more elites, fewer mutants)
     # -----------------------------------------------------------------
-    num_elites = int(pop_size * Config.ELITE_FRAC)
-    num_offspring = int(pop_size * Config.OFFSPRING_FRAC)
+    if heroes_mode:
+        num_elites = int(pop_size * Config.HEROES_ELITE_FRAC)
+        num_offspring = int(pop_size * Config.HEROES_OFFSPRING_FRAC)
+    else:
+        num_elites = int(pop_size * Config.ELITE_FRAC)
+        num_offspring = int(pop_size * Config.OFFSPRING_FRAC)
 
     # Mutants fill the remaining space to guarantee the pop_size is matched
     num_mutants = pop_size - num_elites - num_offspring

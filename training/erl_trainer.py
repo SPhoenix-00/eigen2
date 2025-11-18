@@ -147,6 +147,18 @@ def _run_episode_worker(args):
     if episode_summary['num_trades'] == 0:
         final_fitness -= Config.ZERO_TRADES_PENALTY
 
+    # Apply win rate bonus if enough trades and win rate above threshold
+    if episode_summary['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:
+        win_rate_pct = episode_summary['win_rate'] * 100.0  # Convert to percentage
+        if win_rate_pct > Config.WIN_RATE_BONUS_THRESHOLD:
+            bonus = (win_rate_pct - Config.WIN_RATE_BONUS_THRESHOLD) ** 2
+            final_fitness += bonus
+            episode_summary['win_rate_bonus'] = bonus
+        else:
+            episode_summary['win_rate_bonus'] = 0.0
+    else:
+        episode_summary['win_rate_bonus'] = 0.0
+
     return final_fitness, episode_summary, transition_file_paths
 
 
@@ -156,7 +168,8 @@ class ERLTrainer:
     Manages population, training, and evolution.
     """
 
-    def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False):
+    def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
+                 consistency_mode: bool = False, heroes_hof_dir: str = None):
         """
         Initialize ERL trainer.
 
@@ -164,10 +177,14 @@ class ERLTrainer:
             data_loader: Loaded data with train/val splits
             resume_run_name: Optional wandb run name to resume from (e.g., "azure-thunder-123")
             enable_leverage: If True, enable leverage mode (replaces bottom 5 with top 5 HoF agents with 1.5x coefficients)
+            consistency_mode: If True, evaluate with 5 episodes (sum) and 1.25x loss magnification
+            heroes_hof_dir: Path to Hall of Fame directory to load pre-trained agents from
         """
         self.data_loader = data_loader
         self.resume_run_name = resume_run_name
         self.enable_leverage = enable_leverage
+        self.consistency_mode = consistency_mode
+        self.heroes_hof_dir = heroes_hof_dir
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -399,6 +416,8 @@ class ERLTrainer:
 
         # Create persistent environment (reused across episodes to prevent memory leaks)
         print("Initializing environment...")
+        if self.consistency_mode:
+            print("  Consistency mode enabled: 1.25x loss magnification")
         self.eval_env = TradingEnvironment(
             data_array=self.data_loader.data_array,
             dates=self.data_loader.dates,
@@ -406,8 +425,13 @@ class ERLTrainer:
             start_idx=self.train_start_idx,
             end_idx=self.train_end_idx,
             trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
-            data_array_full=self.data_loader.data_array_full
+            data_array_full=self.data_loader.data_array_full,
+            consistency_mode=self.consistency_mode
         )
+
+        # Load heroes from Hall of Fame if specified (must happen after env creation, before checkpoint load)
+        if self.heroes_hof_dir:
+            self.load_heroes_from_hof()
 
         # Automatically load checkpoint if resuming
         if self.resume_run_name:
@@ -453,6 +477,140 @@ class ERLTrainer:
         )
         # Reset iterator when creating new DataLoader
         self.batch_iterator = None
+
+    def load_heroes_from_hof(self):
+        """
+        Load agents from a Hall of Fame directory, evaluate them, and select top 32.
+
+        This is called when --heroes flag is provided to start training from
+        a set of pre-trained agents instead of random initialization.
+        """
+        from pathlib import Path
+        import glob
+
+        hof_dir = Path(self.heroes_hof_dir)
+        hof_subdir = hof_dir / "hall_of_fame"
+
+        # Check if the directory exists
+        if not hof_dir.exists():
+            print(f"! Heroes HoF directory not found: {hof_dir}")
+            print("  Continuing with random initialization.")
+            return
+
+        # Determine where agent files are
+        if hof_subdir.exists():
+            agent_dir = hof_subdir
+        else:
+            agent_dir = hof_dir
+
+        # Load all agent files
+        agent_files = sorted(glob.glob(str(agent_dir / "*.pth")))
+        if not agent_files:
+            print(f"! No agent files (.pth) found in: {agent_dir}")
+            print("  Continuing with random initialization.")
+            return
+
+        print("\n" + "="*60)
+        print("HEROES MODE: Loading pre-trained agents from Hall of Fame")
+        print("="*60)
+        print(f"Source: {agent_dir}")
+        print(f"Found {len(agent_files)} agent files")
+
+        # Load all agents
+        loaded_agents = []
+        for i, agent_file in enumerate(agent_files):
+            try:
+                agent = DDPGAgent(agent_id=i)
+                agent.load(agent_file)
+                agent.is_elite = False  # Will be re-determined after evaluation
+                loaded_agents.append(agent)
+            except Exception as e:
+                print(f"  ! Failed to load {agent_file}: {e}")
+
+        if not loaded_agents:
+            print("! No agents could be loaded. Continuing with random initialization.")
+            return
+
+        print(f"Successfully loaded {len(loaded_agents)} agents")
+
+        # Evaluate all loaded agents using current reward function
+        print(f"\n--- Evaluating {len(loaded_agents)} heroes with current reward function ---")
+        if self.consistency_mode:
+            print("  Using consistency mode: 5 episodes, sum, 1.25x loss magnification")
+        else:
+            print("  Using standard mode: 3 episodes, avg(lowest 2)")
+
+        hero_fitness = []
+        num_episodes = 5 if self.consistency_mode else 3
+
+        for agent in tqdm(loaded_agents, desc="Evaluating heroes"):
+            slice_fitness_scores = []
+
+            for _ in range(num_episodes):
+                # Calculate episode indices
+                total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                max_start = self.train_end_idx - total_days_needed
+                start_idx = np.random.randint(self.train_start_idx, max_start)
+                end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+
+                # Run episode
+                fitness, _ = self.run_episode(
+                    agent=agent,
+                    env=self.eval_env,
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    training=False  # Don't add to replay buffer during evaluation
+                )
+                slice_fitness_scores.append(fitness)
+
+            # Calculate final fitness
+            if self.consistency_mode:
+                final_fitness = sum(slice_fitness_scores)
+            else:
+                sorted_fitness = sorted(slice_fitness_scores)
+                final_fitness = np.mean(sorted_fitness[:2])
+
+            hero_fitness.append((final_fitness, agent))
+
+        # Sort by fitness (descending) and select top 32
+        hero_fitness.sort(key=lambda x: x[0], reverse=True)
+        num_to_select = min(Config.POPULATION_SIZE, len(hero_fitness))
+
+        print(f"\n--- Selecting top {num_to_select} heroes ---")
+        print("Top 5 heroes:")
+        for i, (fitness, _) in enumerate(hero_fitness[:5]):
+            print(f"  {i+1}. Fitness: {fitness:.2f}")
+
+        # Replace population with selected heroes
+        selected_heroes = []
+        for i in range(num_to_select):
+            fitness, agent = hero_fitness[i]
+            agent.agent_id = i
+            selected_heroes.append(agent)
+
+        # Fill remaining slots with clones of top agents if needed
+        while len(selected_heroes) < Config.POPULATION_SIZE:
+            idx = len(selected_heroes) % num_to_select
+            clone = hero_fitness[idx][1].clone()
+            clone.agent_id = len(selected_heroes)
+            selected_heroes.append(clone)
+
+        # Replace population
+        old_population = self.population
+        self.population = selected_heroes
+
+        # Clean up old population
+        for agent in old_population:
+            del agent
+        gc.collect()
+
+        print(f"\nPopulation replaced with {len(self.population)} heroes")
+        print(f"Using heroes mode elite/offspring fractions:")
+        print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_ELITE_FRAC)} agents)")
+        print(f"  Offspring: {Config.HEROES_OFFSPRING_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_OFFSPRING_FRAC)} agents)")
+        mutant_frac = 1.0 - Config.HEROES_ELITE_FRAC - Config.HEROES_OFFSPRING_FRAC
+        print(f"  Mutants: {mutant_frac * 100:.1f}% ({int(Config.POPULATION_SIZE * mutant_frac)} agents)")
+        print("="*60 + "\n")
 
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
@@ -516,14 +674,26 @@ class ERLTrainer:
         # Get episode summary
         episode_summary = env.get_episode_summary()
         episode_summary['steps'] = steps
-        
+
         # CRITICAL: Use cumulative_reward from environment
         # This includes ALL penalties (inaction, losses, etc.)
         final_fitness = float(cumulative_reward)
-        
+
         # Apply zero-trades penalty if no trades were made (silent - penalty speaks for itself)
         if episode_summary['num_trades'] == 0:
             final_fitness -= Config.ZERO_TRADES_PENALTY
+
+        # Apply win rate bonus if enough trades and win rate above threshold
+        if episode_summary['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:
+            win_rate_pct = episode_summary['win_rate'] * 100.0  # Convert to percentage
+            if win_rate_pct > Config.WIN_RATE_BONUS_THRESHOLD:
+                bonus = (win_rate_pct - Config.WIN_RATE_BONUS_THRESHOLD) ** 2
+                final_fitness += bonus
+                episode_summary['win_rate_bonus'] = bonus
+            else:
+                episode_summary['win_rate_bonus'] = 0.0
+        else:
+            episode_summary['win_rate_bonus'] = 0.0
 
         # NOTE: No need to delete env - we're reusing persistent environments now
         return final_fitness, episode_summary
@@ -745,8 +915,12 @@ class ERLTrainer:
         fitness_scores = []
         all_episode_stats = []
 
+        # Consistency mode uses 5 episodes with sum, normal mode uses 3 with avg(lowest 2)
+        num_episodes = 5 if self.consistency_mode else 3
+        scoring_method = "sum(all 5)" if self.consistency_mode else "avg(lowest 2)"
+
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
-        print(f"Multi-slice evaluation: 3 slices per agent, scoring = avg(lowest 2)")
+        print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
 
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
@@ -754,11 +928,11 @@ class ERLTrainer:
         print(f"Replay buffer diversity: Only {num_exploratory}/{len(self.population)} exploratory agents contribute experiences")
 
         for agent_idx, agent in enumerate(tqdm(self.population, desc="Evaluating agents")):
-            # Evaluate agent on 3 different random training slices
+            # Evaluate agent on multiple random training slices
             slice_fitness_scores = []
             slice_episode_stats = []
 
-            for _ in range(3):
+            for _ in range(num_episodes):
                 # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
                 # Training episodes must not touch interim validation or holdout sets
                 # Need: context (504) + trading (125) + settlement (30) = 659 days total
@@ -785,11 +959,16 @@ class ERLTrainer:
                 slice_fitness_scores.append(fitness)
                 slice_episode_stats.append(episode_info)
 
-            # Robust scoring: average of lowest 2 scores out of 3
-            sorted_fitness = sorted(slice_fitness_scores)
-            lowest_2_avg = np.mean(sorted_fitness[:2])
+            # Calculate fitness based on mode
+            if self.consistency_mode:
+                # Consistency mode: sum of all 5 episodes (rewards total consistency)
+                final_fitness = sum(slice_fitness_scores)
+            else:
+                # Normal mode: average of lowest 2 scores out of 3 (robust estimate)
+                sorted_fitness = sorted(slice_fitness_scores)
+                final_fitness = np.mean(sorted_fitness[:2])
 
-            fitness_scores.append(lowest_2_avg)
+            fitness_scores.append(final_fitness)
 
             # Aggregate episode stats across all 3 slices for this agent
             agent_aggregate_stats = {
@@ -833,8 +1012,12 @@ class ERLTrainer:
         Returns:
             Tuple of (fitness_scores, aggregate_stats)
         """
+        # Consistency mode uses 5 episodes with sum, normal mode uses 3 with avg(lowest 2)
+        num_episodes = 5 if self.consistency_mode else 3
+        scoring_method = "sum(all 5)" if self.consistency_mode else "avg(lowest 2)"
+
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population (Parallel) ---")
-        print(f"Multi-slice evaluation: 3 slices per agent, scoring = avg(lowest 2)")
+        print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
 
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
@@ -865,7 +1048,7 @@ class ERLTrainer:
                 'critic': {k: v.cpu() for k, v in agent.critic.state_dict().items()}
             }
 
-            for slice_idx in range(3):  # 3 slices per agent
+            for slice_idx in range(num_episodes):  # num_episodes slices per agent
                 # Calculate random start indices
                 total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
                 max_start = self.train_end_idx - total_days_needed
@@ -908,7 +1091,7 @@ class ERLTrainer:
             # Collect results as they complete
             for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating (parallel)"):
                 task_idx = futures[future]
-                agent_idx = task_idx // 3  # Each agent has 3 slices
+                agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
 
                 try:
                     fitness, episode_info, transition_file_paths = future.result()
@@ -935,10 +1118,15 @@ class ERLTrainer:
             slice_fitness = [f for f, _ in agent_slices]
             slice_stats = [info for _, info in agent_slices]
 
-            # Robust scoring: average of lowest 2 out of 3
-            sorted_fitness = sorted(slice_fitness)
-            lowest_2_avg = np.mean(sorted_fitness[:2])
-            fitness_scores.append(lowest_2_avg)
+            # Calculate fitness based on mode
+            if self.consistency_mode:
+                # Consistency mode: sum of all episodes (rewards total consistency)
+                final_fitness = sum(slice_fitness)
+            else:
+                # Normal mode: average of lowest 2 out of 3 (robust estimate)
+                sorted_fitness = sorted(slice_fitness)
+                final_fitness = np.mean(sorted_fitness[:2])
+            fitness_scores.append(final_fitness)
 
             # Aggregate stats
             agent_stats = {
@@ -1125,7 +1313,8 @@ class ERLTrainer:
             fitness_scores,
             elite_scores=elite_scores,
             mutation_rate=self.current_mutation_rate,
-            mutation_std=self.current_mutation_std
+            mutation_std=self.current_mutation_std,
+            heroes_mode=self.heroes_hof_dir is not None
         )
 
         # Explicitly delete old agents and force GC

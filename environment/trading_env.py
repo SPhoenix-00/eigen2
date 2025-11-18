@@ -47,7 +47,8 @@ class TradingEnvironment(gym.Env):
                  end_idx: int,
                  trading_end_idx: int = None,
                  data_array_full: np.ndarray = None,
-                 is_training: bool = True):
+                 is_training: bool = True,
+                 consistency_mode: bool = False):
         """
         Initialize trading environment.
 
@@ -61,6 +62,7 @@ class TradingEnvironment(gym.Env):
             data_array_full: Full market data for reward calculation [num_days, num_columns, 9_features]
                             If None, uses data_array (for backward compatibility)
             is_training: If True, applies observation noise for regularization
+            consistency_mode: If True, applies 1.25x loss magnification for consistency training
         """
         super().__init__()
 
@@ -71,6 +73,7 @@ class TradingEnvironment(gym.Env):
         self.start_idx = start_idx
         self.end_idx = end_idx
         self.is_training = is_training  # Flag to control observation noise
+        self.consistency_mode = consistency_mode  # Flag to enable loss magnification
 
         # Trading end is when model stops opening new positions
         # Settlement period allows existing positions to close
@@ -466,8 +469,14 @@ class TradingEnvironment(gym.Env):
                     self.num_wins += 1
                     loss_penalty = 0.0
                 else:
-                    base_reward = position.coefficient * gain_pct  # Negative
-                    # Apply loss penalty multiplier
+                    # In consistency mode, magnify losses by CONSISTENCY_LOSS_MULTIPLIER (1.25x)
+                    # This trains agents to focus on reducing drawdowns and variance
+                    if self.consistency_mode:
+                        magnified_loss = abs(gain_pct) * Config.CONSISTENCY_LOSS_MULTIPLIER
+                        base_reward = position.coefficient * (-magnified_loss)
+                    else:
+                        base_reward = position.coefficient * gain_pct  # Negative
+                    # Apply loss penalty multiplier (additional penalty on top of base)
                     loss_penalty = (Config.LOSS_PENALTY_MULTIPLIER - 1.0) * position.coefficient * abs(gain_pct)
                     self.num_losses += 1
 

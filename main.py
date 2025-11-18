@@ -115,6 +115,20 @@ def main():
             help='Use with --resume to enable leverage mode. Replaces bottom 5 agents with '
                  'top 5 Hall of Fame agents modified to trade with 1.5x coefficients for 5 generations.'
         )
+        parser.add_argument(
+            '--consistency',
+            action='store_true',
+            help='Enable consistency mode. Evaluates agents over 5 episodes with sum (not avg), '
+                 'and magnifies losses by 1.25x to focus training on reducing drawdowns.'
+        )
+        parser.add_argument(
+            '--heroes',
+            type=str,
+            default=None,
+            metavar='HOF_DIR',
+            help='Path to a Hall of Fame directory. Loads all agents, evaluates them with current '
+                 'reward function, and selects best 32 as initial population. Uses reduced mutant ratio.'
+        )
         args = parser.parse_args()
         # --------------------------------
 
@@ -164,7 +178,13 @@ def main():
                 print("⚠ No last_run.json found. Starting new training run.")
 
         # Create trainer (pass resume_run_name and leverage flag if resuming)
-        trainer = ERLTrainer(loader, resume_run_name=resume_run_name, enable_leverage=args.leverage)
+        trainer = ERLTrainer(
+            loader,
+            resume_run_name=resume_run_name,
+            enable_leverage=args.leverage,
+            consistency_mode=args.consistency,
+            heroes_hof_dir=args.heroes
+        )
 
         # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---
         # If resume_run_name was provided, checkpoints are automatically loaded
