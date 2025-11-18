@@ -1456,7 +1456,9 @@ class ERLTrainer:
                 'num_trades': episode_info['num_trades'],
                 'num_wins': episode_info['num_wins'],
                 'num_losses': episode_info['num_losses'],
-                'avg_reward_per_trade': episode_info['avg_reward_per_trade']
+                'avg_reward_per_trade': episode_info['avg_reward_per_trade'],
+                'raw_pnl': episode_info.get('raw_pnl', 0.0),
+                'total_investment': episode_info.get('total_investment', 0.0)
             })
 
             # Collect closed trades from this slice
@@ -1474,6 +1476,10 @@ class ERLTrainer:
 
         # Return aggregated results (average of both fitness scores)
         # Also aggregate other metrics for logging
+        total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
+        total_investment = sum([r['total_investment'] for r in slice_results])
+        roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
+
         return {
             'fitness': validation_fitness,
             'fitness_all_slices': fitness_scores,  # For debugging
@@ -1482,6 +1488,9 @@ class ERLTrainer:
             'num_wins': int(np.mean([r['num_wins'] for r in slice_results])),
             'num_losses': int(np.mean([r['num_losses'] for r in slice_results])),
             'avg_reward_per_trade': np.mean([r['avg_reward_per_trade'] for r in slice_results]),
+            'raw_pnl': total_raw_pnl,  # Total raw P&L across slices
+            'total_investment': total_investment,  # Total investment across slices
+            'roi': roi,  # ROI percentage
             'sample_trade': sample_trade  # One sample trade for verification
         }
 
@@ -2081,7 +2090,9 @@ class ERLTrainer:
                     'validation_fitness': val_fitness,
                     'combined_fitness': combined_fitness,
                     'win_rate': val_results['win_rate'],
-                    'num_trades': val_results['num_trades']
+                    'num_trades': val_results['num_trades'],
+                    'raw_pnl': val_results.get('raw_pnl', 0.0),
+                    'roi': val_results.get('roi', 0.0)
                 })
 
                 # Track best combined fitness in this generation
@@ -2097,7 +2108,7 @@ class ERLTrainer:
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
             print("Top 5 by Combined Fitness (Val + min(0, Train)) - used for elite selection:")
             for i, result in enumerate(validation_results[:5]):
-                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val={result['validation_fitness']:>8.2f}, Train={result['training_fitness']:>8.2f}, WR={result['win_rate']:.1%}")
+                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val={result['validation_fitness']:>8.2f}, Train={result['training_fitness']:>8.2f}, PnL=${result['raw_pnl']:>8.2f}, ROI={result['roi']:>6.2f}%, WR={result['win_rate']:.1%}")
 
             # Update best agent if we found a better one based on combined fitness
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:

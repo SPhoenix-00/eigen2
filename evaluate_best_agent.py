@@ -335,7 +335,7 @@ class AgentEvaluator:
                 **summary
             })
 
-            print(f"  Fitness: {fitness:.2f}")
+            print(f"  Fitness: {fitness:.2f}, Raw P&L: ${summary.get('raw_pnl', 0.0):.2f}, ROI: {summary.get('roi', 0.0):.2f}%")
             print(f"  Trades: {summary['num_trades']}, Win Rate: {summary['win_rate']*100:.1f}%")
 
         # Evaluate on holdout
@@ -361,7 +361,7 @@ class AgentEvaluator:
             **summary
         })
 
-        print(f"  Fitness: {fitness:.2f}")
+        print(f"  Fitness: {fitness:.2f}, Raw P&L: ${summary.get('raw_pnl', 0.0):.2f}, ROI: {summary.get('roi', 0.0):.2f}%")
         print(f"  Trades: {summary['num_trades']}, Win Rate: {summary['win_rate']*100:.1f}%")
 
         # Evaluate on holdout end (most recent data)
@@ -387,7 +387,7 @@ class AgentEvaluator:
             **summary
         })
 
-        print(f"  Fitness: {fitness:.2f}")
+        print(f"  Fitness: {fitness:.2f}, Raw P&L: ${summary.get('raw_pnl', 0.0):.2f}, ROI: {summary.get('roi', 0.0):.2f}%")
         print(f"  Trades: {summary['num_trades']}, Win Rate: {summary['win_rate']*100:.1f}%")
 
     def export_results(self):
@@ -436,6 +436,8 @@ class AgentEvaluator:
                 f.write(f"{summary['slice_name']}:\n")
                 f.write(f"  Period: {summary['start_date']} to {summary['end_date']}\n")
                 f.write(f"  Fitness: {summary['fitness']:.2f}\n")
+                f.write(f"  Raw P&L: ${summary.get('raw_pnl', 0.0):.2f}\n")
+                f.write(f"  ROI: {summary.get('roi', 0.0):.2f}%\n")
                 f.write(f"  Total Trades: {summary['num_trades']}\n")
                 f.write(f"  Wins: {summary['num_wins']}, Losses: {summary['num_losses']}\n")
                 f.write(f"  Win Rate: {summary['win_rate']*100:.1f}%\n")
@@ -455,6 +457,9 @@ class AgentEvaluator:
             total_wins = sum(s['num_wins'] for s in self.slice_summaries)
             total_losses = sum(s['num_losses'] for s in self.slice_summaries)
             avg_fitness = np.mean([s['fitness'] for s in self.slice_summaries])
+            total_raw_pnl = sum(s.get('raw_pnl', 0.0) for s in self.slice_summaries)
+            total_investment = sum(s.get('total_investment', 0.0) for s in self.slice_summaries)
+            overall_roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
             overall_win_rate = total_wins / total_trades if total_trades > 0 else 0
 
             f.write(f"Total Trades: {total_trades}\n")
@@ -462,8 +467,15 @@ class AgentEvaluator:
             f.write(f"Total Losses: {total_losses}\n")
             f.write(f"Overall Win Rate: {overall_win_rate*100:.1f}%\n")
             f.write(f"Average Fitness: {avg_fitness:.2f}\n")
+            f.write(f"Total Raw P&L: ${total_raw_pnl:.2f}\n")
+            f.write(f"Total Investment: ${total_investment:.2f}\n")
+            f.write(f"Overall ROI: {overall_roi:.2f}%\n")
             fitness_values = [f"{s['fitness']:.2f}" for s in self.slice_summaries]
             f.write(f"Fitness by Slice: {fitness_values}\n")
+            raw_pnl_values = [f"${s.get('raw_pnl', 0.0):.2f}" for s in self.slice_summaries]
+            f.write(f"Raw P&L by Slice: {raw_pnl_values}\n")
+            roi_values = [f"{s.get('roi', 0.0):.2f}%" for s in self.slice_summaries]
+            f.write(f"ROI by Slice: {roi_values}\n")
             f.write("\n")
 
             # Detailed trade log

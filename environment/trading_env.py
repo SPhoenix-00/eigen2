@@ -184,6 +184,11 @@ class TradingEnvironment(gym.Env):
         # Reset max coefficient tracking
         self.max_coefficient_during_episode = 0.0
 
+        # Reset raw P&L and investment tracking (for ROI calculation)
+        # Uses floored coefficient (integer shares)
+        self.raw_pnl = 0.0
+        self.total_investment = 0.0
+
         # Get initial observation
         obs = self._get_observation()
         info = self._get_info()
@@ -463,6 +468,11 @@ class TradingEnvironment(gym.Env):
                 # Calculate gain/loss
                 gain_pct = ((exit_price - position.entry_price) / position.entry_price) * 100.0
 
+                # Accumulate raw P&L and investment using floored coefficient (integer shares)
+                shares = int(position.coefficient)
+                self.raw_pnl += (exit_price - position.entry_price) * shares
+                self.total_investment += position.entry_price * shares
+
                 # Calculate base reward (before penalties)
                 if gain_pct >= 0:
                     base_reward = position.coefficient * gain_pct
@@ -561,6 +571,9 @@ class TradingEnvironment(gym.Env):
             'zero_trades_penalty': zero_trades_penalty,  # Just report it, don't apply here
             'closed_trades': closed_trades,  # Include all closed trades for analysis
             'max_coefficient_during_episode': self.max_coefficient_during_episode,  # For validation gradient
+            'raw_pnl': self.raw_pnl,  # Sum of (exit_price - entry_price) * int(coef)
+            'total_investment': self.total_investment,  # Sum of entry_price * int(coef)
+            'roi': (self.raw_pnl / self.total_investment * 100) if self.total_investment > 0 else 0.0,  # ROI percentage
         }
 
         # CRITICAL FIX: Clear episode history to prevent memory leak (~15-20GB per generation)
