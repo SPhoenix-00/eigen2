@@ -10,6 +10,8 @@ __pycache__/
 dist/
 build/
 checkpoints/
+checkpoints_honest_forest_117/
+checkpoint_archive.tar.gz
 logs/
 *.csv
 *.log
