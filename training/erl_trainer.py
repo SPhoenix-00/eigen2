@@ -2066,31 +2066,40 @@ class ERLTrainer:
             for idx in tqdm(range(len(self.population)), desc="Validating agents"):
                 val_results = self.validate_agent_cached(self.population[idx])
                 val_fitness = val_results['fitness']
+                train_fitness = fitness_scores[idx]
+
+                # Combined score: penalize agents with negative training fitness
+                # This prevents "lucky" agents that do well on validation but poorly on training
+                # Formula: combined = val_fitness + min(0, train_fitness)
+                # - If train_fitness < 0: score is reduced by the negative amount
+                # - If train_fitness >= 0: score is unchanged
+                combined_fitness = val_fitness + min(0.0, train_fitness)
 
                 validation_results.append({
                     'idx': idx,
-                    'training_fitness': fitness_scores[idx],
+                    'training_fitness': train_fitness,
                     'validation_fitness': val_fitness,
+                    'combined_fitness': combined_fitness,
                     'win_rate': val_results['win_rate'],
                     'num_trades': val_results['num_trades']
                 })
 
-                # Track best validation fitness in this generation
-                if val_fitness > best_val_fitness_this_gen:
-                    best_val_fitness_this_gen = val_fitness
+                # Track best combined fitness in this generation
+                if combined_fitness > best_val_fitness_this_gen:
+                    best_val_fitness_this_gen = combined_fitness
                     best_val_agent_idx = idx
 
-            # Extract validation scores for elite selection (sorted by agent index)
-            validation_scores = [result['validation_fitness'] for result in sorted(validation_results, key=lambda x: x['idx'])]
+            # Extract combined scores for elite selection (sorted by agent index)
+            validation_scores = [result['combined_fitness'] for result in sorted(validation_results, key=lambda x: x['idx'])]
 
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
-            validation_results.sort(key=lambda x: x['validation_fitness'], reverse=True)
-            print("Top 5 by Validation Fitness (used for elite selection):")
+            validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
+            print("Top 5 by Combined Fitness (Val + min(0, Train)) - used for elite selection:")
             for i, result in enumerate(validation_results[:5]):
-                print(f"  {i+1}. Agent {result['idx']:2d}: Val={result['validation_fitness']:>8.2f}, Train={result['training_fitness']:>8.2f}, WR={result['win_rate']:.1%}")
+                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val={result['validation_fitness']:>8.2f}, Train={result['training_fitness']:>8.2f}, WR={result['win_rate']:.1%}")
 
-            # Update best agent if we found a better one based on validation
+            # Update best agent if we found a better one based on combined fitness
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
                 # Verify this is indeed the top agent in sorted results
                 top_agent_idx = validation_results[0]['idx']
@@ -2098,7 +2107,7 @@ class ERLTrainer:
                     print(f"\n⚠ WARNING: best_val_agent_idx ({best_val_agent_idx}) != top sorted agent ({top_agent_idx})")
                     print(f"   This indicates a bug in best agent selection!")
 
-                print(f"\n✓ New best! Agent {best_val_agent_idx} with Val fitness: {best_val_fitness_this_gen:.2f} (prev: {self.best_validation_fitness:.2f})")
+                print(f"\n✓ New best! Agent {best_val_agent_idx} with Combined fitness: {best_val_fitness_this_gen:.2f} (prev: {self.best_validation_fitness:.2f})")
                 if self.best_agent is not None:
                     del self.best_agent
                     gc.collect()
