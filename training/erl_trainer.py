@@ -2136,20 +2136,30 @@ class ERLTrainer:
                 print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
 
             # --- Hall of Fame Admission Logic ---
-            # Check if best agent from this generation qualifies for HoF
-            if best_val_agent_idx is not None:
-                if self.hall_of_fame.should_admit(best_val_fitness_this_gen):
-                    best_agent_this_gen = self.population[best_val_agent_idx]
-                    was_added = self.hall_of_fame.add(
-                        best_agent_this_gen,
-                        best_val_fitness_this_gen,
-                        gen
-                    )
-                    if was_added:
-                        hof_stats = self.hall_of_fame.get_stats()
-                        print(f"\n⭐ Hall of Fame admission! Agent {best_val_agent_idx} (Val: {best_val_fitness_this_gen:.2f})")
-                        print(f"   HoF size: {hof_stats['size']}/{self.hall_of_fame.capacity}, "
-                              f"Worst: {hof_stats['worst_score']:.2f}, Best: {hof_stats['best_score']:.2f}")
+            # Build candidate list from all agents in this generation
+            candidates = []
+            for result in validation_results:
+                agent_idx = result['idx']
+                combined_score = result['combined_fitness']
+                candidates.append((self.population[agent_idx], combined_score, agent_idx))
+
+            # Use batch update with aggressive admission and cascading swaps
+            admission_results = self.hall_of_fame.update_from_generation(candidates, gen)
+
+            # Print admission results
+            admitted = [(idx, score, action) for idx, score, action in admission_results
+                       if action == 'admitted' or action.startswith('replaced_')]
+            if admitted:
+                hof_stats = self.hall_of_fame.get_stats()
+                print(f"\n⭐ Hall of Fame updates ({len(admitted)} changes):")
+                for agent_idx, score, action in admitted:
+                    if action == 'admitted':
+                        print(f"   + Agent {agent_idx} admitted (Combined: {score:.2f})")
+                    elif action.startswith('replaced_'):
+                        old_score = action.replace('replaced_', '')
+                        print(f"   ↑ Agent {agent_idx} (Combined: {score:.2f}) replaced {old_score}")
+                print(f"   HoF size: {hof_stats['size']}/{self.hall_of_fame.capacity}, "
+                      f"Worst: {hof_stats['worst_score']:.2f}, Best: {hof_stats['best_score']:.2f}")
 
             # Log Hall of Fame metrics after admission check
             hof_stats = self.hall_of_fame.get_stats()

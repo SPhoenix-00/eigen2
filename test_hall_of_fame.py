@@ -119,5 +119,139 @@ def test_hall_of_fame():
         print(f"\n[OK] Cleaned up test directory")
 
 
+def test_batch_admission():
+    """Test the new batch admission with cascading swaps."""
+    print("\n" + "="*60)
+    print("Testing Batch Admission (update_from_generation)")
+    print("="*60)
+
+    # Create temporary directory for testing
+    temp_dir = Path(tempfile.mkdtemp())
+    print(f"\nTest directory: {temp_dir}")
+
+    try:
+        # 1. Test Phase 1: Initial filling with positive scores only
+        print("\n1. Testing Phase 1 (Initial Filling)...")
+        hof = HallOfFame(capacity=10, checkpoint_dir=temp_dir)
+
+        # Create candidates with mixed scores (4 positive, 1 negative)
+        candidates = []
+        scores = [2041.77, 917.25, 805.23, 636.97, -53.44]  # From user's example
+        for i, score in enumerate(scores):
+            agent = DDPGAgent(agent_id=i + 20)
+            candidates.append((agent, score, i + 20))
+
+        # HoF is empty (0/10), should admit all positive (4 agents)
+        results = hof.update_from_generation(candidates, generation=5)
+
+        admitted = [r for r in results if r[2] == 'admitted']
+        rejected_negative = [r for r in results if r[2] == 'rejected_negative']
+
+        print(f"   Candidates: {len(candidates)}")
+        print(f"   Admitted: {len(admitted)}")
+        print(f"   Rejected (negative): {len(rejected_negative)}")
+
+        assert len(admitted) == 4, f"Should admit 4 positive-score agents, got {len(admitted)}"
+        assert len(rejected_negative) == 1, f"Should reject 1 negative-score agent, got {len(rejected_negative)}"
+        assert len(hof) == 4, f"HoF should have 4 entries, got {len(hof)}"
+        print("   [OK] Phase 1 correctly admits all positive-score agents")
+
+        # 2. Test Phase 2: Cascading swaps when full
+        print("\n2. Testing Phase 2 (Cascading Swaps)...")
+
+        # First fill the HoF to capacity with lower-scoring agents
+        hof2 = HallOfFame(capacity=5, checkpoint_dir=temp_dir / "hof2")
+        (temp_dir / "hof2").mkdir(exist_ok=True)
+
+        # Add 5 agents with scores 100-140
+        initial_candidates = []
+        for i in range(5):
+            agent = DDPGAgent(agent_id=i)
+            initial_candidates.append((agent, 100.0 + i * 10, i))
+        hof2.update_from_generation(initial_candidates, generation=1)
+
+        print(f"   Initial HoF: {[e.validation_score for e in sorted(hof2.entries, key=lambda x: x.validation_score)]}")
+        assert len(hof2) == 5, "HoF should be full"
+
+        # Now add new candidates that should cascade-replace the worst entries
+        # Scores: 155, 125, 115, 85
+        # Expected: 155 replaces 100 (HoF: [110,120,130,140,155])
+        #           125 replaces 110 (HoF: [120,125,130,140,155])
+        #           115 < 120 (new worst), rejected
+        #           85 < 120, rejected
+        new_candidates = []
+        new_scores = [155.0, 125.0, 115.0, 85.0]
+        for i, score in enumerate(new_scores):
+            agent = DDPGAgent(agent_id=i + 10)
+            new_candidates.append((agent, score, i + 10))
+
+        results2 = hof2.update_from_generation(new_candidates, generation=2)
+
+        replaced = [r for r in results2 if r[2].startswith('replaced_')]
+        rejected = [r for r in results2 if r[2] == 'rejected_not_better']
+
+        print(f"   New candidates: {new_scores}")
+        print(f"   Replaced: {len(replaced)}")
+        print(f"   Rejected: {len(rejected)}")
+
+        assert len(replaced) == 2, f"Should replace 2 agents, got {len(replaced)}"
+        assert len(rejected) == 2, f"Should reject 2 agents, got {len(rejected)}"
+
+        final_scores = sorted([e.validation_score for e in hof2.entries])
+        expected_final = [120.0, 125.0, 130.0, 140.0, 155.0]
+        print(f"   Final HoF scores: {final_scores}")
+        print(f"   Expected: {expected_final}")
+        assert final_scores == expected_final, f"Final scores mismatch: {final_scores} != {expected_final}"
+        print("   [OK] Cascading swaps work correctly")
+
+        # 3. Test mixed scenario: partial fill then swaps
+        print("\n3. Testing mixed scenario (fill + swap in one call)...")
+        hof3 = HallOfFame(capacity=5, checkpoint_dir=temp_dir / "hof3")
+        (temp_dir / "hof3").mkdir(exist_ok=True)
+
+        # Add 3 agents (HoF has room for 2 more)
+        for i in range(3):
+            agent = DDPGAgent(agent_id=i)
+            hof3.add(agent, 100.0 + i * 10, generation=1)
+
+        print(f"   Initial HoF (3/5): {[e.validation_score for e in sorted(hof3.entries, key=lambda x: x.validation_score)]}")
+
+        # Add 4 new candidates: 2 should fill, 1 should swap, 1 should be rejected
+        # Current worst is 100, scores in HoF: [100, 110, 120]
+        # New scores: 200, 150, 90, 50
+        # Expected: 200 fills, 150 fills (now full), 90 rejected (worse than 100), 50 rejected
+        mixed_candidates = []
+        mixed_scores = [200.0, 150.0, 90.0, 50.0]
+        for i, score in enumerate(mixed_scores):
+            agent = DDPGAgent(agent_id=i + 100)
+            mixed_candidates.append((agent, score, i + 100))
+
+        results3 = hof3.update_from_generation(mixed_candidates, generation=2)
+
+        admitted3 = [r for r in results3 if r[2] == 'admitted']
+        rejected3 = [r for r in results3 if r[2] == 'rejected_not_better']
+
+        print(f"   New candidates: {mixed_scores}")
+        print(f"   Admitted: {len(admitted3)}")
+        print(f"   Rejected: {len(rejected3)}")
+
+        final_scores3 = sorted([e.validation_score for e in hof3.entries])
+        print(f"   Final HoF scores: {final_scores3}")
+
+        assert len(hof3) == 5, f"HoF should be full, got {len(hof3)}"
+        assert 200.0 in final_scores3 and 150.0 in final_scores3, "Top candidates should be in HoF"
+        print("   [OK] Mixed scenario works correctly")
+
+        print("\n" + "="*60)
+        print("[SUCCESS] All batch admission tests passed!")
+        print("="*60)
+
+    finally:
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir)
+        print(f"\n[OK] Cleaned up test directory")
+
+
 if __name__ == "__main__":
     test_hall_of_fame()
+    test_batch_admission()

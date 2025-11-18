@@ -151,6 +151,113 @@ class HallOfFame:
 
         return True
 
+    def update_from_generation(self, candidates: List[Tuple[DDPGAgent, float, int]], generation: int) -> List[Tuple[int, float, str]]:
+        """
+        Update Hall of Fame from a generation of candidates with aggressive admission.
+
+        Implements two-phase admission:
+        1. Initial Filling Phase (HoF < capacity): Admit all candidates with Combined > 0
+        2. Maintenance Phase: Cascading swaps - replace worst HoF agents with best candidates
+
+        Args:
+            candidates: List of (agent, combined_score, agent_idx) tuples
+            generation: Current generation number
+
+        Returns:
+            List of (agent_idx, score, action) tuples describing what happened
+            action is one of: 'admitted', 'replaced_agent_X', 'rejected'
+        """
+        results = []
+
+        if not candidates:
+            return results
+
+        # Sort candidates by combined score (descending - best first)
+        sorted_candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
+
+        # Phase 1: Initial Filling - admit all positive-score candidates if not full
+        if not self.is_full():
+            for agent, score, agent_idx in sorted_candidates:
+                if self.is_full():
+                    break
+
+                # Only admit agents with positive Combined score during filling phase
+                if score > 0:
+                    new_id = self._get_next_id()
+                    entry = HallOfFameEntry(
+                        agent_id=new_id,
+                        validation_score=score,
+                        generation=generation
+                    )
+                    self.entries.append(entry)
+
+                    # Save agent weights
+                    if self.checkpoint_dir:
+                        agent_path = self.hof_dir / f"hof_agent_{new_id}.pth"
+                        agent.save(str(agent_path))
+
+                    results.append((agent_idx, score, 'admitted'))
+                else:
+                    results.append((agent_idx, score, 'rejected_negative'))
+
+        # Phase 2: Cascading Swaps - even if we just filled some slots, check for replacements
+        # Get remaining candidates that weren't admitted in Phase 1
+        admitted_indices = {r[0] for r in results if r[2] == 'admitted'}
+        remaining_candidates = [(a, s, idx) for a, s, idx in sorted_candidates
+                                if idx not in admitted_indices]
+
+        if remaining_candidates and self.is_full():
+            # Sort HoF entries by score (ascending - worst first)
+            sorted_hof = sorted(self.entries, key=lambda e: e.validation_score)
+
+            # Cascading swap: iterate through worst HoF agents and best candidates
+            swaps_made = 0
+            for candidate_agent, candidate_score, agent_idx in remaining_candidates:
+                if swaps_made >= len(sorted_hof):
+                    break
+
+                # Find the current worst HoF agent (accounting for previous swaps)
+                current_hof_sorted = sorted(self.entries, key=lambda e: e.validation_score)
+                if not current_hof_sorted:
+                    break
+
+                worst_entry = current_hof_sorted[0]
+
+                # Check if candidate beats the worst HoF agent
+                if candidate_score > worst_entry.validation_score:
+                    old_score = worst_entry.validation_score
+                    old_id = worst_entry.agent_id
+
+                    # Remove worst entry
+                    self.entries.remove(worst_entry)
+
+                    # Delete old agent file
+                    if self.checkpoint_dir:
+                        old_path = self.hof_dir / f"hof_agent_{old_id}.pth"
+                        if old_path.exists():
+                            old_path.unlink()
+
+                    # Add new entry
+                    new_id = self._get_next_id()
+                    new_entry = HallOfFameEntry(
+                        agent_id=new_id,
+                        validation_score=candidate_score,
+                        generation=generation
+                    )
+                    self.entries.append(new_entry)
+
+                    # Save new agent weights
+                    if self.checkpoint_dir:
+                        agent_path = self.hof_dir / f"hof_agent_{new_id}.pth"
+                        candidate_agent.save(str(agent_path))
+
+                    results.append((agent_idx, candidate_score, f'replaced_{old_score:.2f}'))
+                    swaps_made += 1
+                else:
+                    results.append((agent_idx, candidate_score, 'rejected_not_better'))
+
+        return results
+
     def _get_next_id(self) -> int:
         """Generate next unique agent ID for Hall of Fame."""
         if len(self.entries) == 0:
