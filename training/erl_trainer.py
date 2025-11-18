@@ -533,44 +533,85 @@ class ERLTrainer:
 
         print(f"Successfully loaded {len(loaded_agents)} agents")
 
-        # Evaluate all loaded agents using current reward function
-        print(f"\n--- Evaluating {len(loaded_agents)} heroes with current reward function ---")
-        if self.consistency_mode:
-            print("  Using consistency mode: 5 episodes, sum, 1.25x loss magnification")
-        else:
-            print("  Using standard mode: 3 episodes, avg(lowest 2)")
-
-        hero_fitness = []
+        # Evaluate all loaded agents using current reward function (PARALLEL)
+        print(f"\n--- Evaluating {len(loaded_agents)} heroes with current reward function (Parallel) ---")
         num_episodes = 5 if self.consistency_mode else 3
+        if self.consistency_mode:
+            print(f"  Using consistency mode: {num_episodes} episodes, sum, 1.25x loss magnification")
+        else:
+            print(f"  Using standard mode: {num_episodes} episodes, avg(lowest 2)")
 
-        for agent in tqdm(loaded_agents, desc="Evaluating heroes"):
-            slice_fitness_scores = []
+        # Prepare environment config for parallel workers
+        env_config = {
+            'data_array': self.data_loader.data_array,
+            'dates': self.data_loader.dates,
+            'normalization_stats': self.normalization_stats,
+            'start_idx': self.train_start_idx,
+            'end_idx': self.train_end_idx,
+            'trading_end_idx': self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+            'data_array_full': self.data_loader.data_array_full,
+            'consistency_mode': self.consistency_mode
+        }
 
-            for _ in range(num_episodes):
+        # Prepare tasks for parallel evaluation
+        tasks = []
+        for agent_idx, agent in enumerate(loaded_agents):
+            # Extract agent state (CPU tensors only)
+            agent_state = {
+                'actor': {k: v.cpu() for k, v in agent.actor.state_dict().items()},
+                'critic': {k: v.cpu() for k, v in agent.critic.state_dict().items()}
+            }
+
+            for slice_idx in range(num_episodes):
                 # Calculate episode indices
                 total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
                 max_start = self.train_end_idx - total_days_needed
                 start_idx = np.random.randint(self.train_start_idx, max_start)
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
 
-                # Run episode
-                fitness, _ = self.run_episode(
-                    agent=agent,
-                    env=self.eval_env,
-                    start_idx=start_idx,
-                    end_idx=end_idx,
-                    training=False  # Don't add to replay buffer during evaluation
-                )
-                slice_fitness_scores.append(fitness)
+                # Create unique seed for this task
+                task_seed = self.seed + agent_idx * 1000 + slice_idx
 
-            # Calculate final fitness
+                tasks.append((
+                    agent_state,
+                    env_config,
+                    start_idx,
+                    end_idx,
+                    False,  # training=False, don't add to buffer
+                    task_seed,
+                    None,  # No buffer storage
+                    0  # file_id_start (unused)
+                ))
+
+        # Execute in parallel
+        num_workers = min(mp.cpu_count() - 1, 8)
+        print(f"  Using {num_workers} parallel workers for {len(tasks)} tasks")
+
+        fitness_by_agent = [[] for _ in range(len(loaded_agents))]
+
+        with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp.get_context('spawn')) as executor:
+            futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
+
+            for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating heroes"):
+                task_idx = futures[future]
+                agent_idx = task_idx // num_episodes
+
+                try:
+                    fitness, _, _ = future.result()
+                    fitness_by_agent[agent_idx].append(fitness)
+                except Exception as e:
+                    print(f"\n  ! Worker failed for hero {agent_idx}: {e}")
+                    fitness_by_agent[agent_idx].append(-10000.0)
+
+        # Calculate final fitness for each hero
+        hero_fitness = []
+        for agent_idx, slice_fitness in enumerate(fitness_by_agent):
             if self.consistency_mode:
-                final_fitness = sum(slice_fitness_scores)
+                final_fitness = sum(slice_fitness)
             else:
-                sorted_fitness = sorted(slice_fitness_scores)
+                sorted_fitness = sorted(slice_fitness)
                 final_fitness = np.mean(sorted_fitness[:2])
-
-            hero_fitness.append((final_fitness, agent))
+            hero_fitness.append((final_fitness, loaded_agents[agent_idx]))
 
         # Sort by fitness (descending) and select top 32
         hero_fitness.sort(key=lambda x: x[0], reverse=True)
@@ -1032,7 +1073,8 @@ class ERLTrainer:
             'start_idx': self.train_start_idx,
             'end_idx': self.train_end_idx,
             'trading_end_idx': self.train_start_idx + Config.TRADING_PERIOD_DAYS,
-            'data_array_full': self.data_loader.data_array_full
+            'data_array_full': self.data_loader.data_array_full,
+            'consistency_mode': self.consistency_mode
         }
 
         # Prepare all evaluation tasks with file ID allocation
