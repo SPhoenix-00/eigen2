@@ -274,6 +274,7 @@ class HallOfFameEvaluator:
                 self.agent_results[agent_name].append(result)
 
                 print(f"  {slice_name}: Fitness={fitness:.2f}, "
+                      f"P&L=${summary.get('raw_pnl', 0.0):.2f}, "
                       f"Trades={summary['num_trades']}, "
                       f"Win Rate={summary['win_rate']*100:.1f}%, "
                       f"ROI={summary.get('roi', 0.0):.2f}%")
