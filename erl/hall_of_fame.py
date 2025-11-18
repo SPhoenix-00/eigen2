@@ -205,6 +205,35 @@ class HallOfFame:
 
         return None
 
+    def get_top_k(self, k: int = 5) -> List[DDPGAgent]:
+        """
+        Get the top k agents from the Hall of Fame sorted by validation score.
+
+        Args:
+            k: Number of top agents to retrieve
+
+        Returns:
+            List of DDPGAgent instances (best first)
+        """
+        if len(self.entries) == 0:
+            return []
+
+        # Sort entries by validation score (descending)
+        sorted_entries = sorted(self.entries, key=lambda e: e.validation_score, reverse=True)
+
+        # Take top k
+        top_entries = sorted_entries[:min(k, len(sorted_entries))]
+
+        agents = []
+        for entry in top_entries:
+            agent_path = self.hof_dir / f"hof_agent_{entry.agent_id}.pth"
+            if agent_path.exists():
+                agent = DDPGAgent(agent_id=entry.agent_id)
+                agent.load(str(agent_path))
+                agents.append(agent)
+
+        return agents
+
     def get_stats(self) -> Dict:
         """
         Get Hall of Fame statistics.

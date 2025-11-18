@@ -282,6 +282,10 @@ class Actor(nn.Module):
         # Enable gradient checkpointing
         self.use_gradient_checkpointing = True
 
+        # Leverage mode: multiply coefficients by this factor when coefficient > 1
+        # Default is 1.0 (no leverage). Set to 1.5 for leverage mode.
+        self.leverage_multiplier = 1.0
+
         # CRITICAL FIX: Initialize output heads with proper weights and biases
         # This prevents dead ReLU and low variance issues
         self._initialize_output_heads()
@@ -423,6 +427,13 @@ class Actor(nn.Module):
         # Values below COEFFICIENT_THRESHOLD (1.0) will not trigger trades
         # Values >= COEFFICIENT_THRESHOLD will scale position size (discrete sizing with cap at 100)
         coefficients = F.relu(raw)
+
+        # Apply leverage multiplier if enabled (when coefficient > 1)
+        if self.leverage_multiplier != 1.0:
+            # Create a mask for coefficients > 1
+            mask = coefficients > 1.0
+            # Apply multiplier only to coefficients > 1
+            coefficients = torch.where(mask, coefficients * self.leverage_multiplier, coefficients)
 
         return coefficients
 

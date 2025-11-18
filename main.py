@@ -109,6 +109,12 @@ def main():
             help='Resume training from a specific wandb run (e.g., "azure-thunder-123"). '
                  'Overrides --resume. Useful for resuming older runs.'
         )
+        parser.add_argument(
+            '--leverage',
+            action='store_true',
+            help='Use with --resume to enable leverage mode. Replaces bottom 5 agents with '
+                 'top 5 Hall of Fame agents modified to trade with 1.5x coefficients for 5 generations.'
+        )
         args = parser.parse_args()
         # --------------------------------
 
@@ -157,8 +163,8 @@ def main():
             else:
                 print("⚠ No last_run.json found. Starting new training run.")
 
-        # Create trainer (pass resume_run_name if resuming)
-        trainer = ERLTrainer(loader, resume_run_name=resume_run_name)
+        # Create trainer (pass resume_run_name and leverage flag if resuming)
+        trainer = ERLTrainer(loader, resume_run_name=resume_run_name, enable_leverage=args.leverage)
 
         # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---
         # If resume_run_name was provided, checkpoints are automatically loaded

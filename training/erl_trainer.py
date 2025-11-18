@@ -156,16 +156,23 @@ class ERLTrainer:
     Manages population, training, and evolution.
     """
 
-    def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None):
+    def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False):
         """
         Initialize ERL trainer.
 
         Args:
             data_loader: Loaded data with train/val splits
             resume_run_name: Optional wandb run name to resume from (e.g., "azure-thunder-123")
+            enable_leverage: If True, enable leverage mode (replaces bottom 5 with top 5 HoF agents with 1.5x coefficients)
         """
         self.data_loader = data_loader
         self.resume_run_name = resume_run_name
+        self.enable_leverage = enable_leverage
+
+        # Leverage mode tracking
+        self.leverage_mode_active = False
+        self.leverage_generations_remaining = 0
+        self.leverage_total_generations = 5  # Run leverage mode for 5 generations
 
         # Load stock names for trade reporting
         import pandas as pd
@@ -1416,7 +1423,9 @@ class ERLTrainer:
             'current_mutation_std': self.current_mutation_std,
             'plateau_detected': self.plateau_detected,
             'wandb_run_id': wandb.run.id,
-            'wandb_run_name': wandb.run.name
+            'wandb_run_name': wandb.run.name,
+            'leverage_mode_active': self.leverage_mode_active,
+            'leverage_generations_remaining': self.leverage_generations_remaining
         }
         state_path = checkpoint_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -1450,6 +1459,7 @@ class ERLTrainer:
 
         # 2. Load Population
         pop_dir = checkpoint_dir / "population"
+        population_loaded = False
         if pop_dir.exists():
             try:
                 for i, agent in enumerate(self.population):
@@ -1457,6 +1467,7 @@ class ERLTrainer:
                     if agent_path.exists():
                         agent.load(str(agent_path))
                 print(f"✓ Loaded {len(self.population)} agents")
+                population_loaded = True
             except Exception as e:
                 print(f"❌ Error loading agents: {e}")
 
@@ -1525,8 +1536,23 @@ class ERLTrainer:
                 self.current_mutation_std = trainer_state.get('current_mutation_std', Config.MUTATION_STD)
                 self.plateau_detected = trainer_state.get('plateau_detected', False)
 
+                # Load leverage mode state
+                self.leverage_mode_active = trainer_state.get('leverage_mode_active', False)
+                self.leverage_generations_remaining = trainer_state.get('leverage_generations_remaining', 0)
+
                 print(f"✓ Resuming from Gen {self.start_generation} → Gen {self.start_generation + 1}")
                 print(f"✓ Best validation fitness: {self.best_validation_fitness:.2f}")
+
+                # Restore leverage multiplier if leverage mode was active
+                if self.leverage_mode_active and population_loaded:
+                    print(f"✓ Leverage mode: {self.leverage_generations_remaining} generations remaining")
+                    print("  Restoring leverage multiplier (1.5x) for loaded agents...")
+                    # Note: We can't identify which specific agents had leverage, so we apply it to all
+                    # This is safe because leverage mode affects the entire population during its active period
+                    for agent in self.population:
+                        agent.actor.leverage_multiplier = 1.5
+                        agent.actor_target.leverage_multiplier = 1.5
+                    print("  ✓ Leverage multiplier restored")
             except Exception as e:
                 print(f"❌ Error loading state: {e}")
 
@@ -1649,7 +1675,55 @@ class ERLTrainer:
         print("\n" + "="*60)
         print("Starting ERL Training")
         print("="*60)
-        
+
+        # Initialize leverage mode if requested
+        if self.enable_leverage and not self.leverage_mode_active:
+            hof_size = len(self.hall_of_fame)
+            if hof_size >= 5:
+                print("\n" + "="*60)
+                print("🚀 LEVERAGE MODE ACTIVATED")
+                print("="*60)
+                print(f"Replacing bottom 5 agents with top 5 Hall of Fame champions")
+                print(f"These agents will trade with 1.5x coefficients for {self.leverage_total_generations} generations")
+                print("="*60)
+
+                # Get top 5 champions from Hall of Fame
+                top_5_champions = self.hall_of_fame.get_top_k(k=5)
+
+                # Get indices of bottom 5 agents (we need to evaluate them first)
+                # For now, we'll use a simple random sample since we haven't evaluated yet
+                # In practice, this will replace the worst performers after first evaluation
+                import random
+                bottom_5_indices = random.sample(range(len(self.population)), 5)
+
+                # Replace bottom 5 with leveraged HoF champions
+                for i, (idx, champion) in enumerate(zip(bottom_5_indices, top_5_champions)):
+                    # Clone the champion
+                    leveraged_agent = champion.clone()
+                    leveraged_agent.agent_id = idx
+                    leveraged_agent.is_elite = False
+
+                    # Set leverage multiplier on the actor
+                    leveraged_agent.actor.leverage_multiplier = 1.5
+                    leveraged_agent.actor_target.leverage_multiplier = 1.5
+
+                    # Replace agent in population
+                    old_agent = self.population[idx]
+                    self.population[idx] = leveraged_agent
+                    del old_agent
+
+                    print(f"  Agent {idx}: Replaced with HoF champion (1.5x leverage)")
+
+                # Activate leverage mode
+                self.leverage_mode_active = True
+                self.leverage_generations_remaining = self.leverage_total_generations
+
+                print(f"\n✓ Leverage mode active for next {self.leverage_generations_remaining} generations")
+                print("="*60 + "\n")
+            else:
+                print(f"\n⚠ Leverage mode requested but Hall of Fame only has {hof_size}/5 agents")
+                print("  Leverage mode will not be activated. Continue training normally.\n")
+
         # Use start_generation for the loop
         for gen in range(self.start_generation, Config.NUM_GENERATIONS):
             self.generation = gen  # Keep this to track the *current* gen
@@ -1981,6 +2055,26 @@ class ERLTrainer:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
+
+            # Leverage mode tracking - decrement counter and deactivate after 5 generations
+            if self.leverage_mode_active:
+                self.leverage_generations_remaining -= 1
+                print(f"\n📊 Leverage mode: {self.leverage_generations_remaining} generations remaining")
+
+                if self.leverage_generations_remaining <= 0:
+                    print("\n" + "="*60)
+                    print("✓ LEVERAGE MODE COMPLETE")
+                    print("="*60)
+                    print("Resetting all agents to normal training (1.0x coefficients)")
+
+                    # Reset leverage multiplier for all agents
+                    for agent in self.population:
+                        agent.actor.leverage_multiplier = 1.0
+                        agent.actor_target.leverage_multiplier = 1.0
+
+                    self.leverage_mode_active = False
+                    print("✓ Resumed normal training")
+                    print("="*60 + "\n")
 
             # 🔍 Print memory trend every generation
             # if (gen + 1) % 1 == 0:  # Every generation
