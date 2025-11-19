@@ -102,7 +102,9 @@ def _run_episode_worker(args):
     transition_file_paths = []
 
     # Write transitions directly to disk during episode (parallel I/O)
-    if training and buffer_storage_path:
+    # Note: We save to buffer regardless of training flag (noise) - this enables "Teacher Forcing"
+    # where Elites contribute high-quality positive-reward examples to help the Critic learn
+    if buffer_storage_path:
         from pathlib import Path
         import pickle
         import gzip
@@ -776,15 +778,15 @@ class ERLTrainer:
             # Take step
             next_state, reward, terminated, truncated, info = env.step(action)
             
-            # Store transition in replay buffer (if training)
-            if training:
-                self.replay_buffer.add(
-                    state=state.astype(np.float32),
-                    action=action.astype(np.float32),
-                    reward=reward,
-                    next_state=next_state.astype(np.float32),
-                    done=float(terminated or truncated)
-                )
+            # Store transition in replay buffer (Teacher Forcing: all agents contribute)
+            # Note: training flag controls noise (line 776), not buffer saving
+            self.replay_buffer.add(
+                state=state.astype(np.float32),
+                action=action.astype(np.float32),
+                reward=reward,
+                next_state=next_state.astype(np.float32),
+                done=float(terminated or truncated)
+            )
             
             cumulative_reward += reward
             steps += 1
@@ -1049,7 +1051,7 @@ class ERLTrainer:
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
         num_exploratory = len(self.population) - num_elites
-        print(f"Replay buffer diversity: Only {num_exploratory}/{len(self.population)} exploratory agents contribute experiences")
+        print(f"Teacher Forcing enabled: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
 
         for agent_idx, agent in enumerate(tqdm(self.population, desc="Evaluating agents")):
             # Evaluate agent on multiple random training slices
@@ -1146,7 +1148,7 @@ class ERLTrainer:
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
         num_exploratory = len(self.population) - num_elites
-        print(f"Replay buffer diversity: Only {num_exploratory}/{len(self.population)} exploratory agents contribute experiences")
+        print(f"Teacher Forcing enabled: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
 
         # Prepare environment config (shared across all workers)
         env_config = {
@@ -1193,9 +1195,9 @@ class ERLTrainer:
                     agent_state,
                     start_idx,
                     end_idx,
-                    not agent.is_elite,  # training flag
+                    not agent.is_elite,  # training flag (controls noise, not buffer saving)
                     task_seed,
-                    buffer_storage_path if not agent.is_elite else None,  # Only exploratory agents write
+                    buffer_storage_path,  # All agents write to buffer (Teacher Forcing)
                     file_id_start
                 ))
 
@@ -1299,7 +1301,7 @@ class ERLTrainer:
 
             print(f"  ✓ Buffer updated: {len(self.replay_buffer)} transitions")
         else:
-            print("  No exploratory agents - skipping buffer update")
+            print("  No transitions collected this generation")
 
         # Aggregate statistics across all agents
         aggregate_stats = {
