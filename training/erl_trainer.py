@@ -2143,10 +2143,10 @@ class ERLTrainer:
                 base_combined_fitness = val_fitness + min(0.0, train_fitness)
 
                 # ROI-based scoring adjustment using Hall of Fame median as benchmark
-                # Formula: Score = Fitness + (|Fitness| × 10 × (AgentROI − MedianROI))
+                # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
                 # This rewards agents that outperform the HoF median ROI and penalizes those below
                 # Works correctly for both positive and negative fitness values
-                roi_adjustment = abs(base_combined_fitness) * 10.0 * (agent_roi - median_hof_roi) / 100.0
+                roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
                 combined_fitness = base_combined_fitness + roi_adjustment
 
                 validation_results.append({

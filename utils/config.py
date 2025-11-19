@@ -39,13 +39,17 @@ class Config:
     INACTION_PENALTY = 0.0  # Penalty per day without an open position (reduced from 20.0 to smooth landscape)
     FORCED_EXIT_PENALTY_PCT = 0.01  # 3% penalty on position size (entry_price * coefficient)
     ZERO_TRADES_PENALTY = 100.0  # Heavy penalty for making NO trades at all
-    HURDLE_RATE = 0.0015  # 0.15% transaction cost per trade (mimics real trading costs, disincentivizes high-volume strategies)
+    HURDLE_RATE = 0.006  # 0.6% transaction cost per trade (mimics real trading costs, disincentivizes high-volume strategies)
     CONVICTION_SCALING_POWER = 1.25  # Power law exponent for conviction scaling (convex reward surface encourages high-confidence bets)
 
     # Win rate bonus - rewards consistent winning
     WIN_RATE_BONUS_THRESHOLD = 75.0  # Win rate % above which bonus kicks in
     WIN_RATE_BONUS_MIN_TRADES = 20   # Minimum trades required for bonus to apply
     # Bonus formula: (win_rate% - threshold)^2, e.g., 76% = 1pt, 100% = 625pt
+
+    # ROI-based scoring adjustment
+    ROI_ADJUSTMENT_MULTIPLIER = 50.0  # Multiplier for ROI adjustment in fitness scoring
+    # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
 
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
     SETTLEMENT_PERIOD_DAYS = 30  # Additional days to close remaining positions (must be >= MAX_HOLDING_PERIOD)
