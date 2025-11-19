@@ -675,7 +675,61 @@ class ERLTrainer:
         gc.collect()
 
         print(f"\nPopulation replaced with {len(self.population)} heroes")
-        print(f"Using heroes mode elite/offspring fractions:")
+
+        # --- Validate heroes and populate Hall of Fame with ROI ---
+        # This ensures median HoF ROI is properly set from the start
+        print("\n--- Validating heroes for Hall of Fame (with ROI) ---")
+
+        # Generate validation slices for hero evaluation
+        self.current_generation_val_slices = self.generate_validation_slices()
+
+        # Validate top heroes and add to HoF
+        num_to_validate = min(10, len(self.population))  # Validate top 10 for HoF
+        hero_validation_results = []
+
+        for idx in tqdm(range(num_to_validate), desc="Validating heroes for HoF"):
+            val_results = self.validate_agent_cached(self.population[idx])
+            val_fitness = val_results['fitness']
+            agent_roi = val_results.get('roi', 0.0)
+
+            # Use validation fitness as combined score (no training penalty for initial heroes)
+            combined_fitness = val_fitness
+
+            hero_validation_results.append({
+                'idx': idx,
+                'combined_fitness': combined_fitness,
+                'roi': agent_roi,
+                'raw_pnl': val_results.get('raw_pnl', 0.0)
+            })
+
+        # Sort by combined fitness and add to HoF
+        hero_validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
+
+        # Build candidates for HoF
+        hof_candidates = []
+        for result in hero_validation_results:
+            agent_idx = result['idx']
+            combined_score = result['combined_fitness']
+            agent_roi = result['roi']
+            hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi))
+
+        # Add heroes to Hall of Fame
+        admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
+
+        # Print HoF initialization summary
+        admitted = [(idx, score, action) for idx, score, action in admission_results
+                   if action == 'admitted' or action.startswith('replaced_')]
+        if admitted:
+            hof_stats = self.hall_of_fame.get_stats()
+            print(f"\n⭐ Hall of Fame initialized with {len(admitted)} heroes:")
+            for agent_idx, score, _ in admitted[:5]:  # Show top 5
+                roi = next((r['roi'] for r in hero_validation_results if r['idx'] == agent_idx), 0.0)
+                print(f"   + Agent {agent_idx}: Combined={score:.2f}, ROI={roi:.2f}%")
+            if len(admitted) > 5:
+                print(f"   ... and {len(admitted) - 5} more")
+            print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
+
+        print(f"\nUsing heroes mode elite/offspring fractions:")
         print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_ELITE_FRAC)} agents)")
         print(f"  Offspring: {Config.HEROES_OFFSPRING_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_OFFSPRING_FRAC)} agents)")
         mutant_frac = 1.0 - Config.HEROES_ELITE_FRAC - Config.HEROES_OFFSPRING_FRAC
@@ -2072,27 +2126,40 @@ class ERLTrainer:
             best_val_agent_idx = None
             validation_results = []
 
+            # Get median ROI from Hall of Fame for ROI-based scoring adjustment
+            median_hof_roi = self.hall_of_fame.get_median_roi()
+
             for idx in tqdm(range(len(self.population)), desc="Validating agents"):
                 val_results = self.validate_agent_cached(self.population[idx])
                 val_fitness = val_results['fitness']
                 train_fitness = fitness_scores[idx]
+                agent_roi = val_results.get('roi', 0.0)
 
                 # Combined score: penalize agents with negative training fitness
                 # This prevents "lucky" agents that do well on validation but poorly on training
                 # Formula: combined = val_fitness + min(0, train_fitness)
                 # - If train_fitness < 0: score is reduced by the negative amount
                 # - If train_fitness >= 0: score is unchanged
-                combined_fitness = val_fitness + min(0.0, train_fitness)
+                base_combined_fitness = val_fitness + min(0.0, train_fitness)
+
+                # ROI-based scoring adjustment using Hall of Fame median as benchmark
+                # Formula: Score = Fitness + (|Fitness| × 10 × (AgentROI − MedianROI))
+                # This rewards agents that outperform the HoF median ROI and penalizes those below
+                # Works correctly for both positive and negative fitness values
+                roi_adjustment = abs(base_combined_fitness) * 10.0 * (agent_roi - median_hof_roi) / 100.0
+                combined_fitness = base_combined_fitness + roi_adjustment
 
                 validation_results.append({
                     'idx': idx,
                     'training_fitness': train_fitness,
                     'validation_fitness': val_fitness,
                     'combined_fitness': combined_fitness,
+                    'base_combined_fitness': base_combined_fitness,
+                    'roi_adjustment': roi_adjustment,
                     'win_rate': val_results['win_rate'],
                     'num_trades': val_results['num_trades'],
                     'raw_pnl': val_results.get('raw_pnl', 0.0),
-                    'roi': val_results.get('roi', 0.0)
+                    'roi': agent_roi
                 })
 
                 # Track best combined fitness in this generation
@@ -2105,10 +2172,12 @@ class ERLTrainer:
 
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
+            print(f"Median HoF ROI: {median_hof_roi:.2f}% (benchmark for ROI adjustment)")
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
-            print("Top 5 by Combined Fitness (Val + min(0, Train)) - used for elite selection:")
+            print("Top 5 by Combined Fitness (with ROI adjustment) - used for elite selection:")
             for i, result in enumerate(validation_results[:5]):
-                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val={result['validation_fitness']:>8.2f}, Train={result['training_fitness']:>8.2f}, PnL=${result['raw_pnl']:>8.2f}, ROI={result['roi']:>6.2f}%, WR={result['win_rate']:.1%}")
+                roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
+                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), ROI={result['roi']:>6.2f}%, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
 
             # Update best agent if we found a better one based on combined fitness
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
@@ -2141,7 +2210,8 @@ class ERLTrainer:
             for result in validation_results:
                 agent_idx = result['idx']
                 combined_score = result['combined_fitness']
-                candidates.append((self.population[agent_idx], combined_score, agent_idx))
+                agent_roi = result['roi']
+                candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi))
 
             # Use batch update with aggressive admission and cascading swaps
             admission_results = self.hall_of_fame.update_from_generation(candidates, gen)
@@ -2167,12 +2237,22 @@ class ERLTrainer:
             self.writer.add_scalar('HallOfFame/BestScore', hof_stats['best_score'], gen)
             self.writer.add_scalar('HallOfFame/WorstScore', hof_stats['worst_score'], gen)
             self.writer.add_scalar('HallOfFame/MeanScore', hof_stats['mean_score'], gen)
+            self.writer.add_scalar('HallOfFame/MedianROI', hof_stats['median_roi'], gen)
+
+            # Calculate population ROI stats for this generation
+            population_rois = [r['roi'] for r in validation_results]
+            best_agent_roi = validation_results[0]['roi'] if validation_results else 0.0
+            mean_population_roi = np.mean(population_rois) if population_rois else 0.0
+
             wandb.log({
                 "hall_of_fame/size": hof_stats['size'],
                 "hall_of_fame/best_score": hof_stats['best_score'],
                 "hall_of_fame/worst_score": hof_stats['worst_score'],
                 "hall_of_fame/mean_score": hof_stats['mean_score'],
                 "hall_of_fame/std_score": hof_stats['std_score'],
+                "hall_of_fame/median_roi": hof_stats['median_roi'],
+                "validation/best_agent_roi": best_agent_roi,
+                "validation/mean_population_roi": mean_population_roi,
             }, step=gen)
 
             # 2. Train agents using replay buffer

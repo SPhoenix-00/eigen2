@@ -18,7 +18,7 @@ class HallOfFameEntry:
     and the path to the agent's saved weights.
     """
 
-    def __init__(self, agent_id: int, validation_score: float, generation: int):
+    def __init__(self, agent_id: int, validation_score: float, generation: int, roi: float = 0.0):
         """
         Initialize a Hall of Fame entry.
 
@@ -26,17 +26,20 @@ class HallOfFameEntry:
             agent_id: Unique identifier for this HoF entry
             validation_score: Validation fitness that qualified this agent
             generation: Generation number when this agent was admitted
+            roi: Return on Investment percentage for this agent
         """
         self.agent_id = agent_id
         self.validation_score = validation_score
         self.generation = generation
+        self.roi = roi
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
         return {
             'agent_id': self.agent_id,
             'validation_score': self.validation_score,
-            'generation': self.generation
+            'generation': self.generation,
+            'roi': self.roi
         }
 
     @staticmethod
@@ -45,7 +48,8 @@ class HallOfFameEntry:
         return HallOfFameEntry(
             agent_id=data['agent_id'],
             validation_score=data['validation_score'],
-            generation=data['generation']
+            generation=data['generation'],
+            roi=data.get('roi', 0.0)  # Default for backwards compatibility
         )
 
 
@@ -151,7 +155,7 @@ class HallOfFame:
 
         return True
 
-    def update_from_generation(self, candidates: List[Tuple[DDPGAgent, float, int]], generation: int) -> List[Tuple[int, float, str]]:
+    def update_from_generation(self, candidates: List[Tuple[DDPGAgent, float, int, float]], generation: int) -> List[Tuple[int, float, str]]:
         """
         Update Hall of Fame from a generation of candidates with aggressive admission.
 
@@ -160,7 +164,7 @@ class HallOfFame:
         2. Maintenance Phase: Cascading swaps - replace worst HoF agents with best candidates
 
         Args:
-            candidates: List of (agent, combined_score, agent_idx) tuples
+            candidates: List of (agent, combined_score, agent_idx, roi) tuples
             generation: Current generation number
 
         Returns:
@@ -177,7 +181,7 @@ class HallOfFame:
 
         # Phase 1: Initial Filling - admit all positive-score candidates if not full
         if not self.is_full():
-            for agent, score, agent_idx in sorted_candidates:
+            for agent, score, agent_idx, roi in sorted_candidates:
                 if self.is_full():
                     break
 
@@ -187,7 +191,8 @@ class HallOfFame:
                     entry = HallOfFameEntry(
                         agent_id=new_id,
                         validation_score=score,
-                        generation=generation
+                        generation=generation,
+                        roi=roi
                     )
                     self.entries.append(entry)
 
@@ -203,7 +208,7 @@ class HallOfFame:
         # Phase 2: Cascading Swaps - even if we just filled some slots, check for replacements
         # Get remaining candidates that weren't admitted in Phase 1
         admitted_indices = {r[0] for r in results if r[2] == 'admitted'}
-        remaining_candidates = [(a, s, idx) for a, s, idx in sorted_candidates
+        remaining_candidates = [(a, s, idx, roi) for a, s, idx, roi in sorted_candidates
                                 if idx not in admitted_indices]
 
         if remaining_candidates and self.is_full():
@@ -212,7 +217,7 @@ class HallOfFame:
 
             # Cascading swap: iterate through worst HoF agents and best candidates
             swaps_made = 0
-            for candidate_agent, candidate_score, agent_idx in remaining_candidates:
+            for candidate_agent, candidate_score, agent_idx, candidate_roi in remaining_candidates:
                 if swaps_made >= len(sorted_hof):
                     break
 
@@ -242,7 +247,8 @@ class HallOfFame:
                     new_entry = HallOfFameEntry(
                         agent_id=new_id,
                         validation_score=candidate_score,
-                        generation=generation
+                        generation=generation,
+                        roi=candidate_roi
                     )
                     self.entries.append(new_entry)
 
@@ -341,6 +347,18 @@ class HallOfFame:
 
         return agents
 
+    def get_median_roi(self) -> float:
+        """
+        Get the median ROI of all agents in the Hall of Fame.
+
+        Returns:
+            Median ROI percentage, or 0.0 if Hall is empty
+        """
+        if len(self.entries) == 0:
+            return 0.0
+        roi_values = [e.roi for e in self.entries]
+        return float(np.median(roi_values))
+
     def get_stats(self) -> Dict:
         """
         Get Hall of Fame statistics.
@@ -356,11 +374,13 @@ class HallOfFame:
                 'mean_score': 0.0,
                 'std_score': 0.0,
                 'oldest_generation': 0,
-                'newest_generation': 0
+                'newest_generation': 0,
+                'median_roi': 0.0
             }
 
         scores = [e.validation_score for e in self.entries]
         generations = [e.generation for e in self.entries]
+        roi_values = [e.roi for e in self.entries]
 
         return {
             'size': len(self.entries),
@@ -369,7 +389,8 @@ class HallOfFame:
             'mean_score': np.mean(scores),
             'std_score': np.std(scores),
             'oldest_generation': min(generations),
-            'newest_generation': max(generations)
+            'newest_generation': max(generations),
+            'median_roi': float(np.median(roi_values))
         }
 
     def save(self):
