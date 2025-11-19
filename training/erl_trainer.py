@@ -2158,7 +2158,16 @@ class ERLTrainer:
                 # Confidence factor based on quality trade count to prevent "lucky snipers"
                 # Count quality trades (trades with gain_pct >= threshold)
                 closed_trades = val_results.get('closed_trades', [])
+                total_trades = len(closed_trades)  # Total trades across all slices
                 quality_count = sum(1 for trade in closed_trades if trade.get('gain_pct', 0) >= quality_threshold)
+
+                # Apply extra penalty for non-quality trades (using hurdle_cost as base)
+                non_quality_penalty = sum(
+                    trade.get('hurdle_cost', 0) * Config.NON_QUALITY_HURDLE_COEFFICIENT
+                    for trade in closed_trades
+                    if trade.get('gain_pct', 0) < quality_threshold
+                )
+                base_combined_fitness = base_combined_fitness - non_quality_penalty
 
                 # Confidence factor: quality_count / target_count (capped at 1.0)
                 # This ensures agents only get full ROI bonus credit if they have enough quality trades
@@ -2177,6 +2186,7 @@ class ERLTrainer:
                     'roi_adjustment': roi_adjustment,
                     'win_rate': val_results['win_rate'],
                     'num_trades': val_results['num_trades'],
+                    'total_trades': total_trades,  # Total across all slices (for quality ratio)
                     'quality_count': quality_count,
                     'raw_pnl': val_results.get('raw_pnl', 0.0),
                     'roi': agent_roi
@@ -2198,7 +2208,7 @@ class ERLTrainer:
             print("Top 5 by Combined Fitness (with ROI adjustment) - used for elite selection:")
             for i, result in enumerate(validation_results[:5]):
                 roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
-                quality_ratio = result['quality_count'] / result['num_trades'] if result['num_trades'] > 0 else 0.0
+                quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
                 print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
 
             # Update best agent if we found a better one based on combined fitness
@@ -2266,11 +2276,11 @@ class ERLTrainer:
             best_agent_roi = validation_results[0]['roi'] if validation_results else 0.0
             mean_population_roi = np.mean(population_rois) if population_rois else 0.0
 
-            # Calculate quality ratio stats (quality_count / num_trades)
+            # Calculate quality ratio stats (quality_count / total_trades)
             # This shows what percentage of trades met the quality threshold
             best_agent_result = validation_results[0] if validation_results else None
-            if best_agent_result and best_agent_result['num_trades'] > 0:
-                best_agent_quality_ratio = best_agent_result['quality_count'] / best_agent_result['num_trades']
+            if best_agent_result and best_agent_result['total_trades'] > 0:
+                best_agent_quality_ratio = best_agent_result['quality_count'] / best_agent_result['total_trades']
                 best_agent_quality_count = best_agent_result['quality_count']
             else:
                 best_agent_quality_ratio = 0.0
@@ -2279,8 +2289,8 @@ class ERLTrainer:
             # Calculate mean quality ratio across population
             quality_ratios = []
             for r in validation_results:
-                if r['num_trades'] > 0:
-                    quality_ratios.append(r['quality_count'] / r['num_trades'])
+                if r['total_trades'] > 0:
+                    quality_ratios.append(r['quality_count'] / r['total_trades'])
                 else:
                     quality_ratios.append(0.0)
             mean_population_quality_ratio = np.mean(quality_ratios) if quality_ratios else 0.0

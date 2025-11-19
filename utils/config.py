@@ -55,6 +55,7 @@ class Config:
     # This prevents "lucky snipers" who make few high-ROI trades from getting inflated fitness
     ROI_QUALITY_THRESHOLD = 7.5  # Default minimum gain_pct for a trade to count as "quality"
     ROI_USE_HOF_MEDIAN_AS_THRESHOLD = True  # If True, use HoF median ROI as threshold (supersedes default)
+    NON_QUALITY_HURDLE_COEFFICIENT = 2.0  # Extra penalty multiplier for non-quality trades (applied to hurdle_cost)
 
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
     SETTLEMENT_PERIOD_DAYS = 30  # Additional days to close remaining positions (must be >= MAX_HOLDING_PERIOD)
