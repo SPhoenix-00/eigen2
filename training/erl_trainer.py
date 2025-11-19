@@ -2146,7 +2146,15 @@ class ERLTrainer:
                 # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
                 # This rewards agents that outperform the HoF median ROI and penalizes those below
                 # Works correctly for both positive and negative fitness values
+
+                # Confidence factor based on trade volume to prevent "lucky snipers"
+                # We require at least ROI_CONFIDENCE_MIN_TRADES trades to give full credit
+                # If an agent makes fewer trades, it only gets partial credit for the ROI bonus
+                num_trades = val_results['num_trades']
+                confidence_factor = min(1.0, num_trades / Config.ROI_CONFIDENCE_MIN_TRADES)
+
                 roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
+                roi_adjustment = roi_adjustment * confidence_factor  # Dampen based on trade volume
                 combined_fitness = base_combined_fitness + roi_adjustment
 
                 validation_results.append({

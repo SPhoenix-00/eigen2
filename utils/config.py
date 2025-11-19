@@ -44,12 +44,15 @@ class Config:
 
     # Win rate bonus - rewards consistent winning
     WIN_RATE_BONUS_THRESHOLD = 75.0  # Win rate % above which bonus kicks in
-    WIN_RATE_BONUS_MIN_TRADES = 20   # Minimum trades required for bonus to apply
+    WIN_RATE_BONUS_MIN_TRADES = 15   # Minimum trades required for bonus to apply
     # Bonus formula: (win_rate% - threshold)^2, e.g., 76% = 1pt, 100% = 625pt
 
     # ROI-based scoring adjustment
     ROI_ADJUSTMENT_MULTIPLIER = 50.0  # Multiplier for ROI adjustment in fitness scoring
     # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
+    ROI_CONFIDENCE_MIN_TRADES = 50  # Minimum trades required for full ROI bonus credit
+    # Confidence factor = min(1.0, num_trades / ROI_CONFIDENCE_MIN_TRADES)
+    # This prevents "lucky snipers" who make few trades from getting inflated fitness
 
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
     SETTLEMENT_PERIOD_DAYS = 30  # Additional days to close remaining positions (must be >= MAX_HOLDING_PERIOD)
