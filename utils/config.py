@@ -36,9 +36,11 @@ class Config:
     MAX_HOLDING_PERIOD = MIN_HOLDING_PERIOD + LIQUIDATION_WINDOW  # 30 total days
 
     LOSS_PENALTY_MULTIPLIER = 1.0  # Losses treated equally to gains (was 3.0, removed penalty to fix zombie agents)
-    INACTION_PENALTY = 2.0  # Penalty per day without an open position (reduced from 20.0 to smooth landscape)
-    FORCED_EXIT_PENALTY_PCT = 0.03  # 3% penalty on position size (entry_price * coefficient)
+    INACTION_PENALTY = 0.0  # Penalty per day without an open position (reduced from 20.0 to smooth landscape)
+    FORCED_EXIT_PENALTY_PCT = 0.01  # 3% penalty on position size (entry_price * coefficient)
     ZERO_TRADES_PENALTY = 100.0  # Heavy penalty for making NO trades at all
+    HURDLE_RATE = 0.0015  # 0.15% transaction cost per trade (mimics real trading costs, disincentivizes high-volume strategies)
+    CONVICTION_SCALING_POWER = 1.25  # Power law exponent for conviction scaling (convex reward surface encourages high-confidence bets)
 
     # Win rate bonus - rewards consistent winning
     WIN_RATE_BONUS_THRESHOLD = 75.0  # Win rate % above which bonus kicks in

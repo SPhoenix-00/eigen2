@@ -384,10 +384,10 @@ class HallOfFame:
 
         return {
             'size': len(self.entries),
-            'best_score': max(scores),
-            'worst_score': min(scores),
-            'mean_score': np.mean(scores),
-            'std_score': np.std(scores),
+            'best_score': float(max(scores)),
+            'worst_score': float(min(scores)),
+            'mean_score': float(np.mean(scores)),
+            'std_score': float(np.std(scores)),
             'oldest_generation': min(generations),
             'newest_generation': max(generations),
             'median_roi': float(np.median(roi_values))

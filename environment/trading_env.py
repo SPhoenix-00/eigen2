@@ -3,6 +3,7 @@ Trading Environment for Project Eigen 2
 Gym-style environment for stock trading with ERL
 """
 
+import math
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -474,8 +475,15 @@ class TradingEnvironment(gym.Env):
                 self.total_investment += position.entry_price * shares
 
                 # Calculate base reward (before penalties)
+                # Apply conviction scaling: coefficient^1.25 creates convex reward surface
+                # This encourages high-confidence bets by increasing marginal utility of larger positions
+                scaled_coefficient = position.coefficient ** Config.CONVICTION_SCALING_POWER
+
                 if gain_pct >= 0:
-                    base_reward = position.coefficient * gain_pct
+                    # Apply yield bonus: 1 + log(1 + gain_pct) rewards higher yields non-linearly
+                    # A 10% gain is worth more than 10x a 1% gain, but extreme outliers are dampened
+                    yield_bonus = 1.0 + math.log(1.0 + gain_pct)
+                    base_reward = scaled_coefficient * gain_pct * yield_bonus
                     self.num_wins += 1
                     loss_penalty = 0.0
                 else:
@@ -483,19 +491,23 @@ class TradingEnvironment(gym.Env):
                     # This trains agents to focus on reducing drawdowns and variance
                     if self.consistency_mode:
                         magnified_loss = abs(gain_pct) * Config.CONSISTENCY_LOSS_MULTIPLIER
-                        base_reward = position.coefficient * (-magnified_loss)
+                        base_reward = scaled_coefficient * (-magnified_loss)
                     else:
-                        base_reward = position.coefficient * gain_pct  # Negative
+                        base_reward = scaled_coefficient * gain_pct  # Negative
                     # Apply loss penalty multiplier (additional penalty on top of base)
-                    loss_penalty = (Config.LOSS_PENALTY_MULTIPLIER - 1.0) * position.coefficient * abs(gain_pct)
+                    loss_penalty = (Config.LOSS_PENALTY_MULTIPLIER - 1.0) * scaled_coefficient * abs(gain_pct)
                     self.num_losses += 1
 
                 # Apply forced exit penalty if exit was due to max_holding_period
                 # Penalty is 3% of position size (entry_price * coefficient)
                 forced_exit_penalty = (position.entry_price * position.coefficient * Config.FORCED_EXIT_PENALTY_PCT) if reason == 'max_holding_period' else 0.0
 
-                # Final reward = base_reward - loss_penalty - forced_exit_penalty
-                reward = base_reward - loss_penalty - forced_exit_penalty
+                # Apply hurdle rate (transaction cost) - 0.15% of position size per trade
+                # This mimics real trading costs and disincentivizes high-volume strategies
+                hurdle_cost = position.entry_price * position.coefficient * Config.HURDLE_RATE
+
+                # Final reward = base_reward - loss_penalty - forced_exit_penalty - hurdle_cost
+                reward = base_reward - loss_penalty - forced_exit_penalty - hurdle_cost
 
                 total_reward += reward
                 self.num_trades += 1
@@ -513,6 +525,7 @@ class TradingEnvironment(gym.Env):
                     'base_reward': base_reward,
                     'loss_penalty': loss_penalty,
                     'forced_exit_penalty': forced_exit_penalty,
+                    'hurdle_cost': hurdle_cost,
                     'reward': reward,
                     'reason': reason
                 })
