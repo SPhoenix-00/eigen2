@@ -50,9 +50,11 @@ class Config:
     # ROI-based scoring adjustment
     ROI_ADJUSTMENT_MULTIPLIER = 50.0  # Multiplier for ROI adjustment in fitness scoring
     # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
-    ROI_CONFIDENCE_MIN_TRADES = 50  # Minimum trades required for full ROI bonus credit
-    # Confidence factor = min(1.0, num_trades / ROI_CONFIDENCE_MIN_TRADES)
-    # This prevents "lucky snipers" who make few trades from getting inflated fitness
+    ROI_CONFIDENCE_MIN_TRADES = 50  # Minimum quality trades required for full ROI bonus credit
+    # Confidence factor = min(1.0, quality_count / ROI_CONFIDENCE_MIN_TRADES)
+    # This prevents "lucky snipers" who make few high-ROI trades from getting inflated fitness
+    ROI_QUALITY_THRESHOLD = 7.5  # Default minimum gain_pct for a trade to count as "quality"
+    ROI_USE_HOF_MEDIAN_AS_THRESHOLD = True  # If True, use HoF median ROI as threshold (supersedes default)
 
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
     SETTLEMENT_PERIOD_DAYS = 30  # Additional days to close remaining positions (must be >= MAX_HOLDING_PERIOD)

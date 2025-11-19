@@ -1545,7 +1545,8 @@ class ERLTrainer:
             'raw_pnl': total_raw_pnl,  # Total raw P&L across slices
             'total_investment': total_investment,  # Total investment across slices
             'roi': roi,  # ROI percentage
-            'sample_trade': sample_trade  # One sample trade for verification
+            'sample_trade': sample_trade,  # One sample trade for verification
+            'closed_trades': all_closed_trades  # All closed trades for quality count calculation
         }
 
     def validate_agent_cached(self, agent: DDPGAgent) -> Dict:
@@ -2129,6 +2130,13 @@ class ERLTrainer:
             # Get median ROI from Hall of Fame for ROI-based scoring adjustment
             median_hof_roi = self.hall_of_fame.get_median_roi()
 
+            # Determine quality threshold for confidence factor calculation
+            # Quality trades are those that exceeded this profitability threshold
+            if Config.ROI_USE_HOF_MEDIAN_AS_THRESHOLD and median_hof_roi > 0:
+                quality_threshold = median_hof_roi
+            else:
+                quality_threshold = Config.ROI_QUALITY_THRESHOLD
+
             for idx in tqdm(range(len(self.population)), desc="Validating agents"):
                 val_results = self.validate_agent_cached(self.population[idx])
                 val_fitness = val_results['fitness']
@@ -2147,14 +2155,17 @@ class ERLTrainer:
                 # This rewards agents that outperform the HoF median ROI and penalizes those below
                 # Works correctly for both positive and negative fitness values
 
-                # Confidence factor based on trade volume to prevent "lucky snipers"
-                # We require at least ROI_CONFIDENCE_MIN_TRADES trades to give full credit
-                # If an agent makes fewer trades, it only gets partial credit for the ROI bonus
-                num_trades = val_results['num_trades']
-                confidence_factor = min(1.0, num_trades / Config.ROI_CONFIDENCE_MIN_TRADES)
+                # Confidence factor based on quality trade count to prevent "lucky snipers"
+                # Count quality trades (trades with gain_pct >= threshold)
+                closed_trades = val_results.get('closed_trades', [])
+                quality_count = sum(1 for trade in closed_trades if trade.get('gain_pct', 0) >= quality_threshold)
+
+                # Confidence factor: quality_count / target_count (capped at 1.0)
+                # This ensures agents only get full ROI bonus credit if they have enough quality trades
+                confidence_factor = min(1.0, quality_count / Config.ROI_CONFIDENCE_MIN_TRADES)
 
                 roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
-                roi_adjustment = roi_adjustment * confidence_factor  # Dampen based on trade volume
+                roi_adjustment = roi_adjustment * confidence_factor  # Dampen based on quality trade count
                 combined_fitness = base_combined_fitness + roi_adjustment
 
                 validation_results.append({
@@ -2166,6 +2177,7 @@ class ERLTrainer:
                     'roi_adjustment': roi_adjustment,
                     'win_rate': val_results['win_rate'],
                     'num_trades': val_results['num_trades'],
+                    'quality_count': quality_count,
                     'raw_pnl': val_results.get('raw_pnl', 0.0),
                     'roi': agent_roi
                 })
@@ -2181,11 +2193,13 @@ class ERLTrainer:
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
             print(f"Median HoF ROI: {median_hof_roi:.2f}% (benchmark for ROI adjustment)")
+            print(f"Quality threshold: {quality_threshold:.2f}% (min gain_pct for quality trades, need {Config.ROI_CONFIDENCE_MIN_TRADES} for full bonus)")
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
             print("Top 5 by Combined Fitness (with ROI adjustment) - used for elite selection:")
             for i, result in enumerate(validation_results[:5]):
                 roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
-                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), ROI={result['roi']:>6.2f}%, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
+                quality_ratio = result['quality_count'] / result['num_trades'] if result['num_trades'] > 0 else 0.0
+                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
 
             # Update best agent if we found a better one based on combined fitness
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
@@ -2252,6 +2266,25 @@ class ERLTrainer:
             best_agent_roi = validation_results[0]['roi'] if validation_results else 0.0
             mean_population_roi = np.mean(population_rois) if population_rois else 0.0
 
+            # Calculate quality ratio stats (quality_count / num_trades)
+            # This shows what percentage of trades met the quality threshold
+            best_agent_result = validation_results[0] if validation_results else None
+            if best_agent_result and best_agent_result['num_trades'] > 0:
+                best_agent_quality_ratio = best_agent_result['quality_count'] / best_agent_result['num_trades']
+                best_agent_quality_count = best_agent_result['quality_count']
+            else:
+                best_agent_quality_ratio = 0.0
+                best_agent_quality_count = 0
+
+            # Calculate mean quality ratio across population
+            quality_ratios = []
+            for r in validation_results:
+                if r['num_trades'] > 0:
+                    quality_ratios.append(r['quality_count'] / r['num_trades'])
+                else:
+                    quality_ratios.append(0.0)
+            mean_population_quality_ratio = np.mean(quality_ratios) if quality_ratios else 0.0
+
             wandb.log({
                 "hall_of_fame/size": hof_stats['size'],
                 "hall_of_fame/best_score": hof_stats['best_score'],
@@ -2261,6 +2294,9 @@ class ERLTrainer:
                 "hall_of_fame/median_roi": hof_stats['median_roi'],
                 "validation/best_agent_roi": best_agent_roi,
                 "validation/mean_population_roi": mean_population_roi,
+                "validation/best_agent_quality_count": best_agent_quality_count,
+                "validation/best_agent_quality_ratio": best_agent_quality_ratio,
+                "validation/mean_population_quality_ratio": mean_population_quality_ratio,
             }, step=gen)
 
             # 2. Train agents using replay buffer
