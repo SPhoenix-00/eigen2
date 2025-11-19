@@ -37,9 +37,9 @@ class HallOfFameEntry:
         """Convert to dictionary for JSON serialization."""
         return {
             'agent_id': self.agent_id,
-            'validation_score': self.validation_score,
+            'validation_score': float(self.validation_score),
             'generation': self.generation,
-            'roi': self.roi
+            'roi': float(self.roi)
         }
 
     @staticmethod
