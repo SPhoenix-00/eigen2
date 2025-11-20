@@ -565,9 +565,9 @@ class ERLTrainer:
         print(f"\n--- Evaluating {len(loaded_agents)} heroes with current reward function (Parallel) ---")
         num_episodes = 5 if self.consistency_mode else 3
         if self.consistency_mode:
-            print(f"  Using consistency mode: {num_episodes} episodes, sum, {Config.CONSISTENCY_LOSS_MULTIPLIER}x loss magnification")
+            print(f"  Using consistency mode: {num_episodes} episodes, 0.4*mean + 0.6*min, {Config.CONSISTENCY_LOSS_MULTIPLIER}x loss magnification")
         else:
-            print(f"  Using standard mode: {num_episodes} episodes, avg(lowest 2)")
+            print(f"  Using standard mode: {num_episodes} episodes, 0.4*mean + 0.6*min")
 
         # Prepare environment config for parallel workers
         env_config = {
