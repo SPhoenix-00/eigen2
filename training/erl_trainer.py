@@ -2031,13 +2031,25 @@ class ERLTrainer:
                 self.best_validation_fitness = best_val_results['fitness']
                 print(f"✓ Best agent validation fitness: {self.best_validation_fitness:.2f}")
 
-            # Re-evaluate Hall of Fame agents
+            # Re-evaluate Hall of Fame agents by loading them from disk
             if len(self.hall_of_fame.entries) > 0:
-                print("\nRe-evaluating Hall of Fame agents...")
+                print(f"\nRe-evaluating {len(self.hall_of_fame.entries)} Hall of Fame agents...")
                 for entry in self.hall_of_fame.entries:
-                    val_results = self.validate_agent(entry.agent)
-                    entry.validation_score = val_results['fitness']
-                    entry.roi = val_results.get('roi', 0.0)
+                    # Load agent from HoF directory
+                    agent_path = self.hall_of_fame.hof_dir / f"hof_agent_{entry.agent_id}.pth"
+                    if agent_path.exists():
+                        hof_agent = DDPGAgent(agent_id=entry.agent_id)
+                        hof_agent.load(str(agent_path))
+
+                        # Re-evaluate with current reward function
+                        val_results = self.validate_agent(hof_agent)
+                        entry.validation_score = val_results['fitness']
+                        entry.roi = val_results.get('roi', 0.0)
+
+                        # Clean up
+                        del hof_agent
+                    else:
+                        print(f"  ⚠ Warning: HoF agent {entry.agent_id} file not found")
                 print(f"✓ Re-evaluated {len(self.hall_of_fame.entries)} Hall of Fame agents")
 
             print("\n✓ All agents re-evaluated with current reward function")
