@@ -14,6 +14,7 @@ import os
 import json
 import wandb
 import gc
+import math
 import matplotlib.pyplot as plt
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -392,6 +393,10 @@ class ERLTrainer:
         self.best_fitness = float('-inf')  # Best training fitness (for logging)
         self.best_validation_fitness = float('-inf')  # Best validation fitness (for selection)
         self.best_agent = None
+
+        # ROI hurdle EMA - smoothed target for ROI-based scoring adjustment
+        # Uses EMA with α=0.2 (converges to static target in ~5 iterations)
+        self.roi_hurdle_ema = None  # Initialized from first HoF median
 
         # Statistics
         self.fitness_history = []
@@ -1759,7 +1764,8 @@ class ERLTrainer:
             'wandb_run_id': wandb.run.id,
             'wandb_run_name': wandb.run.name,
             'leverage_mode_active': self.leverage_mode_active,
-            'leverage_generations_remaining': self.leverage_generations_remaining
+            'leverage_generations_remaining': self.leverage_generations_remaining,
+            'roi_hurdle_ema': self.roi_hurdle_ema
         }
         state_path = checkpoint_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -1874,8 +1880,13 @@ class ERLTrainer:
                 self.leverage_mode_active = trainer_state.get('leverage_mode_active', False)
                 self.leverage_generations_remaining = trainer_state.get('leverage_generations_remaining', 0)
 
+                # Load ROI hurdle EMA (defaults to None for old checkpoints)
+                self.roi_hurdle_ema = trainer_state.get('roi_hurdle_ema', None)
+
                 print(f"✓ Resuming from Gen {self.start_generation} → Gen {self.start_generation + 1}")
                 print(f"✓ Best validation fitness: {self.best_validation_fitness:.2f}")
+                if self.roi_hurdle_ema is not None:
+                    print(f"✓ ROI Hurdle EMA: {self.roi_hurdle_ema:.2f}%")
 
                 # Restore leverage multiplier if leverage mode was active
                 if self.leverage_mode_active and population_loaded:
@@ -2130,7 +2141,15 @@ class ERLTrainer:
             validation_results = []
 
             # Get median ROI from Hall of Fame for ROI-based scoring adjustment
-            median_hof_roi = self.hall_of_fame.get_median_roi()
+            # Use EMA to smooth the hurdle and prevent feedback loops
+            raw_median_hof_roi = self.hall_of_fame.get_median_roi()
+
+            # Initialize EMA on first generation with HoF data, or update it
+            if self.roi_hurdle_ema is None:
+                self.roi_hurdle_ema = raw_median_hof_roi
+
+            # Use the smoothed EMA as the benchmark for ROI adjustment
+            median_hof_roi = self.roi_hurdle_ema
 
             # Determine quality threshold for confidence factor calculation
             # Quality trades are those that exceeded this profitability threshold
@@ -2145,39 +2164,54 @@ class ERLTrainer:
                 train_fitness = fitness_scores[idx]
                 agent_roi = val_results.get('roi', 0.0)
 
-                # Combined score: penalize agents with negative training fitness
-                # This prevents "lucky" agents that do well on validation but poorly on training
-                # Formula: combined = val_fitness + min(0, train_fitness)
-                # - If train_fitness < 0: score is reduced by the negative amount
-                # - If train_fitness >= 0: score is unchanged
-                base_combined_fitness = val_fitness + min(0.0, train_fitness)
-
-                # ROI-based scoring adjustment using Hall of Fame median as benchmark
-                # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
-                # This rewards agents that outperform the HoF median ROI and penalizes those below
-                # Works correctly for both positive and negative fitness values
-
-                # Confidence factor based on quality trade count to prevent "lucky snipers"
                 # Count quality trades (trades with gain_pct >= threshold)
                 closed_trades = val_results.get('closed_trades', [])
                 total_trades = len(closed_trades)  # Total trades across all slices
                 quality_count = sum(1 for trade in closed_trades if trade.get('gain_pct', 0) >= quality_threshold)
 
-                # Apply extra penalty for non-quality trades (using hurdle_cost as base)
-                non_quality_penalty = sum(
-                    trade.get('hurdle_cost', 0) * Config.NON_QUALITY_HURDLE_COEFFICIENT
-                    for trade in closed_trades
-                    if trade.get('gain_pct', 0) < quality_threshold
-                )
-                base_combined_fitness = base_combined_fitness - non_quality_penalty
+                if self.consistency_mode:
+                    # Consistency mode fitness formula: (WR^2 * QR * ROI) * volume_scalar
+                    # Where:
+                    # - WR = Win Rate (0-1)
+                    # - QR = Quality Ratio (quality_count / total_trades)
+                    # - ROI = percentage points, clipped to [-50, 50] (provides the SIGN)
+                    # - volume_scalar = log10(abs(Raw_PnL) + 1) (always positive, provides magnitude)
+                    win_rate = val_results['win_rate']
+                    quality_ratio = quality_count / total_trades if total_trades > 0 else 0.0
+                    raw_pnl = val_results.get('raw_pnl', 0.0)
 
-                # Confidence factor: quality_count / target_count (capped at 1.0)
-                # This ensures agents only get full ROI bonus credit if they have enough quality trades
-                confidence_factor = min(1.0, quality_count / Config.ROI_CONFIDENCE_MIN_TRADES)
+                    # Clip ROI to avoid one catastrophic trade producing extreme values
+                    roi_score = np.clip(agent_roi, -50, 50)
 
-                roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
-                roi_adjustment = roi_adjustment * confidence_factor  # Dampen based on quality trade count
-                combined_fitness = base_combined_fitness + roi_adjustment
+                    # Volume scalar: use abs() so log is always defined and positive
+                    # We add 1 so that log10(1) = 0 (neutral) acting as a floor
+                    volume_scalar = math.log10(abs(raw_pnl) + 1)
+
+                    # Calculate fitness
+                    # ROI provides the sign, volume_scalar provides the magnitude
+                    combined_fitness = (win_rate ** 2 * quality_ratio * roi_score) * volume_scalar
+
+                    # Store for logging (these values are still tracked but not used in fitness)
+                    base_combined_fitness = combined_fitness
+                    roi_adjustment = 0.0
+                else:
+                    # Standard mode: original fitness calculation
+                    # Combined score: penalize agents with negative training fitness
+                    # This prevents "lucky" agents that do well on validation but poorly on training
+                    # Formula: combined = val_fitness + min(0, train_fitness)
+                    base_combined_fitness = val_fitness + min(0.0, train_fitness)
+
+                    # ROI-based scoring adjustment using Hall of Fame median as benchmark
+                    # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
+                    # This rewards agents that outperform the HoF median ROI and penalizes those below
+
+                    # Confidence factor: quality_count / target_count (capped at 1.0)
+                    # This ensures agents only get full ROI bonus credit if they have enough quality trades
+                    confidence_factor = min(1.0, quality_count / Config.ROI_CONFIDENCE_MIN_TRADES)
+
+                    roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
+                    roi_adjustment = roi_adjustment * confidence_factor  # Dampen based on quality trade count
+                    combined_fitness = base_combined_fitness + roi_adjustment
 
                 validation_results.append({
                     'idx': idx,
@@ -2204,7 +2238,7 @@ class ERLTrainer:
 
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
-            print(f"Median HoF ROI: {median_hof_roi:.2f}% (benchmark for ROI adjustment)")
+            print(f"ROI Hurdle EMA: {median_hof_roi:.2f}% (raw HoF median: {raw_median_hof_roi:.2f}%)")
             print(f"Quality threshold: {quality_threshold:.2f}% (min gain_pct for quality trades, need {Config.ROI_CONFIDENCE_MIN_TRADES} for full bonus)")
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
             print("Top 5 by Combined Fitness (with ROI adjustment) - used for elite selection:")
@@ -2265,6 +2299,15 @@ class ERLTrainer:
                 print(f"   HoF size: {hof_stats['size']}/{self.hall_of_fame.capacity}, "
                       f"Worst: {hof_stats['worst_score']:.2f}, Best: {hof_stats['best_score']:.2f}")
 
+            # Update ROI hurdle EMA after HoF changes
+            # EMA with α=0.2: converges to static target in ~5 iterations
+            # This smooths the hurdle so it rises gradually as training progresses
+            new_median_roi = self.hall_of_fame.get_median_roi()
+            old_ema = self.roi_hurdle_ema
+            self.roi_hurdle_ema = 0.2 * new_median_roi + 0.8 * self.roi_hurdle_ema
+            if admitted:  # Only log if there were changes
+                print(f"   ROI Hurdle EMA: {old_ema:.2f}% → {self.roi_hurdle_ema:.2f}% (new median: {new_median_roi:.2f}%)")
+
             # Log Hall of Fame metrics after admission check
             hof_stats = self.hall_of_fame.get_stats()
             self.writer.add_scalar('HallOfFame/Size', hof_stats['size'], gen)
@@ -2272,6 +2315,7 @@ class ERLTrainer:
             self.writer.add_scalar('HallOfFame/WorstScore', hof_stats['worst_score'], gen)
             self.writer.add_scalar('HallOfFame/MeanScore', hof_stats['mean_score'], gen)
             self.writer.add_scalar('HallOfFame/MedianROI', hof_stats['median_roi'], gen)
+            self.writer.add_scalar('HallOfFame/ROIHurdleEMA', self.roi_hurdle_ema, gen)
 
             # Calculate population ROI stats for this generation
             population_rois = [r['roi'] for r in validation_results]
@@ -2304,6 +2348,7 @@ class ERLTrainer:
                 "hall_of_fame/mean_score": hof_stats['mean_score'],
                 "hall_of_fame/std_score": hof_stats['std_score'],
                 "hall_of_fame/median_roi": hof_stats['median_roi'],
+                "hall_of_fame/roi_hurdle_ema": self.roi_hurdle_ema,
                 "validation/best_agent_roi": best_agent_roi,
                 "validation/mean_population_roi": mean_population_roi,
                 "validation/best_agent_quality_count": best_agent_quality_count,

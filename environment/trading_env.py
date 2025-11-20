@@ -3,7 +3,6 @@ Trading Environment for Project Eigen 2
 Gym-style environment for stock trading with ERL
 """
 
-import math
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -480,10 +479,8 @@ class TradingEnvironment(gym.Env):
                 scaled_coefficient = position.coefficient ** Config.CONVICTION_SCALING_POWER
 
                 if gain_pct >= 0:
-                    # Apply yield bonus: 1 + log(1 + gain_pct) rewards higher yields non-linearly
-                    # A 10% gain is worth more than 10x a 1% gain, but extreme outliers are dampened
-                    yield_bonus = 1.0 + math.log(1.0 + gain_pct)
-                    base_reward = scaled_coefficient * gain_pct * yield_bonus
+                    # Simple linear reward for wins
+                    base_reward = scaled_coefficient * gain_pct
                     self.num_wins += 1
                     loss_penalty = 0.0
                 else:
