@@ -62,7 +62,7 @@ class TradingEnvironment(gym.Env):
             data_array_full: Full market data for reward calculation [num_days, num_columns, 9_features]
                             If None, uses data_array (for backward compatibility)
             is_training: If True, applies observation noise for regularization
-            consistency_mode: If True, applies 1.25x loss magnification for consistency training
+            consistency_mode: If True, applies loss magnification for consistency training (see Config.CONSISTENCY_LOSS_MULTIPLIER)
         """
         super().__init__()
 

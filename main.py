@@ -119,7 +119,7 @@ def main():
             '--consistency',
             action='store_true',
             help='Enable consistency mode. Evaluates agents over 5 episodes with sum (not avg), '
-                 'and magnifies losses by 1.25x to focus training on reducing drawdowns.'
+                 'and magnifies losses to focus training on reducing drawdowns.'
         )
         parser.add_argument(
             '--heroes',

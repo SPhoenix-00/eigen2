@@ -202,7 +202,7 @@ class ERLTrainer:
             data_loader: Loaded data with train/val splits
             resume_run_name: Optional wandb run name to resume from (e.g., "azure-thunder-123")
             enable_leverage: If True, enable leverage mode (replaces bottom 5 with top 5 HoF agents with 1.5x coefficients)
-            consistency_mode: If True, evaluate with 5 episodes (sum) and 1.25x loss magnification
+            consistency_mode: If True, evaluate with 5 episodes (sum) and loss magnification (see Config.CONSISTENCY_LOSS_MULTIPLIER)
             heroes_hof_dir: Path to Hall of Fame directory to load pre-trained agents from
         """
         self.data_loader = data_loader
@@ -445,7 +445,7 @@ class ERLTrainer:
         # Create persistent environment (reused across episodes to prevent memory leaks)
         print("Initializing environment...")
         if self.consistency_mode:
-            print("  Consistency mode enabled: 1.25x loss magnification")
+            print(f"  Consistency mode enabled: {Config.CONSISTENCY_LOSS_MULTIPLIER}x loss magnification")
         self.eval_env = TradingEnvironment(
             data_array=self.data_loader.data_array,
             dates=self.data_loader.dates,
@@ -565,7 +565,7 @@ class ERLTrainer:
         print(f"\n--- Evaluating {len(loaded_agents)} heroes with current reward function (Parallel) ---")
         num_episodes = 5 if self.consistency_mode else 3
         if self.consistency_mode:
-            print(f"  Using consistency mode: {num_episodes} episodes, sum, 1.25x loss magnification")
+            print(f"  Using consistency mode: {num_episodes} episodes, sum, {Config.CONSISTENCY_LOSS_MULTIPLIER}x loss magnification")
         else:
             print(f"  Using standard mode: {num_episodes} episodes, avg(lowest 2)")
 
@@ -2314,14 +2314,26 @@ class ERLTrainer:
 
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
-            print(f"ROI Hurdle EMA: {median_hof_roi:.2f}% (raw HoF median: {raw_median_hof_roi:.2f}%)")
-            print(f"Quality threshold: {quality_threshold:.2f}% (min gain_pct for quality trades, need {Config.ROI_CONFIDENCE_MIN_TRADES} for full bonus)")
+            if self.consistency_mode:
+                print("Consistency mode: WR^2 × QR × ROI × volume_scalar fitness function")
+            else:
+                print(f"ROI Hurdle EMA: {median_hof_roi:.2f}% (raw HoF median: {raw_median_hof_roi:.2f}%)")
+                print(f"Quality threshold: {quality_threshold:.2f}% (min gain_pct for quality trades, need {Config.ROI_CONFIDENCE_MIN_TRADES} for full bonus)")
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
-            print("Top 5 by Combined Fitness (with ROI adjustment) - used for elite selection:")
-            for i, result in enumerate(validation_results[:5]):
-                roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
-                quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
-                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
+
+            if self.consistency_mode:
+                # Simplified output for consistency mode (no ROI adjustment)
+                print("Top 5 by Combined Fitness - used for elite selection:")
+                for i, result in enumerate(validation_results[:5]):
+                    quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
+                    print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
+            else:
+                # Detailed output for standard mode (with ROI adjustment)
+                print("Top 5 by Combined Fitness (with ROI adjustment) - used for elite selection:")
+                for i, result in enumerate(validation_results[:5]):
+                    roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
+                    quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
+                    print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
 
             # Update best agent if we found a better one based on combined fitness
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
@@ -2377,9 +2389,12 @@ class ERLTrainer:
                 "validation/best_agent_quality_ratio": best_agent_quality_ratio,
             }
 
-            # Add per-slice scores for best agent (all 7 slices)
-            for i, score in enumerate(best_agent_slice_scores, 1):
-                validation_log[f"validation/best_agent_slice_{i}"] = score
+            # Add summary statistics for best agent's slice scores (easier to visualize than 7 separate metrics)
+            if best_agent_slice_scores:
+                validation_log["validation/best_agent_slices_mean"] = np.mean(best_agent_slice_scores)
+                validation_log["validation/best_agent_slices_min"] = np.min(best_agent_slice_scores)
+                validation_log["validation/best_agent_slices_max"] = np.max(best_agent_slice_scores)
+                validation_log["validation/best_agent_slices_std"] = np.std(best_agent_slice_scores)
 
             wandb.log(validation_log, step=gen)
 

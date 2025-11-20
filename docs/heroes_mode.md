@@ -19,7 +19,7 @@ python main.py --heroes /path/to/checkpoint_folder --consistency
 ### Command-line Arguments
 
 - `--heroes HOF_DIR`: Path to a checkpoint directory containing agent files
-- `--consistency`: (Optional) Enable consistency mode with 1.25x loss magnification
+- `--consistency`: (Optional) Enable consistency mode with loss magnification (3.0x by default, see Config.CONSISTENCY_LOSS_MULTIPLIER)
 
 ## Hall of Fame Folder Structure
 
