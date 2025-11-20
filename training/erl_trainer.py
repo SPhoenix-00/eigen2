@@ -2022,10 +2022,7 @@ class ERLTrainer:
             print("\nRe-evaluating population on validation data...")
             for idx, agent in enumerate(self.population):
                 val_results = self.validate_agent(agent)
-                # Update cache
-                agent_hash = self._hash_agent(agent)
-                cache_key = (agent_hash, self.val_slice_hash)
-                self.val_cache[cache_key] = val_results
+                # Note: Cache will be rebuilt naturally during first generation
 
             # Re-evaluate best agent if it exists
             if self.best_agent is not None:
