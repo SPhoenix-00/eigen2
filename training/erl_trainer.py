@@ -633,8 +633,13 @@ class ERLTrainer:
                 agent_idx = task_idx // num_episodes
 
                 try:
-                    fitness, _, _ = future.result()
-                    fitness_by_agent[agent_idx].append(fitness)
+                    # raw_fitness is cumulative reward (good for RL, bad for Evolution)
+                    raw_fitness, episode_info, _ = future.result()
+
+                    # Calculate Structural Fitness for Evolution
+                    triad_fitness = self.calculate_triad_fitness(episode_info)
+
+                    fitness_by_agent[agent_idx].append(triad_fitness)
                 except Exception as e:
                     print(f"\n  ! Worker failed for hero {agent_idx}: {e}")
                     fitness_by_agent[agent_idx].append(-10000.0)
