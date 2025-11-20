@@ -465,46 +465,43 @@ class TradingEnvironment(gym.Env):
                     should_close = True
             
             if should_close:
-                # Calculate gain/loss
+                # 1. Calculate Gross Gain
                 gain_pct = ((exit_price - position.entry_price) / position.entry_price) * 100.0
 
-                # Accumulate raw P&L and investment using floored coefficient (integer shares)
+                # 2. Update Raw Stats (for reporting)
                 shares = int(position.coefficient)
                 self.raw_pnl += (exit_price - position.entry_price) * shares
                 self.total_investment += position.entry_price * shares
 
-                # Calculate base reward (before penalties)
-                # Apply conviction scaling: coefficient^1.25 creates convex reward surface
-                # This encourages high-confidence bets by increasing marginal utility of larger positions
+                # 3. SNIPER LOGIC: Apply Hurdle FIRST
+                # A trade making 0.5% when hurdle is 0.6% is a LOSS of -0.1%
+                # Convert HURDLE_RATE from decimal (0.006) to percentage (0.6%)
+                hurdle_pct = Config.HURDLE_RATE * 100.0
+                net_gain_pct = gain_pct - hurdle_pct
+
+                # 4. Conviction Scaling (Keep convex surface)
                 scaled_coefficient = position.coefficient ** Config.CONVICTION_SCALING_POWER
 
-                if gain_pct >= 0:
-                    # Simple linear reward for wins
-                    base_reward = scaled_coefficient * gain_pct
+                # 5. Calculate Reward with Asymmetric Penalty
+                if net_gain_pct >= 0:
+                    # WIN: Linear reward
+                    base_reward = scaled_coefficient * net_gain_pct
                     self.num_wins += 1
-                    loss_penalty = 0.0
                 else:
-                    # In consistency mode, magnify losses by CONSISTENCY_LOSS_MULTIPLIER (1.25x)
-                    # This trains agents to focus on reducing drawdowns and variance
-                    if self.consistency_mode:
-                        magnified_loss = abs(gain_pct) * Config.CONSISTENCY_LOSS_MULTIPLIER
-                        base_reward = scaled_coefficient * (-magnified_loss)
-                    else:
-                        base_reward = scaled_coefficient * gain_pct  # Negative
-                    # Apply loss penalty multiplier (additional penalty on top of base)
-                    loss_penalty = (Config.LOSS_PENALTY_MULTIPLIER - 1.0) * scaled_coefficient * abs(gain_pct)
+                    # LOSS: 3.0x Penalty (Sniper Mode)
+                    # This makes the agent feel immediate pain for "fake wins"
+                    SNIPER_PENALTY_MULTIPLIER = 3.0
+                    base_reward = scaled_coefficient * net_gain_pct * SNIPER_PENALTY_MULTIPLIER
                     self.num_losses += 1
 
-                # Apply forced exit penalty if exit was due to max_holding_period
-                # Penalty is 3% of position size (entry_price * coefficient)
-                forced_exit_penalty = (position.entry_price * position.coefficient * Config.FORCED_EXIT_PENALTY_PCT) if reason == 'max_holding_period' else 0.0
+                # 6. Forced Exit Penalty (Lack of decisiveness)
+                if reason == 'max_holding_period':
+                    forced_exit_penalty = position.entry_price * position.coefficient * Config.FORCED_EXIT_PENALTY_PCT
+                else:
+                    forced_exit_penalty = 0.0
 
-                # Apply hurdle rate (transaction cost) - 0.15% of position size per trade
-                # This mimics real trading costs and disincentivizes high-volume strategies
-                hurdle_cost = position.entry_price * position.coefficient * Config.HURDLE_RATE
-
-                # Final reward = base_reward - loss_penalty - forced_exit_penalty - hurdle_cost
-                reward = base_reward - loss_penalty - forced_exit_penalty - hurdle_cost
+                # Note: Hurdle is already in net_gain_pct, so we don't subtract it again
+                reward = base_reward - forced_exit_penalty
 
                 total_reward += reward
                 self.num_trades += 1
@@ -520,13 +517,11 @@ class TradingEnvironment(gym.Env):
                     'days_held': position.days_held,
                     'gain_pct': gain_pct,
                     'base_reward': base_reward,
-                    'loss_penalty': loss_penalty,
                     'forced_exit_penalty': forced_exit_penalty,
-                    'hurdle_cost': hurdle_cost,
                     'reward': reward,
                     'reason': reason
                 })
-                
+
                 positions_to_close.append(stock_id)
         
         # Remove closed positions

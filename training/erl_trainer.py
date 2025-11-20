@@ -1031,6 +1031,65 @@ class ERLTrainer:
         import hashlib
         return hashlib.md5(str(slices).encode()).hexdigest()
 
+    def calculate_triad_fitness(self, stats: Dict) -> float:
+        """
+        The 'Triad' Fitness Score (Original Linear QR Version)
+        Fitness = (WR^2 * QR * ROI_Sign) * log10(|PnL| + 1)
+
+        Purpose:
+        - Forces consistency (WR^2)
+        - Rewards efficiency (QR) without paralyzing the agent
+        - Scales with magnitude (Log PnL) but preserves direction (ROI Sign)
+        """
+        total_trades = stats.get('num_trades', 0)
+
+        # 1. Handle Inactivity (Zero Trades)
+        # We apply a penalty but add the 'max_coefficient' as a bonus.
+        # This creates a 'gradient' so agents that ALMOST traded (high conviction)
+        # are ranked higher than agents that did nothing (low conviction).
+        if total_trades == 0:
+            return -Config.ZERO_TRADES_PENALTY + stats.get('max_coefficient_during_episode', 0)
+
+        # 2. Consistency: Squared Win Rate (WR^2)
+        # We KEEP squaring this. A 55% WR is mediocre. A 70% WR is excellent.
+        # Squaring differentiates them significantly (0.30 vs 0.49).
+        win_rate = stats.get('win_rate', 0.0)
+        consistency_score = win_rate ** 2
+
+        # 3. Conviction: Linear Quality Ratio (QR)
+        # A 'Quality Trade' is one that exceeds the hurdle rate (approx 0.2-0.6%)
+        closed_trades = stats.get('closed_trades', [])
+        if closed_trades:
+            # Use a small threshold (0.2%) or the configured hurdle
+            quality_threshold = 0.2
+            quality_count = sum(1 for t in closed_trades if t.get('gain_pct', 0) > quality_threshold)
+            qr_raw = quality_count / total_trades
+        else:
+            qr_raw = 0.0
+
+        # Linear QR (Not squared) to keep the agent active
+        conviction_score = qr_raw
+
+        # 4. Yield: Signed ROI (Provides the +/- Sign)
+        raw_pnl = stats.get('raw_pnl', 0.0)
+        total_inv = stats.get('total_investment', 0.0)
+        roi_pct = (raw_pnl / total_inv * 100) if total_inv > 0 else 0.0
+
+        # Clip ROI to [-50, 50] to prevent one lucky trade from breaking the scale
+        roi_score = np.clip(roi_pct, -50, 50)
+
+        # 5. Volume Scalar: Log Magnitude
+        # We use log10 so that making $10,000 is better than $100,
+        # but not 100x better (prevents chasing outliers).
+        # abs() ensures log is valid; roi_score provides the negative sign if needed.
+        volume_scalar = math.log10(abs(raw_pnl) + 1)
+
+        # --- Final Calculation ---
+        # (WR^2 * QR * ROI) * Log(Vol)
+        fitness = (consistency_score * conviction_score * roi_score * volume_scalar) * 100.0
+
+        return float(fitness)
+
     def evaluate_population(self) -> Tuple[List[float], Dict]:
         """
         Evaluate all agents in population (fitness scores).
@@ -1079,7 +1138,7 @@ class ERLTrainer:
 
                 # Run episode using persistent eval_env (CRITICAL FIX: prevents memory leak)
                 # Only add to replay buffer if agent is exploratory (not elite) for diversity
-                fitness, episode_info = self.run_episode(
+                raw_fitness, episode_info = self.run_episode(
                     agent=agent,
                     env=self.eval_env,  # Reuse persistent environment instead of creating new ones
                     start_idx=start_idx,
@@ -1087,7 +1146,10 @@ class ERLTrainer:
                     training=(not agent.is_elite)  # Only exploratory agents contribute to buffer
                 )
 
-                slice_fitness_scores.append(fitness)
+                # Calculate Structural Fitness for Evolution
+                triad_fitness = self.calculate_triad_fitness(episode_info)
+
+                slice_fitness_scores.append(triad_fitness)
                 slice_episode_stats.append(episode_info)
 
             # Calculate fitness based on mode
@@ -1234,8 +1296,14 @@ class ERLTrainer:
                 agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
 
                 try:
-                    fitness, episode_info, transition_file_paths = future.result()
-                    fitness_by_agent[agent_idx].append((fitness, episode_info))
+                    # raw_fitness is the sum of rewards from env (good for RL, bad for Evolution)
+                    raw_fitness, episode_info, transition_file_paths = future.result()
+
+                    # Calculate Structural Fitness for Evolution
+                    triad_fitness = self.calculate_triad_fitness(episode_info)
+
+                    # Store triad_fitness instead of raw_fitness
+                    fitness_by_agent[agent_idx].append((triad_fitness, episode_info))
 
                     # Collect transition file paths from exploratory agents
                     if transition_file_paths:
@@ -1681,21 +1749,9 @@ class ERLTrainer:
                 print(f"  Mutation STD:  {self.base_mutation_std:.4f} → {self.current_mutation_std:.4f}")
                 print(f"{'='*60}\n")
 
-                # Log to wandb
-                wandb.log({
-                    "adaptive_mutation/plateau_detected": 1,
-                    "adaptive_mutation/mutation_rate": self.current_mutation_rate,
-                    "adaptive_mutation/mutation_std": self.current_mutation_std,
-                    "adaptive_mutation/relative_improvement": relative_improvement,
-                }, step=self.generation)
             else:
-                # Already in plateau - just log current status
-                wandb.log({
-                    "adaptive_mutation/plateau_detected": 1,
-                    "adaptive_mutation/mutation_rate": self.current_mutation_rate,
-                    "adaptive_mutation/mutation_std": self.current_mutation_std,
-                    "adaptive_mutation/relative_improvement": relative_improvement,
-                }, step=self.generation)
+                # Already in plateau - no additional logging needed
+                pass
         else:
             # Improvement detected - reset to base if we were in plateau
             if self.plateau_detected:
@@ -1710,21 +1766,6 @@ class ERLTrainer:
                 print(f"Mutation Rate: {self.current_mutation_rate:.3f}")
                 print(f"Mutation STD:  {self.current_mutation_std:.4f}")
                 print(f"{'='*60}\n")
-
-                wandb.log({
-                    "adaptive_mutation/plateau_detected": 0,
-                    "adaptive_mutation/mutation_rate": self.current_mutation_rate,
-                    "adaptive_mutation/mutation_std": self.current_mutation_std,
-                    "adaptive_mutation/relative_improvement": relative_improvement,
-                }, step=self.generation)
-            else:
-                # Not in plateau, just log status
-                wandb.log({
-                    "adaptive_mutation/plateau_detected": 0,
-                    "adaptive_mutation/mutation_rate": self.current_mutation_rate,
-                    "adaptive_mutation/mutation_std": self.current_mutation_std,
-                    "adaptive_mutation/relative_improvement": relative_improvement,
-                }, step=self.generation)
 
     def save_checkpoint(self):
         """Saves the entire training state to a checkpoint directory."""
@@ -2111,15 +2152,11 @@ class ERLTrainer:
             self.writer.add_scalar('Fitness/Min', min_fitness, gen)
             self.writer.add_scalar('Fitness/Std', np.std(fitness_scores), gen)
 
-            # Log to wandb
+            # Log to wandb (simplified)
             wandb.log({
-                "generation": gen,
                 "fitness/mean": mean_fitness,
                 "fitness/max": max_fitness,
-                "fitness/min": min_fitness,
-                "fitness/std": np.std(fitness_scores),
-                "fitness/best_training_ever": self.best_fitness if hasattr(self, 'best_fitness') else max_fitness,
-                "fitness/best_validation_ever": self.best_validation_fitness if hasattr(self, 'best_validation_fitness') else float('-inf'),
+                "fitness/best_ever": self.best_validation_fitness if hasattr(self, 'best_validation_fitness') else float('-inf'),
             }, step=gen)
 
             # Update best training fitness (for logging only)
@@ -2332,28 +2369,12 @@ class ERLTrainer:
                 best_agent_quality_ratio = 0.0
                 best_agent_quality_count = 0
 
-            # Calculate mean quality ratio across population
-            quality_ratios = []
-            for r in validation_results:
-                if r['total_trades'] > 0:
-                    quality_ratios.append(r['quality_count'] / r['total_trades'])
-                else:
-                    quality_ratios.append(0.0)
-            mean_population_quality_ratio = np.mean(quality_ratios) if quality_ratios else 0.0
-
             wandb.log({
-                "hall_of_fame/size": hof_stats['size'],
                 "hall_of_fame/best_score": hof_stats['best_score'],
-                "hall_of_fame/worst_score": hof_stats['worst_score'],
-                "hall_of_fame/mean_score": hof_stats['mean_score'],
-                "hall_of_fame/std_score": hof_stats['std_score'],
+                "hall_of_fame/min_score": hof_stats['worst_score'],
                 "hall_of_fame/median_roi": hof_stats['median_roi'],
-                "hall_of_fame/roi_hurdle_ema": self.roi_hurdle_ema,
-                "validation/best_agent_roi": best_agent_roi,
-                "validation/mean_population_roi": mean_population_roi,
-                "validation/best_agent_quality_count": best_agent_quality_count,
-                "validation/best_agent_quality_ratio": best_agent_quality_ratio,
-                "validation/mean_population_quality_ratio": mean_population_quality_ratio,
+                "best_agent/roi": best_agent_roi,
+                "best_agent/quality_ratio": best_agent_quality_ratio,
             }, step=gen)
 
             # 2. Train agents using replay buffer
@@ -2365,64 +2386,9 @@ class ERLTrainer:
             # 🔍 Memory tracking after training
             # log_memory(f"Gen {gen+1}: After train_population", show_objects=True)
 
-            # 2b. Log feature importance (computed during training)
-            # Get feature importance for logging
+            # Update feature importance tracking (computed during training)
             feature_importance = self.get_feature_importance().numpy()
-
-            # Calculate summary statistics for feature importance
-            top_k = 20  # Top 20 most important features
-            top_indices = np.argsort(feature_importance)[-top_k:][::-1]
-            top_values = feature_importance[top_indices]
-
-            # Calculate entropy of feature importance (higher = more distributed attention)
-            # Clip to avoid log(0)
-            fi_clipped = np.clip(feature_importance, 1e-10, 1.0)
-            entropy = -np.sum(fi_clipped * np.log(fi_clipped))
-
-            # Analyze persistent low-importance columns
-            low_importance_analysis = self.analyze_persistent_low_importance_columns(feature_importance)
-
-            # Log feature importance to wandb
-            wandb.log({
-                # Feature importance summary
-                "feature_importance/entropy": entropy,
-                "feature_importance/max": float(feature_importance.max()),
-                "feature_importance/mean": float(feature_importance.mean()),
-                "feature_importance/top_1": float(top_values[0]) if len(top_values) > 0 else 0.0,
-                "feature_importance/top_5_sum": float(top_values[:5].sum()) if len(top_values) >= 5 else 0.0,
-                "feature_importance/update_count": self.feature_importance_count,
-                # Current generation thresholds
-                "feature_importance/current_below_1pct": low_importance_analysis['current_below_1pct'],
-                "feature_importance/current_below_0.1pct": low_importance_analysis['current_below_0.1pct'],
-                "feature_importance/current_below_0.01pct": low_importance_analysis['current_below_0.01pct'],
-                # Persistent low-importance counts
-                "feature_importance/persistent_below_1pct_count": low_importance_analysis['<1%']['count'],
-                "feature_importance/persistent_below_0.1pct_count": low_importance_analysis['<0.1%']['count'],
-                "feature_importance/persistent_below_0.01pct_count": low_importance_analysis['<0.01%']['count'],
-            }, step=gen)
-
-            # Log full feature importance vector as histogram every 5 generations
-            if (gen + 1) % 5 == 0:
-                wandb.log({
-                    "feature_importance/histogram": wandb.Histogram(feature_importance),
-                    "feature_importance/top_20_columns": wandb.Table(
-                        data=[[int(idx), float(val)] for idx, val in zip(top_indices, top_values)],
-                        columns=["Column_Index", "Importance"]
-                    )
-                }, step=gen)
-
-                # Log persistent low-importance columns as tables
-                for threshold_name in ['<1%', '<0.1%', '<0.01%']:
-                    threshold_data = low_importance_analysis[threshold_name]
-                    if threshold_data['count'] > 0 and 'columns' in threshold_data:
-                        table_data = [[col['index'], col['name'], col['current_importance']]
-                                     for col in threshold_data['columns']]
-                        wandb.log({
-                            f"feature_importance/persistent_{threshold_name.replace('<', 'below_').replace('%', 'pct')}": wandb.Table(
-                                data=table_data,
-                                columns=["Column_Index", "Column_Name", "Current_Importance"]
-                            )
-                        }, step=gen)
+            self.analyze_persistent_low_importance_columns(feature_importance)
 
             # --- Hall of Fame Injection Logic ---
             # Inject champions from HoF to replace worst performers BEFORE evolution
@@ -2474,14 +2440,11 @@ class ERLTrainer:
                         self.writer.add_scalar('Validation/Fitness', val_results['fitness'], gen)
                         self.writer.add_scalar('Validation/WinRate', val_results['win_rate'], gen)
 
-                        # Log to wandb
+                        # Log best agent validation to wandb
                         wandb.log({
-                            "validation/fitness": val_results['fitness'],
-                            "validation/win_rate": val_results['win_rate'],
-                            "validation/num_trades": val_results['num_trades'],
-                            "validation/num_wins": val_results['num_wins'],
-                            "validation/num_losses": val_results['num_losses'],
-                            "validation/avg_reward_per_trade": val_results['avg_reward_per_trade'],
+                            "best_agent/fitness": val_results['fitness'],
+                            "best_agent/win_rate": val_results['win_rate'],
+                            "best_agent/num_trades": val_results['num_trades'],
                         }, step=gen)
 
                         # Check for plateau and adjust mutation adaptively
@@ -2524,16 +2487,9 @@ class ERLTrainer:
             self.writer.add_scalar('Buffer/Size', buffer_stats['size'], gen)
             self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
 
-            # Log buffer stats, timing, and resource usage to wandb
+            # Log timing to wandb
             wandb.log({
-                "buffer/size": buffer_stats['size'],
-                "buffer/utilization": buffer_stats['utilization'],
-                "buffer/capacity": buffer_stats['capacity'],
                 "training/generation_time": gen_time,
-                "training/avg_generation_time": np.mean(self.generation_times) if self.generation_times else 0,
-                "resources/peak_vram_gb": resource_stats['peak_vram_gb'],
-                "resources/peak_ram_gb": resource_stats['peak_ram_gb'],
-                "resources/peak_disk_gb": resource_stats['peak_disk_gb'],
             }, step=gen)
 
             # Clear GPU cache and run garbage collection to prevent memory leaks
