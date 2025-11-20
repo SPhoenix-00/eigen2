@@ -1189,11 +1189,17 @@ class ERLTrainer:
             fitness_scores.append(final_fitness)
 
             # Aggregate episode stats across all training slices for this agent
+            # Calculate global win rate (total wins / total trades) not average of per-slice win rates
+            agent_total_wins = sum([s['num_wins'] for s in slice_episode_stats])
+            agent_total_losses = sum([s['num_losses'] for s in slice_episode_stats])
+            agent_total_trades = agent_total_wins + agent_total_losses
+            agent_win_rate = agent_total_wins / agent_total_trades if agent_total_trades > 0 else 0.0
+
             agent_aggregate_stats = {
                 'num_trades': int(np.mean([s['num_trades'] for s in slice_episode_stats])),
                 'num_wins': int(np.mean([s['num_wins'] for s in slice_episode_stats])),
                 'num_losses': int(np.mean([s['num_losses'] for s in slice_episode_stats])),
-                'win_rate': np.mean([s['win_rate'] for s in slice_episode_stats]),
+                'win_rate': agent_win_rate,
             }
             all_episode_stats.append(agent_aggregate_stats)
 
@@ -1352,22 +1358,24 @@ class ERLTrainer:
             slice_fitness = [f for f, _ in agent_slices]
             slice_stats = [info for _, info in agent_slices]
 
-            # Calculate fitness based on mode
-            if self.consistency_mode:
-                # Consistency mode: sum of all episodes (rewards total consistency)
-                final_fitness = sum(slice_fitness)
-            else:
-                # Normal mode: average of lowest 2 out of 3 (robust estimate)
-                sorted_fitness = sorted(slice_fitness)
-                final_fitness = np.mean(sorted_fitness[:2])
+            # Calculate fitness using pessimistic aggregator (same as validation gatekeeper)
+            # This aligns training incentives with validation requirements
+            mean_score = np.mean(slice_fitness)
+            min_score = np.min(slice_fitness)
+            final_fitness = (0.4 * mean_score) + (0.6 * min_score)
             fitness_scores.append(final_fitness)
 
-            # Aggregate stats
+            # Aggregate stats - calculate global win rate (not average of per-slice win rates)
+            agent_total_wins = sum([s['num_wins'] for s in slice_stats])
+            agent_total_losses = sum([s['num_losses'] for s in slice_stats])
+            agent_total_trades = agent_total_wins + agent_total_losses
+            agent_win_rate = agent_total_wins / agent_total_trades if agent_total_trades > 0 else 0.0
+
             agent_stats = {
                 'num_trades': int(np.mean([s['num_trades'] for s in slice_stats])),
                 'num_wins': int(np.mean([s['num_wins'] for s in slice_stats])),
                 'num_losses': int(np.mean([s['num_losses'] for s in slice_stats])),
-                'win_rate': np.mean([s['win_rate'] for s in slice_stats]),
+                'win_rate': agent_win_rate,
             }
             all_episode_stats.append(agent_stats)
 
@@ -1640,12 +1648,19 @@ class ERLTrainer:
         total_investment = sum([r['total_investment'] for r in slice_results])
         roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
 
+        # Calculate global win rate (total wins / total trades across all slices)
+        # This ensures WR >= QR (quality rate) since all quality trades are winning trades
+        total_wins = sum([r['num_wins'] for r in slice_results])
+        total_losses = sum([r['num_losses'] for r in slice_results])
+        total_trades = total_wins + total_losses
+        global_win_rate = total_wins / total_trades if total_trades > 0 else 0.0
+
         return {
             'fitness': validation_fitness,
             'fitness_all_slices': fitness_scores,  # For debugging
             'fitness_mean': mean_score,  # Mean of all slices (for debugging)
             'fitness_min': min_score,  # Worst slice (for debugging)
-            'win_rate': np.mean([r['win_rate'] for r in slice_results]),
+            'win_rate': global_win_rate,  # Global WR (not average of per-slice WRs)
             'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),
             'num_wins': int(np.mean([r['num_wins'] for r in slice_results])),
             'num_losses': int(np.mean([r['num_losses'] for r in slice_results])),
@@ -1988,6 +2003,48 @@ class ERLTrainer:
         except Exception as e:
             print(f"⚠ Could not load Hall of Fame: {e}")
 
+        # 7. Re-evaluate all loaded agents with current reward function
+        if population_loaded:
+            print("\n" + "="*60)
+            print("Re-evaluating loaded agents with current reward function")
+            print("="*60)
+
+            # Generate validation slices for re-evaluation
+            print("Generating validation slices for re-evaluation...")
+            self.current_generation_val_slices = self.generate_validation_slices()
+            self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
+
+            # Re-evaluate population on training data
+            print("\nRe-evaluating population on training data...")
+            fitness_scores, _ = self.evaluate_population()
+
+            # Re-evaluate population on validation data
+            print("\nRe-evaluating population on validation data...")
+            for idx, agent in enumerate(self.population):
+                val_results = self.validate_agent(agent)
+                # Update cache
+                agent_hash = agent.get_hash()
+                cache_key = (agent_hash, self.val_slice_hash)
+                self.val_cache[cache_key] = val_results
+
+            # Re-evaluate best agent if it exists
+            if self.best_agent is not None:
+                print("\nRe-evaluating best agent...")
+                best_val_results = self.validate_agent(self.best_agent)
+                self.best_validation_fitness = best_val_results['fitness']
+                print(f"✓ Best agent validation fitness: {self.best_validation_fitness:.2f}")
+
+            # Re-evaluate Hall of Fame agents
+            if len(self.hall_of_fame.entries) > 0:
+                print("\nRe-evaluating Hall of Fame agents...")
+                for entry in self.hall_of_fame.entries:
+                    val_results = self.validate_agent(entry.agent)
+                    entry.validation_score = val_results['fitness']
+                    entry.roi = val_results.get('roi', 0.0)
+                print(f"✓ Re-evaluated {len(self.hall_of_fame.entries)} Hall of Fame agents")
+
+            print("\n✓ All agents re-evaluated with current reward function")
+
     def update_feature_importance(self, attention_weights: torch.Tensor):
         """
         Update the running average of feature importance using exponential moving average.
@@ -2195,6 +2252,8 @@ class ERLTrainer:
             wandb.log({
                 "fitness/best_fitness": max_fitness,
                 "fitness/mean_fitness": mean_fitness,
+                "fitness/min_fitness": min_fitness,
+                "fitness/std_fitness": np.std(fitness_scores),
                 "fitness/best_ever": self.best_fitness,
             }, step=gen)
 
@@ -2202,11 +2261,6 @@ class ERLTrainer:
             print(f"\n--- Walk-Forward Validation (Generation {gen + 1}) ---")
             self.current_generation_val_slices = self.generate_validation_slices()
             self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
-            print(f"Generated 7 validation slices (4 from quarters + 3 straddling):")
-            for i, (start, end, _) in enumerate(self.current_generation_val_slices, 1):
-                start_date = self.data_loader.dates[start] if start < len(self.data_loader.dates) else "N/A"
-                end_date = self.data_loader.dates[end-1] if end-1 < len(self.data_loader.dates) else "N/A"
-                print(f"  Slice {i}: days {start}-{end}: {start_date} to {end_date}")
 
             best_val_fitness_this_gen = float('-inf')
             best_val_agent_idx = None
@@ -2244,28 +2298,17 @@ class ERLTrainer:
                 quality_count = sum(1 for trade in closed_trades if trade.get('gain_pct', 0) >= quality_threshold)
 
                 if self.consistency_mode:
-                    # Consistency mode fitness formula: (WR^2 * QR * ROI) * volume_scalar
-                    # Where:
-                    # - WR = Win Rate (0-1)
-                    # - QR = Quality Ratio (quality_count / total_trades)
-                    # - ROI = percentage points, clipped to [-50, 50] (provides the SIGN)
-                    # - volume_scalar = log10(abs(Raw_PnL) + 1) (always positive, provides magnitude)
-                    win_rate = val_results['win_rate']
-                    quality_ratio = quality_count / total_trades if total_trades > 0 else 0.0
-                    raw_pnl = val_results.get('raw_pnl', 0.0)
+                    # Consistency mode: Use the Pessimistic Score from validate_agent
+                    # This is the CORRECT approach: trust the robustness score (0.4*mean + 0.6*min)
+                    # already calculated in validate_agent, which heavily penalizes blow-up slices.
+                    #
+                    # OLD LOGIC (The Trap): Recalculating based on aggregated totals ignores
+                    # the fact that an agent might have blown up in 3/5 slices, allowing
+                    # "gambler agents" with high volume in 2 good slices to rank high despite
+                    # terrible worst-case performance.
+                    combined_fitness = val_fitness
 
-                    # Clip ROI to avoid one catastrophic trade producing extreme values
-                    roi_score = np.clip(agent_roi, -50, 50)
-
-                    # Volume scalar: use abs() so log is always defined and positive
-                    # We add 1 so that log10(1) = 0 (neutral) acting as a floor
-                    volume_scalar = math.log10(abs(raw_pnl) + 1)
-
-                    # Calculate fitness
-                    # ROI provides the sign, volume_scalar provides the magnitude
-                    combined_fitness = (win_rate ** 2 * quality_ratio * roi_score) * volume_scalar * 100.0
-
-                    # Store for logging (these values are still tracked but not used in fitness)
+                    # Store for logging (no ROI adjustment in consistency mode)
                     base_combined_fitness = combined_fitness
                     roi_adjustment = 0.0
                 else:
@@ -2381,20 +2424,12 @@ class ERLTrainer:
             # Log validation metrics to wandb
             validation_log = {
                 "validation/best_fitness": best_val_fitness_this_gen,
-                "validation/mean_fitness": mean_validation_fitness,
                 "validation/best_ever": self.best_validation_fitness,
                 "validation/best_agent_roi": best_agent_roi,
                 "validation/best_agent_num_trades": best_agent_num_trades,
                 "validation/best_agent_win_rate": best_agent_win_rate,
                 "validation/best_agent_quality_ratio": best_agent_quality_ratio,
             }
-
-            # Add summary statistics for best agent's slice scores (easier to visualize than 7 separate metrics)
-            if best_agent_slice_scores:
-                validation_log["validation/best_agent_slices_mean"] = np.mean(best_agent_slice_scores)
-                validation_log["validation/best_agent_slices_min"] = np.min(best_agent_slice_scores)
-                validation_log["validation/best_agent_slices_max"] = np.max(best_agent_slice_scores)
-                validation_log["validation/best_agent_slices_std"] = np.std(best_agent_slice_scores)
 
             wandb.log(validation_log, step=gen)
 
@@ -2459,7 +2494,7 @@ class ERLTrainer:
             else:
                 hof_best_quality_ratio = 0.0
 
-            # Log comprehensive Hall of Fame metrics to wandb
+            # Log comprehensive Hall of Fame and adaptive mutation metrics to wandb
             wandb.log({
                 "hall_of_fame/min_fitness": hof_stats['worst_score'],
                 "hall_of_fame/max_fitness": hof_stats['best_score'],
@@ -2467,6 +2502,9 @@ class ERLTrainer:
                 "hall_of_fame/median_roi": hof_stats['median_roi'],
                 "hall_of_fame/best_roi": hof_best_roi,
                 "hall_of_fame/best_quality_ratio": hof_best_quality_ratio,
+                "mutation/rate": self.current_mutation_rate,
+                "mutation/std": self.current_mutation_std,
+                "mutation/plateau_detected": int(self.plateau_detected),
             }, step=gen)
 
             # 2. Train agents using replay buffer
@@ -2570,9 +2608,11 @@ class ERLTrainer:
             self.writer.add_scalar('Buffer/Size', buffer_stats['size'], gen)
             self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
 
-            # Log timing to wandb
+            # Log timing and buffer metrics to wandb
             wandb.log({
                 "training/generation_time": gen_time,
+                "buffer/size": buffer_stats['size'],
+                "buffer/utilization": buffer_stats['utilization'],
             }, step=gen)
 
             # Clear GPU cache and run garbage collection to prevent memory leaks

@@ -153,7 +153,7 @@ def print_generation_summary(gen: int, total_gens: int,
     print("\n📊 FITNESS METRICS")
     print("-" * 70)
     print(f"  Mean:              {mean_fitness:>12.2f}")
-    print(f"  Maximum:           {max_fitness:>12.2f}  {'🌟 NEW BEST!' if max_fitness >= best_fitness else ''}")
+    print(f"  Maximum:           {max_fitness:>12.2f}  {'🌟 NEW BEST!' if max_fitness > best_fitness else ''}")
     print(f"  Minimum:           {min_fitness:>12.2f}")
     print(f"  Std Dev:           {np.std(fitness_scores):>12.2f}")
     print(f"  Positive Agents:   {pop_stats['agents_with_positive_fitness']:>12} / {len(fitness_scores)}")
