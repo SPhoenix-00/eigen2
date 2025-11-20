@@ -2226,7 +2226,7 @@ class ERLTrainer:
 
                     # Calculate fitness
                     # ROI provides the sign, volume_scalar provides the magnitude
-                    combined_fitness = (win_rate ** 2 * quality_ratio * roi_score) * volume_scalar
+                    combined_fitness = (win_rate ** 2 * quality_ratio * roi_score) * volume_scalar * 100.0
 
                     # Store for logging (these values are still tracked but not used in fitness)
                     base_combined_fitness = combined_fitness
