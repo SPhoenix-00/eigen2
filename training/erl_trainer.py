@@ -2023,7 +2023,7 @@ class ERLTrainer:
             for idx, agent in enumerate(self.population):
                 val_results = self.validate_agent(agent)
                 # Update cache
-                agent_hash = agent.get_hash()
+                agent_hash = self._hash_agent(agent)
                 cache_key = (agent_hash, self.val_slice_hash)
                 self.val_cache[cache_key] = val_results
 
