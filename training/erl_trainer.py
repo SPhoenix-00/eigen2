@@ -1131,9 +1131,10 @@ class ERLTrainer:
         fitness_scores = []
         all_episode_stats = []
 
-        # Consistency mode uses 5 episodes with sum, normal mode uses 3 with avg(lowest 2)
+        # Use same number of episodes and scoring method for both modes
+        # ALWAYS use pessimistic aggregator (0.4*mean + 0.6*min) to align with validation gatekeeper
         num_episodes = 5 if self.consistency_mode else 3
-        scoring_method = "sum(all 5)" if self.consistency_mode else "avg(lowest 2)"
+        scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
@@ -1178,14 +1179,12 @@ class ERLTrainer:
                 slice_fitness_scores.append(triad_fitness)
                 slice_episode_stats.append(episode_info)
 
-            # Calculate fitness based on mode
-            if self.consistency_mode:
-                # Consistency mode: sum of all 5 episodes (rewards total consistency)
-                final_fitness = sum(slice_fitness_scores)
-            else:
-                # Normal mode: average of lowest 2 scores out of 3 (robust estimate)
-                sorted_fitness = sorted(slice_fitness_scores)
-                final_fitness = np.mean(sorted_fitness[:2])
+            # Calculate fitness using pessimistic aggregator (same as validation gatekeeper)
+            # This aligns training incentives with validation requirements
+            # 60% weight on worst slice, 40% weight on average
+            mean_score = np.mean(slice_fitness_scores)
+            min_score = np.min(slice_fitness_scores)
+            final_fitness = (0.4 * mean_score) + (0.6 * min_score)
 
             fitness_scores.append(final_fitness)
 
@@ -1231,9 +1230,10 @@ class ERLTrainer:
         Returns:
             Tuple of (fitness_scores, aggregate_stats)
         """
-        # Consistency mode uses 5 episodes with sum, normal mode uses 3 with avg(lowest 2)
+        # Use same number of episodes and scoring method for both modes
+        # ALWAYS use pessimistic aggregator (0.4*mean + 0.6*min) to align with validation gatekeeper
         num_episodes = 5 if self.consistency_mode else 3
-        scoring_method = "sum(all 5)" if self.consistency_mode else "avg(lowest 2)"
+        scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population (Parallel) ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
