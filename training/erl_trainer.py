@@ -2014,9 +2014,9 @@ class ERLTrainer:
             self.current_generation_val_slices = self.generate_validation_slices()
             self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
 
-            # Re-evaluate population on training data
+            # Re-evaluate population on training data (using parallel evaluation for speed)
             print("\nRe-evaluating population on training data...")
-            fitness_scores, _ = self.evaluate_population()
+            fitness_scores, _ = self.evaluate_population_parallel()
 
             # Re-evaluate population on validation data
             print("\nRe-evaluating population on validation data...")
