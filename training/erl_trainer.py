@@ -230,17 +230,17 @@ class ERLTrainer:
         print(f"Initializing population of {Config.POPULATION_SIZE} agents...")
         self.population = [DDPGAgent(agent_id=i) for i in range(Config.POPULATION_SIZE)]
 
-        # Training range (excludes interim validation and holdout sets)
+        # Training range (excludes validation set)
         self.train_start_idx = Config.CONTEXT_WINDOW_DAYS
         self.train_end_idx = len(data_loader.train_indices)
 
-        # Interim validation range (for walk-forward validation during training)
+        # Validation range (for walk-forward validation during training)
         # This is separate from training data to ensure genuine out-of-sample validation
-        self.interim_val_start_idx = len(data_loader.train_indices)
-        self.interim_val_end_idx = self.interim_val_start_idx + len(data_loader.interim_val_indices)
+        self.val_start_idx = len(data_loader.train_indices)
+        self.val_end_idx = self.val_start_idx + len(data_loader.val_indices)
 
         # Walk-forward validation slices (generated per generation)
-        # Each generation uses 3 random validation slices from INTERIM validation set
+        # Each generation uses 7 random validation slices from validation set (4 from quarters + 3 straddling)
         # Format: list of (start_idx, end_idx, trading_end_idx) tuples
         self.current_generation_val_slices = []
         
@@ -439,9 +439,8 @@ class ERLTrainer:
         self.resource_tracker = ResourceTracker(disk_path="/workspace")
 
         print(f"Training: days {self.train_start_idx}-{self.train_end_idx}, "
-              f"Validation: days {self.interim_val_start_idx}-{self.interim_val_end_idx}, "
-              f"Holdout: {Config.HOLDOUT_DAYS} days")
-        print(f"Walk-forward: 3 random validation slices/generation")
+              f"Validation: days {self.val_start_idx}-{self.val_end_idx}")
+        print(f"Walk-forward: 7 random validation slices/generation (4 from quarters + 3 straddling)")
 
         # Create persistent environment (reused across episodes to prevent memory leaks)
         print("Initializing environment...")
@@ -960,42 +959,47 @@ class ERLTrainer:
 
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
         """
-        Generate 2 random validation slices for the current generation from INTERIM validation set.
+        Generate 7 random validation slices from validation set.
 
-        NEW: Divides interim validation period into 2 equal segments and samples one slice from each.
-        This ensures diversity across different market conditions in the validation period.
+        Divides validation period into 4 equal quarters, then samples:
+        - 4 slices from within each quarter
+        - 3 straddling slices between quarters (Q1-Q2, Q2-Q3, Q3-Q4)
+
+        This ensures comprehensive coverage with overlapping windows across different market conditions.
 
         Each slice consists of:
         - CONTEXT_WINDOW_DAYS (504) of prior data (may come from training data for context)
-        - TRADING_PERIOD_DAYS (125) where agent can trade (from interim validation set)
-        - SETTLEMENT_PERIOD_DAYS (30) to close positions (from interim validation set)
+        - TRADING_PERIOD_DAYS (125) where agent can trade (from validation set)
+        - SETTLEMENT_PERIOD_DAYS (30) to close positions (from validation set)
 
         Returns:
-            List of 2 tuples: (start_idx, end_idx, trading_end_idx)
+            List of 7 tuples: (start_idx, end_idx, trading_end_idx)
         """
         # NOTE: start_idx is the first day of TRADING (not context)
         # The environment automatically looks back 504 days from start_idx for context
-        # So we just need to ensure trading + settlement fit within interim validation set
+        # So we just need to ensure trading + settlement fit within validation set
 
-        # Trading must start at or after interim_val_start_idx
-        min_start = self.interim_val_start_idx
+        # Trading must start at or after val_start_idx
+        min_start = self.val_start_idx
 
-        # Trading + settlement must end before interim_val_end_idx
-        max_start = self.interim_val_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
+        # Trading + settlement must end before val_end_idx
+        max_start = self.val_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
 
         if max_start < min_start:
-            raise ValueError(f"Not enough interim validation data: need {Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS} days")
+            raise ValueError(f"Not enough validation data: need {Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS} days")
 
-        # Divide the validation range into 2 equal segments
+        # Divide the validation range into 4 equal segments
         total_range = max_start - min_start + 1
-        segment_size = total_range // 2
+        segment_size = total_range // 4
 
         slices = []
-        for segment_idx in range(2):
+
+        # 1. Sample one slice from each quarter (4 slices)
+        for segment_idx in range(4):
             # Calculate segment boundaries
             segment_start = min_start + (segment_idx * segment_size)
             # For the last segment, extend to max_start to avoid rounding issues
-            segment_end = max_start + 1 if segment_idx == 1 else min_start + ((segment_idx + 1) * segment_size)
+            segment_end = max_start + 1 if segment_idx == 3 else min_start + ((segment_idx + 1) * segment_size)
 
             # Sample one random start index from this segment
             start_idx = np.random.randint(segment_start, segment_end)
@@ -1003,6 +1007,23 @@ class ERLTrainer:
             trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
 
             slices.append((start_idx, end_idx, trading_end_idx))
+
+        # 2. Sample straddling slices between quarters (3 slices)
+        for straddle_idx in range(3):
+            # Define straddling region: from halfway through quarter N to halfway through quarter N+1
+            straddle_start = min_start + (segment_size // 2) + (straddle_idx * segment_size)
+            straddle_end = min_start + (segment_size // 2) + ((straddle_idx + 1) * segment_size)
+
+            # Ensure we don't exceed max_start
+            straddle_end = min(straddle_end, max_start + 1)
+
+            # Sample one random start index from this straddling region
+            if straddle_end > straddle_start:
+                start_idx = np.random.randint(straddle_start, straddle_end)
+                end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+
+                slices.append((start_idx, end_idx, trading_end_idx))
 
         return slices
 
@@ -1129,7 +1150,7 @@ class ERLTrainer:
 
             for _ in range(num_episodes):
                 # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
-                # Training episodes must not touch interim validation or holdout sets
+                # Training episodes must not touch validation set
                 # Need: context (504) + trading (125) + settlement (30) = 659 days total
                 total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
 
@@ -1137,7 +1158,7 @@ class ERLTrainer:
                 if max_start <= self.train_start_idx:
                     raise ValueError(f"Not enough training data: need {total_days_needed} days")
 
-                # Random start from training range only (excludes interim val and holdout)
+                # Random start from training range only (excludes validation set)
                 start_idx = np.random.randint(self.train_start_idx, max_start)
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
 
@@ -1168,7 +1189,7 @@ class ERLTrainer:
 
             fitness_scores.append(final_fitness)
 
-            # Aggregate episode stats across all 3 slices for this agent
+            # Aggregate episode stats across all training slices for this agent
             agent_aggregate_stats = {
                 'num_trades': int(np.mean([s['num_trades'] for s in slice_episode_stats])),
                 'num_wins': int(np.mean([s['num_wins'] for s in slice_episode_stats])),
@@ -1540,18 +1561,19 @@ class ERLTrainer:
     
     def validate_agent(self, agent) -> Dict:
         """
-        Validate agent using walk-forward validation on 2 random slices.
+        Validate agent using walk-forward validation on 7 random slices.
 
         Walk-forward validation strategy:
-        - Runs agent on 2 validation slices (same slices for all agents in this generation)
-        - Returns the average of both fitness scores as "true validation fitness"
-        - This provides a conservative estimate that's robust to lucky runs
+        - Runs agent on 7 validation slices (same slices for all agents in this generation)
+        - 4 slices from quarters + 3 straddling slices between quarters
+        - Uses weighted aggregation: fitness = (0.4 * mean) + (0.6 * worst_case)
+        - This rewards consistency and penalizes agents that fail in any market condition
 
         Args:
             agent: The agent to validate
 
         Returns:
-            Validation results with 'fitness' being the average of both scores
+            Validation results with 'fitness' emphasizing worst-case performance
         """
         if agent is None:
             return {}
@@ -1559,7 +1581,7 @@ class ERLTrainer:
         if not self.current_generation_val_slices:
             raise ValueError("No validation slices generated for this generation")
 
-        # Run agent on all 2 validation slices
+        # Run agent on all 7 validation slices
         slice_results = []
         all_closed_trades = []  # Collect all closed trades from all slices
 
@@ -1599,16 +1621,20 @@ class ERLTrainer:
             if 'closed_trades' in episode_info and episode_info['closed_trades']:
                 all_closed_trades.extend(episode_info['closed_trades'])
 
-        # Extract fitness scores from both slices
+        # Extract fitness scores from all 7 slices
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Average both scores
-        validation_fitness = np.mean(fitness_scores)
+        # Weighted aggregation: emphasize worst-case performance to reward consistency
+        # 60% weight on worst slice, 40% weight on average
+        # This forces agents to raise their "floor" rather than just their "ceiling"
+        mean_score = np.mean(fitness_scores)
+        min_score = np.min(fitness_scores)
+        validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
 
         # Select one sample trade (first trade from all validation slices, if any)
         sample_trade = all_closed_trades[0] if all_closed_trades else None
 
-        # Return aggregated results (average of both fitness scores)
+        # Return aggregated results (weighted combination emphasizing worst case)
         # Also aggregate other metrics for logging
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
         total_investment = sum([r['total_investment'] for r in slice_results])
@@ -1617,6 +1643,8 @@ class ERLTrainer:
         return {
             'fitness': validation_fitness,
             'fitness_all_slices': fitness_scores,  # For debugging
+            'fitness_mean': mean_score,  # Mean of all slices (for debugging)
+            'fitness_min': min_score,  # Worst slice (for debugging)
             'win_rate': np.mean([r['win_rate'] for r in slice_results]),
             'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),
             'num_wins': int(np.mean([r['num_wins'] for r in slice_results])),
@@ -2157,22 +2185,24 @@ class ERLTrainer:
             self.writer.add_scalar('Fitness/Min', min_fitness, gen)
             self.writer.add_scalar('Fitness/Std', np.std(fitness_scores), gen)
 
-            # Log to wandb (simplified)
-            wandb.log({
-                "fitness/mean": mean_fitness,
-                "fitness/max": max_fitness,
-                "fitness/best_ever": self.best_validation_fitness if hasattr(self, 'best_validation_fitness') else float('-inf'),
-            }, step=gen)
-
             # Update best training fitness (for logging only)
             if max_fitness > self.best_fitness:
                 self.best_fitness = max_fitness
+
+            # Log comprehensive fitness metrics to wandb
+            # Note: Training fitness is calculated from evaluate_population() on training data
+            # Detailed metrics like ROI, win_rate, etc. are only available after validation
+            wandb.log({
+                "fitness/best_fitness": max_fitness,
+                "fitness/mean_fitness": mean_fitness,
+                "fitness/best_ever": self.best_fitness,
+            }, step=gen)
 
             # Generate validation slices for this generation
             print(f"\n--- Walk-Forward Validation (Generation {gen + 1}) ---")
             self.current_generation_val_slices = self.generate_validation_slices()
             self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
-            print(f"Generated 2 validation slices:")
+            print(f"Generated 7 validation slices (4 from quarters + 3 straddling):")
             for i, (start, end, _) in enumerate(self.current_generation_val_slices, 1):
                 start_date = self.data_loader.dates[start] if start < len(self.data_loader.dates) else "N/A"
                 end_date = self.data_loader.dates[end-1] if end-1 < len(self.data_loader.dates) else "N/A"
@@ -2203,6 +2233,8 @@ class ERLTrainer:
             for idx in tqdm(range(len(self.population)), desc="Validating agents"):
                 val_results = self.validate_agent_cached(self.population[idx])
                 val_fitness = val_results['fitness']
+                val_fitness_mean = val_results.get('fitness_mean', 0.0)
+                val_fitness_min = val_results.get('fitness_min', 0.0)
                 train_fitness = fitness_scores[idx]
                 agent_roi = val_results.get('roi', 0.0)
 
@@ -2259,6 +2291,8 @@ class ERLTrainer:
                     'idx': idx,
                     'training_fitness': train_fitness,
                     'validation_fitness': val_fitness,
+                    'validation_fitness_mean': val_fitness_mean,
+                    'validation_fitness_min': val_fitness_min,
                     'combined_fitness': combined_fitness,
                     'base_combined_fitness': base_combined_fitness,
                     'roi_adjustment': roi_adjustment,
@@ -2287,7 +2321,7 @@ class ERLTrainer:
             for i, result in enumerate(validation_results[:5]):
                 roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
                 quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
-                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
+                print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
 
             # Update best agent if we found a better one based on combined fitness
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
@@ -2313,6 +2347,41 @@ class ERLTrainer:
                 self._run_evaluation()
             else:
                 print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
+
+            # --- Comprehensive Validation Logging ---
+            # Calculate validation statistics across all agents
+            validation_fitness_scores = [r['validation_fitness'] for r in validation_results]
+            mean_validation_fitness = np.mean(validation_fitness_scores)
+
+            # Get best agent's detailed metrics
+            best_agent_result = validation_results[0]  # Already sorted by combined_fitness
+            best_agent_win_rate = best_agent_result['win_rate']
+            best_agent_num_trades = best_agent_result['num_trades']
+            best_agent_roi = best_agent_result['roi']
+            best_agent_quality_ratio = (best_agent_result['quality_count'] / best_agent_result['total_trades']
+                                       if best_agent_result['total_trades'] > 0 else 0.0)
+
+            # Get the best agent's per-slice fitness scores
+            best_agent_idx = best_agent_result['idx']
+            best_agent_val_results = self.validate_agent_cached(self.population[best_agent_idx])
+            best_agent_slice_scores = best_agent_val_results.get('fitness_all_slices', [])
+
+            # Log validation metrics to wandb
+            validation_log = {
+                "validation/best_fitness": best_val_fitness_this_gen,
+                "validation/mean_fitness": mean_validation_fitness,
+                "validation/best_ever": self.best_validation_fitness,
+                "validation/best_agent_roi": best_agent_roi,
+                "validation/best_agent_num_trades": best_agent_num_trades,
+                "validation/best_agent_win_rate": best_agent_win_rate,
+                "validation/best_agent_quality_ratio": best_agent_quality_ratio,
+            }
+
+            # Add per-slice scores for best agent (all 7 slices)
+            for i, score in enumerate(best_agent_slice_scores, 1):
+                validation_log[f"validation/best_agent_slice_{i}"] = score
+
+            wandb.log(validation_log, step=gen)
 
             # --- Hall of Fame Admission Logic ---
             # Build candidate list from all agents in this generation
@@ -2359,27 +2428,30 @@ class ERLTrainer:
             self.writer.add_scalar('HallOfFame/MedianROI', hof_stats['median_roi'], gen)
             self.writer.add_scalar('HallOfFame/ROIHurdleEMA', self.roi_hurdle_ema, gen)
 
+            # Calculate best ROI from Hall of Fame entries
+            hof_roi_values = [entry.roi for entry in self.hall_of_fame.entries] if len(self.hall_of_fame.entries) > 0 else [0.0]
+            hof_best_roi = float(max(hof_roi_values)) if hof_roi_values else 0.0
+
             # Calculate population ROI stats for this generation
             population_rois = [r['roi'] for r in validation_results]
-            best_agent_roi = validation_results[0]['roi'] if validation_results else 0.0
             mean_population_roi = np.mean(population_rois) if population_rois else 0.0
 
-            # Calculate quality ratio stats (quality_count / total_trades)
-            # This shows what percentage of trades met the quality threshold
-            best_agent_result = validation_results[0] if validation_results else None
-            if best_agent_result and best_agent_result['total_trades'] > 0:
-                best_agent_quality_ratio = best_agent_result['quality_count'] / best_agent_result['total_trades']
-                best_agent_quality_count = best_agent_result['quality_count']
+            # Get best quality ratio from current generation's best agent
+            # (HoF doesn't track quality_ratio, so we use current best as proxy)
+            best_agent_result_for_hof = validation_results[0] if validation_results else None
+            if best_agent_result_for_hof and best_agent_result_for_hof['total_trades'] > 0:
+                hof_best_quality_ratio = best_agent_result_for_hof['quality_count'] / best_agent_result_for_hof['total_trades']
             else:
-                best_agent_quality_ratio = 0.0
-                best_agent_quality_count = 0
+                hof_best_quality_ratio = 0.0
 
+            # Log comprehensive Hall of Fame metrics to wandb
             wandb.log({
-                "hall_of_fame/best_score": hof_stats['best_score'],
-                "hall_of_fame/min_score": hof_stats['worst_score'],
+                "hall_of_fame/min_fitness": hof_stats['worst_score'],
+                "hall_of_fame/max_fitness": hof_stats['best_score'],
+                "hall_of_fame/mean_fitness": hof_stats['mean_score'],
                 "hall_of_fame/median_roi": hof_stats['median_roi'],
-                "best_agent/roi": best_agent_roi,
-                "best_agent/quality_ratio": best_agent_quality_ratio,
+                "hall_of_fame/best_roi": hof_best_roi,
+                "hall_of_fame/best_quality_ratio": hof_best_quality_ratio,
             }, step=gen)
 
             # 2. Train agents using replay buffer
@@ -2434,27 +2506,18 @@ class ERLTrainer:
 
             # 🔍 Memory tracking after evolution
             # log_memory(f"Gen {gen+1}: After evolve_population", show_objects=True)
-            
-            # 4. Log validation metrics and check for plateau
+
+            # 4. Check for plateau and adjust mutation adaptively
+            # Run this every generation to detect plateaus quickly
+            self.check_and_adjust_mutation(self.best_validation_fitness)
+
+            # Tensorboard logging (less frequent to reduce I/O)
             if (gen + 1) % Config.LOG_FREQUENCY == 0:
-                # We already validated the best agent during selection, so use those results
-                # Re-validate the current best_agent for logging
                 if self.best_agent is not None:
                     val_results = self.validate_best_agent()
                     if val_results:
                         self.writer.add_scalar('Validation/Fitness', val_results['fitness'], gen)
                         self.writer.add_scalar('Validation/WinRate', val_results['win_rate'], gen)
-
-                        # Log best agent validation to wandb
-                        wandb.log({
-                            "best_agent/fitness": val_results['fitness'],
-                            "best_agent/win_rate": val_results['win_rate'],
-                            "best_agent/num_trades": val_results['num_trades'],
-                        }, step=gen)
-
-                        # Check for plateau and adjust mutation adaptively
-                        # Use the best validation fitness for plateau detection
-                        self.check_and_adjust_mutation(self.best_validation_fitness)
 
             # 5. Save checkpoint periodically
             if (gen + 1) % Config.SAVE_FREQUENCY == 0:

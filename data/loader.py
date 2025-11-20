@@ -35,16 +35,14 @@ class StockDataLoader:
         # Reduced dataset for model training (5 selected features: Close, RSI, MACD_Signal, TRIX, diff20DMA)
         self.data_array = None  # Shape: [num_days, num_columns, 5_features]
         self.train_indices = None
-        self.interim_val_indices = None  # For walk-forward validation during training
-        self.val_indices = None  # Holdout set for final validation
+        self.val_indices = None  # Validation set for walk-forward validation during training
         self.normalization_stats = None  # Computed by load_and_prepare()
         self.column_names = None  # Column names from DataFrame
 
         # Split point indices (set by create_train_val_split)
         self.train_end_idx = None
-        self.interim_val_start_idx = None
-        self.interim_val_end_idx = None
         self.val_start_idx = None
+        self.val_end_idx = None
         
     def load_csv(self) -> pd.DataFrame:
         """Load CSV or pickle file into pandas DataFrame."""
@@ -298,49 +296,43 @@ class StockDataLoader:
 
         return self.data_array
     
-    def create_train_val_split(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def create_train_val_split(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Split data into train, interim validation, and holdout sets (time-series aware).
+        Split data into train and validation sets (time-series aware).
 
-        Three-tier validation strategy:
+        Two-tier validation strategy:
         1. Training data: Used for training episodes only
-        2. Interim validation: Used for walk-forward validation during training (3 random slices per generation)
-        3. Holdout data: Completely secret, used only for final "highlander round" validation
+        2. Validation data: Used for walk-forward validation during training (7 slices per generation)
 
         Returns:
-            Tuple of (train_indices, interim_val_indices, holdout_indices)
+            Tuple of (train_indices, val_indices)
         """
         if self.data_array is None:
             raise ValueError("Must call extract_features() first")
 
         num_days = len(self.data_array)
 
-        # Calculate split points
-        holdout_start_idx = num_days - Config.HOLDOUT_DAYS
-        interim_val_start_idx = holdout_start_idx - Config.INTERIM_VALIDATION_DAYS
+        # Calculate split point
+        val_start_idx = num_days - Config.VALIDATION_DAYS
 
-        # Create three distinct ranges
-        self.train_indices = np.arange(0, interim_val_start_idx)
-        self.interim_val_indices = np.arange(interim_val_start_idx, holdout_start_idx)
-        self.val_indices = np.arange(holdout_start_idx, num_days)
+        # Create two distinct ranges
+        self.train_indices = np.arange(0, val_start_idx)
+        self.val_indices = np.arange(val_start_idx, num_days)
 
         # Store split points as attributes for easy access
-        self.train_end_idx = interim_val_start_idx
-        self.interim_val_start_idx = interim_val_start_idx
-        self.interim_val_end_idx = holdout_start_idx
-        self.val_start_idx = holdout_start_idx
+        self.train_end_idx = val_start_idx
+        self.val_start_idx = val_start_idx
+        self.val_end_idx = num_days
 
-        print(f"\nData Split (Three-Tier Validation Strategy):")
+        print(f"\nData Split (Two-Tier Validation Strategy):")
         print(f"  Total days: {num_days}")
-        print(f"  Training days: {len(self.train_indices)} ({self.dates[0]} to {self.dates[interim_val_start_idx-1]})")
-        print(f"  Interim validation days: {len(self.interim_val_indices)} ({self.dates[interim_val_start_idx]} to {self.dates[holdout_start_idx-1]})")
-        print(f"  Holdout days (secret): {len(self.val_indices)} ({self.dates[holdout_start_idx]} to {self.dates[-1]})")
+        print(f"  Training days: {len(self.train_indices)} ({self.dates[0]} to {self.dates[val_start_idx-1]})")
+        print(f"  Validation days: {len(self.val_indices)} ({self.dates[val_start_idx]} to {self.dates[-1]})")
         print(f"\nValidation strategy:")
         print(f"  - Training episodes: Sample from training data only")
-        print(f"  - Walk-forward validation: 3 random slices from interim validation set each generation")
-        print(f"  - Final validation: Holdout set used only for final 'highlander round'")
+        print(f"  - Walk-forward validation: 7 slices from validation set each generation (4 from quarters + 3 straddling)")
 
-        return self.train_indices, self.interim_val_indices, self.val_indices
+        return self.train_indices, self.val_indices
     
     def get_window(self, end_idx: int) -> Optional[np.ndarray]:
         """

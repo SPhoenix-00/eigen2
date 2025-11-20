@@ -17,9 +17,9 @@ class Config:
     FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
     CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
-    TRAIN_TEST_SPLIT = 0.95  # 95% train, 5% validation (6 months) - DEPRECATED: now using HOLDOUT_DAYS
-    INTERIM_VALIDATION_DAYS = 252  # Interim validation set for walk-forward validation during training
-    HOLDOUT_DAYS = 251  # Last 251 rows reserved for final "highlander round" (completely secret)
+    TRAIN_TEST_SPLIT = 0.95  # 95% train, 5% validation (6 months) - DEPRECATED
+    VALIDATION_DAYS = 503  # Validation set for walk-forward validation during training (formerly interim validation + holdout)
+    HOLDOUT_DAYS = 0  # DEPRECATED: Holdout concept removed, all validation data now used for walk-forward validation
     
     # ============ Action Space Parameters ============
     NUM_ACTIONS = NUM_INVESTABLE_STOCKS  # 108 stocks

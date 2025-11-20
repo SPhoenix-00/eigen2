@@ -4,10 +4,8 @@ Evaluation script for best agent and all Hall of Fame agents from last training 
 This script:
 1. Loads the best agent from the last run (using last_run.json or specified run name)
 2. Loads all agents from the Hall of Fame
-3. Evaluates each agent on 3 validation slices (as done in training)
-4. Evaluates on first 125 days of holdout period
-5. Evaluates on last 125 days of holdout period (most recent data)
-6. Outputs summary comparison of all agents (no detailed trades file)
+3. Evaluates each agent on 7 validation slices (as done in training: 4 from quarters + 3 straddling)
+4. Outputs summary comparison of all agents (no detailed trades file)
 """
 
 import json
@@ -60,18 +58,15 @@ class HallOfFameEvaluator:
         self.norm_stats = self.data_loader.normalization_stats
         self.train_start = 0
         self.train_end = self.data_loader.train_end_idx
-        self.interim_val_start = self.data_loader.interim_val_start_idx
-        self.interim_val_end = self.data_loader.interim_val_end_idx
-        self.holdout_start = self.data_loader.val_start_idx
-        self.holdout_end = len(self.data_array)
+        self.val_start = self.data_loader.val_start_idx
+        self.val_end = len(self.data_array)
 
         # Get stock column names
         self._load_stock_names()
 
         print(f"Data loaded: {len(self.data_array)} days")
         print(f"  Training: days 0-{self.train_end}")
-        print(f"  Interim Validation: days {self.interim_val_start}-{self.interim_val_end}")
-        print(f"  Holdout: days {self.holdout_start}-{self.holdout_end}")
+        print(f"  Validation: days {self.val_start}-{self.val_end}")
 
         # Set up checkpoint directory
         self.checkpoint_dir = Path("checkpoints") / self.run_name
@@ -154,45 +149,53 @@ class HallOfFameEvaluator:
         return agents
 
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
-        """Generate 3 random validation slices from interim validation set."""
+        """Generate 7 random validation slices from validation set (4 from quarters + 3 straddling)."""
+        # Set seed for reproducibility
         np.random.seed(42)
 
-        min_start = self.interim_val_start
-        max_start = self.interim_val_end - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
+        min_start = self.val_start
+        max_start = self.val_end - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
 
         if max_start < min_start:
-            raise ValueError(f"Not enough interim validation data")
+            raise ValueError(f"Not enough validation data")
+
+        # Divide the validation range into 4 equal segments
+        total_range = max_start - min_start + 1
+        segment_size = total_range // 4
 
         slices = []
-        for i in range(3):
-            start_idx = np.random.randint(min_start, max_start + 1)
+
+        # 1. Sample one slice from each quarter (4 slices)
+        for segment_idx in range(4):
+            # Calculate segment boundaries
+            segment_start = min_start + (segment_idx * segment_size)
+            # For the last segment, extend to max_start to avoid rounding issues
+            segment_end = max_start + 1 if segment_idx == 3 else min_start + ((segment_idx + 1) * segment_size)
+
+            # Sample one random start index from this segment
+            start_idx = np.random.randint(segment_start, segment_end)
             end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
             trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
             slices.append((start_idx, end_idx, trading_end_idx))
 
+        # 2. Sample straddling slices between quarters (3 slices)
+        for straddle_idx in range(3):
+            # Define straddling region: from halfway through quarter N to halfway through quarter N+1
+            straddle_start = min_start + (segment_size // 2) + (straddle_idx * segment_size)
+            straddle_end = min_start + (segment_size // 2) + ((straddle_idx + 1) * segment_size)
+
+            # Ensure we don't exceed max_start
+            straddle_end = min(straddle_end, max_start + 1)
+
+            # Sample one random start index from this straddling region
+            if straddle_end > straddle_start:
+                start_idx = np.random.randint(straddle_start, straddle_end)
+                end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+                slices.append((start_idx, end_idx, trading_end_idx))
+
         return slices
 
-    def get_holdout_slice(self) -> Tuple[int, int, int]:
-        """Get the first 125 days of holdout period."""
-        start_idx = self.holdout_start
-        end_idx = min(start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS,
-                      self.holdout_end)
-        trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-        return (start_idx, end_idx, trading_end_idx)
-
-    def get_holdout_end_slice(self) -> Tuple[int, int, int]:
-        """Get the last possible full episode at the very end of the holdout dataset."""
-        end_idx = self.holdout_end
-        trading_end_idx = end_idx - Config.SETTLEMENT_PERIOD_DAYS
-        start_idx = trading_end_idx - Config.TRADING_PERIOD_DAYS
-
-        if start_idx < Config.CONTEXT_WINDOW_DAYS:
-            raise ValueError(
-                f"Not enough data for end slice. Need start_idx >= {Config.CONTEXT_WINDOW_DAYS}, "
-                f"but calculated {start_idx}"
-            )
-
-        return (start_idx, end_idx, trading_end_idx)
 
     def run_episode(self, agent: DDPGAgent, start_idx: int, end_idx: int,
                    trading_end_idx: int) -> Tuple[float, Dict]:
@@ -243,15 +246,15 @@ class HallOfFameEvaluator:
 
         # Generate all slices
         val_slices = self.generate_validation_slices()
-        holdout_slice = self.get_holdout_slice()
-        holdout_end_slice = self.get_holdout_end_slice()
 
         all_slices = [
             ("Val_1", val_slices[0]),
             ("Val_2", val_slices[1]),
             ("Val_3", val_slices[2]),
-            ("Holdout", holdout_slice),
-            ("Holdout_End", holdout_end_slice),
+            ("Val_4", val_slices[3]),
+            ("Val_5", val_slices[4]),
+            ("Val_6", val_slices[5]),
+            ("Val_7", val_slices[6]),
         ]
 
         # Evaluate each agent
@@ -371,7 +374,7 @@ class HallOfFameEvaluator:
             f.write("="*80 + "\n\n")
 
             # Header
-            slice_names = ['Val_1', 'Val_2', 'Val_3', 'Holdout', 'Holdout_End', 'Average']
+            slice_names = ['Val_1', 'Val_2', 'Val_3', 'Val_4', 'Val_5', 'Val_6', 'Val_7', 'Average']
             header = f"{'Agent':<50} " + " ".join([f"{s:>12}" for s in slice_names])
             f.write(header + "\n")
             f.write("-" * len(header) + "\n")

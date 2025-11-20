@@ -3,14 +3,12 @@ Evaluation script for best agent from last training run.
 
 This script:
 1. Loads the best agent from the last run (using last_run.json or specified run name)
-2. Evaluates on 3 validation slices (as done in training)
-3. Evaluates on first 125 days of holdout period
-4. Evaluates on last 125 days of holdout period (most recent data)
-5. Outputs detailed trade information including:
+2. Evaluates on 7 validation slices (as done in training: 4 from quarters + 3 straddling)
+3. Outputs detailed trade information including:
    - Stock purchased, entry/exit dates, prices
    - Whether it was an active sell or automatic liquidation
-6. Exports results to text file and CSV
-7. Provides summary of fitness, number of trades, and win rate
+4. Exports results to text file and CSV
+5. Provides summary of fitness, number of trades, and win rate
 """
 
 import json
@@ -62,18 +60,15 @@ class AgentEvaluator:
         self.norm_stats = self.data_loader.normalization_stats
         self.train_start = 0
         self.train_end = self.data_loader.train_end_idx
-        self.interim_val_start = self.data_loader.interim_val_start_idx
-        self.interim_val_end = self.data_loader.interim_val_end_idx
-        self.holdout_start = self.data_loader.val_start_idx
-        self.holdout_end = len(self.data_array)
+        self.val_start = self.data_loader.val_start_idx
+        self.val_end = len(self.data_array)
 
         # Get stock column names
         self._load_stock_names()
 
         print(f"✓ Data loaded: {len(self.data_array)} days")
         print(f"  Training: days 0-{self.train_end}")
-        print(f"  Interim Validation: days {self.interim_val_start}-{self.interim_val_end}")
-        print(f"  Holdout: days {self.holdout_start}-{self.holdout_end}")
+        print(f"  Validation: days {self.val_start}-{self.val_end}")
 
         # Load best agent
         print(f"\nLoading best agent from run: {self.run_name}")
@@ -131,68 +126,61 @@ class AgentEvaluator:
 
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
         """
-        Generate 3 random validation slices from interim validation set.
+        Generate 7 random validation slices from validation set.
+
+        Divides validation period into 4 equal quarters, then samples:
+        - 4 slices from within each quarter
+        - 3 straddling slices between quarters
 
         Returns:
-            List of 3 tuples: (start_idx, end_idx, trading_end_idx)
+            List of 7 tuples: (start_idx, end_idx, trading_end_idx)
         """
         # Set seed for reproducibility
         np.random.seed(42)
 
-        min_start = self.interim_val_start
-        max_start = self.interim_val_end - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
+        min_start = self.val_start
+        max_start = self.val_end - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
 
         if max_start < min_start:
-            raise ValueError(f"Not enough interim validation data")
+            raise ValueError(f"Not enough validation data")
+
+        # Divide the validation range into 4 equal segments
+        total_range = max_start - min_start + 1
+        segment_size = total_range // 4
 
         slices = []
-        for i in range(3):
-            start_idx = np.random.randint(min_start, max_start + 1)
+
+        # 1. Sample one slice from each quarter (4 slices)
+        for segment_idx in range(4):
+            # Calculate segment boundaries
+            segment_start = min_start + (segment_idx * segment_size)
+            # For the last segment, extend to max_start to avoid rounding issues
+            segment_end = max_start + 1 if segment_idx == 3 else min_start + ((segment_idx + 1) * segment_size)
+
+            # Sample one random start index from this segment
+            start_idx = np.random.randint(segment_start, segment_end)
             end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
             trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
             slices.append((start_idx, end_idx, trading_end_idx))
 
+        # 2. Sample straddling slices between quarters (3 slices)
+        for straddle_idx in range(3):
+            # Define straddling region: from halfway through quarter N to halfway through quarter N+1
+            straddle_start = min_start + (segment_size // 2) + (straddle_idx * segment_size)
+            straddle_end = min_start + (segment_size // 2) + ((straddle_idx + 1) * segment_size)
+
+            # Ensure we don't exceed max_start
+            straddle_end = min(straddle_end, max_start + 1)
+
+            # Sample one random start index from this straddling region
+            if straddle_end > straddle_start:
+                start_idx = np.random.randint(straddle_start, straddle_end)
+                end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+                slices.append((start_idx, end_idx, trading_end_idx))
+
         return slices
 
-    def get_holdout_slice(self) -> Tuple[int, int, int]:
-        """
-        Get the first 125 days of holdout period.
-
-        Returns:
-            Tuple: (start_idx, end_idx, trading_end_idx)
-        """
-        start_idx = self.holdout_start
-        end_idx = min(start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS,
-                      self.holdout_end)
-        trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-        return (start_idx, end_idx, trading_end_idx)
-
-    def get_holdout_end_slice(self) -> Tuple[int, int, int]:
-        """
-        Get the last possible full episode at the very end of the holdout dataset.
-        This tests the agent on the most recent data available.
-
-        Returns:
-            Tuple: (start_idx, end_idx, trading_end_idx)
-        """
-        # End at the last day of data
-        end_idx = self.holdout_end
-
-        # Need settlement period (30 days) for position liquidation
-        trading_end_idx = end_idx - Config.SETTLEMENT_PERIOD_DAYS
-
-        # Need 125 days for trading period
-        start_idx = trading_end_idx - Config.TRADING_PERIOD_DAYS
-
-        # Verify we have enough history for context window
-        if start_idx < Config.CONTEXT_WINDOW_DAYS:
-            raise ValueError(
-                f"Not enough data for end slice. Need start_idx >= {Config.CONTEXT_WINDOW_DAYS}, "
-                f"but calculated {start_idx}"
-            )
-
-        return (start_idx, end_idx, trading_end_idx)
 
     def run_episode(self, start_idx: int, end_idx: int, trading_end_idx: int,
                    slice_name: str) -> Tuple[float, Dict, List[Dict]]:
@@ -305,7 +293,7 @@ class AgentEvaluator:
         return trades
 
     def evaluate_all_slices(self):
-        """Run evaluation on all validation slices and holdout."""
+        """Run evaluation on all validation slices."""
         print(f"\n{'='*80}")
         print("EVALUATION PROCESS")
         print(f"{'='*80}\n")
@@ -314,7 +302,7 @@ class AgentEvaluator:
         val_slices = self.generate_validation_slices()
 
         # Evaluate on validation slices
-        print("Evaluating on 3 Validation Slices...")
+        print("Evaluating on 7 Validation Slices (4 from quarters + 3 straddling)...")
         print("-" * 80)
 
         for i, (start, end, trading_end) in enumerate(val_slices, 1):
@@ -338,57 +326,6 @@ class AgentEvaluator:
             print(f"  Fitness: {fitness:.2f}, Raw P&L: ${summary.get('raw_pnl', 0.0):.2f}, ROI: {summary.get('roi', 0.0):.2f}%")
             print(f"  Trades: {summary['num_trades']}, Win Rate: {summary['win_rate']*100:.1f}%")
 
-        # Evaluate on holdout
-        print(f"\n{'='*80}")
-        print("Evaluating on Holdout Period (First 125 Days)...")
-        print("-" * 80)
-
-        start, end, trading_end = self.get_holdout_slice()
-        slice_name = "Holdout"
-        print(f"\n{slice_name}:")
-        print(f"  Period: {self.dates[start]} to {self.dates[end-1]}")
-        print(f"  Trading days: {trading_end - start}, Settlement days: {end - trading_end}")
-
-        fitness, summary, trades = self.run_episode(start, end, trading_end, slice_name)
-
-        # Store results
-        self.all_trades.extend(trades)
-        self.slice_summaries.append({
-            'slice_name': slice_name,
-            'start_date': self.dates[start],
-            'end_date': self.dates[end-1],
-            'fitness': fitness,
-            **summary
-        })
-
-        print(f"  Fitness: {fitness:.2f}, Raw P&L: ${summary.get('raw_pnl', 0.0):.2f}, ROI: {summary.get('roi', 0.0):.2f}%")
-        print(f"  Trades: {summary['num_trades']}, Win Rate: {summary['win_rate']*100:.1f}%")
-
-        # Evaluate on holdout end (most recent data)
-        print(f"\n{'='*80}")
-        print("Evaluating on Holdout Period (Last 125 Days - Most Recent Data)...")
-        print("-" * 80)
-
-        start, end, trading_end = self.get_holdout_end_slice()
-        slice_name = "Holdout_End"
-        print(f"\n{slice_name}:")
-        print(f"  Period: {self.dates[start]} to {self.dates[end-1]}")
-        print(f"  Trading days: {trading_end - start}, Settlement days: {end - trading_end}")
-
-        fitness, summary, trades = self.run_episode(start, end, trading_end, slice_name)
-
-        # Store results
-        self.all_trades.extend(trades)
-        self.slice_summaries.append({
-            'slice_name': slice_name,
-            'start_date': self.dates[start],
-            'end_date': self.dates[end-1],
-            'fitness': fitness,
-            **summary
-        })
-
-        print(f"  Fitness: {fitness:.2f}, Raw P&L: ${summary.get('raw_pnl', 0.0):.2f}, ROI: {summary.get('roi', 0.0):.2f}%")
-        print(f"  Trades: {summary['num_trades']}, Win Rate: {summary['win_rate']*100:.1f}%")
 
     def export_results(self):
         """Export results to text and CSV files."""
