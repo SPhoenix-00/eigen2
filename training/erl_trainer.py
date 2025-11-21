@@ -1059,60 +1059,60 @@ class ERLTrainer:
 
     def calculate_triad_fitness(self, stats: Dict) -> float:
         """
-        The 'Triad' Fitness Score (Original Linear QR Version)
-        Fitness = (WR^2 * QR * ROI_Sign) * log10(|PnL| + 1)
-
-        Purpose:
-        - Forces consistency (WR^2)
-        - Rewards efficiency (QR) without paralyzing the agent
-        - Scales with magnitude (Log PnL) but preserves direction (ROI Sign)
+        Triad 2.0: Stabilized Fitness Function
+        Base = Signed ROI * Log(Volume)
+        If Positive: Boosted by WR and QR
+        If Negative: Penalized by Inconsistency
         """
         total_trades = stats.get('num_trades', 0)
 
-        # 1. Handle Inactivity (Zero Trades)
-        # We apply a penalty but add the 'max_coefficient' as a bonus.
-        # This creates a 'gradient' so agents that ALMOST traded (high conviction)
-        # are ranked higher than agents that did nothing (low conviction).
+        # 1. Handle Inactivity
+        # Keep your existing gradient logic for zero trades
         if total_trades == 0:
             return -Config.ZERO_TRADES_PENALTY + stats.get('max_coefficient_during_episode', 0)
 
-        # 2. Consistency: Squared Win Rate (WR^2)
-        # We KEEP squaring this. A 55% WR is mediocre. A 70% WR is excellent.
-        # Squaring differentiates them significantly (0.30 vs 0.49).
-        win_rate = stats.get('win_rate', 0.0)
-        consistency_score = win_rate ** 2
+        # 2. Calculate Core Metrics
+        win_rate = stats.get('win_rate', 0.0) # 0.0 to 1.0
 
-        # 3. Conviction: Linear Quality Ratio (QR)
-        # A 'Quality Trade' is one that exceeds the hurdle rate (approx 0.2-0.6%)
         closed_trades = stats.get('closed_trades', [])
+        quality_threshold = 0.2 # 0.2% gain
         if closed_trades:
-            # Use a small threshold (0.2%) or the configured hurdle
-            quality_threshold = 0.2
             quality_count = sum(1 for t in closed_trades if t.get('gain_pct', 0) > quality_threshold)
-            qr_raw = quality_count / total_trades
+            qr = quality_count / total_trades
         else:
-            qr_raw = 0.0
+            qr = 0.0
 
-        # Linear QR (Not squared) to keep the agent active
-        conviction_score = qr_raw
-
-        # 4. Yield: Signed ROI (Provides the +/- Sign)
         raw_pnl = stats.get('raw_pnl', 0.0)
         total_inv = stats.get('total_investment', 0.0)
         roi_pct = (raw_pnl / total_inv * 100) if total_inv > 0 else 0.0
 
-        # Clip ROI to [-50, 50] to prevent one lucky trade from breaking the scale
-        roi_score = np.clip(roi_pct, -50, 50)
+        # Clip ROI for stability (prevent one outlier from breaking scale)
+        roi_score = np.clip(roi_pct, -25, 25)
 
-        # 5. Volume Scalar: Log Magnitude
-        # We use log10 so that making $10,000 is better than $100,
-        # but not 100x better (prevents chasing outliers).
-        # abs() ensures log is valid; roi_score provides the negative sign if needed.
-        volume_scalar = math.log10(abs(raw_pnl) + 1)
+        # 3. Volume Scalar (Log Magnitude)
+        # Adding 10 ensures log is always > 1, providing a baseline score
+        volume_scalar = math.log10(abs(raw_pnl) + 10)
 
-        # --- Final Calculation ---
-        # (WR^2 * QR * ROI) * Log(Vol)
-        fitness = (consistency_score * conviction_score * roi_score * volume_scalar) * 100.0
+        # 4. Calculate Fitness
+        if roi_score > 0:
+            # --- WINNING SCENARIO ---
+            # Base Score: ROI * Volume
+            base_score = roi_score * volume_scalar
+
+            # Boosters: Reward High WR and High QR
+            # We use (1 + x) so we don't punish a 50% WR by halving the score
+            # WR^2 is kept as a bonus multiplier to reward the "Unicorn" 70%+ behavior
+            consistency_bonus = (1.0 + (win_rate ** 2))
+            conviction_bonus = (1.0 + qr)
+
+            fitness = base_score * consistency_bonus * conviction_bonus * 10.0
+
+        else:
+            # --- LOSING SCENARIO ---
+            # Pure Pain: ROI * Volume
+            # We multiply by (2.0 - win_rate) to punish "consistent losers" less than "gamblers"
+            # Actually, simpler is better: Just strict penalization of negative ROI.
+            fitness = roi_score * volume_scalar * 10.0
 
         return float(fitness)
 
