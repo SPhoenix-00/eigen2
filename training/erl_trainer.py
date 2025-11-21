@@ -296,7 +296,8 @@ class ERLTrainer:
                             "max_holding_period": Config.MAX_HOLDING_PERIOD,
                             "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
                             "num_stocks": Config.NUM_INVESTABLE_STOCKS,
-                        }
+                        },
+                        settings=wandb.Settings(console="redirect")
                     )
                 else:
                     print("⚠ No wandb run ID found. Creating new run with same name...")
@@ -315,7 +316,8 @@ class ERLTrainer:
                             "max_holding_period": Config.MAX_HOLDING_PERIOD,
                             "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
                             "num_stocks": Config.NUM_INVESTABLE_STOCKS,
-                        }
+                        },
+                        settings=wandb.Settings(console="redirect")
                     )
 
                 self.run_name = self.resume_run_name  # Use the provided name
@@ -340,7 +342,8 @@ class ERLTrainer:
                         "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
                         "num_stocks": Config.NUM_INVESTABLE_STOCKS,
                     },
-                    resume="allow"  # Allow resuming from checkpoints
+                    resume="allow",  # Allow resuming from checkpoints
+                    settings=wandb.Settings(console="redirect")
                 )
 
                 # Create run-specific checkpoint directory using wandb run name
