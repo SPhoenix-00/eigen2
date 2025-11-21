@@ -2034,6 +2034,9 @@ class ERLTrainer:
             # Re-evaluate Hall of Fame agents by loading them from disk
             if len(self.hall_of_fame.entries) > 0:
                 print(f"\nRe-evaluating {len(self.hall_of_fame.entries)} Hall of Fame agents...")
+                print(f"HoF directory: {self.hall_of_fame.hof_dir}")
+
+                success_count = 0
                 for entry in self.hall_of_fame.entries:
                     # Load agent from HoF directory
                     agent_path = self.hall_of_fame.hof_dir / f"hof_agent_{entry.agent_id}.pth"
@@ -2048,9 +2051,14 @@ class ERLTrainer:
 
                         # Clean up
                         del hof_agent
+                        success_count += 1
                     else:
-                        print(f"  ⚠ Warning: HoF agent {entry.agent_id} file not found")
-                print(f"✓ Re-evaluated {len(self.hall_of_fame.entries)} Hall of Fame agents")
+                        print(f"  ⚠ Warning: HoF agent {entry.agent_id} file not found at {agent_path}")
+
+                if success_count > 0:
+                    print(f"✓ Re-evaluated {success_count}/{len(self.hall_of_fame.entries)} Hall of Fame agents")
+                else:
+                    print(f"⚠ No Hall of Fame agent files found - skipping HoF re-evaluation")
 
             print("\n✓ All agents re-evaluated with current reward function")
 
