@@ -18,7 +18,7 @@ class HallOfFameEntry:
     and the path to the agent's saved weights.
     """
 
-    def __init__(self, agent_id: int, validation_score: float, generation: int, roi: float = 0.0):
+    def __init__(self, agent_id: int, validation_score: float, generation: int, roi: float = 0.0, expectancy: float = 0.0):
         """
         Initialize a Hall of Fame entry.
 
@@ -27,11 +27,13 @@ class HallOfFameEntry:
             validation_score: Validation fitness that qualified this agent
             generation: Generation number when this agent was admitted
             roi: Return on Investment percentage for this agent
+            expectancy: Expectancy metric for this agent
         """
         self.agent_id = agent_id
         self.validation_score = validation_score
         self.generation = generation
         self.roi = roi
+        self.expectancy = expectancy
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -39,7 +41,8 @@ class HallOfFameEntry:
             'agent_id': self.agent_id,
             'validation_score': float(self.validation_score),
             'generation': self.generation,
-            'roi': float(self.roi)
+            'roi': float(self.roi),
+            'expectancy': float(self.expectancy)
         }
 
     @staticmethod
@@ -49,7 +52,8 @@ class HallOfFameEntry:
             agent_id=data['agent_id'],
             validation_score=data['validation_score'],
             generation=data['generation'],
-            roi=data.get('roi', 0.0)  # Default for backwards compatibility
+            roi=data.get('roi', 0.0),  # Default for backwards compatibility
+            expectancy=data.get('expectancy', 0.0)  # Default for backwards compatibility
         )
 
 
@@ -155,7 +159,7 @@ class HallOfFame:
 
         return True
 
-    def update_from_generation(self, candidates: List[Tuple[DDPGAgent, float, int, float]], generation: int) -> List[Tuple[int, float, str]]:
+    def update_from_generation(self, candidates: List[Tuple[DDPGAgent, float, int, float, float]], generation: int) -> List[Tuple[int, float, str]]:
         """
         Update Hall of Fame from a generation of candidates with aggressive admission.
 
@@ -164,7 +168,7 @@ class HallOfFame:
         2. Maintenance Phase: Cascading swaps - replace worst HoF agents with best candidates
 
         Args:
-            candidates: List of (agent, combined_score, agent_idx, roi) tuples
+            candidates: List of (agent, combined_score, agent_idx, roi, expectancy) tuples
             generation: Current generation number
 
         Returns:
@@ -181,7 +185,7 @@ class HallOfFame:
 
         # Phase 1: Initial Filling - admit all positive-score candidates if not full
         if not self.is_full():
-            for agent, score, agent_idx, roi in sorted_candidates:
+            for agent, score, agent_idx, roi, expectancy in sorted_candidates:
                 if self.is_full():
                     break
 
@@ -192,7 +196,8 @@ class HallOfFame:
                         agent_id=new_id,
                         validation_score=score,
                         generation=generation,
-                        roi=roi
+                        roi=roi,
+                        expectancy=expectancy
                     )
                     self.entries.append(entry)
 
@@ -208,7 +213,7 @@ class HallOfFame:
         # Phase 2: Cascading Swaps - even if we just filled some slots, check for replacements
         # Get remaining candidates that weren't admitted in Phase 1
         admitted_indices = {r[0] for r in results if r[2] == 'admitted'}
-        remaining_candidates = [(a, s, idx, roi) for a, s, idx, roi in sorted_candidates
+        remaining_candidates = [(a, s, idx, roi, exp) for a, s, idx, roi, exp in sorted_candidates
                                 if idx not in admitted_indices]
 
         if remaining_candidates and self.is_full():
@@ -217,7 +222,7 @@ class HallOfFame:
 
             # Cascading swap: iterate through worst HoF agents and best candidates
             swaps_made = 0
-            for candidate_agent, candidate_score, agent_idx, candidate_roi in remaining_candidates:
+            for candidate_agent, candidate_score, agent_idx, candidate_roi, candidate_expectancy in remaining_candidates:
                 if swaps_made >= len(sorted_hof):
                     break
 
@@ -248,7 +253,8 @@ class HallOfFame:
                         agent_id=new_id,
                         validation_score=candidate_score,
                         generation=generation,
-                        roi=candidate_roi
+                        roi=candidate_roi,
+                        expectancy=candidate_expectancy
                     )
                     self.entries.append(new_entry)
 

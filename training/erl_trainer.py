@@ -725,7 +725,8 @@ class ERLTrainer:
             agent_idx = result['idx']
             combined_score = result['combined_fitness']
             agent_roi = result['roi']
-            hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi))
+            agent_expectancy = result['expectancy']
+            hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy))
 
         # Add heroes to Hall of Fame
         admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
@@ -1569,7 +1570,44 @@ class ERLTrainer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
+
+    def calculate_expectancy(self, closed_trades):
+        """
+        Calculate Expectancy metric for trading performance.
+
+        Expectancy = (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
+
+        - If Expectancy > 0: The agent has a mathematical edge
+        - If Expectancy trends up: The agent is becoming a sharper trader
+        - If Expectancy is flat but PnL is up: The agent is just trading more (scaling), not getting smarter
+
+        Args:
+            closed_trades: List of closed trade dictionaries with 'gain_pct' field
+
+        Returns:
+            Expectancy value (float)
+        """
+        if not closed_trades:
+            return 0.0
+
+        # Separate wins and losses
+        wins = [t['gain_pct'] for t in closed_trades if t['gain_pct'] > 0]
+        losses = [abs(t['gain_pct']) for t in closed_trades if t['gain_pct'] <= 0]
+
+        if not wins and not losses:
+            return 0.0
+
+        avg_win = np.mean(wins) if wins else 0.0
+        avg_loss = np.mean(losses) if losses else 0.0
+
+        win_rate = len(wins) / len(closed_trades)
+        loss_rate = 1.0 - win_rate
+
+        # Expectancy = (Probability of Win * Reward) - (Probability of Loss * Risk)
+        expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+
+        return expectancy
+
     def validate_agent(self, agent) -> Dict:
         """
         Validate agent using walk-forward validation on 7 random slices.
@@ -1658,6 +1696,9 @@ class ERLTrainer:
         total_trades = total_wins + total_losses
         global_win_rate = total_wins / total_trades if total_trades > 0 else 0.0
 
+        # Calculate Expectancy metric from all closed trades
+        expectancy = self.calculate_expectancy(all_closed_trades)
+
         return {
             'fitness': validation_fitness,
             'fitness_all_slices': fitness_scores,  # For debugging
@@ -1671,6 +1712,7 @@ class ERLTrainer:
             'raw_pnl': total_raw_pnl,  # Total raw P&L across slices
             'total_investment': total_investment,  # Total investment across slices
             'roi': roi,  # ROI percentage
+            'expectancy': expectancy,  # Expectancy metric: (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
             'sample_trade': sample_trade,  # One sample trade for verification
             'closed_trades': all_closed_trades  # All closed trades for quality count calculation
         }
@@ -2433,6 +2475,7 @@ class ERLTrainer:
             best_agent_win_rate = best_agent_result['win_rate']
             best_agent_num_trades = best_agent_result['num_trades']
             best_agent_roi = best_agent_result['roi']
+            best_agent_expectancy = best_agent_result['expectancy']
             best_agent_quality_ratio = (best_agent_result['quality_count'] / best_agent_result['total_trades']
                                        if best_agent_result['total_trades'] > 0 else 0.0)
 
@@ -2449,6 +2492,7 @@ class ERLTrainer:
                 "validation/best_agent_num_trades": best_agent_num_trades,
                 "validation/best_agent_win_rate": best_agent_win_rate,
                 "validation/best_agent_quality_ratio": best_agent_quality_ratio,
+                "validation/best_agent_expectancy": best_agent_expectancy,
             }
 
             wandb.log(validation_log, step=gen)
@@ -2460,7 +2504,8 @@ class ERLTrainer:
                 agent_idx = result['idx']
                 combined_score = result['combined_fitness']
                 agent_roi = result['roi']
-                candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi))
+                agent_expectancy = result['expectancy']
+                candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy))
 
             # Use batch update with aggressive admission and cascading swaps
             admission_results = self.hall_of_fame.update_from_generation(candidates, gen)
@@ -2502,6 +2547,10 @@ class ERLTrainer:
             hof_roi_values = [entry.roi for entry in self.hall_of_fame.entries] if len(self.hall_of_fame.entries) > 0 else [0.0]
             hof_best_roi = float(max(hof_roi_values)) if hof_roi_values else 0.0
 
+            # Calculate best Expectancy from Hall of Fame entries
+            hof_expectancy_values = [entry.expectancy for entry in self.hall_of_fame.entries] if len(self.hall_of_fame.entries) > 0 else [0.0]
+            hof_best_expectancy = float(max(hof_expectancy_values)) if hof_expectancy_values else 0.0
+
             # Calculate population ROI stats for this generation
             population_rois = [r['roi'] for r in validation_results]
             mean_population_roi = np.mean(population_rois) if population_rois else 0.0
@@ -2522,6 +2571,7 @@ class ERLTrainer:
                 "hall_of_fame/median_roi": hof_stats['median_roi'],
                 "hall_of_fame/best_roi": hof_best_roi,
                 "hall_of_fame/best_quality_ratio": hof_best_quality_ratio,
+                "hall_of_fame/best_expectancy": hof_best_expectancy,
                 "mutation/rate": self.current_mutation_rate,
                 "mutation/std": self.current_mutation_std,
                 "mutation/plateau_detected": int(self.plateau_detected),
