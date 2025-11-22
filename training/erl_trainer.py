@@ -1914,7 +1914,7 @@ class ERLTrainer:
 
         # Sync to cloud storage in background (non-blocking)
         self.cloud_sync.sync_checkpoints(str(checkpoint_dir), background=True,
-                                        exclude_patterns=["replay_buffer"])
+                                        exclude_patterns=["buffer_storage"])
         print(f"✓ Saved & syncing to cloud")
 
     def load_checkpoint(self):
