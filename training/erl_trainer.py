@@ -713,7 +713,8 @@ class ERLTrainer:
                 'idx': idx,
                 'combined_fitness': combined_fitness,
                 'roi': agent_roi,
-                'raw_pnl': val_results.get('raw_pnl', 0.0)
+                'raw_pnl': val_results.get('raw_pnl', 0.0),
+                'expectancy': val_results.get('expectancy', 0.0)
             })
 
         # Sort by combined fitness and add to HoF
@@ -2406,7 +2407,8 @@ class ERLTrainer:
                     'total_trades': total_trades,  # Total across all slices (for quality ratio)
                     'quality_count': quality_count,
                     'raw_pnl': val_results.get('raw_pnl', 0.0),
-                    'roi': agent_roi
+                    'roi': agent_roi,
+                    'expectancy': val_results.get('expectancy', 0.0)
                 })
 
                 # Track best combined fitness in this generation
