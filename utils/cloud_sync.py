@@ -308,13 +308,17 @@ class CloudSync:
 
         files_queued = 0
         for root, dirs, files in os.walk(local_dir):
-            for file in files:
-                # Skip excluded files
-                if any(pattern in file for pattern in exclude_patterns):
-                    continue
+            # Skip excluded directories (modify dirs in-place to prevent os.walk from entering them)
+            dirs[:] = [d for d in dirs if not any(pattern in d for pattern in exclude_patterns)]
 
+            for file in files:
                 local_path = os.path.join(root, file)
                 relative_path = os.path.relpath(local_path, local_dir)
+
+                # Skip excluded files (check full relative path, not just filename)
+                if any(pattern in relative_path for pattern in exclude_patterns):
+                    continue
+
                 cloud_path = f"{cloud_prefix}/{relative_path}".replace("\\", "/")
                 self.upload_file(local_path, cloud_path, background=background)
                 files_queued += 1
