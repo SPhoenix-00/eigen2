@@ -86,7 +86,7 @@ def get_actual_files(storage_dir: Path) -> Set[Path]:
     return actual_files
 
 
-def identify_orphans(valid_filenames: Set[str], actual_files: Set[Path]) -> Tuple[Set[Path], Set[str]]:
+def identify_orphans(valid_filenames: Set[str], actual_files: Set[Path], verbose: bool = False) -> Tuple[Set[Path], Set[str]]:
     """
     Compare valid filenames against actual files to find orphans and missing files.
     Uses filename-only comparison to avoid absolute/relative path mismatches.
@@ -94,6 +94,7 @@ def identify_orphans(valid_filenames: Set[str], actual_files: Set[Path]) -> Tupl
     Args:
         valid_filenames: Set of filenames that SHOULD exist (from metadata)
         actual_files: Set of Path objects that actually exist on disk
+        verbose: If True, print progress updates
 
     Returns:
         Tuple of (orphaned_files, missing_filenames)
@@ -101,15 +102,33 @@ def identify_orphans(valid_filenames: Set[str], actual_files: Set[Path]) -> Tupl
         - missing_filenames: Filenames in metadata but not on disk
     """
     orphaned = set()
+    total_files = len(actual_files)
+
+    if verbose and total_files > 0:
+        print(f"  Checking {total_files:,} files on disk against metadata...")
 
     # Check every file on disk - if its name is not in valid set, it's orphaned
-    for file_path in actual_files:
+    for idx, file_path in enumerate(actual_files, 1):
         if file_path.name not in valid_filenames:
             orphaned.add(file_path)
+
+        # Progress reporting for large datasets
+        if verbose and total_files > 10000:
+            # Report every 50k files
+            if idx % 50000 == 0:
+                percent = (idx / total_files) * 100
+                print(f"    Progress: {idx:,}/{total_files:,} files checked ({percent:.1f}%) - {len(orphaned):,} orphans found so far")
+
+    if verbose:
+        print(f"  ✓ Completed checking all files on disk")
+        print(f"  Identifying missing files (in metadata but not on disk)...")
 
     # Calculate missing (inverse check) - filenames in metadata but not on disk
     actual_filenames = {f.name for f in actual_files}
     missing = valid_filenames - actual_filenames
+
+    if verbose:
+        print(f"  ✓ Completed missing file check")
 
     return orphaned, missing
 
@@ -267,7 +286,7 @@ def cleanup_orphans(run_name: str, dry_run: bool = False, verbose: bool = True) 
     if verbose:
         print("\nStep 4: Comparing files (by filename only)...")
 
-    orphaned_files, missing_filenames = identify_orphans(valid_filenames, actual_files)
+    orphaned_files, missing_filenames = identify_orphans(valid_filenames, actual_files, verbose=verbose)
 
     # Calculate sizes
     orphaned_size = calculate_file_sizes(orphaned_files)
