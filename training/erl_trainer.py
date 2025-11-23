@@ -33,6 +33,7 @@ from erl.hall_of_fame import HallOfFame
 from utils.config import Config
 from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress, ResourceTracker
 from utils.cloud_sync import get_cloud_sync_from_env
+from utils.cleanup_orphans import cleanup_orphans
 from torch.utils.data import DataLoader
 # from utils.memory_profiler import get_profiler, log_memory  # Memory profiling disabled
 
@@ -2647,7 +2648,28 @@ class ERLTrainer:
             # 5. Save checkpoint periodically
             if (gen + 1) % Config.SAVE_FREQUENCY == 0:
                 self.save_checkpoint()
-            
+
+            # 6. Cleanup orphaned buffer files every 5 generations
+            if (gen + 1) % 5 == 0:
+                print(f"\n--- Cleaning up orphaned buffer files (Generation {gen + 1}) ---")
+                try:
+                    cleanup_result = cleanup_orphans(
+                        run_name=self.run_name,
+                        dry_run=False,
+                        verbose=False  # Keep output minimal during training
+                    )
+                    if cleanup_result['success'] and cleanup_result['orphaned_count'] > 0:
+                        deleted = cleanup_result['deleted_count']
+                        orphaned = cleanup_result['orphaned_count']
+                        print(f"  ✓ Cleaned up {deleted}/{orphaned} orphaned buffer files")
+                    elif cleanup_result['success']:
+                        print(f"  ✓ No orphaned files found - buffer storage is clean")
+                    else:
+                        print(f"  ⚠ Cleanup failed: {cleanup_result.get('error', 'unknown error')}")
+                except Exception as e:
+                    print(f"  ⚠ Cleanup error: {e}")
+                    print("  Continuing training...")
+
             # Generation time
             gen_time = time.time() - gen_start_time
             self.generation_times.append(gen_time)
