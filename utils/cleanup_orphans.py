@@ -133,23 +133,39 @@ def identify_orphans(valid_filenames: Set[str], actual_files: Set[Path], verbose
     return orphaned, missing
 
 
-def calculate_file_sizes(files: Set[Path]) -> int:
+def calculate_file_sizes(files: Set[Path], verbose: bool = False, label: str = "files") -> int:
     """
     Calculate total size of files in bytes.
 
     Args:
         files: Set of file paths
+        verbose: If True, print progress updates
+        label: Description of files being measured (for progress messages)
 
     Returns:
         Total size in bytes
     """
     total_size = 0
-    for file_path in files:
+    total_files = len(files)
+
+    if verbose and total_files > 10000:
+        print(f"  Calculating size of {total_files:,} {label}...")
+
+    for idx, file_path in enumerate(files, 1):
         try:
             if file_path.exists():
                 total_size += file_path.stat().st_size
         except OSError:
             pass
+
+        # Progress reporting for large datasets
+        if verbose and total_files > 10000 and idx % 50000 == 0:
+            percent = (idx / total_files) * 100
+            print(f"    Progress: {idx:,}/{total_files:,} files measured ({percent:.1f}%)")
+
+    if verbose and total_files > 10000:
+        print(f"  ✓ Completed size calculation for {label}")
+
     return total_size
 
 
@@ -170,7 +186,7 @@ def format_size(bytes_size: int) -> str:
     return f"{bytes_size:.1f} PB"
 
 
-def delete_orphans(orphaned_files: Set[Path], dry_run: bool = False) -> Tuple[int, int, int]:
+def delete_orphans(orphaned_files: Set[Path], dry_run: bool = False) -> Tuple[int, int]:
     """
     Delete orphaned files from disk.
 
@@ -179,27 +195,21 @@ def delete_orphans(orphaned_files: Set[Path], dry_run: bool = False) -> Tuple[in
         dry_run: If True, only simulate deletion without actually deleting
 
     Returns:
-        Tuple of (deleted_count, failed_count, bytes_freed)
+        Tuple of (deleted_count, failed_count)
     """
     deleted_count = 0
     failed_count = 0
-    bytes_freed = 0
 
     for file_path in orphaned_files:
         try:
-            # Get size before deletion
-            file_size = file_path.stat().st_size if file_path.exists() else 0
-
             if not dry_run:
                 os.remove(file_path)
-
             deleted_count += 1
-            bytes_freed += file_size
         except OSError as e:
             print(f"  ⚠ Failed to delete {file_path.name}: {e}")
             failed_count += 1
 
-    return deleted_count, failed_count, bytes_freed
+    return deleted_count, failed_count
 
 
 def cleanup_orphans(run_name: str, dry_run: bool = False, verbose: bool = True) -> Dict:
@@ -288,18 +298,13 @@ def cleanup_orphans(run_name: str, dry_run: bool = False, verbose: bool = True) 
 
     orphaned_files, missing_filenames = identify_orphans(valid_filenames, actual_files, verbose=verbose)
 
-    # Calculate sizes
-    orphaned_size = calculate_file_sizes(orphaned_files)
-
-    # Calculate valid (matched) files - files on disk whose names are in valid set
+    # Calculate matched files (for reporting only)
     actual_filenames = {f.name for f in actual_files}
     matched_filenames = valid_filenames & actual_filenames
-    matched_files = {f for f in actual_files if f.name in matched_filenames}
-    valid_size = calculate_file_sizes(matched_files)
+    matched_count = len(matched_filenames)
 
     if verbose:
-        print(f"  ✓ Orphaned files (on disk but not in metadata): {len(orphaned_files):,}")
-        print(f"    Total size: {format_size(orphaned_size)}")
+        print(f"\n  ✓ Orphaned files (on disk but not in metadata): {len(orphaned_files):,}")
 
         if missing_filenames:
             print(f"  ⚠ Missing files (in metadata but not on disk): {len(missing_filenames):,}")
@@ -307,32 +312,28 @@ def cleanup_orphans(run_name: str, dry_run: bool = False, verbose: bool = True) 
                 for missing_filename in list(missing_filenames)[:5]:
                     print(f"    - {missing_filename}")
 
-        print(f"  ✓ Valid files (matched): {len(matched_files):,}")
-        print(f"    Total size: {format_size(valid_size)}")
+        print(f"  ✓ Valid files (matched): {matched_count:,}")
 
     # Step 5: Delete orphans (or simulate)
     if orphaned_files:
         if verbose:
             print(f"\nStep 5: {'Simulating' if dry_run else 'Deleting'} orphaned files...")
 
-        deleted_count, failed_count, bytes_freed = delete_orphans(orphaned_files, dry_run=dry_run)
+        deleted_count, failed_count = delete_orphans(orphaned_files, dry_run=dry_run)
 
         if verbose:
             if dry_run:
                 print(f"  ✓ Would delete {deleted_count:,} orphaned files")
-                print(f"  ✓ Would free {format_size(bytes_freed)} of disk space")
             else:
                 print(f"  ✓ Deleted {deleted_count:,} orphaned files")
                 if failed_count > 0:
                     print(f"  ⚠ Failed to delete {failed_count:,} files")
-                print(f"  ✓ Freed {format_size(bytes_freed)} of disk space")
     else:
         if verbose:
             print("\nStep 5: No orphaned files found!")
             print("  ✓ Buffer storage is clean")
         deleted_count = 0
         failed_count = 0
-        bytes_freed = 0
 
     # Summary
     if verbose:
@@ -344,7 +345,6 @@ def cleanup_orphans(run_name: str, dry_run: bool = False, verbose: bool = True) 
         print(f"Orphaned files {'that would be' if dry_run else ''} deleted: {deleted_count:,}")
         if failed_count > 0:
             print(f"Failed deletions: {failed_count:,}")
-        print(f"Disk space {'that would be' if dry_run else ''} freed: {format_size(bytes_freed)}")
         print("="*60 + "\n")
 
     return {
@@ -355,7 +355,6 @@ def cleanup_orphans(run_name: str, dry_run: bool = False, verbose: bool = True) 
         'missing_count': len(missing_filenames),
         'deleted_count': deleted_count,
         'failed_count': failed_count,
-        'bytes_freed': bytes_freed,
         'dry_run': dry_run
     }
 
