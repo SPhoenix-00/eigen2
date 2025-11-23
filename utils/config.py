@@ -19,7 +19,14 @@ class Config:
     CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
     TRAIN_TEST_SPLIT = 0.95  # 95% train, 5% validation (6 months) - DEPRECATED
     VALIDATION_DAYS = 503  # Validation set for walk-forward validation during training (formerly interim validation + holdout)
-    HOLDOUT_DAYS = 0  # DEPRECATED: Holdout concept removed, all validation data now used for walk-forward validation
+
+    # ============ Committee Holdout Parameters ============
+    # Holdout period: Data that is NEVER seen during training, reserved for committee validation
+    # This is the "true test set" for evaluating the committee in committee.py
+    COMMITTEE_HOLDOUT_DAYS = 252  # 1 year of holdout data (approximately 1 trading year)
+    # Holdout will be the LAST N days of the dataset
+    # Training will use all data EXCEPT the holdout period
+    # Example: If dataset has 5000 days, training uses days 0-4747, holdout is days 4748-4999
     
     # ============ Action Space Parameters ============
     NUM_ACTIONS = NUM_INVESTABLE_STOCKS  # 108 stocks
