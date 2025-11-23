@@ -1,0 +1,41 @@
+
+######################################################################
+# CLEANUP ORPHANS - SAFETY TEST SUITE
+######################################################################
+======================================================================
+TEST: Path Mismatch Safety
+======================================================================
+
+Scenario: Metadata contains absolute paths, but we scan with relative paths
+----------------------------------------------------------------------
+
+Valid filenames in metadata: 5
+  - transition_0.pkl.gz
+  - transition_1.pkl.gz
+  - transition_100.pkl.gz
+  - transition_2.pkl.gz
+  - transition_500.pkl.gz
+
+Actual files on disk: 7
+  - checkpoints\run-123\buffer_storage\transition_0.pkl.gz
+  - checkpoints\run-123\buffer_storage\transition_1.pkl.gz
+  - checkpoints\run-123\buffer_storage\transition_100.pkl.gz
+  - checkpoints\run-123\buffer_storage\transition_1234.pkl.gz
+  - checkpoints\run-123\buffer_storage\transition_2.pkl.gz
+  - checkpoints\run-123\buffer_storage\transition_500.pkl.gz
+  - checkpoints\run-123\buffer_storage\transition_999.pkl.gz
+
+======================================================================
+RESULTS
+======================================================================
+Traceback (most recent call last):
+  File "c:\Users\antoi\Documents\GitHub\eigen2\test_cleanup_safety.py", line 178, in <module>
+    results.append(("Path Mismatch Safety", test_path_mismatch_safety()))
+                                            ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "c:\Users\antoi\Documents\GitHub\eigen2\test_cleanup_safety.py", line 55, in test_path_mismatch_safety
+    print(f"\n\u2713 Orphaned files detected: {len(orphaned_files)}")
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\antoi\AppData\Local\Programs\Python\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2713' in position 2: character maps to <undefined>

@@ -18,6 +18,7 @@ from datetime import datetime
 from data.loader import StockDataLoader
 from training.erl_trainer import ERLTrainer
 from utils.config import Config
+from utils.cleanup_orphans import cleanup_orphans
 
 
 class TeeLogger:
@@ -129,6 +130,12 @@ def main():
             help='Path to a Hall of Fame directory. Loads all agents, evaluates them with current '
                  'reward function, and selects best 32 as initial population. Uses reduced mutant ratio.'
         )
+        parser.add_argument(
+            '--cleanup',
+            action='store_true',
+            help='Clean up orphaned replay buffer files before resuming. Use with --resume or --resume-run. '
+                 'Scans buffer_storage directory and removes files not tracked in metadata (zombie files from crashes).'
+        )
         args = parser.parse_args()
         # --------------------------------
 
@@ -176,6 +183,28 @@ def main():
                     print("Starting new training run instead.")
             else:
                 print("⚠ No last_run.json found. Starting new training run.")
+
+        # Run cleanup if requested (must have a resume_run_name)
+        if args.cleanup:
+            if resume_run_name:
+                print("\n" + "="*60)
+                print("Phase 1.5: Cleanup Orphaned Buffer Files")
+                print("="*60)
+                try:
+                    cleanup_result = cleanup_orphans(
+                        run_name=resume_run_name,
+                        dry_run=False,
+                        verbose=True
+                    )
+                    if not cleanup_result['success']:
+                        print(f"⚠ Cleanup failed: {cleanup_result.get('error', 'unknown error')}")
+                        print("Continuing with training anyway...")
+                except Exception as e:
+                    print(f"⚠ Cleanup error: {e}")
+                    print("Continuing with training anyway...")
+            else:
+                print("\n⚠ WARNING: --cleanup requires --resume or --resume-run")
+                print("Ignoring --cleanup flag.\n")
 
         # Create trainer (pass resume_run_name and leverage flag if resuming)
         trainer = ERLTrainer(

@@ -26,7 +26,8 @@
       "Bash(set:*)",
       "Bash(git show:*)",
       "Bash(git rm:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(test_results.txt)"
     ],
     "deny": [],
     "ask": []

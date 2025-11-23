@@ -1,0 +1,33 @@
+============================================================
+Project Eigen 2: ERL Stock Trading
+Logging to: evaluation_results\training_log_20251122_192549.txt
+============================================================
+usage: main.py [-h] [--resume] [--resume-run RUN_NAME] [--leverage]
+               [--consistency] [--heroes HOF_DIR] [--cleanup]
+
+Run Project Eigen 2 ERL Training
+
+options:
+  -h, --help            show this help message and exit
+  --resume              Resume training from the last run (reads from
+                        last_run.json). This will download checkpoints from
+                        GCS and reconnect to the wandb run.
+  --resume-run RUN_NAME
+                        Resume training from a specific wandb run (e.g.,
+                        "azure-thunder-123"). Overrides --resume. Useful for
+                        resuming older runs.
+  --leverage            Use with --resume to enable leverage mode. Replaces
+                        bottom 5 agents with top 5 Hall of Fame agents
+                        modified to trade with 1.5x coefficients for 5
+                        generations.
+  --consistency         Enable consistency mode. Evaluates agents over 5
+                        episodes with sum (not avg), and magnifies losses to
+                        focus training on reducing drawdowns.
+  --heroes HOF_DIR      Path to a Hall of Fame directory. Loads all agents,
+                        evaluates them with current reward function, and
+                        selects best 32 as initial population. Uses reduced
+                        mutant ratio.
+  --cleanup             Clean up orphaned replay buffer files before resuming.
+                        Use with --resume or --resume-run. Scans
+                        buffer_storage directory and removes files not tracked
+                        in metadata (zombie files from crashes).
