@@ -105,52 +105,96 @@ def bootstrap_expectancy(gains, rounds=BOOTSTRAP_ROUNDS):
 
 def verify_data_split(loader):
     """
-    Verifies that the holdout period is properly configured and separate from training.
-    Uses Config.COMMITTEE_HOLDOUT_DAYS to compute the holdout period.
+    Verifies THREE-TIER split: Training → Validation → Holdout
+
+    Checks that:
+    1. Loader properly excludes holdout from training/validation
+    2. Holdout period matches Config.COMMITTEE_HOLDOUT_DAYS
+    3. No overlap between training, validation, and holdout
 
     Returns: (is_valid, error_message, holdout_info_dict)
     """
     total_days = len(loader.data_array_full)
 
     # Check minimum dataset size
-    min_required = Config.CONTEXT_WINDOW_DAYS + Config.COMMITTEE_HOLDOUT_DAYS + Config.MIN_HOLDING_PERIOD
+    min_required = Config.CONTEXT_WINDOW_DAYS + Config.VALIDATION_DAYS + Config.COMMITTEE_HOLDOUT_DAYS + Config.MIN_HOLDING_PERIOD
     if total_days < min_required:
         return False, (
             f"Dataset too small: {total_days} days\n"
             f"  Need at least {min_required} days:\n"
             f"    - Context: {Config.CONTEXT_WINDOW_DAYS}\n"
+            f"    - Validation: {Config.VALIDATION_DAYS}\n"
             f"    - Holdout: {Config.COMMITTEE_HOLDOUT_DAYS}\n"
             f"    - Min holding: {Config.MIN_HOLDING_PERIOD}"
         ), None
 
-    # Compute holdout indices (last N days)
-    holdout_start = total_days - Config.COMMITTEE_HOLDOUT_DAYS
+    # Compute expected holdout indices (last N days)
+    expected_holdout_start = total_days - Config.COMMITTEE_HOLDOUT_DAYS
     holdout_end = total_days - 1
 
-    # Determine training end
-    # If loader has explicit train_end_idx, use it. Otherwise compute it.
-    if hasattr(loader, 'train_end_idx') and loader.train_end_idx is not None:
-        train_end = loader.train_end_idx
-        print(f"Using loader.train_end_idx: {train_end}")
-    else:
-        # Default: everything before holdout is available for training
-        # Subtract MIN_HOLDING_PERIOD to ensure we have data for forward returns
-        train_end = holdout_start - 1 - Config.MIN_HOLDING_PERIOD
-        print(f"Computed train_end_idx: {train_end} (holdout_start - MIN_HOLDING_PERIOD - 1)")
+    # Verify loader has proper train_end_idx set
+    if not hasattr(loader, 'train_end_idx') or loader.train_end_idx is None:
+        return False, (
+            "Loader missing train_end_idx!\n"
+            "  The data loader must call create_train_val_split() which sets this attribute.\n"
+            "  This ensures training data excludes the committee holdout."
+        ), None
 
+    train_end = loader.train_end_idx
     train_start = 0
     train_size = train_end - train_start + 1
-    holdout_size = Config.COMMITTEE_HOLDOUT_DAYS
-    gap = holdout_start - train_end - 1
 
-    # Verify no overlap
-    if holdout_start <= train_end:
+    # Verify loader has validation indices
+    if not hasattr(loader, 'val_end_idx') or loader.val_end_idx is None:
+        return False, "Loader missing val_end_idx! Must call create_train_val_split() first.", None
+
+    val_start = loader.val_start_idx
+    val_end = loader.val_end_idx
+    val_size = val_end - val_start + 1
+
+    # CRITICAL: Verify validation doesn't overlap with holdout
+    if val_end >= expected_holdout_start:
         return False, (
-            f"Holdout overlaps with training!\n"
-            f"  Training ends at: {train_end}\n"
-            f"  Holdout starts at: {holdout_start}\n"
-            f"  Gap: {gap} days (NEGATIVE - OVERLAP DETECTED!)"
+            f"❌ VALIDATION OVERLAPS WITH HOLDOUT!\n"
+            f"  Validation ends at: {val_end}\n"
+            f"  Holdout starts at: {expected_holdout_start}\n"
+            f"  This means agents saw holdout data during training!\n"
+            f"\n"
+            f"  Fix: Update data/loader.py to exclude holdout:\n"
+            f"    holdout_start = num_days - Config.COMMITTEE_HOLDOUT_DAYS\n"
+            f"    val_end_idx = holdout_start - 1"
         ), None
+
+    # Verify no gap between validation and holdout (strict adjacency)
+    gap_val_holdout = expected_holdout_start - val_end - 1
+    if gap_val_holdout != 0:
+        return False, (
+            f"Gap detected between validation and holdout: {gap_val_holdout} days\n"
+            f"  Validation ends: {val_end}\n"
+            f"  Holdout starts: {expected_holdout_start}\n"
+            f"  These should be adjacent (val_end + 1 = holdout_start)"
+        ), None
+
+    # Verify no gap between training and validation (strict adjacency)
+    gap_train_val = val_start - train_end - 1
+    if gap_train_val != 0:
+        return False, (
+            f"Gap detected between training and validation: {gap_train_val} days\n"
+            f"  Training ends: {train_end}\n"
+            f"  Validation starts: {val_start}\n"
+            f"  These should be adjacent (train_end + 1 = val_start)"
+        ), None
+
+    # Verify sizes match Config
+    if val_size != Config.VALIDATION_DAYS:
+        return False, (
+            f"Validation size mismatch!\n"
+            f"  Expected: {Config.VALIDATION_DAYS} days\n"
+            f"  Actual: {val_size} days\n"
+            f"  Check data/loader.py split logic."
+        ), None
+
+    holdout_size = Config.COMMITTEE_HOLDOUT_DAYS
 
     # Verify minimum sizes
     if train_size < Config.CONTEXT_WINDOW_DAYS:
@@ -161,20 +205,23 @@ def verify_data_split(loader):
 
     # Package holdout info for later use
     holdout_info = {
-        'holdout_start': holdout_start,
+        'holdout_start': expected_holdout_start,
         'holdout_end': holdout_end,
         'train_start': train_start,
         'train_end': train_end,
-        'gap': gap
+        'val_start': val_start,
+        'val_end': val_end,
+        'gap': 0  # No gaps in strict three-tier split
     }
 
-    print("✅ Data Split Verification PASSED")
-    print(f"  Total Days:     {total_days:,}")
+    print("✅ THREE-TIER DATA SPLIT VERIFICATION PASSED")
+    print(f"\n  Total Days:     {total_days:,}")
     print(f"  Training:       {train_size:,} days (indices {train_start:,} to {train_end:,})")
-    print(f"  Gap:            {gap:,} days")
-    print(f"  Holdout:        {holdout_size:,} days (indices {holdout_start:,} to {holdout_end:,})")
-    print(f"  Train/Holdout:  {train_size/holdout_size:.1f}x ratio")
-    print(f"\n  ⚠ CRITICAL: Ensure your agents were trained ONLY on data up to index {train_end}")
+    print(f"  Validation:     {val_size:,} days (indices {val_start:,} to {val_end:,})")
+    print(f"  Holdout:        {holdout_size:,} days (indices {expected_holdout_start:,} to {holdout_end:,})")
+    print(f"\n  ✓ No overlap detected")
+    print(f"  ✓ Strict adjacency verified (no gaps)")
+    print(f"  ✓ Holdout is completely separate from training/validation")
 
     return True, None, holdout_info
 

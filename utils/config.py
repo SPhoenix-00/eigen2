@@ -17,16 +17,21 @@ class Config:
     FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
     CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
-    TRAIN_TEST_SPLIT = 0.95  # 95% train, 5% validation (6 months) - DEPRECATED
-    VALIDATION_DAYS = 503  # Validation set for walk-forward validation during training (formerly interim validation + holdout)
+    TRAIN_TEST_SPLIT = 0.95  # DEPRECATED - Use VALIDATION_DAYS and COMMITTEE_HOLDOUT_DAYS instead
 
-    # ============ Committee Holdout Parameters ============
-    # Holdout period: Data that is NEVER seen during training, reserved for committee validation
-    # This is the "true test set" for evaluating the committee in committee.py
-    COMMITTEE_HOLDOUT_DAYS = 252  # 1 year of holdout data (approximately 1 trading year)
-    # Holdout will be the LAST N days of the dataset
-    # Training will use all data EXCEPT the holdout period
-    # Example: If dataset has 5000 days, training uses days 0-4747, holdout is days 4748-4999
+    # ============ Data Split Configuration ============
+    # STRICT SEPARATION: Training → Validation → Holdout (no overlap)
+    #
+    # Example for 5000-day dataset:
+    #   Training:   Days 0-4244    (4245 days) ← Used for training episodes
+    #   Validation: Days 4245-4747 (503 days)  ← Used for walk-forward validation during training
+    #   Holdout:    Days 4748-4999 (252 days)  ← ONLY for committee testing (NEVER seen by agents)
+    #
+    VALIDATION_DAYS = 503  # Days reserved for walk-forward validation during training
+    COMMITTEE_HOLDOUT_DAYS = 252  # Days reserved EXCLUSIVELY for committee validation
+
+    # Total reserved days: VALIDATION_DAYS + COMMITTEE_HOLDOUT_DAYS = 755 days
+    # Training will use: (total_days - 755 - MIN_HOLDING_PERIOD) days
     
     # ============ Action Space Parameters ============
     NUM_ACTIONS = NUM_INVESTABLE_STOCKS  # 108 stocks

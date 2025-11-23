@@ -300,9 +300,12 @@ class StockDataLoader:
         """
         Split data into train and validation sets (time-series aware).
 
-        Two-tier validation strategy:
+        THREE-TIER STRATEGY (strict separation):
         1. Training data: Used for training episodes only
         2. Validation data: Used for walk-forward validation during training (7 slices per generation)
+        3. Committee holdout: Reserved EXCLUSIVELY for committee.py (NEVER used during training)
+
+        The last Config.COMMITTEE_HOLDOUT_DAYS are completely excluded from training/validation.
 
         Returns:
             Tuple of (train_indices, val_indices)
@@ -312,25 +315,36 @@ class StockDataLoader:
 
         num_days = len(self.data_array)
 
-        # Calculate split point
-        val_start_idx = num_days - Config.VALIDATION_DAYS
+        # Reserve holdout days for committee (last N days)
+        holdout_start = num_days - Config.COMMITTEE_HOLDOUT_DAYS
 
-        # Create two distinct ranges
-        self.train_indices = np.arange(0, val_start_idx)
-        self.val_indices = np.arange(val_start_idx, num_days)
+        # Validation comes before holdout
+        val_start_idx = holdout_start - Config.VALIDATION_DAYS
+
+        # Training is everything before validation
+        train_end_idx = val_start_idx
+
+        # Create three distinct ranges
+        self.train_indices = np.arange(0, train_end_idx)
+        self.val_indices = np.arange(val_start_idx, holdout_start)
+        # Committee holdout indices NOT stored here (committee.py computes them)
 
         # Store split points as attributes for easy access
-        self.train_end_idx = val_start_idx
+        self.train_end_idx = train_end_idx - 1  # Last training index
         self.val_start_idx = val_start_idx
-        self.val_end_idx = num_days
+        self.val_end_idx = holdout_start - 1  # Last validation index
 
-        print(f"\nData Split (Two-Tier Validation Strategy):")
+        print(f"\nData Split (Three-Tier Strategy with Committee Holdout):")
         print(f"  Total days: {num_days}")
-        print(f"  Training days: {len(self.train_indices)} ({self.dates[0]} to {self.dates[val_start_idx-1]})")
-        print(f"  Validation days: {len(self.val_indices)} ({self.dates[val_start_idx]} to {self.dates[-1]})")
-        print(f"\nValidation strategy:")
-        print(f"  - Training episodes: Sample from training data only")
-        print(f"  - Walk-forward validation: 7 slices from validation set each generation (4 from quarters + 3 straddling)")
+        print(f"  Training days:   {len(self.train_indices):>4} (indices {self.train_indices[0]:>4} to {self.train_indices[-1]:>4}) - {self.dates[0]} to {self.dates[train_end_idx-1]}")
+        print(f"  Validation days: {len(self.val_indices):>4} (indices {val_start_idx:>4} to {holdout_start-1:>4}) - {self.dates[val_start_idx]} to {self.dates[holdout_start-1]}")
+        print(f"  Holdout days:    {Config.COMMITTEE_HOLDOUT_DAYS:>4} (indices {holdout_start:>4} to {num_days-1:>4}) - {self.dates[holdout_start]} to {self.dates[-1]}")
+        print(f"\n  ⚠ CRITICAL: Holdout data is NEVER used during training!")
+        print(f"             It is reserved EXCLUSIVELY for committee.py")
+        print(f"\n  Validation strategy:")
+        print(f"    - Training episodes: Sample from training data only")
+        print(f"    - Walk-forward validation: 7 slices from validation set each generation")
+        print(f"    - Committee testing: Holdout set (separate from training/validation)")
 
         return self.train_indices, self.val_indices
     
