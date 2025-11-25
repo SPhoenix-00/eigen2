@@ -171,8 +171,9 @@ def _run_episode_worker(args):
 
     # Calculate final fitness
     final_fitness = float(cumulative_reward)
+    # Apply zero trades penalty from episode summary (mode-specific)
     if episode_summary['num_trades'] == 0:
-        final_fitness -= Config.ZERO_TRADES_PENALTY
+        final_fitness -= episode_summary['zero_trades_penalty']
 
     # Apply win rate bonus if enough trades and win rate above threshold
     if episode_summary['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:

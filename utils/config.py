@@ -50,7 +50,8 @@ class Config:
     LOSS_PENALTY_MULTIPLIER = 1.0  # DEPRECATED: Use CONSISTENCY_LOSS_MULTIPLIER instead. Kept for backward compatibility with sweep configs.
     INACTION_PENALTY = 0.0  # Penalty per day without an open position (reduced from 20.0 to smooth landscape)
     FORCED_EXIT_PENALTY_PCT = 0.01  # 3% penalty on position size (entry_price * coefficient)
-    ZERO_TRADES_PENALTY = 500.0  # Heavy penalty for making NO trades at all
+    ZERO_TRADES_PENALTY_NORMAL = 5000.0  # Heavy penalty for making NO trades in normal mode
+    ZERO_TRADES_PENALTY_CONSISTENCY = 500.0  # Penalty for making NO trades in consistency mode
     HURDLE_RATE = 0.006  # 0.6% transaction cost per trade (mimics real trading costs, disincentivizes high-volume strategies)
     CONVICTION_SCALING_POWER = 1.25  # Power law exponent for conviction scaling (convex reward surface encourages high-confidence bets)
 

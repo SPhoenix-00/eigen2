@@ -554,7 +554,11 @@ class TradingEnvironment(gym.Env):
         inaction_penalty_total = self.days_without_positions * Config.INACTION_PENALTY
 
         # Calculate zero trades penalty (will be applied by caller)
-        zero_trades_penalty = Config.ZERO_TRADES_PENALTY if self.num_trades == 0 else 0.0
+        # Use mode-specific penalty: harsher in normal mode, lighter in consistency mode
+        if self.num_trades == 0:
+            zero_trades_penalty = Config.ZERO_TRADES_PENALTY_CONSISTENCY if self.consistency_mode else Config.ZERO_TRADES_PENALTY_NORMAL
+        else:
+            zero_trades_penalty = 0.0
 
         # Extract closed trades from episode actions (before clearing)
         closed_trades = [
