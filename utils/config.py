@@ -47,7 +47,7 @@ class Config:
     LIQUIDATION_WINDOW = 10  # Days available to liquidate after min hold (days 21-30)
     MAX_HOLDING_PERIOD = MIN_HOLDING_PERIOD + LIQUIDATION_WINDOW  # 30 total days
 
-    LOSS_PENALTY_MULTIPLIER = 1.0  # Losses treated equally to gains (was 3.0, removed penalty to fix zombie agents)
+    LOSS_PENALTY_MULTIPLIER = 1.0  # DEPRECATED: Use CONSISTENCY_LOSS_MULTIPLIER instead. Kept for backward compatibility with sweep configs.
     INACTION_PENALTY = 0.0  # Penalty per day without an open position (reduced from 20.0 to smooth landscape)
     FORCED_EXIT_PENALTY_PCT = 0.01  # 3% penalty on position size (entry_price * coefficient)
     ZERO_TRADES_PENALTY = 500.0  # Heavy penalty for making NO trades at all
@@ -62,8 +62,9 @@ class Config:
     # ROI-based scoring adjustment
     ROI_ADJUSTMENT_MULTIPLIER = 50.0  # Multiplier for ROI adjustment in fitness scoring
     # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
-    ROI_CONFIDENCE_MIN_TRADES = 50  # Minimum quality trades required for full ROI bonus credit
-    # Confidence factor = min(1.0, quality_count / ROI_CONFIDENCE_MIN_TRADES)
+    ROI_CONFIDENCE_MIN_TRADES = 30  # Normal mode: minimum quality trades for full ROI bonus credit
+    ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY = 50  # Consistency mode: higher bar for stricter requirements
+    # Confidence factor = min(1.0, quality_count / threshold)
     # This prevents "lucky snipers" who make few high-ROI trades from getting inflated fitness
     ROI_QUALITY_THRESHOLD = 7.5  # Default minimum gain_pct for a trade to count as "quality"
     ROI_USE_HOF_MEDIAN_AS_THRESHOLD = True  # If True, use HoF median ROI as threshold (supersedes default)
@@ -120,7 +121,7 @@ class Config:
     
     # ============ ERL Parameters ============
     POPULATION_SIZE = 32
-    NUM_GENERATIONS = 100
+    NUM_GENERATIONS = 50
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
     # Selection
@@ -138,7 +139,8 @@ class Config:
     # HEROES_MUTANT_FRAC = 0.125 (remainder: 4 agents) - minimal random exploration
 
     # Consistency mode - loss magnification for training on consistency
-    CONSISTENCY_LOSS_MULTIPLIER = 3.0  # Magnify losses by 3x to align with brutal fitness function (WR^2)
+    # Applied ONLY when --consistency flag is used. Normal mode uses 1.0 (no magnification)
+    CONSISTENCY_LOSS_MULTIPLIER = 3.0  # Magnify losses by 3x to focus training on reducing drawdowns
     
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)

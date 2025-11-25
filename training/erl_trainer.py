@@ -295,10 +295,11 @@ class ERLTrainer:
                             "critic_lr": Config.CRITIC_LR,
                             "trading_period_days": Config.TRADING_PERIOD_DAYS,
                             "max_holding_period": Config.MAX_HOLDING_PERIOD,
-                            "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
+                            "loss_penalty_multiplier": Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0,
+                            "consistency_mode": self.consistency_mode,
                             "num_stocks": Config.NUM_INVESTABLE_STOCKS,
                         },
-                        settings=wandb.Settings(console="redirect")
+                        settings=wandb.Settings(console="wrap")
                     )
                 else:
                     print("⚠ No wandb run ID found. Creating new run with same name...")
@@ -315,10 +316,11 @@ class ERLTrainer:
                             "critic_lr": Config.CRITIC_LR,
                             "trading_period_days": Config.TRADING_PERIOD_DAYS,
                             "max_holding_period": Config.MAX_HOLDING_PERIOD,
-                            "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
+                            "loss_penalty_multiplier": Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0,
+                            "consistency_mode": self.consistency_mode,
                             "num_stocks": Config.NUM_INVESTABLE_STOCKS,
                         },
-                        settings=wandb.Settings(console="redirect")
+                        settings=wandb.Settings(console="wrap")
                     )
 
                 self.run_name = self.resume_run_name  # Use the provided name
@@ -340,11 +342,12 @@ class ERLTrainer:
                         "critic_lr": Config.CRITIC_LR,
                         "trading_period_days": Config.TRADING_PERIOD_DAYS,
                         "max_holding_period": Config.MAX_HOLDING_PERIOD,
-                        "loss_penalty_multiplier": Config.LOSS_PENALTY_MULTIPLIER,
+                        "loss_penalty_multiplier": Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0,
+                        "consistency_mode": self.consistency_mode,
                         "num_stocks": Config.NUM_INVESTABLE_STOCKS,
                     },
                     resume="allow",  # Allow resuming from checkpoints
-                    settings=wandb.Settings(console="redirect")
+                    settings=wandb.Settings(console="wrap")
                 )
 
                 # Create run-specific checkpoint directory using wandb run name
@@ -2388,7 +2391,9 @@ class ERLTrainer:
 
                     # Confidence factor: quality_count / target_count (capped at 1.0)
                     # This ensures agents only get full ROI bonus credit if they have enough quality trades
-                    confidence_factor = min(1.0, quality_count / Config.ROI_CONFIDENCE_MIN_TRADES)
+                    # Use different thresholds: consistency mode = 50, normal mode = 30
+                    min_trades_threshold = Config.ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY if self.consistency_mode else Config.ROI_CONFIDENCE_MIN_TRADES
+                    confidence_factor = min(1.0, quality_count / min_trades_threshold)
 
                     roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
                     roi_adjustment = roi_adjustment * confidence_factor  # Dampen based on quality trade count

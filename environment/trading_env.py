@@ -488,10 +488,11 @@ class TradingEnvironment(gym.Env):
                     base_reward = scaled_coefficient * net_gain_pct
                     self.num_wins += 1
                 else:
-                    # LOSS: 3.0x Penalty (Sniper Mode)
-                    # This makes the agent feel immediate pain for "fake wins"
-                    SNIPER_PENALTY_MULTIPLIER = 3.0
-                    base_reward = scaled_coefficient * net_gain_pct * SNIPER_PENALTY_MULTIPLIER
+                    # LOSS: Apply magnification only in consistency mode
+                    # Consistency mode: Magnify losses to focus training on reducing drawdowns
+                    # Normal mode: Treat losses equally to gains (1.0x)
+                    loss_multiplier = Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0
+                    base_reward = scaled_coefficient * net_gain_pct * loss_multiplier
                     self.num_losses += 1
 
                 # 6. Forced Exit Penalty (Lack of decisiveness)

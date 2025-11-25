@@ -61,7 +61,7 @@ class AgentEvaluator:
         self.train_start = 0
         self.train_end = self.data_loader.train_end_idx
         self.val_start = self.data_loader.val_start_idx
-        self.val_end = len(self.data_array)
+        self.val_end = self.data_loader.val_end_idx  # Excludes holdout period
 
         # Get stock column names
         self._load_stock_names()
