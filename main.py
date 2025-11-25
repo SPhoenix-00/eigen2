@@ -207,12 +207,15 @@ def main():
                 print("Ignoring --cleanup flag.\n")
 
         # Create trainer (pass resume_run_name and leverage flag if resuming)
+        # Pass original stdout/stderr so wandb can properly capture console output
         trainer = ERLTrainer(
             loader,
             resume_run_name=resume_run_name,
             enable_leverage=args.leverage,
             consistency_mode=args.consistency,
-            heroes_hof_dir=args.heroes
+            heroes_hof_dir=args.heroes,
+            original_stdout=tee_logger.terminal,
+            original_stderr=tee_logger.terminal
         )
 
         # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---

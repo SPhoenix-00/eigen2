@@ -11,6 +11,7 @@ from tqdm import tqdm
 import time
 from torch.utils.tensorboard import SummaryWriter
 import os
+import sys
 import json
 import wandb
 import gc
@@ -195,7 +196,7 @@ class ERLTrainer:
     """
 
     def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
-                 consistency_mode: bool = False, heroes_hof_dir: str = None):
+                 consistency_mode: bool = False, heroes_hof_dir: str = None, original_stdout=None, original_stderr=None):
         """
         Initialize ERL trainer.
 
@@ -205,6 +206,8 @@ class ERLTrainer:
             enable_leverage: If True, enable leverage mode (replaces bottom 5 with top 5 HoF agents with 1.5x coefficients)
             consistency_mode: If True, evaluate with 5 episodes (sum) and loss magnification (see Config.CONSISTENCY_LOSS_MULTIPLIER)
             heroes_hof_dir: Path to Hall of Fame directory to load pre-trained agents from
+            original_stdout: Original stdout before any redirection (for wandb console capture)
+            original_stderr: Original stderr before any redirection (for wandb console capture)
         """
         self.data_loader = data_loader
         self.resume_run_name = resume_run_name
@@ -253,60 +256,97 @@ class ERLTrainer:
 
         # Initialize Weights & Biases and checkpoint directory
         # Note: entity defaults to your personal workspace (eigen2)
-        if wandb.run is None:
-            # If resuming from a specific run, try to load its wandb ID
-            if self.resume_run_name:
-                print(f"--- Resuming W&B run: {self.resume_run_name} ---")
 
-                # Set checkpoint directory based on provided run name
-                self.checkpoint_dir = Config.CHECKPOINT_DIR / self.resume_run_name
-                self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # Temporarily restore original stdout/stderr for wandb initialization
+        # This allows wandb to properly set up console output capture
+        current_stdout = sys.stdout
+        current_stderr = sys.stderr
+        if original_stdout is not None:
+            sys.stdout = original_stdout
+        if original_stderr is not None:
+            sys.stderr = original_stderr
 
-                # Try to download checkpoint from cloud and extract wandb run ID
-                if not self.checkpoint_dir.exists() or len(list(self.checkpoint_dir.glob('*'))) == 0:
-                    print("! No local checkpoint found. Downloading from cloud...")
-                    self.cloud_sync.download_checkpoints(str(self.checkpoint_dir))
+        try:
+            if wandb.run is None:
+                # If resuming from a specific run, try to load its wandb ID
+                if self.resume_run_name:
+                    print(f"--- Resuming W&B run: {self.resume_run_name} ---")
 
-                # Try to load trainer state to get wandb run ID
-                wandb_run_id = None
-                state_path = self.checkpoint_dir / "trainer_state.json"
-                if state_path.exists():
-                    try:
-                        import json
-                        with open(state_path, 'r') as f:
-                            trainer_state = json.load(f)
-                        wandb_run_id = trainer_state.get('wandb_run_id')
-                        print(f"✓ Found wandb run ID: {wandb_run_id}")
-                    except Exception as e:
-                        print(f"⚠ Could not load wandb run ID from checkpoint: {e}")
+                    # Set checkpoint directory based on provided run name
+                    self.checkpoint_dir = Config.CHECKPOINT_DIR / self.resume_run_name
+                    self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-                # Initialize wandb with the run ID for proper resume
-                if wandb_run_id:
-                    wandb.init(
-                        project="eigen2-self",
-                        id=wandb_run_id,
-                        resume="must",  # Must resume this specific run
-                        config={
-                            "population_size": Config.POPULATION_SIZE,
-                            "num_generations": Config.NUM_GENERATIONS,
-                            "buffer_size": Config.BUFFER_SIZE,
-                            "batch_size": Config.BATCH_SIZE,
-                            "actor_lr": Config.ACTOR_LR,
-                            "critic_lr": Config.CRITIC_LR,
-                            "trading_period_days": Config.TRADING_PERIOD_DAYS,
-                            "max_holding_period": Config.MAX_HOLDING_PERIOD,
-                            "loss_penalty_multiplier": Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0,
-                            "consistency_mode": self.consistency_mode,
-                            "num_stocks": Config.NUM_INVESTABLE_STOCKS,
-                        },
-                        settings=wandb.Settings(console="wrap")
-                    )
+                    # Try to download checkpoint from cloud and extract wandb run ID
+                    if not self.checkpoint_dir.exists() or len(list(self.checkpoint_dir.glob('*'))) == 0:
+                        print("! No local checkpoint found. Downloading from cloud...")
+                        self.cloud_sync.download_checkpoints(str(self.checkpoint_dir))
+
+                    # Try to load trainer state to get wandb run ID
+                    wandb_run_id = None
+                    state_path = self.checkpoint_dir / "trainer_state.json"
+                    if state_path.exists():
+                        try:
+                            import json
+                            with open(state_path, 'r') as f:
+                                trainer_state = json.load(f)
+                            wandb_run_id = trainer_state.get('wandb_run_id')
+                            print(f"✓ Found wandb run ID: {wandb_run_id}")
+                        except Exception as e:
+                            print(f"⚠ Could not load wandb run ID from checkpoint: {e}")
+
+                    # Initialize wandb with the run ID for proper resume
+                    if wandb_run_id:
+                        wandb.init(
+                            project="eigen2-self",
+                            id=wandb_run_id,
+                            resume="must",  # Must resume this specific run
+                            config={
+                                "population_size": Config.POPULATION_SIZE,
+                                "num_generations": Config.NUM_GENERATIONS,
+                                "buffer_size": Config.BUFFER_SIZE,
+                                "batch_size": Config.BATCH_SIZE,
+                                "actor_lr": Config.ACTOR_LR,
+                                "critic_lr": Config.CRITIC_LR,
+                                "trading_period_days": Config.TRADING_PERIOD_DAYS,
+                                "max_holding_period": Config.MAX_HOLDING_PERIOD,
+                                "loss_penalty_multiplier": Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0,
+                                "consistency_mode": self.consistency_mode,
+                                "num_stocks": Config.NUM_INVESTABLE_STOCKS,
+                            },
+                            settings=wandb.Settings(console="wrap")
+                        )
+                    else:
+                        print("⚠ No wandb run ID found. Creating new run with same name...")
+                        wandb.init(
+                            project="eigen2-self",
+                            name=self.resume_run_name,  # Try to use same name
+                            resume="allow",
+                            config={
+                                "population_size": Config.POPULATION_SIZE,
+                                "num_generations": Config.NUM_GENERATIONS,
+                                "buffer_size": Config.BUFFER_SIZE,
+                                "batch_size": Config.BATCH_SIZE,
+                                "actor_lr": Config.ACTOR_LR,
+                                "critic_lr": Config.CRITIC_LR,
+                                "trading_period_days": Config.TRADING_PERIOD_DAYS,
+                                "max_holding_period": Config.MAX_HOLDING_PERIOD,
+                                "loss_penalty_multiplier": Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0,
+                                "consistency_mode": self.consistency_mode,
+                                "num_stocks": Config.NUM_INVESTABLE_STOCKS,
+                            },
+                            settings=wandb.Settings(console="wrap")
+                        )
+
+                    self.run_name = self.resume_run_name  # Use the provided name
+
+                    # Update last_run.json with the resumed run info
+                    self._write_last_run_file()
                 else:
-                    print("⚠ No wandb run ID found. Creating new run with same name...")
+                    # New training run
+                    print("--- Initializing new W&B run (main.py mode) ---")
                     wandb.init(
                         project="eigen2-self",
-                        name=self.resume_run_name,  # Try to use same name
-                        resume="allow",
+                        #name=f"erl-{Config.NUM_GENERATIONS}gen",
                         config={
                             "population_size": Config.POPULATION_SIZE,
                             "num_generations": Config.NUM_GENERATIONS,
@@ -320,49 +360,27 @@ class ERLTrainer:
                             "consistency_mode": self.consistency_mode,
                             "num_stocks": Config.NUM_INVESTABLE_STOCKS,
                         },
+                        resume="allow",  # Allow resuming from checkpoints
                         settings=wandb.Settings(console="wrap")
                     )
 
-                self.run_name = self.resume_run_name  # Use the provided name
+                    # Create run-specific checkpoint directory using wandb run name
+                    self.run_name = wandb.run.name
+                    self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
+                    self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-                # Update last_run.json with the resumed run info
-                self._write_last_run_file()
+                    # Write last_run.json for easy resume
+                    self._write_last_run_file()
             else:
-                # New training run
-                print("--- Initializing new W&B run (main.py mode) ---")
-                wandb.init(
-                    project="eigen2-self",
-                    #name=f"erl-{Config.NUM_GENERATIONS}gen",
-                    config={
-                        "population_size": Config.POPULATION_SIZE,
-                        "num_generations": Config.NUM_GENERATIONS,
-                        "buffer_size": Config.BUFFER_SIZE,
-                        "batch_size": Config.BATCH_SIZE,
-                        "actor_lr": Config.ACTOR_LR,
-                        "critic_lr": Config.CRITIC_LR,
-                        "trading_period_days": Config.TRADING_PERIOD_DAYS,
-                        "max_holding_period": Config.MAX_HOLDING_PERIOD,
-                        "loss_penalty_multiplier": Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0,
-                        "consistency_mode": self.consistency_mode,
-                        "num_stocks": Config.NUM_INVESTABLE_STOCKS,
-                    },
-                    resume="allow",  # Allow resuming from checkpoints
-                    settings=wandb.Settings(console="wrap")
-                )
-
+                print("--- W&B run already active (sweep_runner.py mode) ---")
                 # Create run-specific checkpoint directory using wandb run name
                 self.run_name = wandb.run.name
                 self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
                 self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-                # Write last_run.json for easy resume
-                self._write_last_run_file()
-        else:
-            print("--- W&B run already active (sweep_runner.py mode) ---")
-            # Create run-specific checkpoint directory using wandb run name
-            self.run_name = wandb.run.name
-            self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
-            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        finally:
+            # Restore TeeLogger for stdout/stderr
+            sys.stdout = current_stdout
+            sys.stderr = current_stderr
 
         print(f"Checkpoints: {self.checkpoint_dir}")
         print(f"W&B run: {wandb.run.name} (ID: {wandb.run.id})")
