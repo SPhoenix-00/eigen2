@@ -842,9 +842,9 @@ class ERLTrainer:
         # This includes ALL penalties (inaction, losses, etc.)
         final_fitness = float(cumulative_reward)
 
-        # Apply zero-trades penalty if no trades were made (silent - penalty speaks for itself)
+        # Apply zero-trades penalty if no trades were made (mode-specific penalty from env)
         if episode_summary['num_trades'] == 0:
-            final_fitness -= Config.ZERO_TRADES_PENALTY
+            final_fitness -= episode_summary['zero_trades_penalty']
 
         # Apply win rate bonus if enough trades and win rate above threshold
         if episode_summary['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:
@@ -979,9 +979,9 @@ class ERLTrainer:
         # Calculate final fitness
         final_fitness = float(cumulative_reward)
 
-        # Apply zero-trades penalty if no trades were made
+        # Apply zero-trades penalty if no trades were made (mode-specific penalty from env)
         if episode_summary['num_trades'] == 0:
-            final_fitness -= Config.ZERO_TRADES_PENALTY
+            final_fitness -= episode_summary['zero_trades_penalty']
 
         return final_fitness, episode_summary
 
@@ -1097,7 +1097,8 @@ class ERLTrainer:
         # 1. Handle Inactivity
         # Keep your existing gradient logic for zero trades
         if total_trades == 0:
-            return -Config.ZERO_TRADES_PENALTY + stats.get('max_coefficient_during_episode', 0)
+            penalty = Config.ZERO_TRADES_PENALTY_CONSISTENCY if self.consistency_mode else Config.ZERO_TRADES_PENALTY_NORMAL
+            return -penalty + stats.get('max_coefficient_during_episode', 0)
 
         # 2. Calculate Core Metrics
         win_rate = stats.get('win_rate', 0.0) # 0.0 to 1.0
