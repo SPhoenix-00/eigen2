@@ -27,7 +27,10 @@
       "Bash(git show:*)",
       "Bash(git rm:*)",
       "Bash(rm:*)",
-      "Bash(test_results.txt)"
+      "Bash(test_results.txt)",
+      "Bash(if not exist \"c:\\Users\\antoi\\Documents\\GitHub\\eigen2\\tests\" mkdir \"c:\\Users\\antoi\\Documents\\GitHub\\eigen2\\tests\")",
+      "Bash(PYTHONPATH=/c/Users/antoi/Documents/GitHub/eigen2:$PYTHONPATH ./venv/bin/python:*)",
+      "Bash(c:UsersantoiDocumentsGitHubeigen2venvScriptspython.exe c:UsersantoiDocumentsGitHubeigen2utilsdevice_utils.py)"
     ],
     "deny": [],
     "ask": []

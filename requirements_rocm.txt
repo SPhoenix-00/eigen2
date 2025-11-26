@@ -1,0 +1,43 @@
+# ROCm Requirements for Project Eigen 2
+# For AMD GPUs (Radeon RX 6000/7000 series, Instinct MI series)
+#
+# Installation instructions:
+#   1. Install ROCm drivers from: https://rocm.docs.amd.com/
+#   2. Install PyTorch with ROCm support:
+#      pip install -r requirements_rocm.txt
+#
+# Supported AMD GPUs:
+#   - Consumer: RX 6800, 6900 XT, 7900 XT, 7900 XTX (RDNA2/RDNA3)
+#   - Datacenter: MI100, MI200, MI250, MI300 series
+#
+# Recommended ROCm versions: 5.7 or 6.0+
+
+# PyTorch with ROCm 5.7 support
+--index-url https://download.pytorch.org/whl/rocm5.7
+torch>=2.0.0
+
+# Core dependencies (same as CUDA version)
+numpy>=1.24.0
+pandas>=2.0.0
+gymnasium>=0.29.0
+tensorboard>=2.14.0
+wandb>=0.16.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.65.0
+pyyaml>=6.0
+psutil>=5.9.0
+
+# ROCm-specific notes:
+# - torch.cuda.* API works transparently with ROCm
+# - GradScaler and autocast work with ROCm backend
+# - Model checkpoints are cross-compatible with CUDA
+# - Performance should be comparable to NVIDIA GPUs of similar class
+#
+# Performance expectations:
+#   RX 7900 XTX ~ RTX 4080
+#   MI250X ~ A100 80GB
+#
+# Environment variables (automatically set by device_utils.py):
+#   PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+#   HSA_FORCE_FINE_GRAIN_PCIE=1

@@ -475,8 +475,9 @@ class TradingEnvironment(gym.Env):
 
                 # 3. SNIPER LOGIC: Apply Hurdle FIRST
                 # A trade making 0.5% when hurdle is 0.6% is a LOSS of -0.1%
-                # Convert HURDLE_RATE from decimal (0.006) to percentage (0.6%)
-                hurdle_pct = Config.HURDLE_RATE * 100.0
+                # Select hurdle rate based on mode: 0.6% for consistency, 0.1% for normal
+                hurdle_rate = Config.HURDLE_RATE_CONSISTENCY if self.consistency_mode else Config.HURDLE_RATE_NORMAL
+                hurdle_pct = hurdle_rate * 100.0
                 net_gain_pct = gain_pct - hurdle_pct
 
                 # 4. Conviction Scaling (Keep convex surface)
