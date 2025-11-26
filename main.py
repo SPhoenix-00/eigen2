@@ -11,6 +11,7 @@ import torch
 import numpy as np
 import random
 import sys
+import warnings
 from pathlib import Path
 from datetime import datetime
 
@@ -78,6 +79,9 @@ def set_seed(seed: int = 42):
 
 def main():
     """Main training function."""
+    # Suppress ROCm-specific warning about expandable_segments (CUDA feature not available on AMD GPUs)
+    warnings.filterwarnings('ignore', message='.*expandable_segments not supported.*')
+
     # Setup logging to capture all outputs to file
     # Create evaluation_results directory (same folder where evaluations go)
     log_dir = Path("evaluation_results")

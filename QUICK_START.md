@@ -22,7 +22,7 @@ ssh root@YOUR_RUNPOD_HOST -p YOUR_PORT
 mkdir -p /workspace && cd /workspace
 rm -rf * .??*
 git clone https://github.com/SPhoenix-00/eigen2.git .
-python3 -m pip install --no-cache-dir -r requirements.txt google-cloud-storage
+python3 -m pip install --no-cache-dir -r requirementspy.txt google-cloud-storage
 ```
 
 ### 3. Upload Credentials (from local machine)
