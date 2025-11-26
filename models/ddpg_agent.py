@@ -54,10 +54,8 @@ class DDPGAgent:
             weight_decay=Config.WEIGHT_DECAY
         )
 
-        # GradScaler device type ('cuda' works for both CUDA and ROCm)
-        scaler_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.actor_scaler = GradScaler(scaler_device)
-        self.critic_scaler = GradScaler(scaler_device)
+        self.actor_scaler = GradScaler('cuda')
+        self.critic_scaler = GradScaler('cuda')
         
         # Exploration noise
         self.noise_scale = Config.NOISE_SCALE
@@ -174,16 +172,14 @@ class DDPGAgent:
         with torch.no_grad():
             # Get next actions from target actor
             next_actions = self.actor_target(next_states)
-
+            
             # Get target Q-values
             target_q = self.critic_target(next_states, next_actions)
-
+            
             # Compute target: r + gamma * Q_target(s', a')
             target_q = rewards + (1 - dones) * Config.GAMMA * target_q
-
-        # Autocast device type ('cuda' works for both CUDA and ROCm)
-        autocast_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        with autocast(device_type=autocast_device):
+        
+        with autocast(device_type='cuda'):
             current_q = self.critic(states, actions)
             critic_loss = nn.MSELoss()(current_q, target_q)
         
@@ -205,9 +201,8 @@ class DDPGAgent:
         # Freeze critic to save computation
         for param in self.critic.parameters():
             param.requires_grad = False
-
-        # Autocast device type ('cuda' works for both CUDA and ROCm)
-        with autocast(device_type=autocast_device):
+        
+        with autocast(device_type='cuda'):
             actor_actions = self.actor(states)
             actor_loss = -self.critic(states, actor_actions).mean()
         

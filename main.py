@@ -3,8 +3,9 @@ Project Eigen 2 - Main Entry Point
 Evolutionary Reinforcement Learning for Stock Trading
 """
 
-# GPU environment configuration is now handled automatically in Config
-# via device_utils.py (supports both CUDA and ROCm)
+import os
+# Fix PyTorch memory fragmentation (must be set before importing torch)
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import argparse
 import torch
@@ -62,16 +63,11 @@ class TeeLogger:
 
 
 def set_seed(seed: int = 42):
-    """Set random seeds for reproducibility (works for both CUDA and ROCm)."""
+    """Set random seeds for reproducibility."""
     torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)  # Works for both CUDA and ROCm
-
+    torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-
-    # These settings work for both CUDA (cuDNN) and ROCm (MIOpen)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 

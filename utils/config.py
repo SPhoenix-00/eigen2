@@ -5,7 +5,6 @@ All hyperparameters and settings in one place
 
 import torch
 from pathlib import Path
-from utils.device_utils import get_device_info, setup_gpu_environment, get_gpu_memory_info, get_backend_version
 
 class Config:
     # ============ Data Parameters ============
@@ -53,8 +52,7 @@ class Config:
     FORCED_EXIT_PENALTY_PCT = 0.01  # 3% penalty on position size (entry_price * coefficient)
     ZERO_TRADES_PENALTY_NORMAL = 5000.0  # Heavy penalty for making NO trades in normal mode
     ZERO_TRADES_PENALTY_CONSISTENCY = 500.0  # Penalty for making NO trades in consistency mode
-    HURDLE_RATE_NORMAL = 0.001  # 0.1% transaction cost per trade in normal mode
-    HURDLE_RATE_CONSISTENCY = 0.006  # 0.6% transaction cost per trade in consistency mode
+    HURDLE_RATE = 0.006  # 0.6% transaction cost per trade (mimics real trading costs, disincentivizes high-volume strategies)
     CONVICTION_SCALING_POWER = 1.25  # Power law exponent for conviction scaling (convex reward surface encourages high-confidence bets)
 
     # Win rate bonus - rewards consistent winning
@@ -65,7 +63,7 @@ class Config:
     # ROI-based scoring adjustment
     ROI_ADJUSTMENT_MULTIPLIER = 50.0  # Multiplier for ROI adjustment in fitness scoring
     # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
-    ROI_CONFIDENCE_MIN_TRADES = 50  # Normal mode: minimum quality trades for full ROI bonus credit
+    ROI_CONFIDENCE_MIN_TRADES = 30  # Normal mode: minimum quality trades for full ROI bonus credit
     ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY = 50  # Consistency mode: higher bar for stricter requirements
     # Confidence factor = min(1.0, quality_count / threshold)
     # This prevents "lucky snipers" who make few high-ROI trades from getting inflated fitness
@@ -148,7 +146,7 @@ class Config:
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)
     CROSSOVER_ALPHA_MAX = 0.8  # Widened range for more diverse offspring (was 0.7)
-    MUTATION_RATE = 0.25  # Base mutation rate
+    MUTATION_RATE = 0.40  # Base mutation rate (doubled from 0.20 for aggressive exploration)
     MUTATION_STD = 0.05  # Base mutation magnitude (doubled from 0.025 for aggressive exploration)
     # NOTE: Adaptive mutation automatically boosts these values by 1.5x when validation fitness
     # plateaus for 3 consecutive generations (< 2% improvement), helping escape local optima
@@ -159,12 +157,7 @@ class Config:
     GRADIENT_ACCUMULATION_STEPS = 4
     
     # ============ Training Parameters ============
-    # Auto-detect GPU backend (CUDA, ROCm, or CPU)
-    DEVICE, GPU_BACKEND, GPU_NAME = get_device_info()
-
-    # Setup environment variables based on backend
-    _ = setup_gpu_environment(GPU_BACKEND)
-
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     NUM_WORKERS = 4  # For data loading (deprecated, kept for compatibility)
     NUM_DATALOADER_WORKERS = 4  # Number of background workers for async batch loading
     # With 4 workers, batches are prepared in parallel while GPU trains
@@ -199,31 +192,19 @@ class Config:
     def validate(cls):
         """Validate configuration settings"""
         errors = []
-
+        
         # Check data path exists
         if not Path(cls.DATA_PATH).exists():
             errors.append(f"Data file not found: {cls.DATA_PATH}")
-
+        
         # Check directories exist
         cls.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         cls.LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Enhanced GPU availability check
+        
+        # Check GPU availability
         if not torch.cuda.is_available():
-            print("WARNING: GPU not available. Training will be slow on CPU.")
-        else:
-            print(f"✓ GPU detected: {cls.GPU_NAME}")
-            print(f"✓ Backend: {cls.GPU_BACKEND}")
-            print(f"✓ Version: {get_backend_version()}")
-
-            if cls.GPU_BACKEND == "ROCm":
-                print("  ROCm-specific optimizations enabled")
-
-            # Display memory info
-            mem_info = get_gpu_memory_info()
-            if mem_info:
-                print(f"  Available GPUs: {mem_info['device_count']}")
-
+            print("WARNING: CUDA not available. Training will be slow on CPU.")
+        
         if errors:
             print("\n".join(errors))
             return False
