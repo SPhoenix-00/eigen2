@@ -89,19 +89,10 @@ def _run_episode_worker(args):
     torch.manual_seed(seed)
 
     # Reconstruct agent from state dict (agents with CUDA tensors are not picklable)
+    # ROCm uses 2 workers on GPU (reduced from 8 to minimize contention)
+    # CUDA uses 8 workers on GPU (handles multi-process access efficiently)
     from models.ddpg_agent import DDPGAgent
     agent = DDPGAgent(agent_id=0)
-
-    # ROCm-specific: Force workers to use CPU to avoid GPU contention
-    # ROCm has 3x slower multi-process GPU access compared to CUDA
-    if torch.version.hip is not None:  # ROCm detected
-        cpu_device = torch.device('cpu')
-        agent.device = cpu_device
-        agent.actor = agent.actor.cpu()
-        agent.critic = agent.critic.cpu()
-        agent.actor_target = agent.actor_target.cpu()
-        agent.critic_target = agent.critic_target.cpu()
-
     agent.actor.load_state_dict(agent_state['actor'])
     agent.critic.load_state_dict(agent_state['critic'])
     agent.actor.eval()
@@ -1289,6 +1280,10 @@ class ERLTrainer:
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population (Parallel) ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
 
+        # Debug: Show GPU backend for ROCm detection troubleshooting
+        backend_info = f"torch.version.hip={torch.version.hip}, torch.cuda={torch.version.cuda if hasattr(torch.version, 'cuda') else 'N/A'}"
+        print(f"GPU Backend: {backend_info}")
+
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
         num_exploratory = len(self.population) - num_elites
@@ -1346,8 +1341,17 @@ class ERLTrainer:
                 ))
 
         # Execute in parallel
-        num_workers = min(mp.cpu_count() - 1, 8)  # Leave 1 core free, cap at 8
-        print(f"Using {num_workers} parallel workers")
+        # ROCm: Use fewer workers to reduce GPU contention (ROCm has higher multi-process overhead)
+        # CUDA: Use more workers (CUDA handles concurrent GPU access efficiently)
+        is_rocm = (torch.version.hip is not None or
+                   'rocm' in torch.version.cuda.lower() if hasattr(torch.version, 'cuda') and torch.version.cuda else False)
+
+        if is_rocm:  # ROCm
+            num_workers = 2  # Limited parallelism to reduce GPU driver overhead
+            print(f"ROCm detected - using {num_workers} workers to minimize GPU contention")
+        else:  # CUDA
+            num_workers = min(mp.cpu_count() - 1, 8)  # Leave 1 core free, cap at 8
+            print(f"Using {num_workers} parallel workers")
 
         fitness_by_agent = [[] for _ in range(len(self.population))]
 
