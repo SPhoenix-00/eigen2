@@ -54,14 +54,10 @@ def _init_worker(env_config):
     Args:
         env_config: Environment configuration dict with data arrays
     """
-    import os
-    import torch
+    import warnings
 
-    # ROCm-specific optimization: Disable GPU in workers to avoid contention
-    # ROCm has much higher overhead than CUDA for multi-process GPU access (3x slower)
-    # CUDA handles concurrent access better, so keep GPU enabled for CUDA
-    if torch.version.hip is not None:  # Check if using ROCm (HIP backend)
-        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    # Suppress ROCm warning in worker processes (separate processes need their own filter)
+    warnings.filterwarnings('ignore', message='.*expandable_segments not supported.*')
 
     global _worker_env_config
     _worker_env_config = env_config
@@ -93,10 +89,19 @@ def _run_episode_worker(args):
     torch.manual_seed(seed)
 
     # Reconstruct agent from state dict (agents with CUDA tensors are not picklable)
-    # ROCm: GPU hidden via CUDA_VISIBLE_DEVICES (workers use CPU to avoid contention)
-    # CUDA: Workers use GPU (CUDA handles multi-process access efficiently)
     from models.ddpg_agent import DDPGAgent
     agent = DDPGAgent(agent_id=0)
+
+    # ROCm-specific: Force workers to use CPU to avoid GPU contention
+    # ROCm has 3x slower multi-process GPU access compared to CUDA
+    if torch.version.hip is not None:  # ROCm detected
+        cpu_device = torch.device('cpu')
+        agent.device = cpu_device
+        agent.actor = agent.actor.cpu()
+        agent.critic = agent.critic.cpu()
+        agent.actor_target = agent.actor_target.cpu()
+        agent.critic_target = agent.critic_target.cpu()
+
     agent.actor.load_state_dict(agent_state['actor'])
     agent.critic.load_state_dict(agent_state['critic'])
     agent.actor.eval()
