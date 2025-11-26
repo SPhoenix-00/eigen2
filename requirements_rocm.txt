@@ -3,29 +3,39 @@
 #
 # Installation instructions:
 #   1. Install ROCm drivers from: https://rocm.docs.amd.com/
-#   2. Install PyTorch with ROCm support:
-#      pip install -r requirements_rocm.txt
+#   2. Upgrade pip: python -m pip install --upgrade pip
+#   3. Install PyTorch with ROCm support:
+#      python -m pip install -r requirements_rocm.txt
 #
 # Supported AMD GPUs:
 #   - Consumer: RX 6800, 6900 XT, 7900 XT, 7900 XTX (RDNA2/RDNA3)
 #   - Datacenter: MI100, MI200, MI250, MI300 series
 #
 # Recommended ROCm versions: 5.7 or 6.0+
+# Note: Updated for Python 3.13 compatibility and numpy 2.x support
 
-# PyTorch with ROCm 5.7 support
---index-url https://download.pytorch.org/whl/rocm5.7
-torch>=2.0.0
+# PyTorch with ROCm 6.0 support (better Python 3.13 compatibility)
+--index-url https://download.pytorch.org/whl/rocm6.0
+torch>=2.5.0
 
-# Core dependencies (same as CUDA version)
-numpy>=1.24.0
-pandas>=2.0.0
+# Core dependencies - versions compatible with numpy 2.x
+numpy>=1.26.0,<2.3.0
+pandas>=2.2.0
+scipy>=1.11.0
+numba>=0.58.0
+
+# RL and ML libraries
 gymnasium>=0.29.0
 tensorboard>=2.14.0
-wandb>=0.16.0
-matplotlib>=3.7.0
-seaborn>=0.12.0
-tqdm>=4.65.0
-pyyaml>=6.0
+wandb>=0.18.0
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Utilities
+tqdm>=4.66.0
+pyyaml>=6.0.1
 psutil>=5.9.0
 
 # ROCm-specific notes:
@@ -41,3 +51,10 @@ psutil>=5.9.0
 # Environment variables (automatically set by device_utils.py):
 #   PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
 #   HSA_FORCE_FINE_GRAIN_PCIE=1
+#
+# If you encounter dependency conflicts:
+#   1. Create a fresh virtual environment
+#   2. Install in this order:
+#      python -m pip install torch --index-url https://download.pytorch.org/whl/rocm6.0
+#      python -m pip install numpy scipy numba
+#      python -m pip install -r requirements_rocm.txt

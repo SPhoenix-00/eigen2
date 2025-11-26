@@ -1,21 +1,26 @@
 # GPU Support: This project supports both NVIDIA (CUDA) and AMD (ROCm) GPUs
 #
+# Installation Instructions:
+#
 # For NVIDIA GPUs (CUDA):
-#   pip install -r requirements.txt
+#   python -m pip install --upgrade pip
+#   python -m pip install -r requirements.txt
 #
 # For AMD GPUs (ROCm):
-#   pip install -r requirements_rocm.txt
+#   python -m pip install -r requirements_rocm.txt
 #
 # The codebase automatically detects your GPU backend and configures itself accordingly.
+#
+# Note: Updated for Python 3.13 compatibility
 
-torch>=2.0.0
-numpy>=1.24.0
-pandas>=2.0.0
+torch>=2.5.0
+numpy>=1.26.0
+pandas>=2.2.0
 gymnasium>=0.29.0
 tensorboard>=2.14.0
-wandb>=0.16.0
-matplotlib>=3.7.0
-seaborn>=0.12.0
-tqdm>=4.65.0
-pyyaml>=6.0
+wandb>=0.18.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+tqdm>=4.66.0
+pyyaml>=6.0.1
 psutil>=5.9.0
