@@ -38,18 +38,13 @@ class FeatureExtractor(nn.Module):
         # LSTM to capture temporal dependencies
         # Input: [batch, num_columns, context_days, CNN_FILTERS]
         self.lstm_input_size = Config.CNN_FILTERS
-
-        # ROCm/MIOpen compatibility: Disable dropout to avoid MIOpen bugs
-        # MIOpen has known issues with LSTM dropout in certain configurations
-        lstm_dropout = 0.0 if torch.version.hip is not None else (0.1 if Config.LSTM_LAYERS > 1 else 0.0)
-
         self.lstm = nn.LSTM(
             input_size=self.lstm_input_size,
             hidden_size=Config.LSTM_HIDDEN,
             num_layers=Config.LSTM_LAYERS,
             batch_first=True,
             bidirectional=Config.LSTM_BIDIRECTIONAL,
-            dropout=lstm_dropout
+            dropout=0.1 if Config.LSTM_LAYERS > 1 else 0.0
         )
 
         # Output size after LSTM
@@ -69,11 +64,6 @@ class FeatureExtractor(nn.Module):
     def _lstm_block(self, x: torch.Tensor) -> torch.Tensor:
         """LSTM processing block for gradient checkpointing."""
         x = torch.nan_to_num(x, nan=0.0)
-
-        # ROCm/MIOpen compatibility: Ensure tensor is contiguous and properly shaped
-        # MIOpen has stricter requirements than cuDNN for LSTM inputs
-        x = x.contiguous()
-
         lstm_out, _ = self.lstm(x)
         return lstm_out
 
