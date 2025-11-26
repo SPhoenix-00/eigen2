@@ -39,24 +39,21 @@ class FeatureExtractor(nn.Module):
         # Input: [batch, num_columns, context_days, CNN_FILTERS]
         self.lstm_input_size = Config.CNN_FILTERS
 
-        # ROCm/MIOpen compatibility fixes:
-        # 1. Disable dropout (MIOpen LSTM dropout bugs)
-        # 2. Disable bidirectional (MIOpen bidirectional LSTM has miopenStatusBadParm errors)
-        is_rocm = torch.version.hip is not None
-        lstm_dropout = 0.0 if is_rocm else (0.1 if Config.LSTM_LAYERS > 1 else 0.0)
-        lstm_bidirectional = False if is_rocm else Config.LSTM_BIDIRECTIONAL
+        # ROCm/MIOpen compatibility: Disable dropout to avoid MIOpen bugs
+        # MIOpen has known issues with LSTM dropout in certain configurations
+        lstm_dropout = 0.0 if torch.version.hip is not None else (0.1 if Config.LSTM_LAYERS > 1 else 0.0)
 
         self.lstm = nn.LSTM(
             input_size=self.lstm_input_size,
             hidden_size=Config.LSTM_HIDDEN,
             num_layers=Config.LSTM_LAYERS,
             batch_first=True,
-            bidirectional=lstm_bidirectional,
+            bidirectional=Config.LSTM_BIDIRECTIONAL,
             dropout=lstm_dropout
         )
 
-        # Output size after LSTM (ROCm uses unidirectional)
-        self.lstm_output_size = Config.LSTM_HIDDEN * (2 if lstm_bidirectional else 1)
+        # Output size after LSTM
+        self.lstm_output_size = Config.LSTM_HIDDEN * (2 if Config.LSTM_BIDIRECTIONAL else 1)
 
         # Enable gradient checkpointing
         self.use_gradient_checkpointing = True
