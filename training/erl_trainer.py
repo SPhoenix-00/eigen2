@@ -1435,6 +1435,12 @@ class ERLTrainer:
                     except OSError:
                         pass
 
+                # CRITICAL FIX: Reset DataLoader after buffer overflow to prevent worker crashes
+                # Persistent workers hold references to deleted file paths, causing silent crashes
+                print("  Resetting DataLoader workers to clear stale file references...")
+                self._create_dataloader()
+                print("  ✓ DataLoader reset complete")
+
             print(f"  ✓ Buffer updated: {len(self.replay_buffer)} transitions")
         else:
             print("  No transitions collected this generation")
