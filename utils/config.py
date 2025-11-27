@@ -142,11 +142,12 @@ class Config:
     # Consistency mode - loss magnification for training on consistency
     # Applied ONLY when --consistency flag is used. Normal mode uses 1.0 (no magnification)
     CONSISTENCY_LOSS_MULTIPLIER = 3.0  # Magnify losses by 3x to focus training on reducing drawdowns
-    
+
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)
     CROSSOVER_ALPHA_MAX = 0.8  # Widened range for more diverse offspring (was 0.7)
-    MUTATION_RATE = 0.40  # Base mutation rate (doubled from 0.20 for aggressive exploration)
+    MUTATION_RATE = 0.40  # Base mutation rate for normal mode (doubled from 0.20 for aggressive exploration)
+    MUTATION_RATE_CONSISTENCY = 0.20  # Mutation rate for consistency mode (lower to preserve stable traits)
     MUTATION_STD = 0.05  # Base mutation magnitude (doubled from 0.025 for aggressive exploration)
     # NOTE: Adaptive mutation automatically boosts these values by 1.5x when validation fitness
     # plateaus for 3 consecutive generations (< 2% improvement), helping escape local optima

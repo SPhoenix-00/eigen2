@@ -432,9 +432,11 @@ class ERLTrainer:
         # Adaptive mutation parameters
         self.plateau_threshold = 0.02  # Consider plateau if improvement < 2% over window
         self.plateau_window = 3  # Number of generations to check for plateau
-        self.base_mutation_rate = Config.MUTATION_RATE
+        # Use consistency-specific mutation rate if in consistency mode, otherwise use normal rate
+        base_mutation_rate = Config.MUTATION_RATE_CONSISTENCY if self.consistency_mode else Config.MUTATION_RATE
+        self.base_mutation_rate = base_mutation_rate
         self.base_mutation_std = Config.MUTATION_STD
-        self.current_mutation_rate = Config.MUTATION_RATE
+        self.current_mutation_rate = base_mutation_rate
         self.current_mutation_std = Config.MUTATION_STD
         self.mutation_boost_factor = 1.5  # Multiply by this when plateau detected
         self.max_mutation_rate = 0.8  # Cap mutation rate (doubled to allow plateau boost from 0.40 base)
@@ -472,6 +474,9 @@ class ERLTrainer:
         print("Initializing environment...")
         if self.consistency_mode:
             print(f"  Consistency mode enabled: {Config.CONSISTENCY_LOSS_MULTIPLIER}x loss magnification")
+            print(f"  Mutation rate: {self.base_mutation_rate} (consistency mode)")
+        else:
+            print(f"  Mutation rate: {self.base_mutation_rate} (normal mode)")
         self.eval_env = TradingEnvironment(
             data_array=self.data_loader.data_array,
             dates=self.data_loader.dates,
@@ -2037,7 +2042,9 @@ class ERLTrainer:
 
                 # Load adaptive mutation state
                 self.validation_fitness_history = trainer_state.get('validation_fitness_history', [])
-                self.current_mutation_rate = trainer_state.get('current_mutation_rate', Config.MUTATION_RATE)
+                # Use consistency-aware fallback for mutation rate
+                default_mutation_rate = Config.MUTATION_RATE_CONSISTENCY if self.consistency_mode else Config.MUTATION_RATE
+                self.current_mutation_rate = trainer_state.get('current_mutation_rate', default_mutation_rate)
                 self.current_mutation_std = trainer_state.get('current_mutation_std', Config.MUTATION_STD)
                 self.plateau_detected = trainer_state.get('plateau_detected', False)
 
