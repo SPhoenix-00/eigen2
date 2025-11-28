@@ -214,18 +214,25 @@ class BreakthroughState(Enum):
 @dataclass
 class BreakthroughCandidate:
     """
-    Represents a candidate agent for breakthrough validation.
+    Represents a candidate agent (or agents) for breakthrough validation.
 
     Attributes:
-        agent: The candidate DDPGAgent
-        spike_score: Initial validation score that triggered detection
+        agent: The best candidate DDPGAgent (for single-agent compatibility)
+        agents: List of all agents that breached the threshold (quorum)
+        agent_idx: Index of best agent
+        agent_indices: Indices of all agents that breached
+        spike_score: Best validation score that triggered detection
+        spike_scores: Scores of all agents that breached
         detection_generation: Generation when spike was detected
         stabilization_start_gen: Generation when stabilization started
         gauntlet_score: Score achieved in Gauntlet (None until tested)
     """
     agent: 'DDPGAgent'
+    agents: list['DDPGAgent']
     agent_idx: int
+    agent_indices: list[int]
     spike_score: float
+    spike_scores: list[float]
     detection_generation: int
     stabilization_start_gen: Optional[int] = None
     gauntlet_score: Optional[float] = None
@@ -518,6 +525,11 @@ class ERLTrainer:
                                       if self.consistency_mode
                                       else Config.BREAKTHROUGH_THRESHOLD_NORMAL)
 
+        # Breakthrough quorum based on mode
+        self.breakthrough_quorum = (Config.BREAKTHROUGH_QUORUM_CONSISTENCY
+                                   if self.consistency_mode
+                                   else Config.BREAKTHROUGH_QUORUM_NORMAL)
+
         # Target breakthroughs based on mode
         self.target_breakthroughs = (Config.TARGET_BREAKTHROUGHS_CONSISTENCY
                                     if self.consistency_mode
@@ -526,6 +538,7 @@ class ERLTrainer:
         if self.gauntlet_mode_enabled:
             print(f"\n🎯 Gauntlet Mode ENABLED")
             print(f"  Breakthrough threshold: {self.breakthrough_threshold*100:.0f}% improvement")
+            print(f"  Breakthrough quorum: {self.breakthrough_quorum} agents must breach simultaneously")
             print(f"  Stabilization: {Config.STABILIZATION_GENERATIONS} generations")
             print(f"  Gauntlet slices: {Config.GAUNTLET_NUM_SLICES} (vs 7 normal)")
             print(f"  Target breakthroughs: {self.target_breakthroughs}")
@@ -1815,7 +1828,7 @@ class ERLTrainer:
 
         return expectancy
 
-    def validate_agent(self, agent) -> Dict:
+    def validate_agent(self, agent, quality_threshold: float = None) -> Dict:
         """
         Validate agent using walk-forward validation on 7 random slices.
 
@@ -1827,6 +1840,7 @@ class ERLTrainer:
 
         Args:
             agent: The agent to validate
+            quality_threshold: Optional threshold for counting quality trades (trades with gain_pct >= threshold)
 
         Returns:
             Validation results with 'fitness' emphasizing worst-case performance
@@ -1839,7 +1853,7 @@ class ERLTrainer:
 
         # Run agent on all 7 validation slices
         slice_results = []
-        all_closed_trades = []  # Collect all closed trades from all slices
+        all_closed_trades = []  # Collect closed trades for metrics calculation only
 
         for start_idx, end_idx, _ in self.current_generation_val_slices:
             # Use batched inference for faster validation
@@ -1906,6 +1920,11 @@ class ERLTrainer:
         # Calculate Expectancy metric from all closed trades
         expectancy = self.calculate_expectancy(all_closed_trades)
 
+        # Calculate quality count if threshold provided (to avoid returning full closed_trades list)
+        quality_count = 0
+        if quality_threshold is not None:
+            quality_count = sum(1 for trade in all_closed_trades if trade.get('gain_pct', 0) >= quality_threshold)
+
         return {
             'fitness': validation_fitness,
             'fitness_all_slices': fitness_scores,  # For debugging
@@ -1921,10 +1940,11 @@ class ERLTrainer:
             'roi': roi,  # ROI percentage
             'expectancy': expectancy,  # Expectancy metric: (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
             'sample_trade': sample_trade,  # One sample trade for verification
-            'closed_trades': all_closed_trades  # All closed trades for quality count calculation
+            'total_trades': total_trades,  # Total trades across all slices
+            'quality_count': quality_count,  # Count of quality trades (if threshold provided)
         }
 
-    def validate_agent_cached(self, agent: DDPGAgent) -> Dict:
+    def validate_agent_cached(self, agent: DDPGAgent, quality_threshold: float = None) -> Dict:
         """
         Validate agent with caching - skip validation if agent weights unchanged.
 
@@ -1933,20 +1953,23 @@ class ERLTrainer:
 
         Args:
             agent: Agent to validate
+            quality_threshold: Optional threshold for counting quality trades
 
         Returns:
             Validation results (from cache or fresh evaluation)
         """
         agent_hash = self._hash_agent(agent)
         slice_hash = self.val_slice_hash
-        cache_key = f"{agent_hash}_{slice_hash}"
+        # Include quality_threshold in cache key to handle different thresholds
+        threshold_key = f"{quality_threshold:.4f}" if quality_threshold is not None else "none"
+        cache_key = f"{agent_hash}_{slice_hash}_{threshold_key}"
 
         if cache_key in self.validation_cache:
             # Cache hit - return cached results
             return self.validation_cache[cache_key]
 
         # Cache miss - run validation
-        val_results = self.validate_agent(agent)
+        val_results = self.validate_agent(agent, quality_threshold=quality_threshold)
         self.validation_cache[cache_key] = val_results
 
         # Keep cache bounded (last 100 entries to prevent memory growth)
@@ -1989,7 +2012,7 @@ class ERLTrainer:
 
         # Run agent on all Gauntlet slices
         slice_results = []
-        all_closed_trades = []
+        all_closed_trades = []  # Collect for expectancy calculation only
 
         for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
             # Use batched inference for faster validation
@@ -2018,7 +2041,7 @@ class ERLTrainer:
                 'total_investment': episode_info.get('total_investment', 0.0)
             })
 
-            # Collect closed trades
+            # Collect closed trades for expectancy calculation only
             if 'closed_trades' in episode_info and episode_info['closed_trades']:
                 all_closed_trades.extend(episode_info['closed_trades'])
 
@@ -2067,19 +2090,17 @@ class ERLTrainer:
             'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),
             'total_trades': total_trades,
             'expectancy': expectancy,
-            'closed_trades': all_closed_trades
         }
 
-    def check_for_breakthrough(self, best_val_fitness: float, best_agent_idx: int) -> bool:
+    def check_for_breakthrough(self, validation_results: list) -> bool:
         """
         Check if current generation has a potential breakthrough.
 
-        A breakthrough is detected when an agent exceeds the confirmed baseline
+        A breakthrough is detected when sufficient agents (quorum) exceed the confirmed baseline
         by the breakthrough threshold (10% in normal mode, 5% in consistency mode).
 
         Args:
-            best_val_fitness: Best validation fitness in current generation
-            best_agent_idx: Index of best agent
+            validation_results: List of validation results for all agents, sorted by combined_fitness
 
         Returns:
             True if breakthrough detected, False otherwise
@@ -2091,28 +2112,55 @@ class ERLTrainer:
             # Already processing a breakthrough
             return False
 
-        # Calculate improvement over confirmed baseline
-        if self.confirmed_baseline <= 0:
-            # First breakthrough: any positive score qualifies
-            improvement = 1.0 if best_val_fitness > 0 else 0.0
-        else:
-            improvement = (best_val_fitness - self.confirmed_baseline) / abs(self.confirmed_baseline)
+        # Find all agents that breach the threshold
+        breaching_agents = []
+        for result in validation_results:
+            agent_idx = result['idx']
+            val_fitness = result['validation_fitness']
 
-        if improvement >= self.breakthrough_threshold:
+            # Calculate improvement over confirmed baseline
+            if self.confirmed_baseline <= 0:
+                # First breakthrough: any positive score qualifies
+                improvement = 1.0 if val_fitness > 0 else 0.0
+            else:
+                improvement = (val_fitness - self.confirmed_baseline) / abs(self.confirmed_baseline)
+
+            if improvement >= self.breakthrough_threshold:
+                breaching_agents.append({
+                    'idx': agent_idx,
+                    'fitness': val_fitness,
+                    'improvement': improvement
+                })
+
+        # Check if we have quorum
+        if len(breaching_agents) >= self.breakthrough_quorum:
             print(f"\n{'='*60}")
             print(f"🔥 POTENTIAL BREAKTHROUGH DETECTED!")
             print(f"{'='*60}")
-            print(f"  Agent {best_agent_idx}: {best_val_fitness:.2f}")
+            print(f"  Quorum achieved: {len(breaching_agents)}/{self.breakthrough_quorum} agents breached threshold")
             print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
-            print(f"  Improvement: {improvement*100:.1f}% (threshold: {self.breakthrough_threshold*100:.1f}%)")
+            print(f"  Threshold: {self.breakthrough_threshold*100:.0f}% improvement")
+            print(f"\n  Breaching agents:")
+            for i, agent_info in enumerate(breaching_agents[:self.breakthrough_quorum], 1):
+                print(f"    {i}. Agent {agent_info['idx']:2d}: {agent_info['fitness']:>8.2f} ({agent_info['improvement']*100:>5.1f}% improvement)")
             print(f"{'='*60}")
+
+            # Take the top quorum agents for the candidate
+            top_breaching = breaching_agents[:self.breakthrough_quorum]
+
+            # Best agent is the first one (highest fitness)
+            best_agent_idx = top_breaching[0]['idx']
+            best_fitness = top_breaching[0]['fitness']
 
             # Transition to DETECTION state
             self.breakthrough_state = BreakthroughState.DETECTION
             self.breakthrough_candidate = BreakthroughCandidate(
                 agent=self.population[best_agent_idx].clone(),
+                agents=[self.population[a['idx']].clone() for a in top_breaching],
                 agent_idx=best_agent_idx,
-                spike_score=best_val_fitness,
+                agent_indices=[a['idx'] for a in top_breaching],
+                spike_score=best_fitness,
+                spike_scores=[a['fitness'] for a in top_breaching],
                 detection_generation=self.generation
             )
             return True
@@ -2881,17 +2929,16 @@ class ERLTrainer:
                 quality_threshold = Config.ROI_QUALITY_THRESHOLD
 
             for idx in tqdm(range(len(self.population)), desc="Validating agents"):
-                val_results = self.validate_agent_cached(self.population[idx])
+                val_results = self.validate_agent_cached(self.population[idx], quality_threshold=quality_threshold)
                 val_fitness = val_results['fitness']
                 val_fitness_mean = val_results.get('fitness_mean', 0.0)
                 val_fitness_min = val_results.get('fitness_min', 0.0)
                 train_fitness = fitness_scores[idx]
                 agent_roi = val_results.get('roi', 0.0)
 
-                # Count quality trades (trades with gain_pct >= threshold)
-                closed_trades = val_results.get('closed_trades', [])
-                total_trades = len(closed_trades)  # Total trades across all slices
-                quality_count = sum(1 for trade in closed_trades if trade.get('gain_pct', 0) >= quality_threshold)
+                # Get quality count and total trades from validation results
+                total_trades = val_results.get('total_trades', 0)
+                quality_count = val_results.get('quality_count', 0)
 
                 if self.consistency_mode:
                     # Consistency mode: Use the Pessimistic Score from validate_agent
@@ -3006,7 +3053,7 @@ class ERLTrainer:
             if self.gauntlet_mode_enabled:
                 # Check for breakthrough (only in NORMAL state)
                 if self.breakthrough_state == BreakthroughState.NORMAL:
-                    self.check_for_breakthrough(best_val_fitness_this_gen, best_val_agent_idx)
+                    self.check_for_breakthrough(validation_results)
 
                 # Process state machine transitions
                 self.process_gauntlet_state_machine()
