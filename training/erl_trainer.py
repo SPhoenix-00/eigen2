@@ -6,7 +6,7 @@ Evolutionary Reinforcement Learning training loop
 import numpy as np
 import torch
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 import time
 from torch.utils.tensorboard import SummaryWriter
@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
+from enum import Enum
+from dataclasses import dataclass
 
 # Suppress common library warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='gymnasium')
@@ -188,6 +190,45 @@ def _run_episode_worker(args):
         episode_summary['win_rate_bonus'] = 0.0
 
     return final_fitness, episode_summary, transition_file_paths
+
+
+class BreakthroughState(Enum):
+    """
+    State machine for Gauntlet Mode breakthrough validation.
+
+    Transitions:
+        NORMAL → DETECTION (spike detected)
+        DETECTION → STABILIZATION (candidate locked in)
+        STABILIZATION → GAUNTLET (stabilization complete)
+        GAUNTLET → CONFIRMED (passed stress test) → NORMAL (ratchet applied, search for next)
+        GAUNTLET → REJECTED (failed stress test) → NORMAL (continue searching)
+    """
+    NORMAL = "normal"  # Normal training, monitoring for spikes
+    DETECTION = "detection"  # Potential breakthrough detected
+    STABILIZATION = "stabilization"  # Locked on candidate, allowing convergence
+    GAUNTLET = "gauntlet"  # Running rigorous stress test
+    CONFIRMED = "confirmed"  # Breakthrough confirmed, apply ratchet
+    REJECTED = "rejected"  # Candidate failed Gauntlet, back to normal
+
+
+@dataclass
+class BreakthroughCandidate:
+    """
+    Represents a candidate agent for breakthrough validation.
+
+    Attributes:
+        agent: The candidate DDPGAgent
+        spike_score: Initial validation score that triggered detection
+        detection_generation: Generation when spike was detected
+        stabilization_start_gen: Generation when stabilization started
+        gauntlet_score: Score achieved in Gauntlet (None until tested)
+    """
+    agent: 'DDPGAgent'
+    agent_idx: int
+    spike_score: float
+    detection_generation: int
+    stabilization_start_gen: Optional[int] = None
+    gauntlet_score: Optional[float] = None
 
 
 class ERLTrainer:
@@ -462,6 +503,33 @@ class ERLTrainer:
         # Validation caching - skip re-validation for unchanged elite agents
         self.validation_cache = {}  # Maps (agent_hash, slice_hash) → validation results
         self.val_slice_hash = None  # Hash of current validation slices
+
+        # Gauntlet Mode - Breakthrough state machine
+        self.gauntlet_mode_enabled = Config.GAUNTLET_MODE_ENABLED
+        self.breakthrough_state = BreakthroughState.NORMAL
+        self.breakthrough_candidate: Optional[BreakthroughCandidate] = None
+        self.confirmed_baseline = 0.0  # Ratcheting baseline - only updated after Gauntlet confirmation
+        self.confirmed_breakthroughs = 0  # Count of confirmed breakthroughs
+        self.breakthrough_history = []  # Track breakthrough events with timestamps
+        self.stabilization_generations_elapsed = 0  # Counter for stabilization phase
+
+        # Breakthrough threshold based on mode
+        self.breakthrough_threshold = (Config.BREAKTHROUGH_THRESHOLD_CONSISTENCY
+                                      if self.consistency_mode
+                                      else Config.BREAKTHROUGH_THRESHOLD_NORMAL)
+
+        # Target breakthroughs based on mode
+        self.target_breakthroughs = (Config.TARGET_BREAKTHROUGHS_CONSISTENCY
+                                    if self.consistency_mode
+                                    else Config.TARGET_BREAKTHROUGHS_NORMAL)
+
+        if self.gauntlet_mode_enabled:
+            print(f"\n🎯 Gauntlet Mode ENABLED")
+            print(f"  Breakthrough threshold: {self.breakthrough_threshold*100:.0f}% improvement")
+            print(f"  Stabilization: {Config.STABILIZATION_GENERATIONS} generations")
+            print(f"  Gauntlet slices: {Config.GAUNTLET_NUM_SLICES} (vs 7 normal)")
+            print(f"  Target breakthroughs: {self.target_breakthroughs}")
+            print(f"  Mode: {'Consistency' if self.consistency_mode else 'Normal'}")
 
         # Initialize resource tracker
         self.resource_tracker = ResourceTracker(disk_path="/workspace")
@@ -1079,6 +1147,67 @@ class ERLTrainer:
                 trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
 
                 slices.append((start_idx, end_idx, trading_end_idx))
+
+        return slices
+
+    def generate_gauntlet_slices(self) -> List[Tuple[int, int, int]]:
+        """
+        Generate 20+ rigorous validation slices for Gauntlet stress test.
+
+        Samples slices from BOTH training and validation data to ensure the agent
+        performs robustly across all market regimes, not just validation period.
+
+        Strategy:
+        - 10 slices from training data (different market conditions)
+        - 10 slices from validation data (out-of-sample)
+
+        This prevents agents from gaming the validation set and ensures genuine
+        robustness across all available market data.
+
+        Returns:
+            List of 20 tuples: (start_idx, end_idx, trading_end_idx)
+        """
+        slices = []
+
+        # 1. Sample 10 slices from training data
+        min_start_train = self.train_start_idx
+        max_start_train = self.train_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
+
+        if max_start_train >= min_start_train:
+            # Divide training range into 10 segments
+            train_range = max_start_train - min_start_train + 1
+            train_segment_size = max(1, train_range // 10)
+
+            for i in range(10):
+                segment_start = min_start_train + (i * train_segment_size)
+                segment_end = min(max_start_train + 1, segment_start + train_segment_size)
+
+                if segment_end > segment_start:
+                    start_idx = np.random.randint(segment_start, segment_end)
+                    end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+
+                    slices.append((start_idx, end_idx, trading_end_idx))
+
+        # 2. Sample 10 slices from validation data
+        min_start_val = self.val_start_idx
+        max_start_val = self.val_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
+
+        if max_start_val >= min_start_val:
+            # Divide validation range into 10 segments
+            val_range = max_start_val - min_start_val + 1
+            val_segment_size = max(1, val_range // 10)
+
+            for i in range(10):
+                segment_start = min_start_val + (i * val_segment_size)
+                segment_end = min(max_start_val + 1, segment_start + val_segment_size)
+
+                if segment_end > segment_start:
+                    start_idx = np.random.randint(segment_start, segment_end)
+                    end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+
+                    slices.append((start_idx, end_idx, trading_end_idx))
 
         return slices
 
@@ -1828,6 +1957,289 @@ class ERLTrainer:
 
         return val_results
 
+    def run_gauntlet_validation(self, agent: DDPGAgent) -> Dict:
+        """
+        Run rigorous Gauntlet validation on candidate agent.
+
+        The Gauntlet is a stress test using 20+ validation slices from both
+        training and validation data to ensure the agent performs robustly
+        across all available market regimes.
+
+        Unlike normal validation (7 slices, validation-only), the Gauntlet:
+        - Uses 20+ slices (10 from training, 10 from validation)
+        - Tests across ALL market conditions, not just validation period
+        - Uses pessimistic aggregator (0.4*mean + 0.6*min) to heavily penalize blow-ups
+
+        This prevents "Ghost Scores" where agents get lucky on specific
+        validation slices but fail when tested more broadly.
+
+        Args:
+            agent: Candidate agent to test
+
+        Returns:
+            Dict with gauntlet_score (pessimistic aggregator) and detailed metrics
+        """
+        print(f"\n{'='*60}")
+        print(f"🎯 GAUNTLET VALIDATION - Rigorous Stress Test")
+        print(f"{'='*60}")
+
+        # Generate Gauntlet slices (20 diverse slices from training + validation)
+        gauntlet_slices = self.generate_gauntlet_slices()
+        print(f"Testing on {len(gauntlet_slices)} slices (10 training + 10 validation)")
+
+        # Run agent on all Gauntlet slices
+        slice_results = []
+        all_closed_trades = []
+
+        for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
+            # Use batched inference for faster validation
+            fitness, episode_info = self.run_episode_batched(
+                agent=agent,
+                env=self.eval_env,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                training=False,
+                batch_size=16
+            )
+
+            # Apply zero-trades gradient (same as normal validation)
+            if episode_info['num_trades'] == 0:
+                max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
+                fitness = fitness + max_coeff
+
+            slice_results.append({
+                'fitness': fitness,
+                'win_rate': episode_info['win_rate'],
+                'num_trades': episode_info['num_trades'],
+                'num_wins': episode_info['num_wins'],
+                'num_losses': episode_info['num_losses'],
+                'avg_reward_per_trade': episode_info['avg_reward_per_trade'],
+                'raw_pnl': episode_info.get('raw_pnl', 0.0),
+                'total_investment': episode_info.get('total_investment', 0.0)
+            })
+
+            # Collect closed trades
+            if 'closed_trades' in episode_info and episode_info['closed_trades']:
+                all_closed_trades.extend(episode_info['closed_trades'])
+
+            # Progress indicator
+            if (i + 1) % 5 == 0:
+                print(f"  Completed {i+1}/{len(gauntlet_slices)} slices...")
+
+        # Extract fitness scores
+        fitness_scores = [result['fitness'] for result in slice_results]
+
+        # Pessimistic aggregator: 0.4*mean + 0.6*min
+        # This heavily penalizes blow-up slices and rewards robustness
+        mean_score = np.mean(fitness_scores)
+        min_score = np.min(fitness_scores)
+        max_score = np.max(fitness_scores)
+        gauntlet_score = (0.4 * mean_score) + (0.6 * min_score)
+
+        # Calculate aggregate metrics
+        total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
+        total_investment = sum([r['total_investment'] for r in slice_results])
+        roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
+
+        total_wins = sum([r['num_wins'] for r in slice_results])
+        total_losses = sum([r['num_losses'] for r in slice_results])
+        total_trades = total_wins + total_losses
+        global_win_rate = total_wins / total_trades if total_trades > 0 else 0.0
+
+        expectancy = self.calculate_expectancy(all_closed_trades)
+
+        print(f"\n{'='*60}")
+        print(f"GAUNTLET RESULTS:")
+        print(f"  Gauntlet Score: {gauntlet_score:.2f} (0.4*mean + 0.6*min)")
+        print(f"  Mean: {mean_score:.2f}, Min: {min_score:.2f}, Max: {max_score:.2f}")
+        print(f"  ROI: {roi:.2f}%, Win Rate: {global_win_rate:.1%}")
+        print(f"  Total Trades: {total_trades}, Expectancy: {expectancy:.2f}%")
+        print(f"{'='*60}")
+
+        return {
+            'gauntlet_score': gauntlet_score,
+            'fitness_mean': mean_score,
+            'fitness_min': min_score,
+            'fitness_max': max_score,
+            'fitness_all_slices': fitness_scores,
+            'roi': roi,
+            'win_rate': global_win_rate,
+            'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),
+            'total_trades': total_trades,
+            'expectancy': expectancy,
+            'closed_trades': all_closed_trades
+        }
+
+    def check_for_breakthrough(self, best_val_fitness: float, best_agent_idx: int) -> bool:
+        """
+        Check if current generation has a potential breakthrough.
+
+        A breakthrough is detected when an agent exceeds the confirmed baseline
+        by the breakthrough threshold (10% in normal mode, 5% in consistency mode).
+
+        Args:
+            best_val_fitness: Best validation fitness in current generation
+            best_agent_idx: Index of best agent
+
+        Returns:
+            True if breakthrough detected, False otherwise
+        """
+        if not self.gauntlet_mode_enabled:
+            return False
+
+        if self.breakthrough_state != BreakthroughState.NORMAL:
+            # Already processing a breakthrough
+            return False
+
+        # Calculate improvement over confirmed baseline
+        if self.confirmed_baseline <= 0:
+            # First breakthrough: any positive score qualifies
+            improvement = 1.0 if best_val_fitness > 0 else 0.0
+        else:
+            improvement = (best_val_fitness - self.confirmed_baseline) / abs(self.confirmed_baseline)
+
+        if improvement >= self.breakthrough_threshold:
+            print(f"\n{'='*60}")
+            print(f"🔥 POTENTIAL BREAKTHROUGH DETECTED!")
+            print(f"{'='*60}")
+            print(f"  Agent {best_agent_idx}: {best_val_fitness:.2f}")
+            print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
+            print(f"  Improvement: {improvement*100:.1f}% (threshold: {self.breakthrough_threshold*100:.1f}%)")
+            print(f"{'='*60}")
+
+            # Transition to DETECTION state
+            self.breakthrough_state = BreakthroughState.DETECTION
+            self.breakthrough_candidate = BreakthroughCandidate(
+                agent=self.population[best_agent_idx].clone(),
+                agent_idx=best_agent_idx,
+                spike_score=best_val_fitness,
+                detection_generation=self.generation
+            )
+            return True
+
+        return False
+
+    def process_gauntlet_state_machine(self):
+        """
+        Process Gauntlet Mode state machine transitions.
+
+        State transitions:
+        - NORMAL: Monitor for breakthroughs
+        - DETECTION → STABILIZATION: Lock candidate, begin stabilization
+        - STABILIZATION: Count generations, transition to GAUNTLET when complete
+        - GAUNTLET: Run stress test, transition to CONFIRMED or REJECTED
+        - CONFIRMED: Apply ratchet, return to NORMAL
+        - REJECTED: Return to NORMAL
+        """
+        if not self.gauntlet_mode_enabled:
+            return
+
+        if self.breakthrough_state == BreakthroughState.DETECTION:
+            # Transition to STABILIZATION
+            print(f"\n{'='*60}")
+            print(f"⏳ STABILIZATION PHASE STARTED")
+            print(f"{'='*60}")
+            print(f"  Locking training on candidate for {Config.STABILIZATION_GENERATIONS} generations")
+            print(f"  Goal: Allow Actor/Critic networks to converge on new behavior")
+            print(f"{'='*60}")
+
+            self.breakthrough_state = BreakthroughState.STABILIZATION
+            self.breakthrough_candidate.stabilization_start_gen = self.generation
+            self.stabilization_generations_elapsed = 0
+
+        elif self.breakthrough_state == BreakthroughState.STABILIZATION:
+            # Check if stabilization complete
+            self.stabilization_generations_elapsed += 1
+
+            print(f"\n🔄 Stabilization: {self.stabilization_generations_elapsed}/{Config.STABILIZATION_GENERATIONS} generations")
+
+            if self.stabilization_generations_elapsed >= Config.STABILIZATION_GENERATIONS:
+                # Transition to GAUNTLET
+                print(f"\n{'='*60}")
+                print(f"✅ STABILIZATION COMPLETE - Initiating Gauntlet")
+                print(f"{'='*60}")
+
+                self.breakthrough_state = BreakthroughState.GAUNTLET
+
+                # Run Gauntlet validation
+                gauntlet_results = self.run_gauntlet_validation(self.breakthrough_candidate.agent)
+                gauntlet_score = gauntlet_results['gauntlet_score']
+
+                # Store Gauntlet score
+                self.breakthrough_candidate.gauntlet_score = gauntlet_score
+
+                # Check if agent passed the Gauntlet
+                # Pass if: gauntlet_score > confirmed_baseline
+                if gauntlet_score > self.confirmed_baseline:
+                    # CONFIRMED - Apply Ratchet
+                    self.breakthrough_state = BreakthroughState.CONFIRMED
+
+                    print(f"\n{'='*60}")
+                    print(f"⭐ BREAKTHROUGH CONFIRMED!")
+                    print(f"{'='*60}")
+                    print(f"  Spike Score: {self.breakthrough_candidate.spike_score:.2f} (lucky)")
+                    print(f"  Gauntlet Score: {gauntlet_score:.2f} (robust)")
+                    print(f"  Previous Baseline: {self.confirmed_baseline:.2f}")
+                    print(f"  New Baseline: {gauntlet_score:.2f}")
+                    print(f"{'='*60}")
+
+                    # Apply the Ratchet - set baseline to Gauntlet score (not spike score!)
+                    old_baseline = self.confirmed_baseline
+                    self.confirmed_baseline = gauntlet_score
+                    self.confirmed_breakthroughs += 1
+
+                    # Record breakthrough event
+                    breakthrough_event = {
+                        'generation': self.generation,
+                        'spike_score': self.breakthrough_candidate.spike_score,
+                        'gauntlet_score': gauntlet_score,
+                        'old_baseline': old_baseline,
+                        'new_baseline': gauntlet_score,
+                        'roi': gauntlet_results['roi'],
+                        'win_rate': gauntlet_results['win_rate'],
+                        'expectancy': gauntlet_results['expectancy']
+                    }
+                    self.breakthrough_history.append(breakthrough_event)
+
+                    # Log to wandb
+                    wandb.log({
+                        'gauntlet/breakthrough_confirmed': 1,
+                        'gauntlet/confirmed_breakthroughs': self.confirmed_breakthroughs,
+                        'gauntlet/confirmed_baseline': self.confirmed_baseline,
+                        'gauntlet/gauntlet_score': gauntlet_score,
+                        'gauntlet/spike_score': self.breakthrough_candidate.spike_score,
+                    }, step=self.generation)
+
+                    # Return to NORMAL state
+                    self.breakthrough_state = BreakthroughState.NORMAL
+                    self.breakthrough_candidate = None
+                    self.stabilization_generations_elapsed = 0
+
+                else:
+                    # REJECTED - Failed Gauntlet
+                    self.breakthrough_state = BreakthroughState.REJECTED
+
+                    print(f"\n{'='*60}")
+                    print(f"❌ BREAKTHROUGH REJECTED")
+                    print(f"{'='*60}")
+                    print(f"  Spike Score: {self.breakthrough_candidate.spike_score:.2f} (Ghost Score!)")
+                    print(f"  Gauntlet Score: {gauntlet_score:.2f} (Reality)")
+                    print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
+                    print(f"  Agent failed stress test - continue searching")
+                    print(f"{'='*60}")
+
+                    # Log to wandb
+                    wandb.log({
+                        'gauntlet/breakthrough_rejected': 1,
+                        'gauntlet/rejected_spike_score': self.breakthrough_candidate.spike_score,
+                        'gauntlet/rejected_gauntlet_score': gauntlet_score,
+                    }, step=self.generation)
+
+                    # Return to NORMAL state
+                    self.breakthrough_state = BreakthroughState.NORMAL
+                    self.breakthrough_candidate = None
+                    self.stabilization_generations_elapsed = 0
+
     def _run_evaluation(self):
         """
         Run evaluate_best_agent.py as a subprocess to generate detailed trade report.
@@ -1977,7 +2389,14 @@ class ERLTrainer:
             'wandb_run_name': wandb.run.name,
             'leverage_mode_active': self.leverage_mode_active,
             'leverage_generations_remaining': self.leverage_generations_remaining,
-            'roi_hurdle_ema': self.roi_hurdle_ema
+            'roi_hurdle_ema': self.roi_hurdle_ema,
+            # Gauntlet Mode state
+            'gauntlet_mode_enabled': self.gauntlet_mode_enabled,
+            'breakthrough_state': self.breakthrough_state.value if self.gauntlet_mode_enabled else None,
+            'confirmed_baseline': self.confirmed_baseline,
+            'confirmed_breakthroughs': self.confirmed_breakthroughs,
+            'breakthrough_history': self.breakthrough_history,
+            'stabilization_generations_elapsed': self.stabilization_generations_elapsed,
         }
         state_path = checkpoint_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -2096,6 +2515,21 @@ class ERLTrainer:
 
                 # Load ROI hurdle EMA (defaults to None for old checkpoints)
                 self.roi_hurdle_ema = trainer_state.get('roi_hurdle_ema', None)
+
+                # Load Gauntlet Mode state (backwards compatible with old checkpoints)
+                if self.gauntlet_mode_enabled:
+                    breakthrough_state_str = trainer_state.get('breakthrough_state', None)
+                    if breakthrough_state_str:
+                        self.breakthrough_state = BreakthroughState(breakthrough_state_str)
+                    self.confirmed_baseline = trainer_state.get('confirmed_baseline', 0.0)
+                    self.confirmed_breakthroughs = trainer_state.get('confirmed_breakthroughs', 0)
+                    self.breakthrough_history = trainer_state.get('breakthrough_history', [])
+                    self.stabilization_generations_elapsed = trainer_state.get('stabilization_generations_elapsed', 0)
+
+                    print(f"✓ Gauntlet Mode state restored:")
+                    print(f"  State: {self.breakthrough_state.value}")
+                    print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
+                    print(f"  Breakthroughs: {self.confirmed_breakthroughs}/{self.target_breakthroughs}")
 
                 print(f"✓ Resuming from Gen {self.start_generation} → Gen {self.start_generation + 1}")
                 print(f"✓ Best validation fitness: {self.best_validation_fitness:.2f}")
@@ -2343,17 +2777,37 @@ class ERLTrainer:
                 print("  Leverage mode will not be activated. Continue training normally.\n")
 
         # Use start_generation for the loop
-        for gen in range(self.start_generation, Config.NUM_GENERATIONS):
+        # Stopping condition: Gauntlet Mode uses breakthroughs, fallback to generation limit
+        max_generations = Config.MAX_GENERATIONS_GAUNTLET if self.gauntlet_mode_enabled else Config.NUM_GENERATIONS
+
+        for gen in range(self.start_generation, max_generations):
             self.generation = gen  # Keep this to track the *current* gen
             gen_start_time = time.time()
+
+            # Check Gauntlet Mode stopping condition
+            if self.gauntlet_mode_enabled and self.confirmed_breakthroughs >= self.target_breakthroughs:
+                print(f"\n{'='*60}")
+                print(f"🎯 TARGET BREAKTHROUGHS ACHIEVED!")
+                print(f"{'='*60}")
+                print(f"  Confirmed Breakthroughs: {self.confirmed_breakthroughs}/{self.target_breakthroughs}")
+                print(f"  Final Baseline: {self.confirmed_baseline:.2f}")
+                print(f"  Generation: {gen + 1}")
+                print(f"{'='*60}")
+                break
 
             # Reset peak memory stats for this generation
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
 
+            # Print generation header with Gauntlet state
             print(f"\n{'='*60}")
-            print(f"Generation {gen + 1} / {Config.NUM_GENERATIONS}")
+            if self.gauntlet_mode_enabled:
+                print(f"Generation {gen + 1} / {max_generations} | Breakthroughs: {self.confirmed_breakthroughs}/{self.target_breakthroughs} | State: {self.breakthrough_state.value}")
+            else:
+                print(f"Generation {gen + 1} / {max_generations}")
             print(f"Buffer: {len(self.replay_buffer)} / {self.replay_buffer.capacity} ({len(self.replay_buffer)/self.replay_buffer.capacity*100:.1f}%)")
+            if self.gauntlet_mode_enabled:
+                print(f"Confirmed Baseline: {self.confirmed_baseline:.2f}")
             print(f"{'='*60}")
 
             # 1. Evaluate population (collect experiences)
@@ -2548,6 +3002,15 @@ class ERLTrainer:
             else:
                 print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
 
+            # --- Gauntlet Mode Breakthrough Detection ---
+            if self.gauntlet_mode_enabled:
+                # Check for breakthrough (only in NORMAL state)
+                if self.breakthrough_state == BreakthroughState.NORMAL:
+                    self.check_for_breakthrough(best_val_fitness_this_gen, best_val_agent_idx)
+
+                # Process state machine transitions
+                self.process_gauntlet_state_machine()
+
             # --- Comprehensive Validation Logging ---
             # Calculate validation statistics across all agents
             validation_fitness_scores = [r['validation_fitness'] for r in validation_results]
@@ -2577,6 +3040,15 @@ class ERLTrainer:
                 "validation/best_agent_quality_ratio": best_agent_quality_ratio,
                 "validation/best_agent_expectancy": best_agent_expectancy,
             }
+
+            # Add Gauntlet Mode metrics
+            if self.gauntlet_mode_enabled:
+                validation_log.update({
+                    "gauntlet/confirmed_baseline": self.confirmed_baseline,
+                    "gauntlet/confirmed_breakthroughs": self.confirmed_breakthroughs,
+                    "gauntlet/state": self.breakthrough_state.value,
+                    "gauntlet/stabilization_progress": self.stabilization_generations_elapsed,
+                })
 
             wandb.log(validation_log, step=gen)
 

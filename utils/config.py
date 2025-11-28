@@ -177,6 +177,30 @@ class Config:
     
     # ============ Validation Parameters ============
     EVAL_EPISODES = 5  # Number of episodes for evaluation
+
+    # ============ Gauntlet Mode Parameters ============
+    # Shift from "Run for N Generations" to "Achieve N Confirmed Breakthroughs"
+    # This addresses the "Ghost Score" problem where lucky validation spikes
+    # lock in unrealistic baselines that stall training progress
+
+    GAUNTLET_MODE_ENABLED = True  # Enable Gauntlet Mode breakthrough validation
+
+    # Breakthrough detection
+    BREAKTHROUGH_THRESHOLD_NORMAL = 0.10  # 10% improvement over baseline in normal mode
+    BREAKTHROUGH_THRESHOLD_CONSISTENCY = 0.05  # 5% improvement in consistency mode (stricter)
+
+    # Stabilization phase - lock training on candidate for N generations
+    STABILIZATION_GENERATIONS = 5  # Allow networks to converge on new behavior
+
+    # Gauntlet validation - rigorous stress test with many diverse slices
+    GAUNTLET_NUM_SLICES = 20  # Number of validation slices for Gauntlet (vs 7 for normal validation)
+
+    # Breakthrough goals - stopping condition based on confirmed breakthroughs
+    TARGET_BREAKTHROUGHS_NORMAL = 4  # Number of confirmed breakthroughs in normal mode
+    TARGET_BREAKTHROUGHS_CONSISTENCY = 8  # More breakthroughs required in consistency mode
+
+    # Fallback to generation limit if breakthroughs not achieved
+    MAX_GENERATIONS_GAUNTLET = 100  # Maximum generations before stopping regardless of breakthroughs
     
     @classmethod
     def display(cls):
