@@ -525,6 +525,28 @@ class ERLTrainer:
         Create or recreate DataLoader for the replay buffer.
         Called during __init__ and after loading checkpoints.
         """
+        import gc
+
+        # Explicitly shutdown old DataLoader workers before creating new one
+        if hasattr(self, 'batch_iterator') and self.batch_iterator is not None:
+            try:
+                del self.batch_iterator  # Delete iterator first
+            except:
+                pass
+
+        if hasattr(self, 'replay_dataloader') and self.replay_dataloader is not None:
+            try:
+                # Force shutdown of persistent workers
+                if hasattr(self.replay_dataloader, '_iterator'):
+                    if self.replay_dataloader._iterator is not None:
+                        self.replay_dataloader._iterator._shutdown_workers()
+                del self.replay_dataloader
+            except:
+                pass
+
+        # Force garbage collection to ensure workers are cleaned up
+        gc.collect()
+
         print(f"Creating DataLoader with {Config.NUM_DATALOADER_WORKERS} background workers...")
         self.replay_dataloader = DataLoader(
             self.replay_buffer,
@@ -1357,13 +1379,14 @@ class ERLTrainer:
             futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
             # Collect results as they complete
+            completed_tasks = 0
             for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating (parallel)"):
                 task_idx = futures[future]
                 agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
 
                 try:
                     # raw_fitness is the sum of rewards from env (good for RL, bad for Evolution)
-                    raw_fitness, episode_info, transition_file_paths = future.result()
+                    raw_fitness, episode_info, transition_file_paths = future.result(timeout=300)  # 5 min timeout
 
                     # Calculate Structural Fitness for Evolution
                     triad_fitness = self.calculate_triad_fitness(episode_info)
@@ -1375,14 +1398,27 @@ class ERLTrainer:
                     if transition_file_paths:
                         all_transition_file_paths.extend(transition_file_paths)
 
-                except Exception as e:
-                    print(f"\n⚠ Worker failed for agent {agent_idx}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    completed_tasks += 1
+
+                except TimeoutError:
+                    print(f"\n⚠ Worker TIMEOUT for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)})")
+                    print(f"  This may indicate a deadlock or infinite loop in worker process")
                     # Use penalty fitness for failed episodes
                     fitness_by_agent[agent_idx].append((-10000.0, {
                         'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
                     }))
+                    completed_tasks += 1
+                except Exception as e:
+                    print(f"\n⚠ Worker EXCEPTION for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)}): {e}")
+                    import traceback
+                    traceback.print_exc()
+                    import sys
+                    sys.stdout.flush()  # Force flush to ensure error is logged
+                    # Use penalty fitness for failed episodes
+                    fitness_by_agent[agent_idx].append((-10000.0, {
+                        'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
+                    }))
+                    completed_tasks += 1
 
         # Aggregate results (same logic as sequential version)
         fitness_scores = []
@@ -1416,8 +1452,14 @@ class ERLTrainer:
         # Ensure fitness_scores are all plain floats
         fitness_scores = [float(f) for f in fitness_scores]
 
+        # Clean up large data structures before buffer operations
+        del fitness_by_agent
+        import gc
+        gc.collect()
+
         # Add transition file paths to replay buffer (transitions already written to disk by workers!)
         print(f"\n--- Adding {len(all_transition_file_paths)} transitions to replay buffer ---")
+        print(f"  Current buffer size: {len(self.replay_buffer)}/{self.replay_buffer.capacity}")
         if all_transition_file_paths:
             # Transitions were written to disk during parallel evaluation - just add paths to buffer
             print(f"  Transitions already written to disk by workers (parallel I/O)")

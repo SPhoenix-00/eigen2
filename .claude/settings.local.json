@@ -27,7 +27,9 @@
       "Bash(git show:*)",
       "Bash(git rm:*)",
       "Bash(rm:*)",
-      "Bash(test_results.txt)"
+      "Bash(test_results.txt)",
+      "Bash(ulimit:*)",
+      "Bash(df:*)"
     ],
     "deny": [],
     "ask": []
