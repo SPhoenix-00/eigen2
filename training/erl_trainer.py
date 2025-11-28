@@ -2152,6 +2152,10 @@ class ERLTrainer:
             best_agent_idx = top_breaching[0]['idx']
             best_fitness = top_breaching[0]['fitness']
 
+            # SNAPBACK MECHANISM: Save snapshot before entering Gauntlet
+            # This allows us to restore the population if the Gauntlet fails
+            self.save_gauntlet_snapshot()
+
             # Transition to DETECTION state
             self.breakthrough_state = BreakthroughState.DETECTION
             self.breakthrough_candidate = BreakthroughCandidate(
@@ -2283,7 +2287,11 @@ class ERLTrainer:
                         'gauntlet/rejected_gauntlet_score': gauntlet_score,
                     }, step=self.generation)
 
-                    # Return to NORMAL state
+                    # SNAPBACK MECHANISM: Restore pre-Gauntlet state
+                    # This prevents population poisoning from the failed Ghost strategy
+                    self.restore_gauntlet_snapshot()
+
+                    # Return to NORMAL state (already set by restore_gauntlet_snapshot, but kept for clarity)
                     self.breakthrough_state = BreakthroughState.NORMAL
                     self.breakthrough_candidate = None
                     self.stabilization_generations_elapsed = 0
@@ -2668,6 +2676,159 @@ class ERLTrainer:
                     print(f"⚠ No Hall of Fame agent files found - skipping HoF re-evaluation")
 
             print("\n✓ All agents re-evaluated with current reward function")
+
+    def save_gauntlet_snapshot(self):
+        """
+        Save a snapshot of the trainer state before entering the Gauntlet.
+        This allows us to restore the population if the Gauntlet fails.
+
+        The snapshot includes:
+        - Population (all agents)
+        - Hall of Fame
+        - Trainer state (generation, fitness, mutation rates, etc.)
+
+        Note: Replay buffer is NOT saved in snapshot to save time/space.
+        """
+        snapshot_dir = self.checkpoint_dir / "gauntlet_snapshot"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n📸 Saving Gauntlet Snapshot (Gen {self.generation})...")
+
+        # 1. Save population
+        pop_dir = snapshot_dir / "population"
+        pop_dir.mkdir(exist_ok=True)
+        for agent in self.population:
+            agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
+            agent.save(str(agent_path))
+
+        # 2. Save trainer state
+        trainer_state = {
+            'generation': self.generation,
+            'best_fitness': self.best_fitness,
+            'best_validation_fitness': self.best_validation_fitness,
+            'validation_fitness_history': self.validation_fitness_history,
+            'current_mutation_rate': self.current_mutation_rate,
+            'current_mutation_std': self.current_mutation_std,
+            'plateau_detected': self.plateau_detected,
+            'leverage_mode_active': self.leverage_mode_active,
+            'leverage_generations_remaining': self.leverage_generations_remaining,
+            'roi_hurdle_ema': self.roi_hurdle_ema,
+            # Gauntlet Mode state (save pre-detection state)
+            'gauntlet_mode_enabled': self.gauntlet_mode_enabled,
+            'breakthrough_state': BreakthroughState.NORMAL.value,  # Always restore to NORMAL
+            'confirmed_baseline': self.confirmed_baseline,
+            'confirmed_breakthroughs': self.confirmed_breakthroughs,
+            'breakthrough_history': self.breakthrough_history,
+            'stabilization_generations_elapsed': 0,  # Reset stabilization counter
+        }
+        state_path = snapshot_dir / "trainer_state.json"
+        with open(state_path, 'w') as f:
+            json.dump(trainer_state, f, indent=4)
+
+        # 3. Save Hall of Fame (copy the current HoF directory)
+        if self.hall_of_fame is not None and len(self.hall_of_fame) > 0:
+            # Save HoF metadata
+            hof_snapshot_path = snapshot_dir / "hall_of_fame.json"
+            import shutil
+            hof_source = self.hall_of_fame.hof_dir / "hall_of_fame.json"
+            if hof_source.exists():
+                shutil.copy(hof_source, hof_snapshot_path)
+
+            # Copy HoF agent files
+            hof_agents_dir = snapshot_dir / "hof_agents"
+            hof_agents_dir.mkdir(exist_ok=True)
+            for entry in self.hall_of_fame.entries:
+                agent_path = self.hall_of_fame.hof_dir / f"hof_agent_{entry.agent_id}.pth"
+                if agent_path.exists():
+                    dest_path = hof_agents_dir / f"hof_agent_{entry.agent_id}.pth"
+                    shutil.copy(agent_path, dest_path)
+
+        print(f"✓ Snapshot saved to {snapshot_dir}")
+
+    def restore_gauntlet_snapshot(self):
+        """
+        Restore the trainer state from the Gauntlet snapshot.
+        This is called when a Gauntlet fails (REJECTED state).
+
+        Restores:
+        - Population (all agents)
+        - Hall of Fame
+        - Trainer state (generation, fitness, mutation rates, etc.)
+        """
+        snapshot_dir = self.checkpoint_dir / "gauntlet_snapshot"
+
+        if not snapshot_dir.exists():
+            print("⚠ No Gauntlet snapshot found - cannot restore")
+            return
+
+        print(f"\n🔄 RESTORING Gauntlet Snapshot (Snapback Mechanism)...")
+        print(f"{'='*60}")
+        print(f"  Population Poisoning Detected!")
+        print(f"  Reverting to pre-Gauntlet state to protect genetic diversity")
+        print(f"{'='*60}")
+
+        # 1. Restore Population
+        pop_dir = snapshot_dir / "population"
+        if pop_dir.exists():
+            try:
+                for i, agent in enumerate(self.population):
+                    agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
+                    if agent_path.exists():
+                        agent.load(str(agent_path))
+                print(f"✓ Restored {len(self.population)} agents to pre-Gauntlet state")
+            except Exception as e:
+                print(f"❌ Error restoring population: {e}")
+
+        # 2. Restore Trainer State
+        state_path = snapshot_dir / "trainer_state.json"
+        if state_path.exists():
+            try:
+                with open(state_path, 'r') as f:
+                    trainer_state = json.load(f)
+
+                # Restore all relevant state
+                self.best_fitness = trainer_state.get('best_fitness', float('-inf'))
+                self.best_validation_fitness = trainer_state.get('best_validation_fitness', float('-inf'))
+                self.validation_fitness_history = trainer_state.get('validation_fitness_history', [])
+                self.current_mutation_rate = trainer_state.get('current_mutation_rate', Config.MUTATION_RATE)
+                self.current_mutation_std = trainer_state.get('current_mutation_std', Config.MUTATION_STD)
+                self.plateau_detected = trainer_state.get('plateau_detected', False)
+                self.leverage_mode_active = trainer_state.get('leverage_mode_active', False)
+                self.leverage_generations_remaining = trainer_state.get('leverage_generations_remaining', 0)
+                self.roi_hurdle_ema = trainer_state.get('roi_hurdle_ema', None)
+
+                # Gauntlet state is always restored to NORMAL
+                self.breakthrough_state = BreakthroughState.NORMAL
+                self.breakthrough_candidate = None
+                self.stabilization_generations_elapsed = 0
+
+                print(f"✓ Restored trainer state")
+            except Exception as e:
+                print(f"❌ Error restoring trainer state: {e}")
+
+        # 3. Restore Hall of Fame
+        hof_snapshot_path = snapshot_dir / "hall_of_fame.json"
+        hof_agents_dir = snapshot_dir / "hof_agents"
+        if hof_snapshot_path.exists() and hof_agents_dir.exists():
+            try:
+                import shutil
+                # Restore HoF metadata
+                hof_dest = self.hall_of_fame.hof_dir / "hall_of_fame.json"
+                shutil.copy(hof_snapshot_path, hof_dest)
+
+                # Restore HoF agent files
+                for agent_file in hof_agents_dir.glob("hof_agent_*.pth"):
+                    dest_path = self.hall_of_fame.hof_dir / agent_file.name
+                    shutil.copy(agent_file, dest_path)
+
+                # Reload Hall of Fame from restored files
+                self.hall_of_fame.load()
+                print(f"✓ Restored Hall of Fame ({len(self.hall_of_fame.entries)} champions)")
+            except Exception as e:
+                print(f"❌ Error restoring Hall of Fame: {e}")
+
+        print(f"✓ Snapback Complete - Population restored to healthy state")
+        print(f"{'='*60}\n")
 
     def update_feature_importance(self, attention_weights: torch.Tensor):
         """
