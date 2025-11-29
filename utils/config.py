@@ -201,7 +201,14 @@ class Config:
 
     # Breakthrough goals - stopping condition based on confirmed breakthroughs
     TARGET_BREAKTHROUGHS_NORMAL = 4  # Number of confirmed breakthroughs in normal mode
-    TARGET_BREAKTHROUGHS_CONSISTENCY = 8  # More breakthroughs required in consistency mode
+    TARGET_BREAKTHROUGHS_CONSISTENCY = 8  # Deprecated - not used in consistency mode (uses turnovers instead)
+
+    # Hall of Fame turnover goals (consistency mode only)
+    TARGET_HOF_TURNOVERS = 2  # Number of complete HoF turnovers required (minimum 2)
+    # Unified turnover logic: All 10 HoF agents must have ROI >= previous median
+    # Initial median is 0 (gauntlet ensures all agents have score > 0)
+    # Each turnover raises the bar: median₀=0 → median₁ → median₂ → median₃...
+    # This creates a ratcheting quality mechanism where HoF progressively improves
 
     # Fallback to generation limit if breakthroughs not achieved
     MAX_GENERATIONS_GAUNTLET = 100  # Maximum generations before stopping regardless of breakthroughs

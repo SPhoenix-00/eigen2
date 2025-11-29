@@ -537,10 +537,8 @@ class ERLTrainer:
 
         # Hall of Fame turnover tracking (for consistency mode)
         self.hof_turnover_count = 0  # Number of complete HoF turnovers
-        self.hof_initial_agent_ids = set()  # Track initial HoF agent IDs
-        self.hof_turnover_1_complete = False  # First turnover (all initial agents replaced)
-        self.hof_turnover_1_median = None  # Median ROI after first turnover
-        self.hof_turnover_2_agents_cleared = 0  # Count agents that cleared turnover 1 median
+        self.hof_current_median = None  # Current median ROI baseline (updated each turnover)
+        self.target_hof_turnovers = Config.TARGET_HOF_TURNOVERS  # Target number of turnovers
 
         if self.gauntlet_mode_enabled:
             print(f"\n🎯 Gauntlet Mode ENABLED")
@@ -829,66 +827,70 @@ class ERLTrainer:
         print(f"\nPopulation replaced with {len(self.population)} heroes")
 
         # --- Validate heroes and populate Hall of Fame with ROI ---
-        # This ensures median HoF ROI is properly set from the start
-        print("\n--- Validating heroes for Hall of Fame (with ROI) ---")
+        # In normal mode: Add heroes directly to HoF (ensures median ROI is set from start)
+        # In consistency mode: Heroes must gauntlet their way into HoF (no direct admission)
 
-        # Generate validation slices for hero evaluation
-        self.current_generation_val_slices = self.generate_validation_slices()
+        if not self.consistency_mode:
+            print("\n--- Validating heroes for Hall of Fame (with ROI) ---")
 
-        # Validate top heroes and add to HoF
-        num_to_validate = min(10, len(self.population))  # Validate top 10 for HoF
-        hero_validation_results = []
+            # Generate validation slices for hero evaluation
+            self.current_generation_val_slices = self.generate_validation_slices()
 
-        for idx in tqdm(range(num_to_validate), desc="Validating heroes for HoF"):
-            val_results = self.validate_agent_cached(self.population[idx])
-            val_fitness = val_results['fitness']
-            agent_roi = val_results.get('roi', 0.0)
+            # Validate top heroes and add to HoF
+            num_to_validate = min(10, len(self.population))  # Validate top 10 for HoF
+            hero_validation_results = []
 
-            # Use validation fitness as combined score (no training penalty for initial heroes)
-            combined_fitness = val_fitness
+            for idx in tqdm(range(num_to_validate), desc="Validating heroes for HoF"):
+                val_results = self.validate_agent_cached(self.population[idx])
+                val_fitness = val_results['fitness']
+                agent_roi = val_results.get('roi', 0.0)
 
-            hero_validation_results.append({
-                'idx': idx,
-                'combined_fitness': combined_fitness,
-                'roi': agent_roi,
-                'raw_pnl': val_results.get('raw_pnl', 0.0),
-                'expectancy': val_results.get('expectancy', 0.0)
-            })
+                # Use validation fitness as combined score (no training penalty for initial heroes)
+                combined_fitness = val_fitness
 
-        # Sort by combined fitness and add to HoF
-        hero_validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
+                hero_validation_results.append({
+                    'idx': idx,
+                    'combined_fitness': combined_fitness,
+                    'roi': agent_roi,
+                    'raw_pnl': val_results.get('raw_pnl', 0.0),
+                    'expectancy': val_results.get('expectancy', 0.0)
+                })
 
-        # Build candidates for HoF
-        hof_candidates = []
-        for result in hero_validation_results:
-            agent_idx = result['idx']
-            combined_score = result['combined_fitness']
-            agent_roi = result['roi']
-            agent_expectancy = result['expectancy']
-            hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy))
+            # Sort by combined fitness and add to HoF
+            hero_validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
 
-        # Add heroes to Hall of Fame
-        admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
+            # Build candidates for HoF
+            hof_candidates = []
+            for result in hero_validation_results:
+                agent_idx = result['idx']
+                combined_score = result['combined_fitness']
+                agent_roi = result['roi']
+                agent_expectancy = result['expectancy']
+                hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy))
 
-        # Print HoF initialization summary
-        admitted = [(idx, score, action) for idx, score, action in admission_results
-                   if action == 'admitted' or action.startswith('replaced_')]
-        if admitted:
-            hof_stats = self.hall_of_fame.get_stats()
-            print(f"\n⭐ Hall of Fame initialized with {len(admitted)} heroes:")
-            for agent_idx, score, _ in admitted[:5]:  # Show top 5
-                roi = next((r['roi'] for r in hero_validation_results if r['idx'] == agent_idx), 0.0)
-                print(f"   + Agent {agent_idx}: Combined={score:.2f}, ROI={roi:.2f}%")
-            if len(admitted) > 5:
-                print(f"   ... and {len(admitted) - 5} more")
-            print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
+            # Add heroes to Hall of Fame (normal mode only)
+            admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
 
-        # Track initial HoF agent IDs for turnover detection (consistency mode)
-        if self.consistency_mode:
-            self.hof_initial_agent_ids = {entry.agent_id for entry in self.hall_of_fame.entries}
-            print(f"\n📊 Consistency Mode - HoF Turnover Tracking Initialized")
-            print(f"   Initial HoF size: {len(self.hof_initial_agent_ids)} agents")
-            print(f"   Goal: 2 complete turnovers (all initial agents replaced twice)")
+            # Print HoF initialization summary
+            admitted = [(idx, score, action) for idx, score, action in admission_results
+                       if action == 'admitted' or action.startswith('replaced_')]
+            if admitted:
+                hof_stats = self.hall_of_fame.get_stats()
+                print(f"\n⭐ Hall of Fame initialized with {len(admitted)} heroes:")
+                for agent_idx, score, _ in admitted[:5]:  # Show top 5
+                    roi = next((r['roi'] for r in hero_validation_results if r['idx'] == agent_idx), 0.0)
+                    print(f"   + Agent {agent_idx}: Combined={score:.2f}, ROI={roi:.2f}%")
+                if len(admitted) > 5:
+                    print(f"   ... and {len(admitted) - 5} more")
+                print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
+        else:
+            # Consistency mode: Heroes loaded but not admitted to HoF
+            # They must earn their place through gauntlet validation
+            print(f"\n📊 Consistency Mode - Heroes Loaded (HoF Empty)")
+            print(f"   {len(self.population)} heroes loaded into population")
+            print(f"   Heroes must gauntlet their way into Hall of Fame")
+            print(f"   Goal: {self.target_hof_turnovers} complete turnovers")
+            print(f"   Each turnover raises the quality bar (all HoF agents must exceed previous median)")
 
         print(f"\nUsing heroes mode elite/offspring fractions:")
         print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_ELITE_FRAC)} agents)")
@@ -2334,75 +2336,62 @@ class ERLTrainer:
         """
         Check for Hall of Fame turnover in consistency mode.
 
-        Turnover 1: All initial HoF agents have been replaced (gives us median baseline)
-        Turnover 2: 5 agents have cleared the turnover 1 median and entered HoF
+        Unified turnover logic for all N turnovers:
+        - HoF must be full (10 agents)
+        - All agents must have ROI >= current median baseline
+        - Initial median is 0 (since only gauntlet-passing agents enter HoF, all have score > 0)
+        - Each turnover establishes new median: median₀=0 → median₁ → median₂ → ...
 
-        Training ends successfully after turnover 2 is complete.
+        This creates a ratcheting quality bar where the entire HoF must progressively improve.
+        Training ends when target_hof_turnovers is reached.
         """
         if not self.consistency_mode:
             return
 
-        # Get current HoF agent IDs
-        current_hof_ids = {entry.agent_id for entry in self.hall_of_fame.entries}
+        # Check if HoF is full
+        if len(self.hall_of_fame.entries) != self.hall_of_fame.capacity:
+            return  # Wait until HoF is full
 
-        # Check for Turnover 1: All initial agents replaced
-        if not self.hof_turnover_1_complete:
-            initial_agents_remaining = self.hof_initial_agent_ids & current_hof_ids
+        # Initialize median to 0 for first check (all gauntlet agents have score > 0 by design)
+        current_baseline = self.hof_current_median if self.hof_current_median is not None else 0.0
 
-            if len(initial_agents_remaining) == 0 and len(self.hall_of_fame.entries) == self.hall_of_fame.capacity:
-                # Turnover 1 complete!
-                self.hof_turnover_1_complete = True
-                self.hof_turnover_1_median = self.hall_of_fame.get_median_roi()
-                self.hof_turnover_count = 1
+        # Check if all HoF agents have cleared the current baseline
+        all_cleared_baseline = all(entry.roi >= current_baseline for entry in self.hall_of_fame.entries)
 
-                print(f"\n{'='*60}")
-                print(f"🎊 HALL OF FAME TURNOVER 1 COMPLETE!")
-                print(f"{'='*60}")
-                print(f"  All {len(self.hof_initial_agent_ids)} initial agents have been replaced")
-                print(f"  New HoF Median ROI: {self.hof_turnover_1_median:.2f}%")
-                print(f"  This becomes the baseline for Turnover 2")
-                print(f"  Goal: Admit 5 agents that clear {self.hof_turnover_1_median:.2f}% ROI")
-                print(f"{'='*60}")
+        if all_cleared_baseline:
+            # Turnover complete!
+            self.hof_turnover_count += 1
+            previous_median = current_baseline
+            self.hof_current_median = self.hall_of_fame.get_median_roi()
 
-                # Log to wandb
-                wandb.log({
-                    'hof_turnover/turnover_1_complete': 1,
-                    'hof_turnover/turnover_1_median': self.hof_turnover_1_median,
-                    'hof_turnover/count': self.hof_turnover_count,
-                }, step=self.generation)
+            print(f"\n{'='*60}")
+            print(f"🏆 HALL OF FAME TURNOVER {self.hof_turnover_count} COMPLETE!")
+            print(f"{'='*60}")
+            print(f"  HoF is full with {len(self.hall_of_fame.entries)} agents")
+            print(f"  All agents cleared baseline: ROI >= {previous_median:.2f}%")
+            print(f"  New median ROI: {self.hof_current_median:.2f}%")
+            print(f"  Progress: {self.hof_turnover_count}/{self.target_hof_turnovers} turnovers")
 
-        # Check for Turnover 2: 5 agents cleared turnover 1 median
-        elif self.hof_turnover_1_complete and self.hof_turnover_count == 1:
-            # Count agents with ROI > turnover 1 median that were added after turnover 1
-            agents_clearing_median = [
-                entry for entry in self.hall_of_fame.entries
-                if entry.roi > self.hof_turnover_1_median
-                and entry.agent_id not in self.hof_initial_agent_ids  # Added after initial set
-            ]
+            # Print top agents in current HoF
+            sorted_entries = sorted(self.hall_of_fame.entries, key=lambda e: e.roi, reverse=True)
+            print(f"\n  Top 5 agents in HoF:")
+            for i, entry in enumerate(sorted_entries[:5], 1):
+                print(f"    {i}. Agent {entry.agent_id}: ROI={entry.roi:.2f}%, Gen={entry.generation}")
 
-            self.hof_turnover_2_agents_cleared = len(agents_clearing_median)
-
-            if self.hof_turnover_2_agents_cleared >= 5:
-                # Turnover 2 complete!
-                self.hof_turnover_count = 2
-
-                print(f"\n{'='*60}")
-                print(f"🏆 HALL OF FAME TURNOVER 2 COMPLETE!")
-                print(f"{'='*60}")
-                print(f"  {self.hof_turnover_2_agents_cleared} agents cleared the Turnover 1 median ({self.hof_turnover_1_median:.2f}%)")
-                print(f"  Agents that cleared:")
-                for i, entry in enumerate(agents_clearing_median[:5], 1):
-                    print(f"    {i}. Agent {entry.agent_id}: ROI={entry.roi:.2f}%, Gen={entry.generation}")
+            if self.hof_turnover_count >= self.target_hof_turnovers:
                 print(f"\n  🎯 TRAINING OBJECTIVE ACHIEVED!")
                 print(f"  Hall of Fame is now an Archive of the Proven")
-                print(f"{'='*60}")
+            else:
+                print(f"\n  Next goal: All HoF agents must have ROI >= {self.hof_current_median:.2f}%")
+            print(f"{'='*60}")
 
-                # Log to wandb
-                wandb.log({
-                    'hof_turnover/turnover_2_complete': 1,
-                    'hof_turnover/turnover_2_agents_cleared': self.hof_turnover_2_agents_cleared,
-                    'hof_turnover/count': self.hof_turnover_count,
-                }, step=self.generation)
+            # Log to wandb
+            wandb.log({
+                'hof_turnover/turnover_complete': 1,
+                'hof_turnover/previous_median': previous_median,
+                'hof_turnover/current_median': self.hof_current_median,
+                'hof_turnover/count': self.hof_turnover_count,
+            }, step=self.generation)
 
     def _run_evaluation(self):
         """
@@ -3102,14 +3091,14 @@ class ERLTrainer:
             gen_start_time = time.time()
 
             # Check stopping conditions
-            # Consistency mode: Stop after 2 complete HoF turnovers
+            # Consistency mode: Stop after target HoF turnovers achieved
             # Normal mode: Stop after target breakthroughs achieved
-            if self.consistency_mode and self.hof_turnover_count >= 2:
+            if self.consistency_mode and self.hof_turnover_count >= self.target_hof_turnovers:
                 print(f"\n{'='*60}")
-                print(f"🎯 CONSISTENCY MODE SUCCESS - 2 HoF TURNOVERS COMPLETE!")
+                print(f"🎯 CONSISTENCY MODE SUCCESS - {self.target_hof_turnovers} HoF TURNOVERS COMPLETE!")
                 print(f"{'='*60}")
-                print(f"  Turnover 1: All initial agents replaced")
-                print(f"  Turnover 2: {self.hof_turnover_2_agents_cleared} agents cleared median ({self.hof_turnover_1_median:.2f}%)")
+                print(f"  Total turnovers: {self.hof_turnover_count}")
+                print(f"  Final median ROI: {self.hof_current_median:.2f}%")
                 print(f"  Hall of Fame is now an Archive of the Proven")
                 print(f"  Generation: {gen + 1}")
                 print(f"{'='*60}")
@@ -3132,9 +3121,9 @@ class ERLTrainer:
             print(f"\n{'='*60}")
             if self.gauntlet_mode_enabled:
                 if self.consistency_mode:
-                    turnover_status = f"Turnover: {self.hof_turnover_count}/2"
-                    if self.hof_turnover_1_complete:
-                        turnover_status += f" | T2 Progress: {self.hof_turnover_2_agents_cleared}/5"
+                    turnover_status = f"Turnover: {self.hof_turnover_count}/{self.target_hof_turnovers}"
+                    if self.hof_current_median is not None:
+                        turnover_status += f" | Median: {self.hof_current_median:.2f}%"
                     print(f"Generation {gen + 1} / {max_generations} | {turnover_status} | State: {self.breakthrough_state.value}")
                 else:
                     print(f"Generation {gen + 1} / {max_generations} | Breakthroughs: {self.confirmed_breakthroughs}/{self.target_breakthroughs} | State: {self.breakthrough_state.value}")
