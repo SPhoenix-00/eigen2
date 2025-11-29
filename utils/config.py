@@ -191,7 +191,7 @@ class Config:
 
     # Breakthrough quorum - number of agents that must breach threshold simultaneously
     BREAKTHROUGH_QUORUM_NORMAL = 3  # Require 3 agents to breach in normal mode
-    BREAKTHROUGH_QUORUM_CONSISTENCY = 5  # Require 5 agents to breach in consistency mode
+    BREAKTHROUGH_QUORUM_CONSISTENCY = 1  # Only test highest agent per generation in consistency mode
 
     # Stabilization phase - lock training on candidate for N generations
     STABILIZATION_GENERATIONS = 5  # Allow networks to converge on new behavior
