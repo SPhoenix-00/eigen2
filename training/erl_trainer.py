@@ -520,6 +520,11 @@ class ERLTrainer:
         self.breakthrough_history = []  # Track breakthrough events with timestamps
         self.stabilization_generations_elapsed = 0  # Counter for stabilization phase
 
+        # Candidate queue and tracking (fixes Ghost Loop and Winner-Takes-All)
+        self.candidate_queue = []  # Queue of all agents that breached threshold (sorted by fitness, descending)
+        self.tested_candidate_indices = set()  # Set of agent indices that have been tested in Gauntlet
+        self.pending_baseline_update = None  # Store baseline update until all candidates exhausted
+
         # Breakthrough threshold based on mode
         self.breakthrough_threshold = (Config.BREAKTHROUGH_THRESHOLD_CONSISTENCY
                                       if self.consistency_mode
@@ -2115,6 +2120,13 @@ class ERLTrainer:
         A breakthrough is detected when sufficient agents (quorum) exceed the confirmed baseline
         by the breakthrough threshold (10% in normal mode, 5% in consistency mode).
 
+        This implementation uses a queue-based system to prevent the "Ghost Loop" and
+        "Winner-Takes-All" problems:
+        - All qualifying agents are added to a candidate queue
+        - Agents are tested one at a time through the Gauntlet
+        - Failed agents trigger snapback and the next candidate is selected
+        - Baseline only ratchets after ALL candidates have been exhausted
+
         Args:
             validation_results: List of validation results for all agents, sorted by combined_fitness
 
@@ -2128,11 +2140,20 @@ class ERLTrainer:
             # Already processing a breakthrough
             return False
 
+        # Check if we have candidates in the queue from a previous detection
+        if self.candidate_queue:
+            # Try next candidate from queue
+            return self._select_next_candidate_from_queue()
+
         # Find all agents that breach the threshold
         breaching_agents = []
         for result in validation_results:
             agent_idx = result['idx']
             val_fitness = result['validation_fitness']
+
+            # Skip agents we've already tested
+            if agent_idx in self.tested_candidate_indices:
+                continue
 
             # Calculate improvement over confirmed baseline
             if self.confirmed_baseline <= 0:
@@ -2156,35 +2177,96 @@ class ERLTrainer:
             print(f"  Quorum achieved: {len(breaching_agents)}/{self.breakthrough_quorum} agents breached threshold")
             print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
             print(f"  Threshold: {self.breakthrough_threshold*100:.0f}% improvement")
-            print(f"\n  Breaching agents:")
-            for i, agent_info in enumerate(breaching_agents[:self.breakthrough_quorum], 1):
-                print(f"    {i}. Agent {agent_info['idx']:2d}: {agent_info['fitness']:>8.2f} ({agent_info['improvement']*100:>5.1f}% improvement)")
+            print(f"\n  All qualifying agents (will be tested sequentially):")
+            for i, agent_info in enumerate(breaching_agents, 1):
+                already_tested = " [ALREADY TESTED]" if agent_info['idx'] in self.tested_candidate_indices else ""
+                print(f"    {i}. Agent {agent_info['idx']:2d}: {agent_info['fitness']:>8.2f} ({agent_info['improvement']*100:>5.1f}% improvement){already_tested}")
             print(f"{'='*60}")
 
-            # Take the top quorum agents for the candidate
-            top_breaching = breaching_agents[:self.breakthrough_quorum]
-
-            # Best agent is the first one (highest fitness)
-            best_agent_idx = top_breaching[0]['idx']
-            best_fitness = top_breaching[0]['fitness']
+            # Populate candidate queue with ALL breaching agents (not just quorum)
+            # This ensures we test all qualified heroes, not just the top few
+            self.candidate_queue = breaching_agents.copy()
 
             # SNAPBACK MECHANISM: Save snapshot before entering Gauntlet
             # This allows us to restore the population if the Gauntlet fails
             self.save_gauntlet_snapshot()
 
+            # Select first candidate from queue
+            return self._select_next_candidate_from_queue()
+
+        return False
+
+    def _select_next_candidate_from_queue(self) -> bool:
+        """
+        Select the next untested candidate from the queue.
+
+        This helper method handles the queue-based candidate selection to prevent
+        the Ghost Loop problem. After a snapback, we move to the next candidate
+        instead of re-selecting the same agent.
+
+        Returns:
+            True if a candidate was selected, False if queue is exhausted
+        """
+        while self.candidate_queue:
+            # Pop the next candidate (highest fitness first)
+            candidate_info = self.candidate_queue.pop(0)
+            agent_idx = candidate_info['idx']
+
+            # Check if we've already tested this agent
+            if agent_idx in self.tested_candidate_indices:
+                print(f"  ⏩ Skipping Agent {agent_idx} (already tested)")
+                continue
+
+            # Valid untested candidate found
+            best_agent_idx = agent_idx
+            best_fitness = candidate_info['fitness']
+
+            print(f"\n{'='*60}")
+            print(f"🎯 SELECTING CANDIDATE FROM QUEUE")
+            print(f"{'='*60}")
+            print(f"  Agent {best_agent_idx}: {best_fitness:.2f}")
+            print(f"  Remaining in queue: {len(self.candidate_queue)}")
+            print(f"  Already tested: {len(self.tested_candidate_indices)} agents")
+            print(f"{'='*60}")
+
+            # Mark this agent as tested
+            self.tested_candidate_indices.add(best_agent_idx)
+
             # Transition to DETECTION state
             self.breakthrough_state = BreakthroughState.DETECTION
             self.breakthrough_candidate = BreakthroughCandidate(
                 agent=self.population[best_agent_idx].clone(),
-                agents=[self.population[a['idx']].clone() for a in top_breaching],
+                agents=[self.population[best_agent_idx].clone()],  # Single agent for queue-based selection
                 agent_idx=best_agent_idx,
-                agent_indices=[a['idx'] for a in top_breaching],
+                agent_indices=[best_agent_idx],
                 spike_score=best_fitness,
-                spike_scores=[a['fitness'] for a in top_breaching],
+                spike_scores=[best_fitness],
                 detection_generation=self.generation
             )
             return True
 
+        # Queue exhausted - no more candidates to test
+        print(f"\n{'='*60}")
+        print(f"✅ CANDIDATE QUEUE EXHAUSTED")
+        print(f"{'='*60}")
+        print(f"  All {len(self.tested_candidate_indices)} qualifying agents have been tested")
+
+        # Apply any pending baseline update (fixes Winner-Takes-All problem)
+        if self.pending_baseline_update is not None:
+            old_baseline = self.confirmed_baseline
+            self.confirmed_baseline = self.pending_baseline_update
+            self.confirmed_breakthroughs += 1
+            print(f"\n  📈 APPLYING DEFERRED BASELINE RATCHET")
+            print(f"     Old Baseline: {old_baseline:.2f}")
+            print(f"     New Baseline: {self.confirmed_baseline:.2f}")
+            print(f"     This was the highest score from all tested heroes")
+            self.pending_baseline_update = None
+
+        print(f"  Clearing tested agents set for next detection cycle")
+        print(f"{'='*60}")
+
+        # Clear the tested set for next breakthrough cycle
+        self.tested_candidate_indices.clear()
         return False
 
     def process_gauntlet_state_machine(self):
@@ -2239,7 +2321,7 @@ class ERLTrainer:
                 # Check if agent passed the Gauntlet
                 # Pass if: gauntlet_score > confirmed_baseline
                 if gauntlet_score > self.confirmed_baseline:
-                    # CONFIRMED - Apply Ratchet
+                    # CONFIRMED - Apply Ratchet (potentially deferred)
                     self.breakthrough_state = BreakthroughState.CONFIRMED
 
                     print(f"\n{'='*60}")
@@ -2248,28 +2330,45 @@ class ERLTrainer:
                     print(f"  Spike Score: {self.breakthrough_candidate.spike_score:.2f} (lucky)")
                     print(f"  Gauntlet Score: {gauntlet_score:.2f} (robust)")
                     print(f"  Previous Baseline: {self.confirmed_baseline:.2f}")
-                    print(f"  New Baseline: {gauntlet_score:.2f}")
+
+                    # Store old baseline before update
+                    old_baseline = self.confirmed_baseline
+
+                    # Check if we should defer the baseline ratchet
+                    if self.candidate_queue:
+                        # Defer ratchet: Store for later application
+                        # This allows other heroes to be tested against the original baseline
+                        if self.pending_baseline_update is None or gauntlet_score > self.pending_baseline_update:
+                            self.pending_baseline_update = gauntlet_score
+                        print(f"  Pending Baseline: {gauntlet_score:.2f} (deferred - {len(self.candidate_queue)} candidates remaining)")
+                        print(f"  Current Baseline: {self.confirmed_baseline:.2f} (unchanged)")
+                        print(f"  Reason: Testing remaining heroes against original baseline to avoid Winner-Takes-All")
+                    else:
+                        # No more candidates: Apply ratchet immediately
+                        self.confirmed_baseline = gauntlet_score
+                        self.confirmed_breakthroughs += 1
+                        print(f"  New Baseline: {gauntlet_score:.2f} (applied immediately)")
+                        print(f"  Reason: Candidate queue exhausted")
+
                     print(f"{'='*60}")
 
-                    # Apply the Ratchet - set baseline to Gauntlet score (not spike score!)
-                    old_baseline = self.confirmed_baseline
-                    self.confirmed_baseline = gauntlet_score
-                    self.confirmed_breakthroughs += 1
-
-                    # Record breakthrough event
-                    breakthrough_event = {
-                        'generation': self.generation,
-                        'spike_score': self.breakthrough_candidate.spike_score,
-                        'gauntlet_score': gauntlet_score,
-                        'old_baseline': old_baseline,
-                        'new_baseline': gauntlet_score,
-                        'roi': gauntlet_results['roi'],
-                        'win_rate': gauntlet_results['win_rate'],
-                        'expectancy': gauntlet_results['expectancy']
-                    }
-                    self.breakthrough_history.append(breakthrough_event)
+                    # Record breakthrough event (only if baseline was actually applied)
+                    # If deferred, we'll record it when the baseline is finally applied
+                    if not self.candidate_queue:
+                        breakthrough_event = {
+                            'generation': self.generation,
+                            'spike_score': self.breakthrough_candidate.spike_score,
+                            'gauntlet_score': gauntlet_score,
+                            'old_baseline': old_baseline,
+                            'new_baseline': gauntlet_score,
+                            'roi': gauntlet_results['roi'],
+                            'win_rate': gauntlet_results['win_rate'],
+                            'expectancy': gauntlet_results['expectancy']
+                        }
+                        self.breakthrough_history.append(breakthrough_event)
 
                     # CONSISTENCY MODE: Add agent to Hall of Fame (gauntlet is the gate to HoF)
+                    # This happens regardless of whether baseline is deferred
                     if self.consistency_mode:
                         agent_to_admit = self.breakthrough_candidate.agent
                         agent_roi = gauntlet_results['roi']
@@ -2286,16 +2385,19 @@ class ERLTrainer:
                                     print(f"\n🏆 Agent {agent_idx} admitted to Hall of Fame!")
                                     print(f"   Gauntlet Score: {score:.2f}, ROI: {agent_roi:.2f}%")
 
-                        # Check for HoF turnover
-                        self.check_hof_turnover()
+                        # Check for HoF turnover (only if baseline was applied)
+                        if not self.candidate_queue:
+                            self.check_hof_turnover()
 
                     # Log to wandb
                     wandb.log({
                         'gauntlet/breakthrough_confirmed': 1,
                         'gauntlet/confirmed_breakthroughs': self.confirmed_breakthroughs,
                         'gauntlet/confirmed_baseline': self.confirmed_baseline,
+                        'gauntlet/pending_baseline': self.pending_baseline_update if self.pending_baseline_update else 0.0,
                         'gauntlet/gauntlet_score': gauntlet_score,
                         'gauntlet/spike_score': self.breakthrough_candidate.spike_score,
+                        'gauntlet/candidates_remaining': len(self.candidate_queue),
                     }, step=self.generation)
 
                     # Return to NORMAL state
@@ -2313,7 +2415,11 @@ class ERLTrainer:
                     print(f"  Spike Score: {self.breakthrough_candidate.spike_score:.2f} (Ghost Score!)")
                     print(f"  Gauntlet Score: {gauntlet_score:.2f} (Reality)")
                     print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
-                    print(f"  Agent failed stress test - continue searching")
+                    print(f"  Agent failed stress test")
+                    if self.candidate_queue:
+                        print(f"  Trying next candidate from queue ({len(self.candidate_queue)} remaining)")
+                    else:
+                        print(f"  No more candidates in queue - returning to normal evolution")
                     print(f"{'='*60}")
 
                     # Log to wandb
@@ -2331,6 +2437,11 @@ class ERLTrainer:
                     self.breakthrough_state = BreakthroughState.NORMAL
                     self.breakthrough_candidate = None
                     self.stabilization_generations_elapsed = 0
+
+                    # Queue-based recovery: Try next candidate instead of re-selecting the same agent
+                    # This prevents the "Ghost Loop" where the same lucky agent keeps getting selected
+                    # Note: check_for_breakthrough will be called on the next generation and will
+                    # automatically select the next candidate from the queue if available
 
     def check_hof_turnover(self):
         """
@@ -2817,6 +2928,10 @@ class ERLTrainer:
             'confirmed_breakthroughs': self.confirmed_breakthroughs,
             'breakthrough_history': self.breakthrough_history,
             'stabilization_generations_elapsed': 0,  # Reset stabilization counter
+            # Queue-based candidate tracking (save for snapback)
+            'candidate_queue': self.candidate_queue.copy(),  # Preserve queue across snapback
+            'tested_candidate_indices': list(self.tested_candidate_indices),  # Convert set to list for JSON
+            'pending_baseline_update': self.pending_baseline_update,
         }
         state_path = snapshot_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -2899,7 +3014,15 @@ class ERLTrainer:
                 self.breakthrough_candidate = None
                 self.stabilization_generations_elapsed = 0
 
+                # Restore queue-based candidate tracking (critical for Ghost Loop prevention)
+                self.candidate_queue = trainer_state.get('candidate_queue', [])
+                self.tested_candidate_indices = set(trainer_state.get('tested_candidate_indices', []))
+                self.pending_baseline_update = trainer_state.get('pending_baseline_update', None)
+
                 print(f"✓ Restored trainer state")
+                if self.candidate_queue:
+                    print(f"  ✓ Restored candidate queue ({len(self.candidate_queue)} candidates)")
+                    print(f"  ✓ Restored tested set ({len(self.tested_candidate_indices)} agents already tested)")
             except Exception as e:
                 print(f"❌ Error restoring trainer state: {e}")
 
