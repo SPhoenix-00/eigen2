@@ -2224,6 +2224,15 @@ class ERLTrainer:
                     spike_scores=[a['fitness'] for a in top_breaching],
                     detection_generation=self.generation
                 )
+
+                # Log breakthrough detection to wandb
+                wandb.log({
+                    'gauntlet/state': 'DETECTION',
+                    'gauntlet/candidate_spike_score': best_fitness,
+                    'gauntlet/detection_generation': self.generation,
+                    'gauntlet/quorum_size': len(top_breaching),
+                }, step=self.generation)
+
                 return True
 
         return False
@@ -2275,6 +2284,15 @@ class ERLTrainer:
                 spike_scores=[best_fitness],
                 detection_generation=self.generation
             )
+
+            # Log queue-based breakthrough detection to wandb
+            wandb.log({
+                'gauntlet/state': 'DETECTION',
+                'gauntlet/candidate_spike_score': best_fitness,
+                'gauntlet/detection_generation': self.generation,
+                'heroes/queue_selection': 1,
+            }, step=self.generation)
+
             return True
 
         # Queue exhausted - no more candidates to test
@@ -2329,11 +2347,24 @@ class ERLTrainer:
             self.breakthrough_candidate.stabilization_start_gen = self.generation
             self.stabilization_generations_elapsed = 0
 
+            # Log stabilization start to wandb
+            wandb.log({
+                'gauntlet/state': 'STABILIZATION',
+                'gauntlet/stabilization_started': self.generation,
+                'gauntlet/candidate_fitness': self.breakthrough_candidate.fitness,
+            }, step=self.generation)
+
         elif self.breakthrough_state == BreakthroughState.STABILIZATION:
             # Check if stabilization complete
             self.stabilization_generations_elapsed += 1
 
             print(f"\n🔄 Stabilization: {self.stabilization_generations_elapsed}/{Config.STABILIZATION_GENERATIONS} generations")
+
+            # Log stabilization progress to wandb
+            wandb.log({
+                'gauntlet/stabilization_progress': self.stabilization_generations_elapsed,
+                'gauntlet/stabilization_target': Config.STABILIZATION_GENERATIONS,
+            }, step=self.generation)
 
             if self.stabilization_generations_elapsed >= Config.STABILIZATION_GENERATIONS:
                 # Transition to GAUNTLET
@@ -2342,6 +2373,12 @@ class ERLTrainer:
                 print(f"{'='*60}")
 
                 self.breakthrough_state = BreakthroughState.GAUNTLET
+
+                # Log gauntlet test start to wandb
+                wandb.log({
+                    'gauntlet/state': 'GAUNTLET',
+                    'gauntlet/test_started': self.generation,
+                }, step=self.generation)
 
                 # Run Gauntlet validation
                 gauntlet_results = self.run_gauntlet_validation(self.breakthrough_candidate.agent)
@@ -2689,9 +2726,14 @@ class ERLTrainer:
             'plateau_detected': self.plateau_detected,
             'wandb_run_id': wandb.run.id,
             'wandb_run_name': wandb.run.name,
+
+            # Leverage mode state
             'leverage_mode_active': self.leverage_mode_active,
             'leverage_generations_remaining': self.leverage_generations_remaining,
+
+            # ROI hurdle tracking
             'roi_hurdle_ema': self.roi_hurdle_ema,
+
             # Gauntlet Mode state
             'gauntlet_mode_enabled': self.gauntlet_mode_enabled,
             'breakthrough_state': self.breakthrough_state.value if self.gauntlet_mode_enabled else None,
@@ -2699,6 +2741,33 @@ class ERLTrainer:
             'confirmed_breakthroughs': self.confirmed_breakthroughs,
             'breakthrough_history': self.breakthrough_history,
             'stabilization_generations_elapsed': self.stabilization_generations_elapsed,
+
+            # Breakthrough candidate state (includes agent_id, fitness, detection_gen, etc.)
+            'breakthrough_candidate': {
+                'agent_id': self.breakthrough_candidate.agent_id,
+                'fitness': self.breakthrough_candidate.fitness,
+                'detection_generation': self.breakthrough_candidate.detection_generation,
+                'stabilization_start_gen': self.breakthrough_candidate.stabilization_start_gen,
+                'gauntlet_score': self.breakthrough_candidate.gauntlet_score,
+            } if self.breakthrough_candidate is not None else None,
+
+            # Heroes queue state (for consistency mode with heroes)
+            'use_candidate_queue': self.use_candidate_queue,
+            'candidate_queue': self.candidate_queue,  # List of {idx, fitness, agent_id} dicts
+            'tested_candidate_indices': list(self.tested_candidate_indices),  # Convert set to list for JSON
+            'pending_baseline_update': self.pending_baseline_update,
+
+            # Hall of Fame turnover tracking (for consistency mode)
+            'hof_turnover_count': self.hof_turnover_count,
+            'hof_current_median': self.hof_current_median,
+
+            # Configuration mode flags (for proper restoration context)
+            'consistency_mode': self.consistency_mode,
+            'enable_leverage': self.enable_leverage,
+            'breakthrough_threshold': self.breakthrough_threshold,
+            'breakthrough_quorum': self.breakthrough_quorum,
+            'target_breakthroughs': self.target_breakthroughs,
+            'target_hof_turnovers': self.target_hof_turnovers,
         }
         state_path = checkpoint_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -2828,10 +2897,45 @@ class ERLTrainer:
                     self.breakthrough_history = trainer_state.get('breakthrough_history', [])
                     self.stabilization_generations_elapsed = trainer_state.get('stabilization_generations_elapsed', 0)
 
+                    # Load breakthrough candidate (may be None)
+                    candidate_data = trainer_state.get('breakthrough_candidate', None)
+                    if candidate_data is not None:
+                        self.breakthrough_candidate = BreakthroughCandidate(
+                            agent_id=candidate_data['agent_id'],
+                            fitness=candidate_data['fitness'],
+                            detection_generation=candidate_data['detection_generation'],
+                            stabilization_start_gen=candidate_data.get('stabilization_start_gen'),
+                            gauntlet_score=candidate_data.get('gauntlet_score')
+                        )
+                        print(f"  Breakthrough Candidate: Agent {self.breakthrough_candidate.agent_id} "
+                              f"(fitness: {self.breakthrough_candidate.fitness:.2f})")
+                    else:
+                        self.breakthrough_candidate = None
+
+                    # Load heroes queue state (for consistency mode with heroes)
+                    self.use_candidate_queue = trainer_state.get('use_candidate_queue', False)
+                    self.candidate_queue = trainer_state.get('candidate_queue', [])
+                    # Convert list back to set
+                    tested_indices_list = trainer_state.get('tested_candidate_indices', [])
+                    self.tested_candidate_indices = set(tested_indices_list)
+                    self.pending_baseline_update = trainer_state.get('pending_baseline_update', None)
+
                     print(f"✓ Gauntlet Mode state restored:")
                     print(f"  State: {self.breakthrough_state.value}")
                     print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
                     print(f"  Breakthroughs: {self.confirmed_breakthroughs}/{self.target_breakthroughs}")
+                    if self.use_candidate_queue:
+                        print(f"  Candidate Queue: {len(self.candidate_queue)} pending")
+                        print(f"  Tested Candidates: {len(self.tested_candidate_indices)} agents")
+
+                # Load Hall of Fame turnover tracking (for consistency mode, backwards compatible)
+                self.hof_turnover_count = trainer_state.get('hof_turnover_count', 0)
+                self.hof_current_median = trainer_state.get('hof_current_median', None)
+                if self.consistency_mode and (self.hof_turnover_count > 0 or self.hof_current_median is not None):
+                    print(f"✓ HoF Turnover tracking restored:")
+                    print(f"  Turnovers: {self.hof_turnover_count}/{self.target_hof_turnovers}")
+                    if self.hof_current_median is not None:
+                        print(f"  Current Median ROI: {self.hof_current_median:.2f}%")
 
                 print(f"✓ Resuming from Gen {self.start_generation} → Gen {self.start_generation + 1}")
                 print(f"✓ Best validation fitness: {self.best_validation_fitness:.2f}")
@@ -2970,6 +3074,9 @@ class ERLTrainer:
             'candidate_queue': self.candidate_queue.copy(),  # Preserve queue across snapback
             'tested_candidate_indices': list(self.tested_candidate_indices),  # Convert set to list for JSON
             'pending_baseline_update': self.pending_baseline_update,
+            # Hall of Fame turnover tracking (for consistency mode)
+            'hof_turnover_count': self.hof_turnover_count,
+            'hof_current_median': self.hof_current_median,
         }
         state_path = snapshot_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -3057,10 +3164,16 @@ class ERLTrainer:
                 self.tested_candidate_indices = set(trainer_state.get('tested_candidate_indices', []))
                 self.pending_baseline_update = trainer_state.get('pending_baseline_update', None)
 
+                # Restore Hall of Fame turnover tracking (for consistency mode)
+                self.hof_turnover_count = trainer_state.get('hof_turnover_count', 0)
+                self.hof_current_median = trainer_state.get('hof_current_median', None)
+
                 print(f"✓ Restored trainer state")
                 if self.candidate_queue:
                     print(f"  ✓ Restored candidate queue ({len(self.candidate_queue)} candidates)")
                     print(f"  ✓ Restored tested set ({len(self.tested_candidate_indices)} agents already tested)")
+                if self.hof_turnover_count > 0:
+                    print(f"  ✓ Restored HoF turnover tracking ({self.hof_turnover_count} turnovers)")
             except Exception as e:
                 print(f"❌ Error restoring trainer state: {e}")
 
@@ -3239,6 +3352,13 @@ class ERLTrainer:
 
                 print(f"\n✓ Leverage mode active for next {self.leverage_generations_remaining} generations")
                 print("="*60 + "\n")
+
+                # Log leverage mode activation to wandb
+                wandb.log({
+                    'leverage/active': 1,
+                    'leverage/generations_remaining': self.leverage_generations_remaining,
+                    'leverage/multiplier': 1.5,
+                }, step=self.start_generation)
             else:
                 print(f"\n⚠ Leverage mode requested but Hall of Fame only has {hof_size}/5 agents")
                 print("  Leverage mode will not be activated. Continue training normally.\n")
@@ -3330,13 +3450,24 @@ class ERLTrainer:
             # Log comprehensive fitness metrics to wandb
             # Note: Training fitness is calculated from evaluate_population() on training data
             # Detailed metrics like ROI, win_rate, etc. are only available after validation
-            wandb.log({
+            fitness_log = {
                 "fitness/best_fitness": max_fitness,
                 "fitness/mean_fitness": mean_fitness,
                 "fitness/min_fitness": min_fitness,
                 "fitness/std_fitness": np.std(fitness_scores),
                 "fitness/best_ever": self.best_fitness,
-            }, step=gen)
+            }
+
+            # Add gauntlet state machine overview tracking
+            if self.gauntlet_mode_enabled:
+                fitness_log.update({
+                    "gauntlet/current_state": self.breakthrough_state.value,
+                    "gauntlet/baseline": self.confirmed_baseline,
+                    "gauntlet/breakthrough_count": self.confirmed_breakthroughs,
+                    "gauntlet/target_breakthroughs": self.target_breakthroughs,
+                })
+
+            wandb.log(fitness_log, step=gen)
 
             # Generate validation slices for this generation
             print(f"\n--- Walk-Forward Validation (Generation {gen + 1}) ---")
@@ -3609,7 +3740,7 @@ class ERLTrainer:
                 hof_best_quality_ratio = 0.0
 
             # Log comprehensive Hall of Fame and adaptive mutation metrics to wandb
-            wandb.log({
+            log_data = {
                 "hall_of_fame/min_fitness": hof_stats['worst_score'],
                 "hall_of_fame/max_fitness": hof_stats['best_score'],
                 "hall_of_fame/mean_fitness": hof_stats['mean_score'],
@@ -3620,7 +3751,26 @@ class ERLTrainer:
                 "mutation/rate": self.current_mutation_rate,
                 "mutation/std": self.current_mutation_std,
                 "mutation/plateau_detected": int(self.plateau_detected),
-            }, step=gen)
+            }
+
+            # Add HoF turnover tracking (for consistency mode)
+            if self.consistency_mode:
+                log_data.update({
+                    "hall_of_fame/turnover_count": self.hof_turnover_count,
+                    "hall_of_fame/current_median": self.hof_current_median or 0.0,
+                    "hall_of_fame/target_turnovers": self.target_hof_turnovers,
+                    "hall_of_fame/turnover_progress": self.hof_turnover_count / self.target_hof_turnovers if self.target_hof_turnovers > 0 else 0.0,
+                })
+
+            # Add heroes queue tracking (for consistency mode with heroes)
+            if self.use_candidate_queue:
+                log_data.update({
+                    "heroes/queue_size": len(self.candidate_queue),
+                    "heroes/tested_count": len(self.tested_candidate_indices),
+                    "heroes/pending_baseline": self.pending_baseline_update or 0.0,
+                })
+
+            wandb.log(log_data, step=gen)
 
             # 2. Train agents using replay buffer
             self.train_population()
@@ -3761,6 +3911,11 @@ class ERLTrainer:
                 self.leverage_generations_remaining -= 1
                 print(f"\n📊 Leverage mode: {self.leverage_generations_remaining} generations remaining")
 
+                # Log leverage mode countdown to wandb
+                wandb.log({
+                    'leverage/countdown': self.leverage_generations_remaining,
+                }, step=gen)
+
                 if self.leverage_generations_remaining <= 0:
                     print("\n" + "="*60)
                     print("✓ LEVERAGE MODE COMPLETE")
@@ -3775,6 +3930,11 @@ class ERLTrainer:
                     self.leverage_mode_active = False
                     print("✓ Resumed normal training")
                     print("="*60 + "\n")
+
+                    # Log leverage mode deactivation to wandb
+                    wandb.log({
+                        'leverage/active': 0,
+                    }, step=gen)
 
             # 🔍 Print memory trend every generation
             # if (gen + 1) % 1 == 0:  # Every generation
