@@ -2319,7 +2319,7 @@ class ERLTrainer:
         self.tested_candidate_indices.clear()
         return False
 
-    def process_gauntlet_state_machine(self):
+    def process_gauntlet_state_machine(self, validation_results=None):
         """
         Process Gauntlet Mode state machine transitions.
 
@@ -2330,11 +2330,21 @@ class ERLTrainer:
         - GAUNTLET: Run stress test, transition to CONFIRMED or REJECTED
         - CONFIRMED: Apply ratchet, return to NORMAL
         - REJECTED: Return to NORMAL
+
+        Args:
+            validation_results: Current generation's validation results (sorted by combined_fitness)
         """
         if not self.gauntlet_mode_enabled:
             return
 
         if self.breakthrough_state == BreakthroughState.DETECTION:
+            # Safety check: Ensure candidate exists
+            if self.breakthrough_candidate is None:
+                print(f"\n⚠️ WARNING: Breakthrough candidate is None at stabilization entry!")
+                print(f"  Returning to NORMAL state.\n")
+                self.breakthrough_state = BreakthroughState.NORMAL
+                return
+
             # Transition to STABILIZATION
             print(f"\n{'='*60}")
             print(f"⏳ STABILIZATION PHASE STARTED")
@@ -2367,10 +2377,175 @@ class ERLTrainer:
             }, step=self.generation)
 
             if self.stabilization_generations_elapsed >= Config.STABILIZATION_GENERATIONS:
-                # Transition to GAUNTLET
+                # Stabilization complete - select current best agent for gauntlet
                 print(f"\n{'='*60}")
-                print(f"✅ STABILIZATION COMPLETE - Initiating Gauntlet")
+                print(f"✅ STABILIZATION COMPLETE - Evaluating Current Best Agent")
                 print(f"{'='*60}")
+
+                # Get the current best agent from this generation's validation
+                if validation_results is None or len(validation_results) == 0:
+                    print(f"\n⚠️ WARNING: No validation results available at gauntlet entry!")
+                    print(f"  Returning to NORMAL state.\n")
+                    wandb.log({
+                        'gauntlet/error': 'no_validation_results',
+                        'gauntlet/state': 'NORMAL',
+                    }, step=self.generation)
+                    self.breakthrough_state = BreakthroughState.NORMAL
+                    self.stabilization_generations_elapsed = 0
+                    return
+
+                # Best agent is first in validation_results (already sorted by combined_fitness)
+                best_result = validation_results[0]
+                best_agent_idx = best_result['idx']
+                best_val_fitness = best_result['validation_fitness']
+                best_combined_fitness = best_result['combined_fitness']
+
+                print(f"  Current Best Agent: Agent {best_agent_idx}")
+                print(f"  Validation Fitness: {best_val_fitness:.2f}")
+                print(f"  Combined Fitness: {best_combined_fitness:.2f}")
+                print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
+
+                # Check if the best agent clears the hurdle to enter the gauntlet
+                # Calculate improvement over confirmed baseline
+                if self.confirmed_baseline <= 0:
+                    improvement = 1.0 if best_val_fitness > 0 else 0.0
+                else:
+                    improvement = (best_val_fitness - self.confirmed_baseline) / abs(self.confirmed_baseline)
+
+                if improvement < self.breakthrough_threshold:
+                    # Current best agent does not clear the hurdle
+                    print(f"\n{'='*60}")
+                    print(f"⚠️ CURRENT BEST AGENT FAILED TO CLEAR HURDLE")
+                    print(f"{'='*60}")
+                    print(f"  Agent {best_agent_idx} does not clear the hurdle")
+                    print(f"  Required improvement: {self.breakthrough_threshold*100:.0f}%")
+                    print(f"  Actual improvement: {improvement*100:.1f}%")
+                    print(f"{'='*60}")
+
+                    # FALLBACK: Check if the original agent can still enter the gauntlet
+                    if self.breakthrough_candidate is not None:
+                        original_agent_idx = self.breakthrough_candidate.agent_idx
+
+                        # Only try fallback if original agent is different from current best
+                        if original_agent_idx != best_agent_idx:
+                            print(f"\n🎲 FALLBACK: Checking original breakthrough agent (Agent {original_agent_idx})...")
+
+                            # Find the original agent in validation results
+                            original_result = None
+                            for result in validation_results:
+                                if result['idx'] == original_agent_idx:
+                                    original_result = result
+                                    break
+
+                            if original_result is not None:
+                                original_val_fitness = original_result['validation_fitness']
+
+                                # Calculate improvement for original agent
+                                if self.confirmed_baseline <= 0:
+                                    original_improvement = 1.0 if original_val_fitness > 0 else 0.0
+                                else:
+                                    original_improvement = (original_val_fitness - self.confirmed_baseline) / abs(self.confirmed_baseline)
+
+                                print(f"  Original Agent {original_agent_idx} validation fitness: {original_val_fitness:.2f}")
+                                print(f"  Original Agent improvement: {original_improvement*100:.1f}%")
+
+                                if original_improvement >= self.breakthrough_threshold:
+                                    # Original agent clears the hurdle! Give it a shot
+                                    print(f"\n{'='*60}")
+                                    print(f"🎯 FALLBACK SUCCESS!")
+                                    print(f"{'='*60}")
+                                    print(f"  Original Agent {original_agent_idx} clears the hurdle!")
+                                    print(f"  Proceeding to Gauntlet with original agent...")
+                                    print(f"{'='*60}")
+
+                                    # Update breakthrough candidate with current version of original agent
+                                    self.breakthrough_candidate = BreakthroughCandidate(
+                                        agent=self.population[original_agent_idx].clone(),
+                                        agents=[self.population[original_agent_idx].clone()],
+                                        agent_idx=original_agent_idx,
+                                        agent_indices=[original_agent_idx],
+                                        spike_score=self.breakthrough_candidate.spike_score,
+                                        spike_scores=[self.breakthrough_candidate.spike_score],
+                                        detection_generation=self.breakthrough_candidate.detection_generation
+                                    )
+
+                                    # Continue to gauntlet (don't return)
+                                    # Set a flag to skip the normal agent selection below
+                                    fallback_used = True
+
+                                    # Log fallback success
+                                    wandb.log({
+                                        'gauntlet/fallback_used': 1,
+                                        'gauntlet/fallback_agent_idx': original_agent_idx,
+                                        'gauntlet/fallback_val_fitness': original_val_fitness,
+                                        'gauntlet/fallback_improvement': original_improvement,
+                                    }, step=self.generation)
+                                else:
+                                    print(f"  Original agent also fails to clear hurdle ({original_improvement*100:.1f}% < {self.breakthrough_threshold*100:.0f}%)")
+                                    fallback_used = False
+                            else:
+                                print(f"  Could not find original agent in validation results")
+                                fallback_used = False
+                        else:
+                            print(f"  Original agent is same as current best - no fallback needed")
+                            fallback_used = False
+                    else:
+                        print(f"  No original breakthrough candidate available for fallback")
+                        fallback_used = False
+
+                    # If fallback was not used or failed, return to NORMAL
+                    if not fallback_used:
+                        print(f"\n{'='*60}")
+                        print(f"❌ FAILED TO ENTER GAUNTLET")
+                        print(f"{'='*60}")
+                        print(f"  No agent clears the hurdle")
+                        print(f"  Returning to NORMAL state")
+                        print(f"{'='*60}")
+
+                        # Log failure to wandb
+                        wandb.log({
+                            'gauntlet/failed_to_enter': 1,
+                            'gauntlet/best_val_fitness': best_val_fitness,
+                            'gauntlet/improvement': improvement,
+                            'gauntlet/state': 'NORMAL',
+                        }, step=self.generation)
+
+                        # Return to NORMAL state
+                        self.breakthrough_state = BreakthroughState.NORMAL
+                        self.breakthrough_candidate = None
+                        self.stabilization_generations_elapsed = 0
+                        return
+                else:
+                    # Current best agent clears the hurdle
+                    fallback_used = False
+
+                # Only execute this block if we're proceeding to gauntlet normally (not via fallback)
+                if not fallback_used:
+                    # Agent clears the hurdle - proceed to gauntlet
+                    print(f"  ✓ Agent clears hurdle ({improvement*100:.1f}% improvement)")
+                    print(f"  Proceeding to Gauntlet validation...")
+                    print(f"{'='*60}")
+
+                    # Update breakthrough candidate with current best agent
+                    # Keep original spike score for tracking, but use current agent
+                    original_spike_score = self.breakthrough_candidate.spike_score if self.breakthrough_candidate else best_val_fitness
+                    original_agent_idx = self.breakthrough_candidate.agent_idx if self.breakthrough_candidate else None
+
+                    # If the current best agent is different from the original queued agent, mark it as tested
+                    if self.use_candidate_queue and original_agent_idx is not None and best_agent_idx != original_agent_idx:
+                        print(f"  Note: Current best agent (Agent {best_agent_idx}) differs from originally queued agent (Agent {original_agent_idx})")
+                        print(f"  Marking Agent {best_agent_idx} as tested to prevent re-queuing")
+                        self.tested_candidate_indices.add(best_agent_idx)
+
+                    self.breakthrough_candidate = BreakthroughCandidate(
+                        agent=self.population[best_agent_idx].clone(),
+                        agents=[self.population[best_agent_idx].clone()],
+                        agent_idx=best_agent_idx,
+                        agent_indices=[best_agent_idx],
+                        spike_score=original_spike_score,  # Keep original for comparison
+                        spike_scores=[original_spike_score],
+                        detection_generation=self.breakthrough_candidate.detection_generation if self.breakthrough_candidate else self.generation
+                    )
 
                 self.breakthrough_state = BreakthroughState.GAUNTLET
 
@@ -2378,9 +2553,11 @@ class ERLTrainer:
                 wandb.log({
                     'gauntlet/state': 'GAUNTLET',
                     'gauntlet/test_started': self.generation,
+                    'gauntlet/candidate_val_fitness': best_val_fitness,
+                    'gauntlet/candidate_improvement': improvement,
                 }, step=self.generation)
 
-                # Run Gauntlet validation
+                # Run Gauntlet validation on the current best agent
                 gauntlet_results = self.run_gauntlet_validation(self.breakthrough_candidate.agent)
                 gauntlet_score = gauntlet_results['gauntlet_score']
 
@@ -2742,10 +2919,10 @@ class ERLTrainer:
             'breakthrough_history': self.breakthrough_history,
             'stabilization_generations_elapsed': self.stabilization_generations_elapsed,
 
-            # Breakthrough candidate state (includes agent_id, fitness, detection_gen, etc.)
+            # Breakthrough candidate state (includes agent_idx, spike_score, detection_gen, etc.)
             'breakthrough_candidate': {
-                'agent_id': self.breakthrough_candidate.agent_id,
-                'fitness': self.breakthrough_candidate.fitness,
+                'agent_idx': self.breakthrough_candidate.agent_idx,
+                'spike_score': self.breakthrough_candidate.spike_score,
                 'detection_generation': self.breakthrough_candidate.detection_generation,
                 'stabilization_start_gen': self.breakthrough_candidate.stabilization_start_gen,
                 'gauntlet_score': self.breakthrough_candidate.gauntlet_score,
@@ -2898,17 +3075,25 @@ class ERLTrainer:
                     self.stabilization_generations_elapsed = trainer_state.get('stabilization_generations_elapsed', 0)
 
                     # Load breakthrough candidate (may be None)
+                    # NOTE: We can only restore metadata, not the actual agent objects
+                    # The agent will need to be re-selected from the population after loading
                     candidate_data = trainer_state.get('breakthrough_candidate', None)
                     if candidate_data is not None:
+                        agent_idx = candidate_data.get('agent_idx', 0)
+                        # Reconstruct BreakthroughCandidate with agent from current population
                         self.breakthrough_candidate = BreakthroughCandidate(
-                            agent_id=candidate_data['agent_id'],
-                            fitness=candidate_data['fitness'],
-                            detection_generation=candidate_data['detection_generation'],
+                            agent=self.population[agent_idx].clone(),
+                            agents=[self.population[agent_idx].clone()],
+                            agent_idx=agent_idx,
+                            agent_indices=[agent_idx],
+                            spike_score=candidate_data.get('spike_score', 0.0),
+                            spike_scores=[candidate_data.get('spike_score', 0.0)],
+                            detection_generation=candidate_data.get('detection_generation', 0),
                             stabilization_start_gen=candidate_data.get('stabilization_start_gen'),
                             gauntlet_score=candidate_data.get('gauntlet_score')
                         )
-                        print(f"  Breakthrough Candidate: Agent {self.breakthrough_candidate.agent_id} "
-                              f"(fitness: {self.breakthrough_candidate.fitness:.2f})")
+                        print(f"  Breakthrough Candidate: Agent {agent_idx} "
+                              f"(spike score: {self.breakthrough_candidate.spike_score:.2f})")
                     else:
                         self.breakthrough_candidate = None
 
@@ -3624,7 +3809,7 @@ class ERLTrainer:
                     self.check_for_breakthrough(validation_results)
 
                 # Process state machine transitions
-                self.process_gauntlet_state_machine()
+                self.process_gauntlet_state_machine(validation_results)
 
             # --- Comprehensive Validation Logging ---
             # Calculate validation statistics across all agents
