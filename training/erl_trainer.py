@@ -2361,7 +2361,7 @@ class ERLTrainer:
             wandb.log({
                 'gauntlet/state': 'STABILIZATION',
                 'gauntlet/stabilization_started': self.generation,
-                'gauntlet/candidate_fitness': self.breakthrough_candidate.fitness,
+                'gauntlet/candidate_spike_score': self.breakthrough_candidate.spike_score,
             }, step=self.generation)
 
         elif self.breakthrough_state == BreakthroughState.STABILIZATION:
