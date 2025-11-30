@@ -1768,10 +1768,12 @@ class ERLTrainer:
             del actor_losses
             del critic_losses
 
-            # Clear GPU cache after each agent to prevent accumulation
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    
+        # Clear GPU cache once after training all agents
+        # Note: With expandable_segments=True, CUDA handles fragmentation efficiently
+        # so we only need to clear once per generation, not after each agent
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def evolve_population(self, fitness_scores: List[float], validation_scores: List[float] = None):
         """
         Evolve population using genetic algorithm.
@@ -3743,7 +3745,8 @@ class ERLTrainer:
                     'quality_count': quality_count,
                     'raw_pnl': val_results.get('raw_pnl', 0.0),
                     'roi': agent_roi,
-                    'expectancy': val_results.get('expectancy', 0.0)
+                    'expectancy': val_results.get('expectancy', 0.0),
+                    'fitness_all_slices': val_results.get('fitness_all_slices', [])  # Per-slice scores for logging
                 })
 
                 # Track best combined fitness in this generation
@@ -3825,10 +3828,8 @@ class ERLTrainer:
             best_agent_quality_ratio = (best_agent_result['quality_count'] / best_agent_result['total_trades']
                                        if best_agent_result['total_trades'] > 0 else 0.0)
 
-            # Get the best agent's per-slice fitness scores
-            best_agent_idx = best_agent_result['idx']
-            best_agent_val_results = self.validate_agent_cached(self.population[best_agent_idx])
-            best_agent_slice_scores = best_agent_val_results.get('fitness_all_slices', [])
+            # Get the best agent's per-slice fitness scores from already-validated results
+            best_agent_slice_scores = best_agent_result.get('fitness_all_slices', [])
 
             # Log validation metrics to wandb
             validation_log = {
