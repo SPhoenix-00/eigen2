@@ -29,7 +29,8 @@
       "Bash(rm:*)",
       "Bash(test_results.txt)",
       "Bash(ulimit:*)",
-      "Bash(df:*)"
+      "Bash(df:*)",
+      "Bash(awk:*)"
     ],
     "deny": [],
     "ask": []

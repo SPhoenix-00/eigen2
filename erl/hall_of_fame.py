@@ -284,7 +284,12 @@ class HallOfFame:
             k: Number of agents to sample
 
         Returns:
-            List of k cloned DDPGAgent instances
+            List of k cloned DDPGAgent instances with fresh optimizers
+
+        Note:
+            Uses load_weights_only() to avoid loading stale optimizer states.
+            This prevents 60% training slowdown caused by mismatched Adam
+            momentum from previous training contexts.
         """
         if len(self.entries) == 0:
             return []
@@ -297,9 +302,10 @@ class HallOfFame:
         for entry in sampled_entries:
             agent_path = self.hof_dir / f"hof_agent_{entry.agent_id}.pth"
             if agent_path.exists():
-                # Create new agent and load weights
+                # Create new agent with fresh optimizers
                 agent = DDPGAgent(agent_id=entry.agent_id)
-                agent.load(str(agent_path))
+                # Load only network weights, not optimizer states
+                agent.load_weights_only(str(agent_path))
                 agents.append(agent)
 
         return agents

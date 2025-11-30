@@ -288,6 +288,28 @@ class DDPGAgent:
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
         self.noise_scale = checkpoint['noise_scale']
         self.update_count = checkpoint['update_count']
+
+    def load_weights_only(self, path: str):
+        """
+        Load only network weights without optimizer states.
+
+        This is used for Hall of Fame injection where we want the champion's
+        learned policy but with fresh optimizers that can adapt quickly to
+        the current training regime. Loading stale optimizer states causes
+        60% slowdown due to mismatched momentum and memory layout issues.
+
+        Args:
+            path: Path to checkpoint file
+        """
+        checkpoint = torch.load(path, map_location=self.device)
+        self.agent_id = checkpoint['agent_id']
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
+        self.noise_scale = checkpoint.get('noise_scale', Config.NOISE_SCALE)
+        # Note: optimizers remain fresh (initialized in __init__)
+        # Note: update_count remains 0 (this agent starts fresh in the population)
     
     def clone(self) -> 'DDPGAgent':
         """Create a deep copy of this agent."""
