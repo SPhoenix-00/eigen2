@@ -23,17 +23,21 @@ The Protocol
     We monitor the population for any agent that exceeds our Confirmed Baseline (initially 0) by a significant margin (e.g., 10%).
     Status: "Potential Breakthrough" detected.
 - Step 2: Stabilization (The Siege)
-    We do not celebrate yet. We lock the training focus on this candidate for 5 generations.
+    We do not celebrate yet. We lock the training focus on this candidate for 3 generations.
     Goal: Allow the Actor and Critic networks to converge around this new behavior, preventing "one-hit wonders" that vanish in the next gradient step.
 - Step 3: The Gauntlet (The Test)
     Once stabilized, the candidate faces The Gauntlet:
     - Standard Validation: 7 random data slices.
-    - The Gauntlet: 20+ rigorously randomized slices covering different market regimes across all training and validation data
-    - Scoring: We use a "Pessimistic Aggregator" (heavy weight on the worst-case scenario)
-- Step 4: The Ratchet (The Fix)This is the most critical change.If a candidate scores 50.0 in the Gauntlet:
+    - The Gauntlet: 20 rigorously randomized slices covering different market regimes across all training and validation data
+    - Scoring: We use a "Slightly Forgiving Aggregator" (0.75*mean + 0.25*min) to balance robustness with average performance
+- Step 4: The Ratchet (The Fix)This is the most critical change.
+    FIRST BREAKTHROUGH: We "give away" the first breakthrough - any gauntlet score (even negative) becomes the baseline.
+    This provides a realistic starting point since we don't know in advance what performance level is achievable.
+
+    SUBSEQUENT BREAKTHROUGHS: If a candidate scores 50.0 in the Gauntlet:
     - It is lower than the lucky spike of 552.
-    - But it is higher than the previous Confirmed Baseline of 0.
-    
+    - But it is higher than the previous Confirmed Baseline (e.g., -100).
+
     Action: We CONFIRM the breakthrough.The Ratchet: We set the new "High Water Mark" to 50.0 (the reality), NOT 552 (the ghost).
     
 3. Why This Works

@@ -70,6 +70,11 @@ class Config:
     ROI_QUALITY_THRESHOLD = 7.5  # Default minimum gain_pct for a trade to count as "quality"
     ROI_USE_HOF_MEDIAN_AS_THRESHOLD = True  # If True, use HoF median ROI as threshold (supersedes default)
 
+    # Hall of Fame erosion mechanism
+    HOF_EROSION_ALPHA = 0.33  # EMA smoothing factor for gradual score erosion (0-1)
+    # Higher α = faster erosion. Default 0.33 means scores converge to new median over ~3 generations
+    # This prevents early agents from having unfair ROI advantages as the median rises
+
     TRADING_PERIOD_DAYS = 125  # 6 months - period where model can open new positions
     SETTLEMENT_PERIOD_DAYS = 30  # Additional days to close remaining positions (must be >= MAX_HOLDING_PERIOD)
     EPISODE_LENGTH = TRADING_PERIOD_DAYS  # For backward compatibility
@@ -141,7 +146,7 @@ class Config:
 
     # Consistency mode - loss magnification for training on consistency
     # Applied ONLY when --consistency flag is used. Normal mode uses 1.0 (no magnification)
-    CONSISTENCY_LOSS_MULTIPLIER = 3.0  # Magnify losses by 3x to focus training on reducing drawdowns
+    CONSISTENCY_LOSS_MULTIPLIER = 1.5  # Magnify losses by 1.5x to focus training on reducing drawdowns
 
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)
@@ -182,6 +187,9 @@ class Config:
     # Shift from "Run for N Generations" to "Achieve N Confirmed Breakthroughs"
     # This addresses the "Ghost Score" problem where lucky validation spikes
     # lock in unrealistic baselines that stall training progress
+    #
+    # FIRST BREAKTHROUGH: Automatically accepted (any gauntlet score establishes baseline)
+    # SUBSEQUENT BREAKTHROUGHS: Must exceed confirmed baseline by threshold percentage
 
     GAUNTLET_MODE_ENABLED = True  # Enable Gauntlet Mode breakthrough validation
 
@@ -206,7 +214,7 @@ class Config:
     # Hall of Fame turnover goals (consistency mode only)
     TARGET_HOF_TURNOVERS = 2  # Number of complete HoF turnovers required (minimum 2)
     # Unified turnover logic: All 10 HoF agents must have ROI >= previous median
-    # Initial median is 0 (gauntlet ensures all agents have score > 0)
+    # Initial median is 0 (first breakthrough establishes baseline from gauntlet score)
     # Each turnover raises the bar: median₀=0 → median₁ → median₂ → median₃...
     # This creates a ratcheting quality mechanism where HoF progressively improves
 

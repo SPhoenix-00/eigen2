@@ -18,22 +18,35 @@ class HallOfFameEntry:
     and the path to the agent's saved weights.
     """
 
-    def __init__(self, agent_id: int, validation_score: float, generation: int, roi: float = 0.0, expectancy: float = 0.0):
+    def __init__(self, agent_id: int, validation_score: float, generation: int, roi: float = 0.0, expectancy: float = 0.0,
+                 train_fitness: float = 0.0, quality_count: int = 0, total_trades: int = 0,
+                 val_fitness: float = 0.0, base_combined_fitness: float = 0.0):
         """
         Initialize a Hall of Fame entry.
 
         Args:
             agent_id: Unique identifier for this HoF entry
-            validation_score: Validation fitness that qualified this agent
+            validation_score: Combined fitness (with ROI adjustment) that qualified this agent
             generation: Generation number when this agent was admitted
             roi: Return on Investment percentage for this agent
             expectancy: Expectancy metric for this agent
+            train_fitness: Training fitness score (for re-computing combined score)
+            quality_count: Number of quality trades (for re-computing confidence factor)
+            total_trades: Total trades across all slices (for re-computing confidence factor)
+            val_fitness: Raw validation fitness before ROI adjustment
+            base_combined_fitness: Base combined fitness before ROI adjustment
         """
         self.agent_id = agent_id
-        self.validation_score = validation_score
+        self.validation_score = validation_score  # This is the combined_fitness (with ROI adjustment)
         self.generation = generation
         self.roi = roi
         self.expectancy = expectancy
+        # Store raw metrics for re-evaluation with EMA erosion
+        self.train_fitness = train_fitness
+        self.quality_count = quality_count
+        self.total_trades = total_trades
+        self.val_fitness = val_fitness
+        self.base_combined_fitness = base_combined_fitness
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -42,7 +55,12 @@ class HallOfFameEntry:
             'validation_score': float(self.validation_score),
             'generation': self.generation,
             'roi': float(self.roi),
-            'expectancy': float(self.expectancy)
+            'expectancy': float(self.expectancy),
+            'train_fitness': float(self.train_fitness),
+            'quality_count': int(self.quality_count),
+            'total_trades': int(self.total_trades),
+            'val_fitness': float(self.val_fitness),
+            'base_combined_fitness': float(self.base_combined_fitness)
         }
 
     @staticmethod
@@ -53,7 +71,12 @@ class HallOfFameEntry:
             validation_score=data['validation_score'],
             generation=data['generation'],
             roi=data.get('roi', 0.0),  # Default for backwards compatibility
-            expectancy=data.get('expectancy', 0.0)  # Default for backwards compatibility
+            expectancy=data.get('expectancy', 0.0),  # Default for backwards compatibility
+            train_fitness=data.get('train_fitness', 0.0),
+            quality_count=data.get('quality_count', 0),
+            total_trades=data.get('total_trades', 0),
+            val_fitness=data.get('val_fitness', 0.0),
+            base_combined_fitness=data.get('base_combined_fitness', 0.0)
         )
 
 
@@ -159,7 +182,7 @@ class HallOfFame:
 
         return True
 
-    def update_from_generation(self, candidates: List[Tuple[DDPGAgent, float, int, float, float]], generation: int) -> List[Tuple[int, float, str]]:
+    def update_from_generation(self, candidates: List[Tuple[DDPGAgent, float, int, float, float, float, int, int, float, float]], generation: int) -> List[Tuple[int, float, str]]:
         """
         Update Hall of Fame from a generation of candidates with aggressive admission.
 
@@ -168,7 +191,8 @@ class HallOfFame:
         2. Maintenance Phase: Cascading swaps - replace worst HoF agents with best candidates
 
         Args:
-            candidates: List of (agent, combined_score, agent_idx, roi, expectancy) tuples
+            candidates: List of (agent, combined_score, agent_idx, roi, expectancy,
+                       train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness) tuples
             generation: Current generation number
 
         Returns:
@@ -185,7 +209,7 @@ class HallOfFame:
 
         # Phase 1: Initial Filling - admit all positive-score candidates if not full
         if not self.is_full():
-            for agent, score, agent_idx, roi, expectancy in sorted_candidates:
+            for agent, score, agent_idx, roi, expectancy, train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness in sorted_candidates:
                 if self.is_full():
                     break
 
@@ -197,7 +221,12 @@ class HallOfFame:
                         validation_score=score,
                         generation=generation,
                         roi=roi,
-                        expectancy=expectancy
+                        expectancy=expectancy,
+                        train_fitness=train_fitness,
+                        quality_count=quality_count,
+                        total_trades=total_trades,
+                        val_fitness=val_fitness,
+                        base_combined_fitness=base_combined_fitness
                     )
                     self.entries.append(entry)
 
@@ -213,7 +242,7 @@ class HallOfFame:
         # Phase 2: Cascading Swaps - even if we just filled some slots, check for replacements
         # Get remaining candidates that weren't admitted in Phase 1
         admitted_indices = {r[0] for r in results if r[2] == 'admitted'}
-        remaining_candidates = [(a, s, idx, roi, exp) for a, s, idx, roi, exp in sorted_candidates
+        remaining_candidates = [(a, s, idx, roi, exp, tf, qc, tt, vf, bcf) for a, s, idx, roi, exp, tf, qc, tt, vf, bcf in sorted_candidates
                                 if idx not in admitted_indices]
 
         if remaining_candidates and self.is_full():
@@ -222,7 +251,7 @@ class HallOfFame:
 
             # Cascading swap: iterate through worst HoF agents and best candidates
             swaps_made = 0
-            for candidate_agent, candidate_score, agent_idx, candidate_roi, candidate_expectancy in remaining_candidates:
+            for candidate_agent, candidate_score, agent_idx, candidate_roi, candidate_expectancy, candidate_train_fitness, candidate_quality_count, candidate_total_trades, candidate_val_fitness, candidate_base_combined in remaining_candidates:
                 if swaps_made >= len(sorted_hof):
                     break
 
@@ -254,7 +283,12 @@ class HallOfFame:
                         validation_score=candidate_score,
                         generation=generation,
                         roi=candidate_roi,
-                        expectancy=candidate_expectancy
+                        expectancy=candidate_expectancy,
+                        train_fitness=candidate_train_fitness,
+                        quality_count=candidate_quality_count,
+                        total_trades=candidate_total_trades,
+                        val_fitness=candidate_val_fitness,
+                        base_combined_fitness=candidate_base_combined
                     )
                     self.entries.append(new_entry)
 
@@ -370,6 +404,74 @@ class HallOfFame:
             return 0.0
         roi_values = [e.roi for e in self.entries]
         return float(np.median(roi_values))
+
+    def recompute_all_scores(self, current_median_roi: float, roi_adjustment_multiplier: float,
+                            min_trades_threshold: int, erosion_alpha: float = 0.33,
+                            consistency_mode: bool = False) -> int:
+        """
+        Re-evaluate HoF entries' combined fitness using the current median ROI with gradual erosion.
+
+        This implements the "erosion" mechanism: as the median rises over time,
+        historical agents' relative ROI advantage diminishes, and their combined
+        fitness scores are adjusted accordingly. This ensures newer agents compete
+        on equal footing and prevents early agents from having unfair advantages.
+
+        Erosion is gradual using an EMA (Exponential Moving Average) approach:
+        - Each generation, we compute what the score SHOULD be with current median
+        - We blend the old score with the new target using EMA: score = (1-α)*old + α*new
+        - Default α=0.33 means full adjustment takes ~3 generations (convergence at ~95% in 3 steps)
+
+        This prevents sudden HoF turnover and reduces noise while still implementing erosion.
+
+        Args:
+            current_median_roi: Current HoF median ROI to use as benchmark
+            roi_adjustment_multiplier: Multiplier for ROI adjustment (Config.ROI_ADJUSTMENT_MULTIPLIER)
+            min_trades_threshold: Minimum quality trades for full confidence (Config.ROI_CONFIDENCE_MIN_TRADES)
+            erosion_alpha: EMA smoothing factor (0-1). Higher = faster erosion. Default 0.33 ≈ 3 generations
+            consistency_mode: If True, skip ROI adjustment (consistency mode)
+
+        Returns:
+            Number of entries that had their scores updated
+        """
+        if len(self.entries) == 0:
+            return 0
+
+        updated_count = 0
+
+        for entry in self.entries:
+            # Store original score for comparison
+            old_score = entry.validation_score
+
+            # Compute target combined fitness using stored raw metrics and CURRENT median
+            if consistency_mode:
+                # Consistency mode: validation fitness only (no ROI adjustment)
+                target_combined_fitness = entry.val_fitness
+            else:
+                # Normal mode: recalculate with current median
+                # Base combined: val_fitness + min(0, train_fitness)
+                base_combined = entry.val_fitness + min(0.0, entry.train_fitness)
+
+                # Confidence factor based on quality trades
+                confidence_factor = min(1.0, entry.quality_count / min_trades_threshold) if min_trades_threshold > 0 else 0.0
+
+                # ROI adjustment: (|base| × multiplier × (agent_roi - current_median) / 100) × confidence
+                roi_adjustment = abs(base_combined) * roi_adjustment_multiplier * (entry.roi - current_median_roi) / 100.0
+                roi_adjustment = roi_adjustment * confidence_factor
+
+                target_combined_fitness = base_combined + roi_adjustment
+
+            # Apply EMA smoothing: blend old score toward target
+            # new_score = (1 - alpha) * old_score + alpha * target_score
+            # This creates gradual erosion over multiple generations
+            new_combined_fitness = (1.0 - erosion_alpha) * old_score + erosion_alpha * target_combined_fitness
+
+            # Update the validation_score (which represents combined fitness)
+            entry.validation_score = new_combined_fitness
+
+            if abs(new_combined_fitness - old_score) > 0.01:  # Track meaningful changes
+                updated_count += 1
+
+        return updated_count
 
     def get_stats(self) -> Dict:
         """
