@@ -2077,12 +2077,12 @@ class ERLTrainer:
         # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Pessimistic aggregator: 0.4*mean + 0.6*min
-        # This heavily penalizes blow-up slices and rewards robustness
+        # Slightly forgiving aggregator: 0.75*mean + 0.25*min
+        # Balances robustness with average performance
         mean_score = np.mean(fitness_scores)
         min_score = np.min(fitness_scores)
         max_score = np.max(fitness_scores)
-        gauntlet_score = (0.4 * mean_score) + (0.6 * min_score)
+        gauntlet_score = (0.75 * mean_score) + (0.25 * min_score)
 
         # Calculate aggregate metrics
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -2098,7 +2098,7 @@ class ERLTrainer:
 
         print(f"\n{'='*60}")
         print(f"GAUNTLET RESULTS:")
-        print(f"  Gauntlet Score: {gauntlet_score:.2f} (0.4*mean + 0.6*min)")
+        print(f"  Gauntlet Score: {gauntlet_score:.2f} (0.75*mean + 0.25*min)")
         print(f"  Mean: {mean_score:.2f}, Min: {min_score:.2f}, Max: {max_score:.2f}")
         print(f"  ROI: {roi:.2f}%, Win Rate: {global_win_rate:.1%}")
         print(f"  Total Trades: {total_trades}, Expectancy: {expectancy:.2f}%")
@@ -2367,15 +2367,47 @@ class ERLTrainer:
             }, step=self.generation)
 
         elif self.breakthrough_state == BreakthroughState.STABILIZATION:
-            # Check if stabilization complete
+            # Progressive Stabilization: Fail fast if candidate collapses
             self.stabilization_generations_elapsed += 1
 
             print(f"\n🔄 Stabilization: {self.stabilization_generations_elapsed}/{Config.STABILIZATION_GENERATIONS} generations")
+
+            # PROGRESSIVE STABILIZATION CHECK: Abort if performance drops below baseline
+            if validation_results is not None and len(validation_results) > 0:
+                best_result = validation_results[0]
+                best_val_fitness = best_result['validation_fitness']
+
+                # Check if current best is below baseline (ghost collapse detected)
+                if best_val_fitness < self.confirmed_baseline:
+                    print(f"\n{'='*60}")
+                    print(f"❌ PROGRESSIVE STABILIZATION FAILED - GHOST DETECTED")
+                    print(f"{'='*60}")
+                    print(f"  Current Best Fitness: {best_val_fitness:.2f}")
+                    print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
+                    print(f"  Candidate collapsed below baseline - aborting stabilization")
+                    print(f"  Returning to NORMAL state")
+                    print(f"{'='*60}")
+
+                    # Log ghost detection to wandb
+                    wandb.log({
+                        'gauntlet/ghost_detected': 1,
+                        'gauntlet/stabilization_aborted_at': self.stabilization_generations_elapsed,
+                        'gauntlet/collapse_fitness': best_val_fitness,
+                        'gauntlet/baseline': self.confirmed_baseline,
+                        'gauntlet/state': 'NORMAL',
+                    }, step=self.generation)
+
+                    # Reset to NORMAL state
+                    self.breakthrough_state = BreakthroughState.NORMAL
+                    self.breakthrough_candidate = None
+                    self.stabilization_generations_elapsed = 0
+                    return
 
             # Log stabilization progress to wandb
             wandb.log({
                 'gauntlet/stabilization_progress': self.stabilization_generations_elapsed,
                 'gauntlet/stabilization_target': Config.STABILIZATION_GENERATIONS,
+                'gauntlet/current_best_fitness': best_val_fitness if validation_results and len(validation_results) > 0 else None,
             }, step=self.generation)
 
             if self.stabilization_generations_elapsed >= Config.STABILIZATION_GENERATIONS:

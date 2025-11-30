@@ -194,7 +194,7 @@ class Config:
     BREAKTHROUGH_QUORUM_CONSISTENCY = 1  # Only test highest agent per generation in consistency mode
 
     # Stabilization phase - lock training on candidate for N generations
-    STABILIZATION_GENERATIONS = 5  # Allow networks to converge on new behavior
+    STABILIZATION_GENERATIONS = 3  # Allow networks to converge on new behavior
 
     # Gauntlet validation - rigorous stress test with many diverse slices
     GAUNTLET_NUM_SLICES = 20  # Number of validation slices for Gauntlet (vs 7 for normal validation)
