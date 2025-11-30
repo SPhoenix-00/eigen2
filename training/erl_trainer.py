@@ -4055,6 +4055,37 @@ class ERLTrainer:
             self.resource_tracker.update()
             resource_stats = self.resource_tracker.get_current_stats()
 
+            # Prepare gauntlet info for display
+            gauntlet_info = None
+            if self.gauntlet_mode_enabled:
+                # Calculate stabilization progress if in stabilization state
+                stab_progress = None
+                if self.breakthrough_state == BreakthroughState.STABILIZATION:
+                    stab_progress = (self.stabilization_generations_elapsed, Config.STABILIZATION_GENERATIONS)
+
+                # Get Hall of Fame stats
+                hof_stats = self.hall_of_fame.get_stats()
+
+                gauntlet_info = {
+                    'gauntlet_enabled': True,
+                    'consistency_mode': self.consistency_mode,
+                    'breakthrough_state': self.breakthrough_state.value,
+                    'confirmed_baseline': self.confirmed_baseline,
+                    'confirmed_breakthroughs': self.confirmed_breakthroughs,
+                    'target_breakthroughs': self.target_breakthroughs,
+                    'hof_turnover_count': self.hof_turnover_count,
+                    'target_hof_turnovers': self.target_hof_turnovers,
+                    'hof_current_median': self.hof_current_median,
+                    'hof_size': hof_stats['size'],
+                    'hof_capacity': self.hall_of_fame.capacity,
+                    'stabilization_progress': stab_progress,
+                    'breakthrough_history': self.breakthrough_history
+                }
+
+                # Add queue size if using candidate queue (heroes mode)
+                if self.use_candidate_queue:
+                    gauntlet_info['queue_size'] = len(self.candidate_queue)
+
             # Print comprehensive generation summary with resource stats
             print_generation_summary(
                 gen=gen,
@@ -4065,7 +4096,8 @@ class ERLTrainer:
                 best_fitness=self.best_validation_fitness,  # Use validation fitness for "best ever"
                 gen_time=gen_time,
                 avg_gen_time=np.mean(self.generation_times) if self.generation_times else 0,
-                resource_stats=resource_stats
+                resource_stats=resource_stats,
+                gauntlet_info=gauntlet_info
             )
 
             # Show progress plot every 5 generations

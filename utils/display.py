@@ -119,6 +119,98 @@ def plot_fitness_progress(fitness_history: List[List[float]]):
     print("="*60)
 
 
+def _print_progress_and_eta(gen: int, total_gens: int, avg_gen_time: float, gauntlet_info: Optional[dict] = None):
+    """
+    Print progress and ETA information based on training mode.
+
+    Args:
+        gen: Current generation number
+        total_gens: Total number of generations (fallback limit)
+        avg_gen_time: Average time per generation
+        gauntlet_info: Optional gauntlet/consistency mode information
+    """
+    remaining = total_gens - (gen + 1)
+
+    # Check if we're in gauntlet or consistency mode
+    if gauntlet_info and gauntlet_info.get('gauntlet_enabled'):
+        consistency_mode = gauntlet_info.get('consistency_mode', False)
+
+        if consistency_mode:
+            # Consistency mode: progress based on HoF turnovers
+            current_turnovers = gauntlet_info.get('hof_turnover_count', 0)
+            target_turnovers = gauntlet_info.get('target_hof_turnovers', 2)
+
+            print(f"\n  🎯 CONSISTENCY PROGRESS")
+            print(f"  HoF Turnovers:     {current_turnovers:>12} / {target_turnovers}")
+
+            if current_turnovers < target_turnovers:
+                turnovers_needed = target_turnovers - current_turnovers
+                print(f"  Turnovers Needed:  {turnovers_needed:>12}")
+                print(f"  Est. ETA:          {'Unknown':>11}  (depends on performance)")
+            else:
+                print(f"  Status:            {'🏆 Complete!':>11}")
+
+            # Show fallback generation limit
+            print(f"\n  Fallback Limit:    {remaining:>12} generations remaining")
+            if remaining > 0:
+                eta_seconds = avg_gen_time * remaining
+                eta_minutes = eta_seconds / 60
+                eta_hours = eta_seconds / 3600
+                print(f"  Max Time Left:     {eta_minutes:>11.1f}m  ({eta_hours:.1f}h)")
+        else:
+            # Normal gauntlet mode: progress based on breakthroughs
+            current_breakthroughs = gauntlet_info.get('confirmed_breakthroughs', 0)
+            target_breakthroughs = gauntlet_info.get('target_breakthroughs', 4)
+
+            print(f"\n  🎯 BREAKTHROUGH PROGRESS")
+            print(f"  Confirmed:         {current_breakthroughs:>12} / {target_breakthroughs}")
+
+            if current_breakthroughs < target_breakthroughs:
+                breakthroughs_needed = target_breakthroughs - current_breakthroughs
+                print(f"  Needed:            {breakthroughs_needed:>12}")
+
+                # Estimate ETA based on breakthrough history if available
+                history = gauntlet_info.get('breakthrough_history', [])
+                if len(history) >= 2:
+                    # Calculate average generations between breakthroughs
+                    gen_diffs = []
+                    for i in range(1, len(history)):
+                        gen_diffs.append(history[i].get('generation', 0) - history[i-1].get('generation', 0))
+                    avg_gens_per_breakthrough = np.mean(gen_diffs)
+
+                    est_gens_remaining = avg_gens_per_breakthrough * breakthroughs_needed
+                    est_time_seconds = est_gens_remaining * avg_gen_time
+                    est_time_minutes = est_time_seconds / 60
+                    est_time_hours = est_time_seconds / 3600
+
+                    print(f"  Est. Gens Left:    {est_gens_remaining:>11.1f}  (based on {len(history)} breakthroughs)")
+                    print(f"  Est. ETA:          {est_time_minutes:>11.1f}m  ({est_time_hours:.1f}h)")
+                else:
+                    print(f"  Est. ETA:          {'Unknown':>11}  (insufficient data)")
+            else:
+                print(f"  Status:            {'🏆 Complete!':>11}")
+
+            # Show fallback generation limit
+            print(f"\n  Fallback Limit:    {remaining:>12} generations remaining")
+            if remaining > 0:
+                eta_seconds = avg_gen_time * remaining
+                eta_minutes = eta_seconds / 60
+                eta_hours = eta_seconds / 3600
+                print(f"  Max Time Left:     {eta_minutes:>11.1f}m  ({eta_hours:.1f}h)")
+    else:
+        # Traditional fixed-generation mode
+        print(f"\n  Remaining Gens:    {remaining:>12}")
+
+        # Only show ETA if there are remaining generations
+        if remaining > 0:
+            eta_seconds = avg_gen_time * remaining
+            eta_minutes = eta_seconds / 60
+            eta_hours = eta_seconds / 3600
+            print(f"  ETA:               {eta_minutes:>11.1f}m  ({eta_hours:.1f}h)")
+        else:
+            print(f"  ETA:               {'Complete':>11}  (0.0h)")
+
+
 def print_generation_summary(gen: int, total_gens: int,
                              fitness_scores: List[float],
                              pop_stats: dict,
@@ -126,7 +218,8 @@ def print_generation_summary(gen: int, total_gens: int,
                              best_fitness: float,
                              gen_time: float,
                              avg_gen_time: float,
-                             resource_stats: Optional[dict] = None):
+                             resource_stats: Optional[dict] = None,
+                             gauntlet_info: Optional[dict] = None):
     """
     Print a comprehensive summary of the generation.
 
@@ -140,6 +233,21 @@ def print_generation_summary(gen: int, total_gens: int,
         gen_time: Time taken for this generation
         avg_gen_time: Average time per generation
         resource_stats: Optional dictionary with resource usage statistics
+        gauntlet_info: Optional dictionary with gauntlet/consistency mode info:
+            - gauntlet_enabled: bool
+            - consistency_mode: bool
+            - breakthrough_state: str (e.g., 'NORMAL', 'STABILIZATION', 'GAUNTLET')
+            - confirmed_baseline: float
+            - confirmed_breakthroughs: int
+            - target_breakthroughs: int
+            - hof_turnover_count: int
+            - target_hof_turnovers: int
+            - hof_current_median: float or None
+            - hof_size: int (current number of agents in Hall of Fame)
+            - hof_capacity: int (maximum Hall of Fame size)
+            - queue_size: int or None (number of candidates in queue, heroes mode only)
+            - stabilization_progress: tuple (current, total) or None
+            - breakthrough_history: list of breakthrough events
     """
     mean_fitness = np.mean(fitness_scores)
     max_fitness = np.max(fitness_scores)
@@ -168,7 +276,68 @@ def print_generation_summary(gen: int, total_gens: int,
         else:
             print("░", end="")
     print()
-    
+
+    # Gauntlet State Machine section (if in gauntlet mode)
+    if gauntlet_info and gauntlet_info.get('gauntlet_enabled'):
+        print("\n🎮 GAUNTLET STATE")
+        print("-" * 70)
+
+        state = gauntlet_info.get('breakthrough_state', 'UNKNOWN')
+        confirmed_baseline = gauntlet_info.get('confirmed_baseline', 0.0)
+        consistency_mode = gauntlet_info.get('consistency_mode', False)
+
+        # State indicator with visual progress
+        state_icons = {
+            'NORMAL': '🔵 NORMAL',
+            'DETECTION': '🟡 DETECTION',
+            'STABILIZATION': '🟠 STABILIZATION',
+            'GAUNTLET': '🔴 GAUNTLET',
+            'CONFIRMED': '🟢 CONFIRMED',
+            'REJECTED': '⚫ REJECTED'
+        }
+        print(f"  Current State:     {state_icons.get(state, state):>12}")
+        print(f"  Baseline:          {confirmed_baseline:>12.2f}")
+
+        # State-specific progress information
+        if state == 'STABILIZATION':
+            stab_progress = gauntlet_info.get('stabilization_progress')
+            if stab_progress:
+                current, total = stab_progress
+                progress_bar = '█' * current + '░' * (total - current)
+                print(f"  Stab Progress:     [{progress_bar}] {current}/{total}")
+
+        # Consistency mode: show HoF turnover info
+        if consistency_mode:
+            current_turnovers = gauntlet_info.get('hof_turnover_count', 0)
+            target_turnovers = gauntlet_info.get('target_hof_turnovers', 2)
+            hof_median = gauntlet_info.get('hof_current_median')
+            hof_size = gauntlet_info.get('hof_size', 0)
+            hof_capacity = gauntlet_info.get('hof_capacity', 10)
+
+            print(f"  HoF Size:          {hof_size:>12} / {hof_capacity}")
+            print(f"  HoF Turnovers:     {current_turnovers:>12} / {target_turnovers}")
+            if hof_median is not None:
+                print(f"  HoF Median ROI:    {hof_median:>11.2f}%")
+
+            # Show queue size if using candidate queue (heroes mode)
+            queue_size = gauntlet_info.get('queue_size')
+            if queue_size is not None:
+                print(f"  Queue Size:        {queue_size:>12}")
+        else:
+            # Normal gauntlet mode: show breakthrough count
+            current_breakthroughs = gauntlet_info.get('confirmed_breakthroughs', 0)
+            target_breakthroughs = gauntlet_info.get('target_breakthroughs', 4)
+            hof_size = gauntlet_info.get('hof_size', 0)
+            hof_capacity = gauntlet_info.get('hof_capacity', 10)
+
+            print(f"  Breakthroughs:     {current_breakthroughs:>12} / {target_breakthroughs}")
+            print(f"  HoF Size:          {hof_size:>12} / {hof_capacity}")
+
+            # Show queue size if using candidate queue (heroes mode)
+            queue_size = gauntlet_info.get('queue_size')
+            if queue_size is not None:
+                print(f"  Queue Size:        {queue_size:>12}")
+
     # Trading section
     print("\n📈 TRADING ACTIVITY")
     print("-" * 70)
@@ -188,14 +357,9 @@ def print_generation_summary(gen: int, total_gens: int,
     print(f"  Buffer Ready:      {' '*10}{'✓ Yes' if buffer_size >= min_size else '✗ No (needs ' + str(min_size-buffer_size) + ' more)'}")
     print(f"  Generation Time:   {gen_time:>11.1f}s")
     print(f"  Avg Gen Time:      {avg_gen_time:>11.1f}s")
-    
-    remaining = total_gens - (gen + 1)
-    eta_seconds = avg_gen_time * remaining
-    eta_minutes = eta_seconds / 60
-    eta_hours = eta_seconds / 3600
-    
-    print(f"  Remaining Gens:    {remaining:>12}")
-    print(f"  ETA:               {eta_minutes:>11.1f}m  ({eta_hours:.1f}h)")
+
+    # Progress and ETA - context-aware based on training mode
+    _print_progress_and_eta(gen, total_gens, avg_gen_time, gauntlet_info)
 
     # Add one-line resource summary if provided
     if resource_stats:
