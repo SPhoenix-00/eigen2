@@ -211,7 +211,7 @@ class Config:
     # This creates a ratcheting quality mechanism where HoF progressively improves
 
     # Fallback to generation limit if breakthroughs not achieved
-    MAX_GENERATIONS_GAUNTLET = 100  # Maximum generations before stopping regardless of breakthroughs
+    MAX_GENERATIONS_GAUNTLET = 200  # Maximum generations before stopping regardless of breakthroughs
     
     @classmethod
     def display(cls):
