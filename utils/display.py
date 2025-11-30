@@ -373,17 +373,167 @@ def print_generation_summary(gen: int, total_gens: int,
     print("\n" + "="*70)
 
 
+def visualize_gauntlet_slices(fitness_scores: List[float], mean_score: float, min_score: float,
+                               max_score: float, gauntlet_score: float):
+    """
+    Visualize gauntlet slice scores with a detailed breakdown.
+
+    Shows:
+    - Bar chart of all 20 slice scores
+    - Statistical metrics (std dev, coefficient of variation)
+    - Identification of problematic slices
+    - Score distribution
+
+    Args:
+        fitness_scores: List of fitness scores for each of the 20 slices
+        mean_score: Mean fitness across all slices
+        min_score: Minimum fitness score
+        max_score: Maximum fitness score
+        gauntlet_score: Final aggregated gauntlet score (0.75*mean + 0.25*min)
+    """
+    print("\n" + "="*70)
+    print(f"{'GAUNTLET SLICE ANALYSIS':^70}")
+    print("="*70)
+
+    # Statistical analysis
+    std_dev = np.std(fitness_scores)
+    # Coefficient of Variation: measure of volatility (std dev / mean)
+    # Higher CV = more volatile performance across slices
+    cv = (std_dev / abs(mean_score)) * 100 if abs(mean_score) > 0.001 else 0
+
+    print("\n📊 STATISTICAL SUMMARY")
+    print("-" * 70)
+    print(f"  Gauntlet Score:    {gauntlet_score:>12.2f}  (0.75*mean + 0.25*min)")
+    print(f"  Mean:              {mean_score:>12.2f}")
+    print(f"  Min:               {min_score:>12.2f}")
+    print(f"  Max:               {max_score:>12.2f}")
+    print(f"  Std Dev:           {std_dev:>12.2f}")
+    print(f"  Coefficient of Variation: {cv:>8.1f}%  {'⚠️  High volatility!' if cv > 50 else '✓ Stable' if cv < 25 else '~ Moderate'}")
+    print(f"  Range:             {max_score - min_score:>12.2f}")
+
+    # Identify problematic slices (below mean - 0.5*std_dev)
+    threshold = mean_score - 0.5 * std_dev
+    problematic_slices = [(i, score) for i, score in enumerate(fitness_scores) if score < threshold]
+
+    if problematic_slices:
+        print(f"\n⚠️  PROBLEMATIC SLICES (below {threshold:.2f})")
+        print("-" * 70)
+        for slice_idx, score in sorted(problematic_slices, key=lambda x: x[1]):
+            deviation = score - mean_score
+            print(f"  Slice #{slice_idx+1:2d}:          {score:>12.2f}  ({deviation:+.2f} from mean)")
+
+    # Bar chart visualization
+    print("\n📊 SLICE SCORE DISTRIBUTION")
+    print("-" * 70)
+
+    # Determine scale for visualization (normalize to 0-40 character width)
+    score_range = max_score - min_score
+    if score_range < 0.01:
+        # All scores are essentially the same
+        scale_func = lambda x: 20
+    else:
+        scale_func = lambda x: int(((x - min_score) / score_range) * 40)
+
+    # Sort slices by score for better visualization
+    sorted_slices = sorted(enumerate(fitness_scores), key=lambda x: x[1], reverse=True)
+
+    # Show bar chart
+    for slice_idx, score in sorted_slices:
+        bar_length = scale_func(score)
+        bar = '█' * bar_length
+
+        # Color code based on performance
+        if score >= mean_score:
+            marker = '✓'
+        elif score < threshold:
+            marker = '⚠'
+        else:
+            marker = '·'
+
+        deviation = score - mean_score
+        print(f"  {marker} Slice #{slice_idx+1:2d}  {bar:<40}  {score:>8.2f}  ({deviation:+.2f})")
+
+    # Add reference lines
+    print(f"\n  {'Reference Lines':}")
+    mean_pos = scale_func(mean_score)
+    mean_line = ' ' * mean_pos + '↑'
+    print(f"    Mean:      {mean_line} {mean_score:.2f}")
+
+    if min_score != max_score:
+        min_line = '↑'
+        max_pos = scale_func(max_score)
+        max_line = ' ' * max_pos + '↑'
+        print(f"    Min:       {min_line} {min_score:.2f}")
+        print(f"    Max:       {max_line} {max_score:.2f}")
+
+    # Quartile analysis
+    q1 = np.percentile(fitness_scores, 25)
+    q2 = np.percentile(fitness_scores, 50)  # median
+    q3 = np.percentile(fitness_scores, 75)
+
+    print(f"\n📈 QUARTILE BREAKDOWN")
+    print("-" * 70)
+    print(f"  Q1 (25th percentile):  {q1:>12.2f}")
+    print(f"  Q2 (50th / median):    {q2:>12.2f}")
+    print(f"  Q3 (75th percentile):  {q3:>12.2f}")
+    print(f"  IQR (Q3-Q1):           {q3-q1:>12.2f}")
+
+    # Performance consistency rating
+    print(f"\n🎯 PERFORMANCE RATING")
+    print("-" * 70)
+    if cv < 15:
+        rating = "EXCELLENT"
+        emoji = "🌟"
+        desc = "Very consistent across all slices"
+    elif cv < 25:
+        rating = "GOOD"
+        emoji = "✓"
+        desc = "Stable performance with minor variations"
+    elif cv < 40:
+        rating = "MODERATE"
+        emoji = "~"
+        desc = "Some volatility, improvement possible"
+    elif cv < 60:
+        rating = "POOR"
+        emoji = "⚠️"
+        desc = "High volatility, inconsistent performance"
+    else:
+        rating = "VERY POOR"
+        emoji = "❌"
+        desc = "Extremely volatile, major consistency issues"
+
+    print(f"  Consistency:       {emoji} {rating}")
+    print(f"  Assessment:        {desc}")
+
+    # Analyze if one slice is ruining the score
+    if len(problematic_slices) > 0:
+        worst_score = min(fitness_scores)
+        score_without_worst = [s for s in fitness_scores if s != worst_score or fitness_scores.count(worst_score) > 1]
+        if score_without_worst:
+            mean_without_worst = np.mean(score_without_worst)
+            impact = mean_without_worst - mean_score
+            print(f"\n💡 WORST SLICE IMPACT")
+            print("-" * 70)
+            print(f"  Mean without worst slice:  {mean_without_worst:>12.2f}")
+            print(f"  Impact on mean:            {impact:>12.2f}  ({impact/abs(mean_score)*100:+.1f}%)" if abs(mean_score) > 0.001 else "  Impact on mean:            N/A")
+
+            if abs(impact) > std_dev:
+                print(f"  ⚠️  Single slice is disproportionately affecting the score!")
+
+    print("\n" + "="*70)
+
+
 def print_final_summary(trainer):
     """
     Print final training summary.
-    
+
     Args:
         trainer: ERLTrainer instance
     """
     print("\n" + "="*70)
     print(f"{'TRAINING COMPLETE':^70}")
     print("="*70)
-    
+
     print("\n🏆 BEST RESULTS")
     print("-" * 70)
     print(f"  Best Training Fitness:     {trainer.best_fitness:>12.2f}")
@@ -392,24 +542,24 @@ def print_final_summary(trainer):
     print(f"  Total Transitions: {trainer.replay_buffer.total_added:>12,}")
     print(f"  Avg Gen Time:      {np.mean(trainer.generation_times):>11.1f}s")
     print(f"  Total Time:        {sum(trainer.generation_times)/60:>11.1f}m")
-    
+
     # Fitness improvement
     if len(trainer.fitness_history) > 1:
         first_gen_max = max(trainer.fitness_history[0])
         last_gen_max = max(trainer.fitness_history[-1])
         improvement = last_gen_max - first_gen_max
-        
+
         print(f"\n📈 IMPROVEMENT")
         print("-" * 70)
         print(f"  First Gen Max:     {first_gen_max:>12.2f}")
         print(f"  Last Gen Max:      {last_gen_max:>12.2f}")
         perc_str = f"({improvement/abs(first_gen_max)*100:+.1f}%)" if abs(first_gen_max) > 0 else "(N/A)"
         print(f"  Improvement:       {improvement:>12.2f}  {perc_str}")
-    
+
     print("\n📁 OUTPUT FILES")
     print("-" * 70)
     print(f"  Checkpoints:       checkpoints/")
     print(f"  TensorBoard Logs:  logs/")
     print(f"\n  View logs with:    tensorboard --logdir=logs")
-    
+
     print("\n" + "="*70)

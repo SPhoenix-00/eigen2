@@ -2096,13 +2096,19 @@ class ERLTrainer:
 
         expectancy = self.calculate_expectancy(all_closed_trades)
 
-        print(f"\n{'='*60}")
-        print(f"GAUNTLET RESULTS:")
-        print(f"  Gauntlet Score: {gauntlet_score:.2f} (0.75*mean + 0.25*min)")
-        print(f"  Mean: {mean_score:.2f}, Min: {min_score:.2f}, Max: {max_score:.2f}")
-        print(f"  ROI: {roi:.2f}%, Win Rate: {global_win_rate:.1%}")
-        print(f"  Total Trades: {total_trades}, Expectancy: {expectancy:.2f}%")
-        print(f"{'='*60}")
+        # Display detailed visualization of slice scores
+        from utils.display import visualize_gauntlet_slices
+        visualize_gauntlet_slices(fitness_scores, mean_score, min_score, max_score, gauntlet_score)
+
+        # Print trading metrics summary
+        print(f"\n{'='*70}")
+        print(f"{'GAUNTLET TRADING METRICS':^70}")
+        print(f"{'='*70}")
+        print(f"  ROI:               {roi:>12.2f}%")
+        print(f"  Win Rate:          {global_win_rate:>11.1%}")
+        print(f"  Total Trades:      {total_trades:>12}")
+        print(f"  Expectancy:        {expectancy:>11.2f}%")
+        print(f"{'='*70}")
 
         return {
             'gauntlet_score': gauntlet_score,
