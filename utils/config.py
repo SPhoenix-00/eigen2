@@ -212,7 +212,7 @@ class Config:
     TARGET_BREAKTHROUGHS_CONSISTENCY = 8  # Deprecated - not used in consistency mode (uses turnovers instead)
 
     # Hall of Fame turnover goals (consistency mode only)
-    TARGET_HOF_TURNOVERS = 2  # Number of complete HoF turnovers required (minimum 2)
+    TARGET_HOF_TURNOVERS = 3  # Number of complete HoF turnovers required (minimum 2)
     # Unified turnover logic: All 10 HoF agents must have ROI >= previous median
     # Initial median is 0 (first breakthrough establishes baseline from gauntlet score)
     # Each turnover raises the bar: median₀=0 → median₁ → median₂ → median₃...
