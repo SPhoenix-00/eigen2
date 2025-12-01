@@ -182,15 +182,15 @@ class AgentEvaluator:
         print(f"   Running Gauntlet ({len(gauntlet_slices)} slices: {sum(1 for s in gauntlet_slices if s[0] < self.val_start_idx)} training + {sum(1 for s in gauntlet_slices if s[0] >= self.val_start_idx)} validation)...")
 
         # Create persistent eval environment (mirrors ERLTrainer)
-        # Note: start/end indices span full dataset for gauntlet (includes training data)
+        # Note: Environment needs enough data for context window (504 days)
         full_end_idx = len(self.data_loader.data_array_full)
         eval_env = TradingEnvironment(
             data_array=self.data_loader.data_array,
             dates=self.data_loader.dates,
             normalization_stats=self.normalization_stats,
-            start_idx=0,
+            start_idx=Config.CONTEXT_WINDOW_DAYS,  # Minimum for context window
             end_idx=full_end_idx,
-            trading_end_idx=Config.TRADING_PERIOD_DAYS,
+            trading_end_idx=Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS,
             data_array_full=self.data_loader.data_array_full,
             consistency_mode=False  # Gauntlet always uses normal mode
         )
