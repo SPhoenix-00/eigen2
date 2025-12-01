@@ -111,7 +111,7 @@ class AgentEvaluator:
                     end_idx=full_end_idx,
                     trading_end_idx=Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS,
                     data_array_full=data_loader.data_array_full,
-                    consistency_mode=False  # Gauntlet always uses normal mode
+                    consistency_mode=True  # Global 50 ALWAYS uses consistency mode for rigorous evaluation
                 )
 
                 # Replay buffer is not needed for gauntlet (training=False)
