@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 import torch
 import numpy as np
-from tqdm import tqdm
 
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
@@ -48,6 +47,7 @@ class AgentEvaluator:
         print("\n1. Loading market data...")
         self.data_loader = StockDataLoader()
         data_array, stats = self.data_loader.load_and_prepare()
+        self.normalization_stats = stats  # Store for environment creation
         print(f"   Loaded {len(self.data_loader.data_array_full)} days of data")
 
         # Get validation indices (for gauntlet)
@@ -72,17 +72,6 @@ class AgentEvaluator:
             checkpoint_dir=checkpoint_dir,
             disable_global50=False
         )
-
-        if not self.global_hof.enabled:
-            print("\n   WARNING: Global 50 is DISABLED")
-            print("   Reasons could be:")
-            print("   - Cloud sync is set to 'local' (set CLOUD_PROVIDER=gcs)")
-            print("   - League rules don't match existing Global 50")
-            print("\n   Evaluation will run, but agents won't be promoted.")
-        else:
-            print(f"   Global 50 Status: ENABLED")
-            print(f"   Current Size: {len(self.global_hof.entries)}/50")
-            print(f"   Entry Threshold: {self.global_hof.entry_threshold:.2f}")
 
         print("\n" + "="*70)
 
@@ -113,9 +102,73 @@ class AgentEvaluator:
 
         return agent_files
 
+    def generate_gauntlet_slices(self) -> List[Tuple[int, int, int]]:
+        """
+        Generate 20+ rigorous validation slices for Gauntlet stress test.
+        EXACTLY mirrors ERLTrainer.generate_gauntlet_slices()
+
+        Samples slices from BOTH training and validation data to ensure the agent
+        performs robustly across all market regimes, not just validation period.
+
+        Strategy:
+        - 10 slices from training data (different market conditions)
+        - 10 slices from validation data (out-of-sample)
+
+        Returns:
+            List of tuples: (start_idx, end_idx, trading_end_idx)
+        """
+        slices = []
+        train_start_idx = 0  # Training starts at beginning
+        train_end_idx = self.val_start_idx  # Training ends where validation starts
+
+        # 1. Sample 10 slices from training data
+        min_start_train = train_start_idx
+        max_start_train = train_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
+
+        if max_start_train >= min_start_train:
+            # Divide training range into 10 segments
+            train_range = max_start_train - min_start_train + 1
+            train_segment_size = max(1, train_range // 10)
+
+            for i in range(10):
+                segment_start = min_start_train + (i * train_segment_size)
+                segment_end = min(max_start_train + 1, segment_start + train_segment_size)
+
+                if segment_end > segment_start:
+                    start_idx = np.random.randint(segment_start, segment_end)
+                    end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+
+                    slices.append((start_idx, end_idx, trading_end_idx))
+
+        # 2. Sample 10 slices from validation data
+        min_start_val = self.val_start_idx
+        max_start_val = self.val_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
+
+        if max_start_val >= min_start_val:
+            # Divide validation range into 10 segments
+            val_range = max_start_val - min_start_val + 1
+            val_segment_size = max(1, val_range // 10)
+
+            for i in range(10):
+                segment_start = min_start_val + (i * val_segment_size)
+                segment_end = min(max_start_val + 1, segment_start + val_segment_size)
+
+                if segment_end > segment_start:
+                    start_idx = np.random.randint(segment_start, segment_end)
+                    end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+
+                    slices.append((start_idx, end_idx, trading_end_idx))
+
+        return slices
+
     def run_gauntlet(self, agent: DDPGAgent, agent_name: str) -> Tuple[float, dict]:
         """
-        Run gauntlet validation on an agent.
+        Run gauntlet validation on an agent - EXACTLY mirroring ERLTrainer's logic.
+
+        This must match the trainer's gauntlet validation precisely to ensure
+        Global 50 scores are accurate and consistent.
 
         Args:
             agent: Agent to evaluate
@@ -124,56 +177,34 @@ class AgentEvaluator:
         Returns:
             Tuple of (gauntlet_score, detailed_metrics)
         """
-        num_slices = Config.GAUNTLET_NUM_SLICES
-        slice_length = Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+        # Generate gauntlet slices (10 training + 10 validation, EXACTLY as ERLTrainer does)
+        gauntlet_slices = self.generate_gauntlet_slices()
+        print(f"   Running Gauntlet ({len(gauntlet_slices)} slices: {sum(1 for s in gauntlet_slices if s[0] < self.val_start_idx)} training + {sum(1 for s in gauntlet_slices if s[0] >= self.val_start_idx)} validation)...")
 
-        # Calculate available validation window
-        val_window_size = self.val_end_idx - self.val_start_idx
-        max_slices = val_window_size // slice_length
-
-        if max_slices < num_slices:
-            print(f"   WARNING: Only {max_slices} slices possible, requested {num_slices}")
-            num_slices = max_slices
-
-        if num_slices == 0:
-            print(f"   ERROR: Validation window too small for gauntlet")
-            return 0.0, {}
-
-        # Generate uniformly distributed slice start points
-        slice_starts = np.linspace(
-            self.val_start_idx,
-            self.val_end_idx - slice_length,
-            num=num_slices,
-            dtype=int
+        # Create persistent eval environment (mirrors ERLTrainer)
+        # Note: start/end indices span full dataset for gauntlet (includes training data)
+        full_end_idx = len(self.data_loader.data_array_full)
+        eval_env = TradingEnvironment(
+            data_array=self.data_loader.data_array,
+            dates=self.data_loader.dates,
+            normalization_stats=self.normalization_stats,
+            start_idx=0,
+            end_idx=full_end_idx,
+            trading_end_idx=Config.TRADING_PERIOD_DAYS,
+            data_array_full=self.data_loader.data_array_full,
+            consistency_mode=False  # Gauntlet always uses normal mode
         )
 
-        fitness_scores = []
-        roi_values = []
-        total_trades_list = []
-        win_counts = []
+        slice_results = []
+        all_closed_trades = []
 
         # Evaluate each slice
         agent.actor.eval()
         agent.critic.eval()
 
-        for i, start_idx in enumerate(slice_starts):
-            end_idx = start_idx + slice_length
-
-            # Create environment for this slice
-            env = TradingEnvironment(
-                data=self.data_loader.data_array_full,
-                context_window_days=Config.CONTEXT_WINDOW_DAYS,
-                min_holding_period=Config.MIN_HOLDING_PERIOD,
-                max_holding_period=Config.MAX_HOLDING_PERIOD,
-                trading_period_days=Config.TRADING_PERIOD_DAYS,
-                settlement_period_days=Config.SETTLEMENT_PERIOD_DAYS,
-                loss_penalty_multiplier=1.0,  # Normal mode for gauntlet
-                consistency_mode=False
-            )
-
-            # Run episode
-            trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-            _, episode_info = env.run_episode(
+        for i, (start_idx, end_idx, trading_end_idx) in enumerate(gauntlet_slices):
+            # Run episode (mirrors run_episode_batched behavior but simpler)
+            fitness, episode_info = eval_env.run_episode(
                 agent=agent,
                 start_idx=start_idx,
                 end_idx=end_idx,
@@ -181,25 +212,51 @@ class AgentEvaluator:
                 training=False
             )
 
-            fitness_scores.append(episode_info['fitness'])
-            roi_values.append(episode_info['roi'])
-            total_trades_list.append(episode_info['total_trades'])
-            win_counts.append(episode_info['total_wins'])
+            # Apply zero-trades gradient (CRITICAL - matches trainer logic)
+            if episode_info['num_trades'] == 0:
+                max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
+                fitness = fitness + max_coeff
 
-        # Compute gauntlet score (pessimistic aggregator)
+            slice_results.append({
+                'fitness': fitness,
+                'win_rate': episode_info['win_rate'],
+                'num_trades': episode_info['num_trades'],
+                'num_wins': episode_info['num_wins'],
+                'num_losses': episode_info['num_losses'],
+                'avg_reward_per_trade': episode_info['avg_reward_per_trade'],
+                'raw_pnl': episode_info.get('raw_pnl', 0.0),
+                'total_investment': episode_info.get('total_investment', 0.0)
+            })
+
+            # Collect closed trades for expectancy
+            if 'closed_trades' in episode_info and episode_info['closed_trades']:
+                all_closed_trades.extend(episode_info['closed_trades'])
+
+        # Extract fitness scores
+        fitness_scores = [result['fitness'] for result in slice_results]
+
+        # CRITICAL: Exact aggregator as trainer (0.75*mean + 0.25*min)
         mean_score = np.mean(fitness_scores)
         min_score = np.min(fitness_scores)
+        max_score = np.max(fitness_scores)
         gauntlet_score = (0.75 * mean_score) + (0.25 * min_score)
 
-        # Aggregate metrics
-        mean_roi = np.mean(roi_values)
-        total_trades = sum(total_trades_list)
-        total_wins = sum(win_counts)
+        # Aggregate metrics (exact calculations as trainer)
+        total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
+        total_investment = sum([r['total_investment'] for r in slice_results])
+        roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
+
+        total_wins = sum([r['num_wins'] for r in slice_results])
+        total_losses = sum([r['num_losses'] for r in slice_results])
+        total_trades = total_wins + total_losses
         win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
 
-        # Calculate expectancy
-        if total_trades > 0:
-            expectancy = mean_roi * (win_rate / 100.0)
+        # Calculate expectancy (mirrors trainer's calculate_expectancy)
+        if all_closed_trades:
+            avg_gain = np.mean([t['reward_pct'] for t in all_closed_trades if t['reward_pct'] > 0]) if any(t['reward_pct'] > 0 for t in all_closed_trades) else 0.0
+            avg_loss = np.mean([abs(t['reward_pct']) for t in all_closed_trades if t['reward_pct'] < 0]) if any(t['reward_pct'] < 0 for t in all_closed_trades) else 0.0
+            win_rate_decimal = win_rate / 100.0
+            expectancy = (win_rate_decimal * avg_gain) - ((1 - win_rate_decimal) * avg_loss)
         else:
             expectancy = 0.0
 
@@ -207,11 +264,13 @@ class AgentEvaluator:
             'gauntlet_score': gauntlet_score,
             'mean_fitness': mean_score,
             'min_fitness': min_score,
-            'roi': mean_roi,
+            'max_fitness': max_score,
+            'roi': roi,
             'total_trades': total_trades,
             'win_rate': win_rate,
             'expectancy': expectancy,
-            'num_slices': num_slices
+            'num_slices': num_slices,
+            'fitness_all_slices': fitness_scores
         }
 
         return gauntlet_score, detailed_metrics
@@ -375,6 +434,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # First-time setup (initialize Global 50 structure)
+  python evaluate_for_global50.py --init
+
   # Evaluate agents from Hall of Fame directory
   python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
 
@@ -389,7 +451,7 @@ Examples:
     parser.add_argument(
         '--agent-dir',
         type=str,
-        required=True,
+        required=False,
         help='Directory containing agent .pth files to evaluate'
     )
 
@@ -400,13 +462,59 @@ Examples:
         help='Run name to use for this evaluation batch (default: batch-evaluation)'
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        '--init',
+        action='store_true',
+        help='Initialize Global 50 structure (first-time setup). Creates empty global50.json and validates cloud sync.'
+    )
 
-    # Convert to Path
-    agent_dir = Path(args.agent_dir)
+    args = parser.parse_args()
 
     # Initialize evaluator
     evaluator = AgentEvaluator(run_name=args.run_name)
+
+    # Handle --init mode (first-time setup)
+    if args.init:
+        print("\n" + "="*70)
+        print("INITIALIZATION MODE - First-Time Setup")
+        print("="*70)
+
+        if evaluator.global_hof.enabled:
+            print("\n✓ Global 50 initialized successfully!")
+            print(f"  Cloud Provider: {evaluator.cloud_sync.provider}")
+            print(f"  Bucket: {evaluator.cloud_sync.bucket_name}")
+            print(f"  Project: {evaluator.cloud_sync.project_name}")
+
+            stats = evaluator.global_hof.get_stats()
+            print(f"\n  Current Size: {stats['size']}/50")
+            print(f"  Entry Threshold: {stats['entry_threshold']}")
+
+            print("\nGlobal 50 structure created:")
+            print(f"  Local:  {evaluator.global_hof.local_dir}")
+            print(f"  Cloud:  gs://{evaluator.cloud_sync.bucket_name}/{evaluator.cloud_sync.project_name}/global50/")
+
+            print("\n✓ Setup complete! You can now run evaluations.")
+            print("\nNext step:")
+            print(f"  python evaluate_for_global50.py --agent-dir <path>")
+        else:
+            print("\n✗ Initialization FAILED")
+            print(f"  Cloud Provider: {evaluator.cloud_sync.provider}")
+            print("\nPlease check your environment variables:")
+            print("  - CLOUD_PROVIDER=gcs")
+            print("  - CLOUD_BUCKET=<your-bucket>")
+            print("  - GOOGLE_APPLICATION_CREDENTIALS=<path-to-credentials>")
+
+        print("\n" + "="*70)
+        return
+
+    # Require agent_dir for evaluation mode
+    if not args.agent_dir:
+        print("Error: --agent-dir is required (or use --init for first-time setup)")
+        parser.print_help()
+        return
+
+    # Convert to Path
+    agent_dir = Path(args.agent_dir)
 
     # Evaluate agents
     results = evaluator.evaluate_batch(agent_dir)
