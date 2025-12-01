@@ -235,23 +235,23 @@ class AgentEvaluator:
         fitness_scores = [result['fitness'] for result in slice_results]
 
         # Use same aggregator as ERLTrainer: 0.75*mean + 0.25*min
-        mean_score = np.mean(fitness_scores)
-        min_score = np.min(fitness_scores)
-        max_score = np.max(fitness_scores)
-        gauntlet_score = (0.75 * mean_score) + (0.25 * min_score)
+        mean_score = float(np.mean(fitness_scores))
+        min_score = float(np.min(fitness_scores))
+        max_score = float(np.max(fitness_scores))
+        gauntlet_score = float((0.75 * mean_score) + (0.25 * min_score))
 
         # Aggregate metrics (same calculations as ERLTrainer)
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
         total_investment = sum([r['total_investment'] for r in slice_results])
-        roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
+        roi = float((total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0)
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])
-        total_trades = total_wins + total_losses
-        win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
+        total_trades = int(total_wins + total_losses)
+        win_rate = float((total_wins / total_trades * 100) if total_trades > 0 else 0.0)
 
         # Use ERLTrainer's calculate_expectancy method
-        expectancy = self.gauntlet_helper.calculate_expectancy(all_closed_trades)
+        expectancy = float(self.gauntlet_helper.calculate_expectancy(all_closed_trades))
 
         detailed_metrics = {
             'gauntlet_score': gauntlet_score,
@@ -263,7 +263,7 @@ class AgentEvaluator:
             'win_rate': win_rate,
             'expectancy': expectancy,
             'num_slices': len(gauntlet_slices),
-            'fitness_all_slices': fitness_scores
+            'fitness_all_slices': [float(score) for score in fitness_scores]
         }
 
         return gauntlet_score, detailed_metrics

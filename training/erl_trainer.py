@@ -2677,27 +2677,35 @@ class ERLTrainer:
                         self.breakthrough_history.append(breakthrough_event)
 
                     # GLOBAL 50: Attempt to promote agent to Global Hall of Fame
-                    # This happens for ALL confirmed breakthroughs (both normal and consistency mode)
-                    agent_to_admit = self.breakthrough_candidate.agent
-                    agent_roi = gauntlet_results['roi']
-                    agent_expectancy = gauntlet_results['expectancy']
-                    quality_count = gauntlet_results.get('total_trades', 0)
-                    total_trades = gauntlet_results.get('total_trades', 0)
+                    # CRITICAL: Only allow promotion when running with --consistency mode
+                    # This ensures Global 50 contains only agents evaluated with rigorous consistency standards
+                    if self.consistency_mode:
+                        agent_to_admit = self.breakthrough_candidate.agent
+                        agent_roi = gauntlet_results['roi']
+                        agent_expectancy = gauntlet_results['expectancy']
+                        quality_count = gauntlet_results.get('total_trades', 0)
+                        total_trades = gauntlet_results.get('total_trades', 0)
 
-                    # Try to promote to Global 50
-                    promoted = self.global_hof.check_and_promote(
-                        agent=agent_to_admit,
-                        gauntlet_score=gauntlet_score,
-                        generation=self.generation,
-                        roi=agent_roi,
-                        expectancy=agent_expectancy,
-                        quality_count=quality_count,
-                        total_trades=total_trades
-                    )
+                        # Try to promote to Global 50
+                        promoted = self.global_hof.check_and_promote(
+                            agent=agent_to_admit,
+                            gauntlet_score=gauntlet_score,
+                            generation=self.generation,
+                            roi=agent_roi,
+                            expectancy=agent_expectancy,
+                            quality_count=quality_count,
+                            total_trades=total_trades
+                        )
 
-                    if promoted:
-                        # Log Global 50 promotion
-                        wandb.log({'gauntlet/global50_promotion': 1}, step=self.generation)
+                        if promoted:
+                            # Log Global 50 promotion
+                            wandb.log({'gauntlet/global50_promotion': 1}, step=self.generation)
+                    else:
+                        # Normal mode: Can compare scores but cannot promote to Global 50
+                        print(f"   ⓘ Global 50 promotion skipped (requires --consistency mode)")
+                        print(f"   Agent gauntlet score: {gauntlet_score:.2f}")
+                        if self.global_hof.enabled:
+                            print(f"   Global 50 threshold: {self.global_hof.entry_threshold:.2f}")
 
                     # CONSISTENCY MODE: Add agent to Hall of Fame (gauntlet is the gate to HoF)
                     # This happens regardless of whether baseline is deferred
