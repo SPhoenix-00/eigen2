@@ -25,6 +25,7 @@ from models.ddpg_agent import DDPGAgent
 from erl.global_hof import GlobalHallOfFame, LeagueRules
 from utils.config import Config
 from utils.cloud_sync import get_cloud_sync_from_env
+from training.erl_trainer import ERLTrainer
 
 
 class AgentEvaluator:
@@ -73,7 +74,67 @@ class AgentEvaluator:
             disable_global50=False
         )
 
+        # Initialize a minimal trainer helper for accessing gauntlet methods
+        # We'll use ERLTrainer's methods directly to avoid code duplication
+        print("\n4. Setting up gauntlet validation...")
+        self._setup_gauntlet_helper()
+
         print("\n" + "="*70)
+
+    def _setup_gauntlet_helper(self):
+        """
+        Create a minimal helper object to access ERLTrainer's gauntlet methods.
+
+        This avoids duplicating the gauntlet logic while keeping initialization lightweight.
+        We only set up the necessary attributes for gauntlet validation, without the
+        heavy initialization (wandb, population, replay buffer, etc.).
+        """
+        # Create a minimal object that has the necessary attributes for gauntlet methods
+        class GauntletHelper:
+            def __init__(self, data_loader, val_start_idx, val_end_idx, normalization_stats):
+                self.data_loader = data_loader
+                self.val_start_idx = val_start_idx
+                self.val_end_idx = val_end_idx
+                self.normalization_stats = normalization_stats
+
+                # Training indices (used by generate_gauntlet_slices)
+                self.train_start_idx = Config.CONTEXT_WINDOW_DAYS
+                self.train_end_idx = val_start_idx
+
+                # Create persistent evaluation environment (reused across slices)
+                full_end_idx = len(data_loader.data_array_full)
+                self.eval_env = TradingEnvironment(
+                    data_array=data_loader.data_array,
+                    dates=data_loader.dates,
+                    normalization_stats=normalization_stats,
+                    start_idx=Config.CONTEXT_WINDOW_DAYS,
+                    end_idx=full_end_idx,
+                    trading_end_idx=Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS,
+                    data_array_full=data_loader.data_array_full,
+                    consistency_mode=False  # Gauntlet always uses normal mode
+                )
+
+                # Replay buffer is not needed for gauntlet (training=False)
+                self.replay_buffer = None
+
+        # Create helper and borrow methods from ERLTrainer
+        self.gauntlet_helper = GauntletHelper(
+            self.data_loader,
+            self.val_start_idx,
+            self.val_end_idx,
+            self.normalization_stats
+        )
+
+        # Bind ERLTrainer methods to our helper object
+        self.gauntlet_helper.generate_gauntlet_slices = ERLTrainer.generate_gauntlet_slices.__get__(
+            self.gauntlet_helper, GauntletHelper
+        )
+        self.gauntlet_helper.run_episode_batched = ERLTrainer.run_episode_batched.__get__(
+            self.gauntlet_helper, GauntletHelper
+        )
+        self.gauntlet_helper.calculate_expectancy = ERLTrainer.calculate_expectancy.__get__(
+            self.gauntlet_helper, GauntletHelper
+        )
 
     def discover_agents(self, agent_dir: Path) -> List[Path]:
         """
@@ -105,70 +166,19 @@ class AgentEvaluator:
     def generate_gauntlet_slices(self) -> List[Tuple[int, int, int]]:
         """
         Generate 20+ rigorous validation slices for Gauntlet stress test.
-        EXACTLY mirrors ERLTrainer.generate_gauntlet_slices()
-
-        Samples slices from BOTH training and validation data to ensure the agent
-        performs robustly across all market regimes, not just validation period.
-
-        Strategy:
-        - 10 slices from training data (different market conditions)
-        - 10 slices from validation data (out-of-sample)
+        Delegates to ERLTrainer.generate_gauntlet_slices() to avoid code duplication.
 
         Returns:
             List of tuples: (start_idx, end_idx, trading_end_idx)
         """
-        slices = []
-        train_start_idx = 0  # Training starts at beginning
-        train_end_idx = self.val_start_idx  # Training ends where validation starts
-
-        # 1. Sample 10 slices from training data
-        min_start_train = train_start_idx
-        max_start_train = train_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
-
-        if max_start_train >= min_start_train:
-            # Divide training range into 10 segments
-            train_range = max_start_train - min_start_train + 1
-            train_segment_size = max(1, train_range // 10)
-
-            for i in range(10):
-                segment_start = min_start_train + (i * train_segment_size)
-                segment_end = min(max_start_train + 1, segment_start + train_segment_size)
-
-                if segment_end > segment_start:
-                    start_idx = np.random.randint(segment_start, segment_end)
-                    end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-                    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-                    slices.append((start_idx, end_idx, trading_end_idx))
-
-        # 2. Sample 10 slices from validation data
-        min_start_val = self.val_start_idx
-        max_start_val = self.val_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
-
-        if max_start_val >= min_start_val:
-            # Divide validation range into 10 segments
-            val_range = max_start_val - min_start_val + 1
-            val_segment_size = max(1, val_range // 10)
-
-            for i in range(10):
-                segment_start = min_start_val + (i * val_segment_size)
-                segment_end = min(max_start_val + 1, segment_start + val_segment_size)
-
-                if segment_end > segment_start:
-                    start_idx = np.random.randint(segment_start, segment_end)
-                    end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-                    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-                    slices.append((start_idx, end_idx, trading_end_idx))
-
-        return slices
+        return self.gauntlet_helper.generate_gauntlet_slices()
 
     def run_gauntlet(self, agent: DDPGAgent, agent_name: str) -> Tuple[float, dict]:
         """
-        Run gauntlet validation on an agent - EXACTLY mirroring ERLTrainer's logic.
+        Run gauntlet validation on an agent using ERLTrainer's methods.
 
-        This must match the trainer's gauntlet validation precisely to ensure
-        Global 50 scores are accurate and consistent.
+        This delegates to ERLTrainer's run_episode_batched and calculate_expectancy
+        to ensure Global 50 scores are perfectly consistent with trainer validation.
 
         Args:
             agent: Agent to evaluate
@@ -177,42 +187,31 @@ class AgentEvaluator:
         Returns:
             Tuple of (gauntlet_score, detailed_metrics)
         """
-        # Generate gauntlet slices (10 training + 10 validation, EXACTLY as ERLTrainer does)
+        # Generate gauntlet slices using ERLTrainer's method
         gauntlet_slices = self.generate_gauntlet_slices()
         print(f"   Running Gauntlet ({len(gauntlet_slices)} slices: {sum(1 for s in gauntlet_slices if s[0] < self.val_start_idx)} training + {sum(1 for s in gauntlet_slices if s[0] >= self.val_start_idx)} validation)...")
-
-        # Create persistent eval environment (mirrors ERLTrainer)
-        # Note: Environment needs enough data for context window (504 days)
-        full_end_idx = len(self.data_loader.data_array_full)
-        eval_env = TradingEnvironment(
-            data_array=self.data_loader.data_array,
-            dates=self.data_loader.dates,
-            normalization_stats=self.normalization_stats,
-            start_idx=Config.CONTEXT_WINDOW_DAYS,  # Minimum for context window
-            end_idx=full_end_idx,
-            trading_end_idx=Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS,
-            data_array_full=self.data_loader.data_array_full,
-            consistency_mode=False  # Gauntlet always uses normal mode
-        )
 
         slice_results = []
         all_closed_trades = []
 
-        # Evaluate each slice
+        # Set agent to eval mode
         agent.actor.eval()
         agent.critic.eval()
 
-        for i, (start_idx, end_idx, trading_end_idx) in enumerate(gauntlet_slices):
-            # Run episode (mirrors run_episode_batched behavior but simpler)
-            fitness, episode_info = eval_env.run_episode(
+        # Evaluate each slice using ERLTrainer's run_episode_batched
+        for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
+            # Use ERLTrainer's optimized batched inference
+            # Note: training=False so replay_buffer is not used
+            fitness, episode_info = self.gauntlet_helper.run_episode_batched(
                 agent=agent,
+                env=self.gauntlet_helper.eval_env,
                 start_idx=start_idx,
                 end_idx=end_idx,
-                trading_end_idx=trading_end_idx,
-                training=False
+                training=False,
+                batch_size=16
             )
 
-            # Apply zero-trades gradient (CRITICAL - matches trainer logic)
+            # Apply zero-trades gradient (matches ERLTrainer logic)
             if episode_info['num_trades'] == 0:
                 max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
                 fitness = fitness + max_coeff
@@ -228,20 +227,20 @@ class AgentEvaluator:
                 'total_investment': episode_info.get('total_investment', 0.0)
             })
 
-            # Collect closed trades for expectancy
+            # Collect closed trades for expectancy calculation
             if 'closed_trades' in episode_info and episode_info['closed_trades']:
                 all_closed_trades.extend(episode_info['closed_trades'])
 
         # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # CRITICAL: Exact aggregator as trainer (0.75*mean + 0.25*min)
+        # Use same aggregator as ERLTrainer: 0.75*mean + 0.25*min
         mean_score = np.mean(fitness_scores)
         min_score = np.min(fitness_scores)
         max_score = np.max(fitness_scores)
         gauntlet_score = (0.75 * mean_score) + (0.25 * min_score)
 
-        # Aggregate metrics (exact calculations as trainer)
+        # Aggregate metrics (same calculations as ERLTrainer)
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
         total_investment = sum([r['total_investment'] for r in slice_results])
         roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
@@ -251,14 +250,8 @@ class AgentEvaluator:
         total_trades = total_wins + total_losses
         win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
 
-        # Calculate expectancy (mirrors trainer's calculate_expectancy)
-        if all_closed_trades:
-            avg_gain = np.mean([t['reward_pct'] for t in all_closed_trades if t['reward_pct'] > 0]) if any(t['reward_pct'] > 0 for t in all_closed_trades) else 0.0
-            avg_loss = np.mean([abs(t['reward_pct']) for t in all_closed_trades if t['reward_pct'] < 0]) if any(t['reward_pct'] < 0 for t in all_closed_trades) else 0.0
-            win_rate_decimal = win_rate / 100.0
-            expectancy = (win_rate_decimal * avg_gain) - ((1 - win_rate_decimal) * avg_loss)
-        else:
-            expectancy = 0.0
+        # Use ERLTrainer's calculate_expectancy method
+        expectancy = self.gauntlet_helper.calculate_expectancy(all_closed_trades)
 
         detailed_metrics = {
             'gauntlet_score': gauntlet_score,
@@ -269,7 +262,7 @@ class AgentEvaluator:
             'total_trades': total_trades,
             'win_rate': win_rate,
             'expectancy': expectancy,
-            'num_slices': num_slices,
+            'num_slices': len(gauntlet_slices),
             'fitness_all_slices': fitness_scores
         }
 
