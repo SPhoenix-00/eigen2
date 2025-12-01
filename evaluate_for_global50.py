@@ -46,11 +46,12 @@ class AgentEvaluator:
 
         # Initialize data loader
         print("\n1. Loading market data...")
-        self.data_loader = StockDataLoader(Config.DATA_PATH)
-        print(f"   Loaded {len(self.data_loader.data)} days of data")
+        self.data_loader = StockDataLoader()
+        data_array, stats = self.data_loader.load_and_prepare()
+        print(f"   Loaded {len(self.data_loader.data_array_full)} days of data")
 
         # Get validation indices (for gauntlet)
-        self.val_start_idx = self.data_loader.train_end_idx
+        self.val_start_idx = self.data_loader.val_start_idx
         self.val_end_idx = self.data_loader.val_end_idx
         print(f"   Validation range: {self.val_start_idx} - {self.val_end_idx}")
 
@@ -160,7 +161,7 @@ class AgentEvaluator:
 
             # Create environment for this slice
             env = TradingEnvironment(
-                data=self.data_loader.data,
+                data=self.data_loader.data_array_full,
                 context_window_days=Config.CONTEXT_WINDOW_DAYS,
                 min_holding_period=Config.MIN_HOLDING_PERIOD,
                 max_holding_period=Config.MAX_HOLDING_PERIOD,
