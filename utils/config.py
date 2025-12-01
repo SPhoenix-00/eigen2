@@ -50,7 +50,7 @@ class Config:
     LOSS_PENALTY_MULTIPLIER = 1.0  # DEPRECATED: Use CONSISTENCY_LOSS_MULTIPLIER instead. Kept for backward compatibility with sweep configs.
     INACTION_PENALTY = 0.0  # Penalty per day without an open position (reduced from 20.0 to smooth landscape)
     FORCED_EXIT_PENALTY_PCT = 0.01  # 3% penalty on position size (entry_price * coefficient)
-    ZERO_TRADES_PENALTY_NORMAL = 5000.0  # Heavy penalty for making NO trades in normal mode
+    ZERO_TRADES_PENALTY_NORMAL = 2000.0  # Heavy penalty for making NO trades in normal mode
     ZERO_TRADES_PENALTY_CONSISTENCY = 500.0  # Penalty for making NO trades in consistency mode
     HURDLE_RATE = 0.006  # 0.6% transaction cost per trade (mimics real trading costs, disincentivizes high-volume strategies)
     CONVICTION_SCALING_POWER = 1.25  # Power law exponent for conviction scaling (convex reward surface encourages high-confidence bets)
@@ -127,7 +127,7 @@ class Config:
     
     # ============ ERL Parameters ============
     POPULATION_SIZE = 32
-    NUM_GENERATIONS = 50
+    NUM_GENERATIONS = 150
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
     # Selection
@@ -198,7 +198,7 @@ class Config:
     BREAKTHROUGH_THRESHOLD_CONSISTENCY = 0.05  # 5% improvement in consistency mode (stricter)
 
     # Breakthrough quorum - number of agents that must breach threshold simultaneously
-    BREAKTHROUGH_QUORUM_NORMAL = 3  # Require 3 agents to breach in normal mode
+    BREAKTHROUGH_QUORUM_NORMAL = 1  # Require 1 agent to breach in normal mode
     BREAKTHROUGH_QUORUM_CONSISTENCY = 1  # Only test highest agent per generation in consistency mode
 
     # Stabilization phase - lock training on candidate for N generations
