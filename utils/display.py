@@ -338,6 +338,21 @@ def print_generation_summary(gen: int, total_gens: int,
             if queue_size is not None:
                 print(f"  Queue Size:        {queue_size:>12}")
 
+        # Global Hall of Fame section (if enabled)
+        global_hof_enabled = gauntlet_info.get('global_hof_enabled', False)
+        if global_hof_enabled:
+            global_hof_size = gauntlet_info.get('global_hof_size', 0)
+            global_hof_threshold = gauntlet_info.get('global_hof_threshold', float('-inf'))
+
+            print("\n🌍 GLOBAL HALL OF FAME")
+            print("-" * 70)
+            print(f"  Status:            {'ENABLED ✓' if global_hof_enabled else 'DISABLED'}")
+            print(f"  Current Size:      {global_hof_size:>12} / 50")
+            if global_hof_threshold != float('-inf'):
+                print(f"  Entry Threshold:   {global_hof_threshold:>12.2f}  (Rank #50)")
+            else:
+                print(f"  Entry Threshold:   {'None (Open)':>12}")
+
     # Trading section
     print("\n📈 TRADING ACTIVITY")
     print("-" * 70)

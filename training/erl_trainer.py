@@ -16,7 +16,6 @@ import json
 import wandb
 import gc
 import math
-import matplotlib.pyplot as plt
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
@@ -33,8 +32,9 @@ from models.ddpg_agent import DDPGAgent
 from models.replay_buffer import ReplayBuffer, OnDiskReplayBuffer
 from erl.genetic_ops import create_next_generation
 from erl.hall_of_fame import HallOfFame
+from erl.global_hof import GlobalHallOfFame, LeagueRules
 from utils.config import Config
-from utils.display import print_generation_summary, print_final_summary, plot_fitness_progress, ResourceTracker
+from utils.display import print_generation_summary, print_final_summary, ResourceTracker
 from utils.cloud_sync import get_cloud_sync_from_env
 from utils.cleanup_orphans import cleanup_orphans
 from torch.utils.data import DataLoader
@@ -437,6 +437,18 @@ class ERLTrainer:
         # Initialize Hall of Fame (now that checkpoint_dir is set)
         print("Initializing Hall of Fame (capacity: 10)...")
         self.hall_of_fame = HallOfFame(capacity=10, checkpoint_dir=self.checkpoint_dir)
+
+        # Initialize Global Hall of Fame (cross-run top 50 tracking)
+        league_rules = LeagueRules(
+            context_window_days=Config.CONTEXT_WINDOW_DAYS
+        )
+        self.global_hof = GlobalHallOfFame(
+            cloud_sync=self.cloud_sync,
+            run_name=wandb.run.name,
+            league_rules=league_rules,
+            checkpoint_dir=self.checkpoint_dir,
+            disable_global50=False  # Set to True to disable Global 50 for debugging
+        )
 
         # Create replay buffer with storage INSIDE checkpoint directory
         # This ensures buffer files are synced to cloud along with checkpoints
@@ -2664,18 +2676,35 @@ class ERLTrainer:
                         }
                         self.breakthrough_history.append(breakthrough_event)
 
+                    # GLOBAL 50: Attempt to promote agent to Global Hall of Fame
+                    # This happens for ALL confirmed breakthroughs (both normal and consistency mode)
+                    agent_to_admit = self.breakthrough_candidate.agent
+                    agent_roi = gauntlet_results['roi']
+                    agent_expectancy = gauntlet_results['expectancy']
+                    quality_count = gauntlet_results.get('total_trades', 0)
+                    total_trades = gauntlet_results.get('total_trades', 0)
+
+                    # Try to promote to Global 50
+                    promoted = self.global_hof.check_and_promote(
+                        agent=agent_to_admit,
+                        gauntlet_score=gauntlet_score,
+                        generation=self.generation,
+                        roi=agent_roi,
+                        expectancy=agent_expectancy,
+                        quality_count=quality_count,
+                        total_trades=total_trades
+                    )
+
+                    if promoted:
+                        # Log Global 50 promotion
+                        wandb.log({'gauntlet/global50_promotion': 1}, step=self.generation)
+
                     # CONSISTENCY MODE: Add agent to Hall of Fame (gauntlet is the gate to HoF)
                     # This happens regardless of whether baseline is deferred
                     if self.consistency_mode:
-                        agent_to_admit = self.breakthrough_candidate.agent
-                        agent_roi = gauntlet_results['roi']
-                        agent_expectancy = gauntlet_results['expectancy']
-
                         # For gauntlet agents, we use the gauntlet_score as combined fitness
                         # and store necessary fields for re-evaluation
                         train_fitness = 0.0  # Gauntlet doesn't use training fitness
-                        quality_count = gauntlet_results.get('total_trades', 0)  # Use total trades as proxy
-                        total_trades = gauntlet_results.get('total_trades', 0)
                         val_fitness = gauntlet_score  # Gauntlet score is the validation fitness
                         base_combined_fitness = gauntlet_score
 
@@ -4146,6 +4175,9 @@ class ERLTrainer:
                 # Get Hall of Fame stats
                 hof_stats = self.hall_of_fame.get_stats()
 
+                # Get Global Hall of Fame stats
+                global_hof_stats = self.global_hof.get_stats()
+
                 gauntlet_info = {
                     'gauntlet_enabled': True,
                     'consistency_mode': self.consistency_mode,
@@ -4159,7 +4191,10 @@ class ERLTrainer:
                     'hof_size': hof_stats['size'],
                     'hof_capacity': self.hall_of_fame.capacity,
                     'stabilization_progress': stab_progress,
-                    'breakthrough_history': self.breakthrough_history
+                    'breakthrough_history': self.breakthrough_history,
+                    'global_hof_enabled': global_hof_stats['enabled'],
+                    'global_hof_size': global_hof_stats['size'],
+                    'global_hof_threshold': global_hof_stats['entry_threshold']
                 }
 
                 # Add queue size if using candidate queue (heroes mode)
@@ -4181,10 +4216,10 @@ class ERLTrainer:
             )
 
             # Show progress plot every 5 generations
-            if (gen + 1) % 5 == 0:
-                plot_fitness_progress(self.fitness_history)
-                # CRITICAL FIX: Close matplotlib figures to prevent memory leak (~100MB per plot)
-                plt.close('all')
+            # if (gen + 1) % 5 == 0:
+            #     plot_fitness_progress(self.fitness_history)
+            #     # CRITICAL FIX: Close matplotlib figures to prevent memory leak (~100MB per plot)
+            #     plt.close('all')
 
             # Buffer stats and generation time
             buffer_stats = self.replay_buffer.get_stats()
@@ -4192,11 +4227,23 @@ class ERLTrainer:
             self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
 
             # Log timing and buffer metrics to wandb
-            wandb.log({
+            wandb_log_data = {
                 "training/generation_time": gen_time,
                 "buffer/size": buffer_stats['size'],
                 "buffer/utilization": buffer_stats['utilization'],
-            }, step=gen)
+            }
+
+            # Add Global HoF stats if enabled
+            if self.global_hof.enabled:
+                global_hof_stats = self.global_hof.get_stats()
+                wandb_log_data.update({
+                    'global_hof/size': global_hof_stats['size'],
+                    'global_hof/entry_threshold': global_hof_stats['entry_threshold'],
+                    'global_hof/best_score': global_hof_stats['best_score'],
+                    'global_hof/mean_score': global_hof_stats['mean_score'],
+                })
+
+            wandb.log(wandb_log_data, step=gen)
 
             # Clear GPU cache and run garbage collection to prevent memory leaks
             if torch.cuda.is_available():
