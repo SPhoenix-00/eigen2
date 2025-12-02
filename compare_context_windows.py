@@ -45,6 +45,18 @@ class ContextWindowResult:
     slice_scores: List[float]
     slice_rois: List[float]
 
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        from dataclasses import asdict
+        data = asdict(self)
+        # Convert numpy types to Python native types for JSON serialization
+        for key, value in data.items():
+            if hasattr(value, 'item'):  # numpy scalar
+                data[key] = value.item()
+            elif isinstance(value, (list, tuple)):
+                data[key] = [v.item() if hasattr(v, 'item') else v for v in value]
+        return data
+
 
 class ContextWindowComparator:
     """Compare agent performance across different context window sizes."""
@@ -369,8 +381,8 @@ class ContextWindowComparator:
                 'agent_path': agent_path,
                 'timestamp': datetime.now().isoformat(),
                 'num_slices': self.num_slices,
-                'result_504d': asdict(result_504),
-                'result_151d': asdict(result_151),
+                'result_504d': result_504.to_dict(),
+                'result_151d': result_151.to_dict(),
                 'degradation': {
                     'score_delta': score_delta,
                     'score_delta_pct': score_delta_pct,

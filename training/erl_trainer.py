@@ -331,7 +331,8 @@ def _run_validation_worker(args):
         'fitness_mean': mean_score,
         'fitness_min': min_score,
         'roi': roi,
-        'total_trades': total_trades,
+        'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),  # Mean trades per slice
+        'total_trades': total_trades,  # Total across all slices
         'win_rate': global_win_rate,
         'quality_count': quality_count,
         'quality_roi': quality_roi,
@@ -4201,7 +4202,7 @@ class ERLTrainer:
                     'base_combined_fitness': base_combined_fitness,
                     'roi_adjustment': roi_adjustment,
                     'win_rate': val_results['win_rate'],
-                    'num_trades': total_trades,  # Use total_trades (already extracted from val_results)
+                    'num_trades': val_results['num_trades'],  # Mean trades per slice
                     'total_trades': total_trades,  # Total across all slices (for quality ratio)
                     'quality_count': quality_count,
                     'raw_pnl': val_results.get('raw_pnl', 0.0),

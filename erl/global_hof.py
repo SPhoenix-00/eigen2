@@ -29,7 +29,14 @@ class LeagueRules:
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        data = asdict(self)
+        # Convert numpy types to Python native types for JSON serialization
+        for key, value in data.items():
+            if hasattr(value, 'item'):  # numpy scalar
+                data[key] = value.item()
+            elif isinstance(value, (list, tuple)):
+                data[key] = [v.item() if hasattr(v, 'item') else v for v in value]
+        return data
 
     @staticmethod
     def from_dict(data: dict) -> 'LeagueRules':
@@ -54,7 +61,14 @@ class GlobalHoFEntry:
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        data = asdict(self)
+        # Convert numpy types to Python native types for JSON serialization
+        for key, value in data.items():
+            if hasattr(value, 'item'):  # numpy scalar
+                data[key] = value.item()
+            elif isinstance(value, (list, tuple)):
+                data[key] = [v.item() if hasattr(v, 'item') else v for v in value]
+        return data
 
     @staticmethod
     def from_dict(data: dict) -> 'GlobalHoFEntry':
