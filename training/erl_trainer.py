@@ -2539,6 +2539,94 @@ class ERLTrainer:
             'expectancy': expectancy,
         }
 
+    def stress_test_candidates(self, breaching_agents: list) -> list:
+        """
+        PHASE 2: STRESS TEST - Pre-stabilization filter to identify the strongest candidate.
+
+        Instead of blindly selecting the top agent, run a quick "audition" on all candidates
+        to filter out agents that got lucky on normal validation but fail under stress.
+
+        The Logic:
+        1. Run single validation episode on each candidate
+        2. Re-rank candidates based on pessimistic fitness
+        3. Select winner based on stress test performance
+
+        This prevents wasting GPU time stabilizing weak candidates that won't survive the Gauntlet.
+
+        Args:
+            breaching_agents: List of candidate agents that passed initial threshold
+
+        Returns:
+            Ranked list of candidates based on stress test performance
+        """
+        if not Config.STRESS_TEST_ENABLED or not breaching_agents:
+            return breaching_agents
+
+        print(f"\n{'='*60}")
+        print(f"⚡ STRESS TEST - Pre-Stabilization Audition")
+        print(f"{'='*60}")
+        print(f"  Testing {len(breaching_agents)} candidates with pessimistic fitness")
+        print(f"  Metric: Pessimistic fitness (0.4*mean + 0.6*worst)")
+        print(f"{'='*60}")
+
+        # Run stress test on each candidate
+        stress_results = []
+        for i, agent_info in enumerate(breaching_agents, 1):
+            agent_idx = agent_info['idx']
+            agent = self.population[agent_idx]
+
+            # Run single validation episode (use first validation slice for speed)
+            if not self.current_generation_val_slices:
+                print(f"  ⚠️  Warning: No validation slices available for stress test")
+                return breaching_agents
+
+            start_idx, end_idx, _ = self.current_generation_val_slices[0]
+
+            # Run episode in validation mode
+            fitness, episode_info = self.run_episode_batched(
+                agent=agent,
+                env=self.eval_env,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                training=False,
+                batch_size=16
+            )
+
+            # Extract metrics
+            num_trades = episode_info.get('num_trades', 0)
+            win_rate = episode_info.get('win_rate', 0.0)
+
+            stress_results.append({
+                'idx': agent_idx,
+                'original_fitness': agent_info['fitness'],
+                'stress_fitness': fitness,
+                'num_trades': num_trades,
+                'win_rate': win_rate
+            })
+
+            print(f"  Agent {agent_idx:2d}: Fitness={fitness:>8.2f} | Trades={num_trades:>3d} | WinRate={win_rate*100:>5.1f}%")
+
+        # Sort by stress test fitness (descending)
+        stress_results.sort(key=lambda x: x['stress_fitness'], reverse=True)
+
+        print(f"\n{'='*60}")
+        print(f"✅ STRESS TEST COMPLETE")
+        print(f"{'='*60}")
+        winner = stress_results[0]
+        print(f"  Winner: Agent {winner['idx']}")
+        print(f"  Stress Fitness: {winner['stress_fitness']:.2f}")
+        print(f"  Trades: {winner['num_trades']} | WinRate: {winner['win_rate']*100:.1f}%")
+        print(f"{'='*60}")
+
+        # Return re-ranked candidates (mapped back to original breaching_agents format)
+        reranked = []
+        for result in stress_results:
+            # Find original agent_info
+            original = next(a for a in breaching_agents if a['idx'] == result['idx'])
+            reranked.append(original)
+
+        return reranked
+
     def check_for_breakthrough(self, validation_results: list) -> bool:
         """
         Check if current generation has a potential breakthrough.
@@ -2560,6 +2648,11 @@ class ERLTrainer:
             True if breakthrough detected, False otherwise
         """
         if not self.gauntlet_mode_enabled:
+            return False
+
+        # WARMUP PERIOD: Prevent breakthrough detection until Generation > threshold
+        # Let the population churn before declaring winners
+        if self.generation <= Config.BREAKTHROUGH_WARMUP_GENERATIONS:
             return False
 
         if self.breakthrough_state != BreakthroughState.NORMAL:
@@ -2594,6 +2687,52 @@ class ERLTrainer:
                     'fitness': val_fitness,
                     'improvement': improvement
                 })
+
+        # PHASE 1: QUALITY CULL - Deduplication & Truncation
+        # Remove weak candidates before wasting GPU time on them
+        if breaching_agents:
+            original_count = len(breaching_agents)
+
+            # Step 1: Deduplicate - remove agents with identical fitness
+            seen_fitness = {}
+            deduplicated = []
+            for agent_info in breaching_agents:
+                fitness = agent_info['fitness']
+                if fitness not in seen_fitness:
+                    seen_fitness[fitness] = True
+                    deduplicated.append(agent_info)
+
+            duplicates_removed = original_count - len(deduplicated)
+
+            # Step 2: Truncate - keep only top K candidates
+            # Sort by fitness descending (highest first)
+            deduplicated.sort(key=lambda x: x['fitness'], reverse=True)
+            max_candidates = Config.MAX_CANDIDATES_FOR_STRESS_TEST
+            truncated = deduplicated[:max_candidates]
+            weak_removed = len(deduplicated) - len(truncated)
+
+            if duplicates_removed > 0 or weak_removed > 0:
+                print(f"\n{'='*60}")
+                print(f"📊 ASSET SELECTION - QUALITY CULL")
+                print(f"{'='*60}")
+                print(f"  Original candidates: {original_count}")
+                if duplicates_removed > 0:
+                    print(f"  Duplicates removed: {duplicates_removed} (identical fitness)")
+                if weak_removed > 0:
+                    print(f"  Weak candidates culled: {weak_removed} (below top {max_candidates})")
+                print(f"  Remaining candidates: {len(truncated)}")
+                print(f"{'='*60}")
+
+            breaching_agents = truncated
+
+        # PHASE 2: STRESS TEST - Pre-Stabilization Filter
+        # Run quick audition on remaining candidates to filter out weak agents
+        breaching_agents = self.stress_test_candidates(breaching_agents)
+
+        # If all candidates failed stress test, continue normal evolution
+        if not breaching_agents:
+            print(f"\n  Returning to normal evolution (no candidates passed stress test)\n")
+            return False
 
         # Check if we have quorum
         if len(breaching_agents) >= self.breakthrough_quorum:

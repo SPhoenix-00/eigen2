@@ -196,12 +196,17 @@ class Config:
     GAUNTLET_MODE_ENABLED = True  # Enable Gauntlet Mode breakthrough validation
 
     # Breakthrough detection
+    BREAKTHROUGH_WARMUP_GENERATIONS = 5  # No breakthrough detection until Generation > this value (let population churn)
     BREAKTHROUGH_THRESHOLD_NORMAL = 0.10  # 10% improvement over baseline in normal mode
     BREAKTHROUGH_THRESHOLD_CONSISTENCY = 0.05  # 5% improvement in consistency mode (stricter)
 
     # Breakthrough quorum - number of agents that must breach threshold simultaneously
     BREAKTHROUGH_QUORUM_NORMAL = 1  # Require 1 agent to breach in normal mode
     BREAKTHROUGH_QUORUM_CONSISTENCY = 1  # Only test highest agent per generation in consistency mode
+
+    # Asset Selection - Two-phase filtering to prevent wasting GPU time on weak candidates
+    MAX_CANDIDATES_FOR_STRESS_TEST = 5  # Phase 1: Truncate queue to top K candidates after deduplication
+    STRESS_TEST_ENABLED = True  # Phase 2: Run stress test using pessimistic fitness before stabilization
 
     # Stabilization phase - lock training on candidate for N generations
     STABILIZATION_GENERATIONS = 3  # Allow networks to converge on new behavior
