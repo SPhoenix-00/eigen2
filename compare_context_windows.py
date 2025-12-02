@@ -164,11 +164,15 @@ class ContextWindowComparator:
         from training.erl_trainer import ERLTrainer
 
         # Use a dummy trainer just to call the static-ish method
-        # We need to create a minimal trainer instance
+        # We need to create a minimal trainer instance with required attributes
         dummy_trainer = ERLTrainer.__new__(ERLTrainer)
         dummy_trainer.data_loader = self.data_loader
-        dummy_trainer.val_start_idx = self.data_loader.val_start_idx
-        dummy_trainer.val_end_idx = self.data_loader.val_end_idx
+
+        # Set training and validation ranges (same as ERLTrainer.__init__)
+        dummy_trainer.train_start_idx = Config.CONTEXT_WINDOW_DAYS
+        dummy_trainer.train_end_idx = len(self.data_loader.train_indices)
+        dummy_trainer.val_start_idx = len(self.data_loader.train_indices)
+        dummy_trainer.val_end_idx = dummy_trainer.val_start_idx + len(self.data_loader.val_indices)
 
         # Call the original method
         slices = dummy_trainer.generate_gauntlet_slices()
