@@ -144,7 +144,6 @@ def main():
 
         # Auto-detect global50 directory if --heroes was used without a path
         if args.heroes == 'auto':
-            from pathlib import Path
             # Try Docker path first (global50/), then Windows path (workspace/global50/)
             global50_candidates = [
                 Path("global50"),
