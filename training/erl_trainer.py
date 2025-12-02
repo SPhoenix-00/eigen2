@@ -2180,7 +2180,7 @@ class ERLTrainer:
         Returns:
             List of validation results for each agent in population
         """
-        print(f"\n--- Walk-Forward Validation (Generation {self.current_generation}) ---")
+        print(f"\n--- Walk-Forward Validation (Generation {self.generation + 1}) ---")
 
         # Prepare validation slices (shared across all agents)
         if not self.current_generation_val_slices:
