@@ -851,45 +851,61 @@ class ERLTrainer:
 
     def load_heroes_from_hof(self):
         """
-        Load agents from a Hall of Fame directory, evaluate them, and select top 32.
+        Load agents from Hall of Fame directory(ies), combining multiple sources if needed.
 
-        This is called when --heroes flag is provided to start training from
-        a set of pre-trained agents instead of random initialization.
+        Supports multiple directories separated by '|' to aggregate agents from:
+        1. Current context window (e.g., cw151)
+        2. Fallback context window (e.g., cw504)
+        3. Legacy directories
+
+        Fills any remaining population slots with random agents (not clones).
         """
         from pathlib import Path
         import glob
 
-        hof_dir = Path(self.heroes_hof_dir)
-        hof_subdir = hof_dir / "hall_of_fame"
-
-        # Check if the directory exists
-        if not hof_dir.exists():
-            print(f"! Heroes HoF directory not found: {hof_dir}")
-            print("  Continuing with random initialization.")
-            return
-
-        # Determine where agent files are
-        if hof_subdir.exists():
-            agent_dir = hof_subdir
-        else:
-            agent_dir = hof_dir
-
-        # Load all agent files
-        agent_files = sorted(glob.glob(str(agent_dir / "*.pth")))
-        if not agent_files:
-            print(f"! No agent files (.pth) found in: {agent_dir}")
-            print("  Continuing with random initialization.")
-            return
+        # Support multiple directories separated by '|'
+        hof_dirs = self.heroes_hof_dir.split('|') if '|' in self.heroes_hof_dir else [self.heroes_hof_dir]
 
         print("\n" + "="*60)
         print("HEROES MODE: Loading pre-trained agents from Hall of Fame")
         print("="*60)
-        print(f"Source: {agent_dir}")
-        print(f"Found {len(agent_files)} agent files")
+
+        # Load agents from all specified directories
+        all_agent_files = []
+        for hof_dir_str in hof_dirs:
+            hof_dir = Path(hof_dir_str.strip())
+            hof_subdir = hof_dir / "hall_of_fame"
+
+            # Check if the directory exists
+            if not hof_dir.exists():
+                print(f"  ⚠ Skipping {hof_dir}: directory not found")
+                continue
+
+            # Determine where agent files are (check both agents/ and hall_of_fame/)
+            agent_subdirs = [
+                hof_dir / "agents",         # Standard: global50/cw151/agents/
+                hof_subdir,                 # Legacy: checkpoints/run/hall_of_fame/
+                hof_dir                     # Root: global50/cw151/
+            ]
+
+            for agent_dir in agent_subdirs:
+                if agent_dir.exists():
+                    agent_files = sorted(glob.glob(str(agent_dir / "*.pth")))
+                    if agent_files:
+                        print(f"  ✓ {hof_dir}: found {len(agent_files)} agents in {agent_dir.name}/")
+                        all_agent_files.extend(agent_files)
+                        break  # Found agents in this directory, move to next hof_dir
+
+        if not all_agent_files:
+            print("! No agent files (.pth) found in any specified directory")
+            print("  Continuing with random initialization.")
+            return
+
+        print(f"\nTotal agents found: {len(all_agent_files)}")
 
         # Load all agents
         loaded_agents = []
-        for i, agent_file in enumerate(agent_files):
+        for i, agent_file in enumerate(all_agent_files):
             try:
                 agent = DDPGAgent(agent_id=i)
                 agent.load(agent_file)
@@ -1012,12 +1028,13 @@ class ERLTrainer:
             agent.agent_id = i
             selected_heroes.append(agent)
 
-        # Fill remaining slots with clones of top agents if needed
-        while len(selected_heroes) < Config.POPULATION_SIZE:
-            idx = len(selected_heroes) % num_to_select
-            clone = hero_fitness[idx][1].clone()
-            clone.agent_id = len(selected_heroes)
-            selected_heroes.append(clone)
+        # Fill remaining slots with random agents if needed (NOT clones)
+        num_random_needed = Config.POPULATION_SIZE - len(selected_heroes)
+        if num_random_needed > 0:
+            print(f"\n  Filling {num_random_needed} remaining slots with random agents")
+            for i in range(num_random_needed):
+                random_agent = DDPGAgent(agent_id=len(selected_heroes))
+                selected_heroes.append(random_agent)
 
         # Replace population
         old_population = self.population

@@ -144,31 +144,48 @@ def main():
 
         # Auto-detect global50 directory if --heroes was used without a path
         if args.heroes == 'auto':
+            import glob
+
             # Context window identifier (e.g., "cw151" for 151-day window)
             context_window_id = f"cw{Config.CONTEXT_WINDOW_DAYS}"
 
-            # Try context-window-specific paths first, then fall back to legacy paths
+            # Build list of ALL available directories in priority order
+            # Heroes loading will aggregate agents from all of them
             global50_candidates = [
-                Path("global50") / context_window_id,           # Docker: global50/cw151/
-                Path("workspace/global50") / context_window_id, # Windows: workspace/global50/cw151/
-                Path("global50"),                               # Legacy: global50/
-                Path("workspace/global50")                      # Legacy: workspace/global50/
+                (Path("global50") / context_window_id, f"current context ({context_window_id})"),
+                (Path("workspace/global50") / context_window_id, f"current context ({context_window_id})"),
+                (Path("global50") / "cw504", "fallback (cw504)"),
+                (Path("workspace/global50") / "cw504", "fallback (cw504)"),
+                (Path("global50"), "legacy"),
+                (Path("workspace/global50"), "legacy")
             ]
 
-            global50_dir = None
-            for candidate in global50_candidates:
-                if candidate.exists() and (candidate / "agents").exists():
-                    global50_dir = candidate
-                    break
+            # Collect all directories with agents
+            found_dirs = []
+            total_agents = 0
 
-            if global50_dir:
-                args.heroes = str(global50_dir)
-                print(f"\n✓ Auto-detected global50 directory: {args.heroes}")
-                print(f"  Context window: {Config.CONTEXT_WINDOW_DAYS} days")
+            for candidate, desc in global50_candidates:
+                if candidate.exists():
+                    # Check all possible agent subdirectories
+                    for subdir in ["agents", "hall_of_fame", "."]:
+                        agent_dir = candidate / subdir if subdir != "." else candidate
+                        if agent_dir.exists():
+                            agent_files = glob.glob(str(agent_dir / "*.pth"))
+                            if agent_files:
+                                found_dirs.append(str(candidate))
+                                total_agents += len(agent_files)
+                                print(f"  ✓ Found {len(agent_files)} agents in {candidate} ({desc})")
+                                break  # Found agents in this candidate, move to next
+
+            if found_dirs:
+                # Join all directories with '|' separator for heroes loading
+                args.heroes = '|'.join(found_dirs)
+                print(f"\n✓ Auto-detected global50 directories")
+                print(f"  Total agents available: {total_agents}")
+                print(f"  Training context window: {Config.CONTEXT_WINDOW_DAYS} days")
             else:
                 print("\n⚠ WARNING: --heroes auto-detect failed")
-                print(f"  Could not find global50/{context_window_id}/ or workspace/global50/{context_window_id}/ with agents/")
-                print(f"  Also tried legacy paths: global50/, workspace/global50/")
+                print(f"  Tried: global50/{context_window_id}/, global50/cw504/, and legacy paths")
                 print(f"  You may need to run: python download_global50.py")
                 print("  Continuing with random initialization.")
                 args.heroes = None
