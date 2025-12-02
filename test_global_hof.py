@@ -51,13 +51,14 @@ def test_basic_functionality():
         generation=10,
         roi=15.5,
         expectancy=2.3,
-        quality_count=50,
+        quality_ratio=0.67,  # Updated from quality_count
+        win_ratio=0.75,
         total_trades=75
     )
 
     filename = entry.get_filename()
     print(f"   Entry filename: {filename}")
-    assert filename == "1234.56_test-run-001_123.pth", f"Expected '1234.56_test-run-001_123.pth', got '{filename}'"
+    assert filename == "test-run-001_123.pth", f"Expected 'test-run-001_123.pth', got '{filename}'"
 
     # Test serialization
     print("\n3. Testing entry serialization...")
@@ -125,7 +126,8 @@ def test_json_ledger_format():
             generation=25,
             roi=18.5,
             expectancy=2.8,
-            quality_count=60,
+            quality_ratio=0.75,  # Updated from quality_count
+            win_ratio=0.80,
             total_trades=80
         ),
         GlobalHoFEntry(
@@ -135,7 +137,8 @@ def test_json_ledger_format():
             generation=30,
             roi=16.2,
             expectancy=2.5,
-            quality_count=55,
+            quality_ratio=0.73,  # Updated from quality_count
+            win_ratio=0.77,
             total_trades=75
         )
     ]

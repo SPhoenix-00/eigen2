@@ -119,15 +119,21 @@ class GlobalHallOfFame:
         # Thread safety for atomic updates
         self._lock = threading.Lock()
 
-        # Paths
-        self.local_dir = self.LOCAL_BASE_DIR
+        # Context window identifier for path (e.g., "cw151" for 151 days)
+        self.context_window_id = f"cw{league_rules.context_window_days}"
+
+        # Paths (now include context window subdirectory)
+        self.local_dir = self.LOCAL_BASE_DIR / self.context_window_id
         self.local_agents_dir = self.local_dir / "agents"
         self.local_archive_dir = self.local_dir / "archive"
         self.local_json_path = self.local_dir / "global50.json"
 
-        # Cloud paths
-        self.cloud_base = f"{cloud_sync.project_name}/global50"
+        # Cloud paths (now include context window subdirectory)
+        self.cloud_base = f"{cloud_sync.project_name}/global50/{self.context_window_id}"
         self.cloud_json_path = f"{self.cloud_base}/global50.json"
+
+        # Fallback leagues for diversity injection (populated during initialization)
+        self.fallback_leagues: List[Dict] = []
 
         if self.enabled:
             self._initialize()
@@ -136,9 +142,9 @@ class GlobalHallOfFame:
         """
         Phase A: Startup
         - Create local directories
-        - Download global50.json from cloud
-        - Validate league rules
-        - Determine entry threshold
+        - Download global50.json from cloud for our context window
+        - If no match, create new league for this context window
+        - Discover other context windows for fallback diversity injection
         """
         # Create local directories
         self.local_dir.mkdir(parents=True, exist_ok=True)
@@ -148,8 +154,9 @@ class GlobalHallOfFame:
         print(f"\n{'='*60}")
         print("Global Hall of Fame - Initialization")
         print(f"{'='*60}")
+        print(f"Context Window: {self.league_rules.context_window_days} days")
 
-        # Download global50.json
+        # Download global50.json for our context window
         success = self._download_global_ledger()
 
         if success:
@@ -157,9 +164,11 @@ class GlobalHallOfFame:
             self._load_local_ledger()
             self._validate_league_rules()
             self._update_entry_threshold()
+            print(f"✓ Connected to existing Global 50 (context window: {self.league_rules.context_window_days} days)")
         else:
-            # First run or no existing global50.json
-            print("⚠ No existing Global 50 found. This will be the founding run.")
+            # No existing global50.json for this context window - create new league
+            print(f"⚠ No existing Global 50 for {self.league_rules.context_window_days} days context window.")
+            print(f"  This will be the founding run for this context window.")
             self.league_compatible = True
             self.entry_threshold = float('-inf')
             # Initialize empty ledger
@@ -174,6 +183,10 @@ class GlobalHallOfFame:
             print(f"✗ League Validation: FAILED")
             print(f"✗ Global 50 DISABLED for this run to prevent pollution")
             self.enabled = False
+
+        # Discover other context windows for fallback diversity injection
+        if self.enabled:
+            self._discover_fallback_leagues()
 
         print(f"{'='*60}\n")
 
@@ -209,8 +222,12 @@ class GlobalHallOfFame:
         with open(self.local_json_path, 'r') as f:
             data = json.load(f)
 
-        # Load league rules
-        stored_rules = LeagueRules.from_dict(data.get('league_rules', {}))
+        # Load league rules with backward compatibility
+        # If no league_rules specified, assume old default context window of 504 days
+        league_rules_data = data.get('league_rules', {})
+        if 'context_window_days' not in league_rules_data:
+            league_rules_data['context_window_days'] = 504  # Old default
+        stored_rules = LeagueRules.from_dict(league_rules_data)
 
         # Load entries
         self.entries = [GlobalHoFEntry.from_dict(e) for e in data.get('entries', [])]
@@ -253,6 +270,75 @@ class GlobalHallOfFame:
             # Get the 50th ranked agent's score (worst in top 50)
             sorted_entries = sorted(self.entries, key=lambda e: e.gauntlet_score, reverse=True)
             self.entry_threshold = sorted_entries[self.CAPACITY - 1].gauntlet_score
+
+    def _discover_fallback_leagues(self):
+        """
+        Discover other context window leagues available in cloud storage.
+        These can be used for diversity injection if our league is empty or struggling.
+        """
+        print(f"Discovering other context window leagues for diversity injection...")
+
+        # First, check for old global50 structure (without context window subdirectory)
+        # This would be the legacy 504-day context window league
+        if self.league_rules.context_window_days != 504:
+            old_cloud_json_path = f"{self.cloud_sync.project_name}/global50/global50.json"
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=True) as tmp:
+                try:
+                    success = self.cloud_sync.download_file(old_cloud_json_path, tmp.name)
+                    if success:
+                        # Load to get entry count
+                        with open(tmp.name, 'r') as f:
+                            data = json.load(f)
+                        entry_count = len(data.get('entries', []))
+
+                        self.fallback_leagues.append({
+                            'context_window_days': 504,
+                            'context_window_id': 'legacy',  # Special ID for old structure
+                            'entry_count': entry_count,
+                            'cloud_base': f"{self.cloud_sync.project_name}/global50",  # No subdirectory
+                            'is_legacy': True
+                        })
+                        print(f"  ✓ Found legacy fallback: 504 days (legacy structure, {entry_count} agents)")
+                except Exception:
+                    pass  # Doesn't exist, skip
+
+        # Try common context window values: 504 (new structure), 252, 377, 125, etc.
+        common_windows = [504, 252, 377, 125, 100, 200, 300]
+
+        # Remove our own context window from the list
+        common_windows = [w for w in common_windows if w != self.league_rules.context_window_days]
+
+        for window_days in common_windows:
+            fallback_id = f"cw{window_days}"
+            cloud_json_path = f"{self.cloud_sync.project_name}/global50/{fallback_id}/global50.json"
+
+            # Try to download the JSON (just check if it exists, don't save)
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=True) as tmp:
+                try:
+                    success = self.cloud_sync.download_file(cloud_json_path, tmp.name)
+                    if success:
+                        # Load to get entry count
+                        with open(tmp.name, 'r') as f:
+                            data = json.load(f)
+                        entry_count = len(data.get('entries', []))
+
+                        self.fallback_leagues.append({
+                            'context_window_days': window_days,
+                            'context_window_id': fallback_id,
+                            'entry_count': entry_count,
+                            'cloud_base': f"{self.cloud_sync.project_name}/global50/{fallback_id}",
+                            'is_legacy': False
+                        })
+                        print(f"  ✓ Found fallback: {window_days} days ({entry_count} agents)")
+                except Exception:
+                    pass  # Doesn't exist, skip
+
+        if len(self.fallback_leagues) == 0:
+            print(f"  No fallback leagues found (only {self.league_rules.context_window_days} days league exists)")
+        else:
+            print(f"  Total fallback leagues: {len(self.fallback_leagues)}")
 
     def should_promote(self, gauntlet_score: float) -> bool:
         """
@@ -420,36 +506,108 @@ class GlobalHallOfFame:
         This is used for diversity injection during plateau detection.
         Downloads the agent file from cloud storage if not in local cache.
 
+        If our league is empty but fallback leagues exist, we download from those instead.
+
         Returns:
             Random DDPGAgent from Global 50, or None if Global 50 is empty/disabled
         """
-        if not self.enabled or len(self.entries) == 0:
+        if not self.enabled:
             return None
 
-        # Select random entry
         import random
-        random_entry = random.choice(self.entries)
 
-        # Check if agent is in local cache
-        filename = random_entry.get_filename()
-        local_agent_path = self.local_agents_dir / filename
-
-        # Download from cloud if not in cache
-        if not local_agent_path.exists():
+        # Try our own league first
+        if len(self.entries) > 0:
+            random_entry = random.choice(self.entries)
+            filename = random_entry.get_filename()
+            local_agent_path = self.local_agents_dir / filename
             cloud_agent_path = f"{self.cloud_base}/agents/{filename}"
-            success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
-            if not success:
-                print(f"⚠ Failed to download Global 50 agent: {filename}")
+
+            # Download from cloud if not in cache
+            if not local_agent_path.exists():
+                success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
+                if not success:
+                    print(f"⚠ Failed to download Global 50 agent: {filename}")
+                    return None
+
+            # Load agent
+            try:
+                agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
+                agent.load(str(local_agent_path))
+                return agent
+            except Exception as e:
+                print(f"⚠ Failed to load Global 50 agent: {e}")
                 return None
 
-        # Load agent
-        try:
-            agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
-            agent.load(str(local_agent_path))
-            return agent
-        except Exception as e:
-            print(f"⚠ Failed to load Global 50 agent: {e}")
-            return None
+        # Our league is empty - try fallback leagues
+        if len(self.fallback_leagues) > 0:
+            print(f"⚠ Current league ({self.league_rules.context_window_days} days) is empty.")
+            print(f"  Attempting diversity injection from fallback league...")
+
+            # Pick a random fallback league
+            fallback = random.choice(self.fallback_leagues)
+            fallback_id = fallback['context_window_id']
+            fallback_cloud_base = fallback['cloud_base']
+
+            # Download the fallback league's JSON to see available agents
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                temp_json_path = tmp.name
+
+            try:
+                cloud_json_path = f"{fallback_cloud_base}/global50.json"
+                success = self.cloud_sync.download_file(cloud_json_path, temp_json_path)
+                if not success:
+                    print(f"  ✗ Failed to download fallback league JSON")
+                    return None
+
+                # Load entries
+                with open(temp_json_path, 'r') as f:
+                    data = json.load(f)
+                fallback_entries = [GlobalHoFEntry.from_dict(e) for e in data.get('entries', [])]
+
+                if len(fallback_entries) == 0:
+                    print(f"  ✗ Fallback league is empty")
+                    return None
+
+                # Pick random agent from fallback league
+                random_entry = random.choice(fallback_entries)
+                filename = random_entry.get_filename()
+
+                # Create local directory for fallback agents
+                # Handle legacy structure (no subdirectory)
+                if fallback.get('is_legacy', False):
+                    fallback_local_dir = self.LOCAL_BASE_DIR / "agents"
+                else:
+                    fallback_local_dir = self.LOCAL_BASE_DIR / fallback_id / "agents"
+                fallback_local_dir.mkdir(parents=True, exist_ok=True)
+                local_agent_path = fallback_local_dir / filename
+
+                # Download from fallback league's cloud storage
+                cloud_agent_path = f"{fallback_cloud_base}/agents/{filename}"
+                if not local_agent_path.exists():
+                    success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
+                    if not success:
+                        print(f"  ✗ Failed to download fallback agent: {filename}")
+                        return None
+
+                # Load agent
+                agent = DDPGAgent(agent_id=-1)
+                agent.load(str(local_agent_path))
+                print(f"  ✓ Loaded agent from {fallback['context_window_days']} days league: {filename}")
+                return agent
+
+            except Exception as e:
+                print(f"  ✗ Failed to load fallback agent: {e}")
+                return None
+            finally:
+                # Clean up temp file
+                import os
+                if os.path.exists(temp_json_path):
+                    os.unlink(temp_json_path)
+
+        # No agents available anywhere
+        return None
 
     def get_stats(self) -> Dict:
         """

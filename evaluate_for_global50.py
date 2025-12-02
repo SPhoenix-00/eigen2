@@ -91,7 +91,8 @@ class AgentEvaluator:
         # Log mirroring setup
         if self.global_hof.enabled:
             print(f"   Local directory: {self.global_hof.local_dir}")
-            print(f"   Cloud mirror: gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+            print(f"   Cloud mirror: gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
+            print(f"   Context Window: {league_rules.context_window_days} days")
             print(f"   Mirroring: ENABLED")
 
         # Initialize a minimal trainer helper for accessing gauntlet methods
@@ -420,7 +421,7 @@ class AgentEvaluator:
         # Final sync to ensure everything is mirrored to GCP
         if self.global_hof.enabled:
             print(f"\n{'='*70}")
-            print("Syncing global50/ to GCP...")
+            print(f"Syncing {self.global_hof.context_window_id}/ to GCP...")
             print(f"{'='*70}")
             self._sync_to_cloud()
 
@@ -428,7 +429,7 @@ class AgentEvaluator:
 
     def _sync_to_cloud(self):
         """
-        Sync the entire global50/ directory to GCP.
+        Sync the context-window-specific global50 directory to GCP.
         Ensures local and cloud are mirrored.
         """
         if not self.global_hof.enabled:
@@ -469,7 +470,7 @@ class AgentEvaluator:
 
         print(f"   Synced {agents_synced} agent files")
         print(f"   Synced {archive_synced} archive files")
-        print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+        print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
         print(f"   Status: UP TO DATE")
 
     def check_mirror_status(self) -> bool:
@@ -732,7 +733,7 @@ class AgentEvaluator:
         print(f"   ✓ Uploaded {agents_uploaded} agent files")
         print(f"   ✓ Uploaded {archive_uploaded} archive files")
         print(f"\n✓ Cloud now matches local")
-        print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+        print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
 
     def _sync_cloud_to_local(self):
         """
@@ -979,7 +980,7 @@ class AgentEvaluator:
         print(f"  Updated:        {len(successful)} agents")
         print(f"  Failed:         {len(failed)} agents")
         print(f"  New threshold:  {self.global_hof.entry_threshold:.2f}")
-        print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+        print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
         print(f"{'='*70}")
 
     def trim_agents(self, threshold: float):
@@ -1118,7 +1119,7 @@ class AgentEvaluator:
         print(f"  Remaining:      {len(agents_to_keep)} agents")
         print(f"  New threshold:  {self.global_hof.entry_threshold:.2f}")
         print(f"  Archived to:    {self.global_hof.local_archive_dir}")
-        print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+        print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
         print(f"{'='*70}")
 
     def print_summary(self, results: List[dict]):
@@ -1254,7 +1255,7 @@ Examples:
 
             print("\nGlobal 50 structure created and mirrored:")
             print(f"  Local:  {evaluator.global_hof.local_dir}")
-            print(f"  Cloud:  gs://{evaluator.cloud_sync.bucket_name}/{evaluator.cloud_sync.project_name}/global50/")
+            print(f"  Cloud:  gs://{evaluator.cloud_sync.bucket_name}/{evaluator.global_hof.cloud_base}/")
             print(f"  Status: MIRRORED")
 
             print("\n  Subdirectories:")

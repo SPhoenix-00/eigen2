@@ -3373,6 +3373,12 @@ class ERLTrainer:
             'breakthrough_quorum': self.breakthrough_quorum,
             'target_breakthroughs': self.target_breakthroughs,
             'target_hof_turnovers': self.target_hof_turnovers,
+
+            # Normalization stats (to avoid recomputing on resume)
+            'normalization_stats': {
+                'mean': self.normalization_stats['mean'].tolist(),
+                'std': self.normalization_stats['std'].tolist()
+            }
         }
         state_path = checkpoint_dir / "trainer_state.json"
         with open(state_path, 'w') as f:
@@ -3541,6 +3547,18 @@ class ERLTrainer:
                         print(f"  Candidate Queue: {len(self.candidate_queue)} pending")
                         print(f"  Tested Candidates: {len(self.tested_candidate_indices)} agents")
 
+                # Load normalization stats (backwards compatible - recompute if not in checkpoint)
+                if 'normalization_stats' in trainer_state:
+                    import numpy as np
+                    norm_stats = trainer_state['normalization_stats']
+                    self.normalization_stats = {
+                        'mean': np.array(norm_stats['mean']),
+                        'std': np.array(norm_stats['std'])
+                    }
+                    print("✓ Loaded normalization stats from checkpoint")
+                else:
+                    print("! Normalization stats not in checkpoint, will use the ones computed at init")
+
                 # Load Hall of Fame turnover tracking (for consistency mode, backwards compatible)
                 self.hof_turnover_count = trainer_state.get('hof_turnover_count', 0)
                 self.hof_current_median = trainer_state.get('hof_current_median', None)
@@ -3582,7 +3600,7 @@ class ERLTrainer:
             print(f"⚠ Could not load Hall of Fame: {e}")
 
         # 7. Re-evaluate all loaded agents with current reward function
-        if population_loaded:
+        if population_loaded and not Config.SKIP_REEVALUATION_ON_RESUME:
             print("\n" + "="*60)
             print("Re-evaluating loaded agents with current reward function")
             print("="*60)
@@ -3639,6 +3657,9 @@ class ERLTrainer:
                     print(f"⚠ No Hall of Fame agent files found - skipping HoF re-evaluation")
 
             print("\n✓ All agents re-evaluated with current reward function")
+        elif population_loaded and Config.SKIP_REEVALUATION_ON_RESUME:
+            print("\n⚡ Skipping re-evaluation on resume (SKIP_REEVALUATION_ON_RESUME=True)")
+            print("   Set to False in config.py if reward function changed")
 
     def save_gauntlet_snapshot(self):
         """
