@@ -5,7 +5,8 @@ This script loads agents from a specified folder, runs them through gauntlet
 validation, and promotes qualifying agents to the Global Hall of Fame.
 
 The script maintains a mirrored directory structure between local (global50/)
-and GCP cloud storage. Use --mirror to check and resolve any sync conflicts.
+and GCP cloud storage. Use --mirror to check sync status and download any missing
+agent files. If JSON mismatch is detected, conflicts can be resolved interactively.
 
 Usage:
     python evaluate_for_global50.py --init                              # Initialize Global 50
@@ -474,6 +475,7 @@ class AgentEvaluator:
     def check_mirror_status(self) -> bool:
         """
         Check synchronization status between local and GCP.
+        Verifies JSON metadata and downloads any missing agent files.
         Returns True if in sync, False if mismatch detected.
         """
         print(f"\n{'='*70}")
@@ -550,9 +552,91 @@ class AgentEvaluator:
 
             # Compare content
             if local_data == cloud_data:
-                print("✓ Local and cloud are synchronized")
+                print("✓ Local and cloud JSON are synchronized")
                 print(f"  Local:  {len(local_data.get('entries', []))} entries, modified {local_time_str}")
                 print(f"  Cloud:  {len(cloud_data.get('entries', []))} entries, modified {cloud_time_str}")
+
+                # Check if agent files exist locally and verify cloud
+                print("\nChecking agent files...")
+                missing_local_agents = []
+                present_local_agents = []
+                entries = local_data.get('entries', [])
+
+                for entry in entries:
+                    # Construct filename from entry
+                    run_name = entry.get('run_name', 'unknown')
+                    agent_id = entry.get('agent_id', 0)
+                    filename = f"{run_name}_agent_{agent_id}.pth"
+
+                    local_agent_path = self.global_hof.local_agents_dir / filename
+                    cloud_path = f"{self.global_hof.cloud_base}/agents/{filename}"
+
+                    if not local_agent_path.exists():
+                        missing_local_agents.append((filename, cloud_path, str(local_agent_path)))
+                    else:
+                        present_local_agents.append((filename, str(local_agent_path), cloud_path))
+
+                # Download missing local agents
+                if missing_local_agents:
+                    print(f"⚠ Found {len(missing_local_agents)} missing local agent files")
+                    print(f"  Downloading from cloud...")
+
+                    downloaded = 0
+                    for filename, cloud_path, local_path in missing_local_agents:
+                        try:
+                            success = self.cloud_sync.download_file(cloud_path, local_path)
+                            if success:
+                                print(f"  ✓ Downloaded: {filename}")
+                                downloaded += 1
+                            else:
+                                print(f"  ✗ Failed to download: {filename}")
+                        except Exception as e:
+                            print(f"  ✗ Error downloading {filename}: {e}")
+
+                    print(f"  Downloaded {downloaded}/{len(missing_local_agents)} agent files")
+
+                if not missing_local_agents:
+                    print("✓ All agent files present locally")
+
+                # Verify cloud has all agents (by checking if local→cloud download would fail)
+                # This checks bidirectional sync without unnecessary uploads
+                print(f"\n  Verifying cloud has all {len(present_local_agents)} agent files...")
+                missing_in_cloud = []
+
+                for filename, local_path, cloud_path in present_local_agents:
+                    # Test if cloud has the file by attempting to download to a temp location
+                    with tempfile.NamedTemporaryFile(delete=True) as tmp:
+                        try:
+                            exists = self.cloud_sync.download_file(cloud_path, tmp.name)
+                            if not exists:
+                                missing_in_cloud.append((filename, local_path, cloud_path))
+                        except Exception:
+                            missing_in_cloud.append((filename, local_path, cloud_path))
+
+                # Upload missing agents to cloud
+                if missing_in_cloud:
+                    print(f"⚠ Found {len(missing_in_cloud)} agent files missing in cloud")
+                    print(f"  Uploading to cloud...")
+
+                    uploaded = 0
+                    for filename, local_path, cloud_path in missing_in_cloud:
+                        try:
+                            self.cloud_sync.upload_file(
+                                local_path,
+                                cloud_path,
+                                background=False
+                            )
+                            print(f"  ✓ Uploaded: {filename}")
+                            uploaded += 1
+                        except Exception as e:
+                            print(f"  ✗ Error uploading {filename}: {e}")
+
+                    print(f"  Uploaded {uploaded}/{len(missing_in_cloud)} agent files to cloud")
+                else:
+                    print("✓ All agent files present in cloud")
+
+                print("\n✓ Local and cloud are fully synchronized")
+
                 if temp_cloud_path and os.path.exists(temp_cloud_path):
                     os.unlink(temp_cloud_path)
                 return True
@@ -1131,7 +1215,7 @@ Examples:
     parser.add_argument(
         '--mirror',
         action='store_true',
-        help='Check mirror status between local and GCP. If mismatch detected, resolve conflict interactively.'
+        help='Check mirror status between local and GCP. Downloads any missing agent files. If JSON mismatch detected, resolve conflict interactively.'
     )
 
     parser.add_argument(
