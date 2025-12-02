@@ -1074,7 +1074,9 @@ class ERLTrainer:
                     'combined_fitness': combined_fitness,
                     'roi': agent_roi,
                     'raw_pnl': val_results.get('raw_pnl', 0.0),
-                    'expectancy': val_results.get('expectancy', 0.0)
+                    'expectancy': val_results.get('expectancy', 0.0),
+                    'quality_count': val_results.get('quality_count', 0),
+                    'total_trades': val_results.get('total_trades', 0)
                 })
 
             # Sort by combined fitness and add to HoF
@@ -1087,7 +1089,13 @@ class ERLTrainer:
                 combined_score = result['combined_fitness']
                 agent_roi = result['roi']
                 agent_expectancy = result['expectancy']
-                hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy))
+                train_fitness = 0.0  # Heroes don't have training fitness
+                quality_count = result.get('quality_count', 0)
+                total_trades = result.get('total_trades', 0)
+                val_fitness = combined_score  # Use combined fitness as validation fitness
+                base_combined_fitness = combined_score
+                hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
+                                     train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
 
             # Add heroes to Hall of Fame (normal mode only)
             admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
@@ -1129,7 +1137,9 @@ class ERLTrainer:
                     'combined_fitness': combined_fitness,
                     'roi': agent_roi,
                     'raw_pnl': val_results.get('raw_pnl', 0.0),
-                    'expectancy': val_results.get('expectancy', 0.0)
+                    'expectancy': val_results.get('expectancy', 0.0),
+                    'quality_count': val_results.get('quality_count', 0),
+                    'total_trades': val_results.get('total_trades', 0)
                 })
 
             # Sort by combined fitness and add top 10 to HoF
@@ -1142,7 +1152,13 @@ class ERLTrainer:
                 combined_score = result['combined_fitness']
                 agent_roi = result['roi']
                 agent_expectancy = result['expectancy']
-                hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy))
+                train_fitness = 0.0  # Heroes don't have training fitness
+                quality_count = result.get('quality_count', 0)
+                total_trades = result.get('total_trades', 0)
+                val_fitness = combined_score  # Use combined fitness as validation fitness
+                base_combined_fitness = combined_score
+                hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
+                                     train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
 
             # Add heroes to Hall of Fame
             admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
