@@ -78,7 +78,7 @@ class ContextWindowComparator:
         """
         Create a TradingEnvironment with a specific context window size.
 
-        This temporarily modifies Config.CONTEXT_WINDOW_DAYS for the environment.
+        NOTE: Does NOT restore Config.CONTEXT_WINDOW_DAYS - caller must handle this!
 
         Args:
             context_window_days: Context window size to use
@@ -86,13 +86,8 @@ class ContextWindowComparator:
         Returns:
             TradingEnvironment configured with specified context window
         """
-        # Save original config
-        original_context = Config.CONTEXT_WINDOW_DAYS
-
-        # Temporarily override
-        Config.CONTEXT_WINDOW_DAYS = context_window_days
-
-        # Create environment (will use the modified CONTEXT_WINDOW_DAYS)
+        # Config.CONTEXT_WINDOW_DAYS should already be set by caller
+        # Create environment (will use the current CONTEXT_WINDOW_DAYS)
         env = TradingEnvironment(
             data_array=self.data_array_reduced,
             dates=self.dates,
@@ -102,9 +97,6 @@ class ContextWindowComparator:
             data_array_full=self.data_array,
             is_training=False  # Evaluation mode - no observation noise
         )
-
-        # Restore original config
-        Config.CONTEXT_WINDOW_DAYS = original_context
 
         return env
 
@@ -197,6 +189,14 @@ class ContextWindowComparator:
             # Reset environment for this slice
             obs, info = env.reset(start_idx=start_idx, end_idx=end_idx, trading_end_idx=trading_end_idx)
 
+            # Debug: verify observation shape matches context window
+            if slice_idx == 0:
+                expected_shape = (context_window_days, obs.shape[1], obs.shape[2])
+                actual_shape = obs.shape
+                print(f"   First slice observation shape: {actual_shape} (expected: {expected_shape})")
+                if actual_shape[0] != context_window_days:
+                    print(f"   WARNING: Context window mismatch! Expected {context_window_days}, got {actual_shape[0]}")
+
             done = False
             episode_reward = 0.0
 
@@ -247,13 +247,13 @@ class ContextWindowComparator:
             if roi < max_drawdown:
                 max_drawdown = roi
 
-        # Calculate aggregate metrics
-        avg_score = np.mean(slice_scores)
-        std_score = np.std(slice_scores)
-        avg_roi = np.mean(slice_rois)
-        std_roi = np.std(slice_rois)
-        win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
-        avg_gain_pct = np.mean(all_gain_pcts) if len(all_gain_pcts) > 0 else 0.0
+        # Calculate aggregate metrics (convert to Python float for JSON serialization)
+        avg_score = float(np.mean(slice_scores))
+        std_score = float(np.std(slice_scores))
+        avg_roi = float(np.mean(slice_rois))
+        std_roi = float(np.std(slice_rois))
+        win_rate = float((total_wins / total_trades * 100) if total_trades > 0 else 0.0)
+        avg_gain_pct = float(np.mean(all_gain_pcts)) if len(all_gain_pcts) > 0 else 0.0
 
         # Restore config
         Config.CONTEXT_WINDOW_DAYS = original_context
@@ -268,8 +268,8 @@ class ContextWindowComparator:
             num_trades=total_trades,
             avg_gain_pct=avg_gain_pct,
             max_drawdown=max_drawdown,
-            slice_scores=slice_scores,
-            slice_rois=slice_rois
+            slice_scores=[float(x) for x in slice_scores],  # Convert to Python float
+            slice_rois=[float(x) for x in slice_rois]  # Convert to Python float
         )
 
         return result
