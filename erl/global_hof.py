@@ -48,7 +48,8 @@ class GlobalHoFEntry:
     generation: int
     roi: float = 0.0
     expectancy: float = 0.0
-    quality_count: int = 0
+    quality_ratio: float = 0.0
+    win_ratio: float = 0.0
     total_trades: int = 0
 
     def to_dict(self) -> dict:
@@ -57,7 +58,19 @@ class GlobalHoFEntry:
 
     @staticmethod
     def from_dict(data: dict) -> 'GlobalHoFEntry':
-        """Create from dictionary."""
+        """Create from dictionary with backward compatibility."""
+        # Handle migration from old format (quality_count) to new format (quality_ratio, win_ratio)
+        if 'quality_count' in data and 'quality_ratio' not in data:
+            # Old format detected - convert to new format
+            quality_count = data.pop('quality_count')
+            total_trades = data.get('total_trades', 0)
+
+            # Calculate quality_ratio from quality_count
+            data['quality_ratio'] = float(quality_count / total_trades) if total_trades > 0 else 0.0
+
+            # win_ratio wasn't stored before, default to 0.0
+            data['win_ratio'] = 0.0
+
         return GlobalHoFEntry(**data)
 
     def get_filename(self) -> str:
@@ -258,7 +271,8 @@ class GlobalHallOfFame:
 
     def check_and_promote(self, agent: DDPGAgent, gauntlet_score: float, generation: int,
                           roi: float = 0.0, expectancy: float = 0.0,
-                          quality_count: int = 0, total_trades: int = 0) -> bool:
+                          quality_ratio: float = 0.0, win_ratio: float = 0.0,
+                          total_trades: int = 0) -> bool:
         """
         Phase C: The Promotion Routine (Atomic Update)
 
@@ -271,7 +285,8 @@ class GlobalHallOfFame:
             generation: Generation when agent passed Gauntlet
             roi: Return on Investment percentage
             expectancy: Expectancy metric
-            quality_count: Number of quality trades
+            quality_ratio: Ratio of quality trades to total trades
+            win_ratio: Ratio of winning trades to total trades
             total_trades: Total trades
 
         Returns:
@@ -305,7 +320,8 @@ class GlobalHallOfFame:
                 generation=generation,
                 roi=roi,
                 expectancy=expectancy,
-                quality_count=quality_count,
+                quality_ratio=quality_ratio,
+                win_ratio=win_ratio,
                 total_trades=total_trades
             )
 
@@ -396,6 +412,44 @@ class GlobalHallOfFame:
             # Delete from cloud agents/ (handled by next sync or manually)
             # Note: Most cloud APIs require explicit delete, but we can let it accumulate
             # or clean up in a separate maintenance script
+
+    def get_random_agent(self) -> Optional[DDPGAgent]:
+        """
+        Load a random agent from the Global 50.
+
+        This is used for diversity injection during plateau detection.
+        Downloads the agent file from cloud storage if not in local cache.
+
+        Returns:
+            Random DDPGAgent from Global 50, or None if Global 50 is empty/disabled
+        """
+        if not self.enabled or len(self.entries) == 0:
+            return None
+
+        # Select random entry
+        import random
+        random_entry = random.choice(self.entries)
+
+        # Check if agent is in local cache
+        filename = random_entry.get_filename()
+        local_agent_path = self.local_agents_dir / filename
+
+        # Download from cloud if not in cache
+        if not local_agent_path.exists():
+            cloud_agent_path = f"{self.cloud_base}/agents/{filename}"
+            success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
+            if not success:
+                print(f"⚠ Failed to download Global 50 agent: {filename}")
+                return None
+
+        # Load agent
+        try:
+            agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
+            agent.load(str(local_agent_path))
+            return agent
+        except Exception as e:
+            print(f"⚠ Failed to load Global 50 agent: {e}")
+            return None
 
     def get_stats(self) -> Dict:
         """

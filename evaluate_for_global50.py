@@ -4,10 +4,19 @@ Evaluate existing agents for Global 50 promotion.
 This script loads agents from a specified folder, runs them through gauntlet
 validation, and promotes qualifying agents to the Global Hall of Fame.
 
+The script maintains a mirrored directory structure between local (workspace/global50/)
+and GCP cloud storage. Use --mirror to check and resolve any sync conflicts.
+
 Usage:
+    python evaluate_for_global50.py --init                              # Initialize Global 50
+    python evaluate_for_global50.py --mirror                            # Check sync status
+    python evaluate_for_global50.py --eval                              # Re-evaluate all agents
+    python evaluate_for_global50.py --trim <threshold>                  # Remove agents below threshold
     python evaluate_for_global50.py --agent-dir <path> [--run-name <name>]
 
 Example:
+    python evaluate_for_global50.py --eval                              # Update all metrics
+    python evaluate_for_global50.py --trim 0                            # Remove negative scores
     python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
     python evaluate_for_global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
 """
@@ -18,11 +27,13 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 import torch
 import numpy as np
+from datetime import datetime
+import json
 
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
 from models.ddpg_agent import DDPGAgent
-from erl.global_hof import GlobalHallOfFame, LeagueRules
+from erl.global_hof import GlobalHallOfFame, LeagueRules, GlobalHoFEntry
 from utils.config import Config
 from utils.cloud_sync import get_cloud_sync_from_env
 from training.erl_trainer import ERLTrainer
@@ -63,7 +74,9 @@ class AgentEvaluator:
         # Initialize Global HoF
         print("\n3. Initializing Global Hall of Fame...")
         league_rules = LeagueRules(context_window_days=Config.CONTEXT_WINDOW_DAYS)
-        checkpoint_dir = Path("workspace") / "global50_evaluation"
+
+        # Use workspace/global50 directory (mirrored with GCP)
+        checkpoint_dir = Path("workspace") / "global50"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.global_hof = GlobalHallOfFame(
@@ -73,6 +86,12 @@ class AgentEvaluator:
             checkpoint_dir=checkpoint_dir,
             disable_global50=False
         )
+
+        # Log mirroring setup
+        if self.global_hof.enabled:
+            print(f"   Local directory: {self.global_hof.local_dir}")
+            print(f"   Cloud mirror: gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+            print(f"   Mirroring: ENABLED")
 
         # Initialize a minimal trainer helper for accessing gauntlet methods
         # We'll use ERLTrainer's methods directly to avoid code duplication
@@ -253,6 +272,18 @@ class AgentEvaluator:
         # Use ERLTrainer's calculate_expectancy method
         expectancy = float(self.gauntlet_helper.calculate_expectancy(all_closed_trades))
 
+        # Calculate quality_count (trades with gain >= Config.ROI_QUALITY_THRESHOLD)
+        # This is the threshold used for confidence factor in ROI adjustment
+        quality_threshold = Config.ROI_QUALITY_THRESHOLD  # Default: 7.5% gain
+        if all_closed_trades:
+            quality_count = sum(1 for t in all_closed_trades if t.get('gain_pct', 0) >= quality_threshold)
+        else:
+            quality_count = 0
+
+        # Calculate ratios
+        quality_ratio = float(quality_count / total_trades) if total_trades > 0 else 0.0
+        win_ratio = float(total_wins / total_trades) if total_trades > 0 else 0.0
+
         detailed_metrics = {
             'gauntlet_score': gauntlet_score,
             'mean_fitness': mean_score,
@@ -260,7 +291,10 @@ class AgentEvaluator:
             'max_fitness': max_score,
             'roi': roi,
             'total_trades': total_trades,
+            'quality_count': quality_count,
+            'quality_ratio': quality_ratio,
             'win_rate': win_rate,
+            'win_ratio': win_ratio,
             'expectancy': expectancy,
             'num_slices': len(gauntlet_slices),
             'fitness_all_slices': [float(score) for score in fitness_scores]
@@ -310,7 +344,8 @@ class AgentEvaluator:
             print(f"   Min Fitness:       {metrics['min_fitness']:>10.2f}")
             print(f"   ROI:               {metrics['roi']:>10.2f}%")
             print(f"   Total Trades:      {metrics['total_trades']:>10}")
-            print(f"   Win Rate:          {metrics['win_rate']:>10.1f}%")
+            print(f"   Quality Ratio:     {metrics['quality_ratio']:>10.3f}")
+            print(f"   Win Ratio:         {metrics['win_ratio']:>10.3f}")
             print(f"   Expectancy:        {metrics['expectancy']:>10.2f}")
 
             result.update(metrics)
@@ -329,7 +364,8 @@ class AgentEvaluator:
                     generation=generation,
                     roi=metrics['roi'],
                     expectancy=metrics['expectancy'],
-                    quality_count=metrics['total_trades'],
+                    quality_ratio=metrics['quality_ratio'],
+                    win_ratio=metrics['win_ratio'],
                     total_trades=metrics['total_trades']
                 )
 
@@ -380,7 +416,620 @@ class AgentEvaluator:
             result = self.evaluate_agent(agent_path, generation=i)
             results.append(result)
 
+        # Final sync to ensure everything is mirrored to GCP
+        if self.global_hof.enabled:
+            print(f"\n{'='*70}")
+            print("Syncing workspace/global50/ to GCP...")
+            print(f"{'='*70}")
+            self._sync_to_cloud()
+
         return results
+
+    def _sync_to_cloud(self):
+        """
+        Sync the entire workspace/global50/ directory to GCP.
+        Ensures local and cloud are mirrored.
+        """
+        if not self.global_hof.enabled:
+            return
+
+        # Sync global50.json
+        if self.global_hof.local_json_path.exists():
+            print(f"   Uploading global50.json...")
+            self.cloud_sync.upload_file(
+                str(self.global_hof.local_json_path),
+                self.global_hof.cloud_json_path,
+                background=False
+            )
+
+        # Sync agents directory
+        agents_synced = 0
+        if self.global_hof.local_agents_dir.exists():
+            for agent_file in self.global_hof.local_agents_dir.glob("*.pth"):
+                cloud_path = f"{self.global_hof.cloud_base}/agents/{agent_file.name}"
+                self.cloud_sync.upload_file(
+                    str(agent_file),
+                    cloud_path,
+                    background=False
+                )
+                agents_synced += 1
+
+        # Sync archive directory
+        archive_synced = 0
+        if self.global_hof.local_archive_dir.exists():
+            for archive_file in self.global_hof.local_archive_dir.glob("*"):
+                cloud_path = f"{self.global_hof.cloud_base}/archive/{archive_file.name}"
+                self.cloud_sync.upload_file(
+                    str(archive_file),
+                    cloud_path,
+                    background=False
+                )
+                archive_synced += 1
+
+        print(f"   Synced {agents_synced} agent files")
+        print(f"   Synced {archive_synced} archive files")
+        print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+        print(f"   Status: UP TO DATE")
+
+    def check_mirror_status(self) -> bool:
+        """
+        Check synchronization status between local and GCP.
+        Returns True if in sync, False if mismatch detected.
+        """
+        print(f"\n{'='*70}")
+        print("Checking Mirror Status")
+        print(f"{'='*70}")
+
+        if not self.global_hof.enabled:
+            print("⚠ Global 50 not enabled (local mode or disabled)")
+            return True
+
+        # Check if local file exists
+        local_exists = self.global_hof.local_json_path.exists()
+
+        # Check if cloud file exists by trying to download it to a temp location
+        import tempfile
+        import os
+
+        cloud_exists = False
+        temp_cloud_path = None
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+            temp_cloud_path = tmp.name
+
+        try:
+            cloud_exists = self.cloud_sync.download_file(
+                self.global_hof.cloud_json_path,
+                temp_cloud_path
+            )
+        except Exception:
+            cloud_exists = False
+
+        # Case 1: Neither exists
+        if not local_exists and not cloud_exists:
+            print("✓ No global50.json found locally or in cloud")
+            print("  This appears to be a fresh setup")
+            if temp_cloud_path and os.path.exists(temp_cloud_path):
+                os.unlink(temp_cloud_path)
+            return True
+
+        # Case 2: Only local exists
+        if local_exists and not cloud_exists:
+            print("⚠ Mismatch detected:")
+            print(f"  Local:  EXISTS at {self.global_hof.local_json_path}")
+            print(f"  Cloud:  NOT FOUND")
+            if temp_cloud_path and os.path.exists(temp_cloud_path):
+                os.unlink(temp_cloud_path)
+            return False
+
+        # Case 3: Only cloud exists
+        if not local_exists and cloud_exists:
+            print("⚠ Mismatch detected:")
+            print(f"  Local:  NOT FOUND")
+            print(f"  Cloud:  EXISTS at gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_json_path}")
+            if temp_cloud_path and os.path.exists(temp_cloud_path):
+                os.unlink(temp_cloud_path)
+            return False
+
+        # Case 4: Both exist - compare content and timestamps
+        try:
+            # Load local file
+            with open(self.global_hof.local_json_path, 'r') as f:
+                local_data = json.load(f)
+
+            # Load cloud file (from temp download)
+            with open(temp_cloud_path, 'r') as f:
+                cloud_data = json.load(f)
+
+            # Get modification times
+            local_mtime = os.path.getmtime(self.global_hof.local_json_path)
+            cloud_mtime = os.path.getmtime(temp_cloud_path)
+
+            local_time_str = datetime.fromtimestamp(local_mtime).strftime('%Y-%m-%d %H:%M:%S')
+            cloud_time_str = datetime.fromtimestamp(cloud_mtime).strftime('%Y-%m-%d %H:%M:%S')
+
+            # Compare content
+            if local_data == cloud_data:
+                print("✓ Local and cloud are synchronized")
+                print(f"  Local:  {len(local_data.get('entries', []))} entries, modified {local_time_str}")
+                print(f"  Cloud:  {len(cloud_data.get('entries', []))} entries, modified {cloud_time_str}")
+                if temp_cloud_path and os.path.exists(temp_cloud_path):
+                    os.unlink(temp_cloud_path)
+                return True
+            else:
+                print("⚠ Mismatch detected:")
+                print(f"\n  Local:  {self.global_hof.local_json_path}")
+                print(f"          {len(local_data.get('entries', []))} entries")
+                print(f"          Modified: {local_time_str}")
+
+                print(f"\n  Cloud:  gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_json_path}")
+                print(f"          {len(cloud_data.get('entries', []))} entries")
+                print(f"          Modified: {cloud_time_str}")
+
+                # Store temp file path for potential sync
+                self._temp_cloud_file = temp_cloud_path
+                return False
+
+        except Exception as e:
+            print(f"⚠ Error comparing files: {e}")
+            if temp_cloud_path and os.path.exists(temp_cloud_path):
+                os.unlink(temp_cloud_path)
+            return False
+
+    def resolve_mirror_conflict(self):
+        """
+        Resolve mirror conflict by asking user which version to keep.
+        """
+        print(f"\n{'='*70}")
+        print("Resolving Mirror Conflict")
+        print(f"{'='*70}")
+
+        print("\nWhich version should be kept?")
+        print("  1. Local  - Upload local version to cloud (cloud will match local)")
+        print("  2. Cloud  - Download cloud version to local (local will match cloud)")
+        print("  3. Cancel - Exit without making changes")
+
+        while True:
+            choice = input("\nEnter choice (1/2/3): ").strip()
+
+            if choice == '1':
+                print("\n→ Syncing LOCAL to CLOUD...")
+                self._sync_local_to_cloud()
+                break
+            elif choice == '2':
+                print("\n→ Syncing CLOUD to LOCAL...")
+                self._sync_cloud_to_local()
+                break
+            elif choice == '3':
+                print("\n→ Cancelled. No changes made.")
+                return
+            else:
+                print("Invalid choice. Please enter 1, 2, or 3.")
+
+    def _sync_local_to_cloud(self):
+        """
+        Sync local directory to cloud (local supersedes cloud).
+        """
+        print("   Uploading local files to cloud...")
+
+        # Upload global50.json
+        if self.global_hof.local_json_path.exists():
+            self.cloud_sync.upload_file(
+                str(self.global_hof.local_json_path),
+                self.global_hof.cloud_json_path,
+                background=False
+            )
+            print(f"   ✓ Uploaded global50.json")
+
+        # Upload all agents
+        agents_uploaded = 0
+        if self.global_hof.local_agents_dir.exists():
+            for agent_file in self.global_hof.local_agents_dir.glob("*.pth"):
+                cloud_path = f"{self.global_hof.cloud_base}/agents/{agent_file.name}"
+                self.cloud_sync.upload_file(
+                    str(agent_file),
+                    cloud_path,
+                    background=False
+                )
+                agents_uploaded += 1
+
+        # Upload all archive files
+        archive_uploaded = 0
+        if self.global_hof.local_archive_dir.exists():
+            for archive_file in self.global_hof.local_archive_dir.glob("*"):
+                cloud_path = f"{self.global_hof.cloud_base}/archive/{archive_file.name}"
+                self.cloud_sync.upload_file(
+                    str(archive_file),
+                    cloud_path,
+                    background=False
+                )
+                archive_uploaded += 1
+
+        print(f"   ✓ Uploaded {agents_uploaded} agent files")
+        print(f"   ✓ Uploaded {archive_uploaded} archive files")
+        print(f"\n✓ Cloud now matches local")
+        print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+
+    def _sync_cloud_to_local(self):
+        """
+        Sync cloud directory to local (cloud supersedes local).
+        """
+        print("   Downloading cloud files to local...")
+
+        # Download global50.json
+        success = self.cloud_sync.download_file(
+            self.global_hof.cloud_json_path,
+            str(self.global_hof.local_json_path)
+        )
+        if success:
+            print(f"   ✓ Downloaded global50.json")
+            # Reload entries
+            self.global_hof._load_local_ledger()
+            self.global_hof._update_entry_threshold()
+
+        # Download all agents from cloud
+        # Note: This requires listing files in cloud, which depends on cloud provider
+        # For now, we'll download agents mentioned in global50.json
+        agents_downloaded = 0
+        for entry in self.global_hof.entries:
+            filename = entry.get_filename()
+            cloud_path = f"{self.global_hof.cloud_base}/agents/{filename}"
+            local_path = self.global_hof.local_agents_dir / filename
+
+            try:
+                self.cloud_sync.download_file(cloud_path, str(local_path))
+                agents_downloaded += 1
+            except Exception as e:
+                print(f"   ⚠ Could not download {filename}: {e}")
+
+        print(f"   ✓ Downloaded {agents_downloaded} agent files")
+        print(f"\n✓ Local now matches cloud")
+        print(f"   Local: {self.global_hof.local_dir}")
+
+    def reevaluate_global50(self):
+        """
+        Re-evaluate all agents in Global 50 with current evaluation logic.
+        Updates all metrics (gauntlet_score, ROI, expectancy, etc.) for existing agents.
+        """
+        print(f"\n{'='*70}")
+        print("Re-evaluating Global 50")
+        print(f"{'='*70}")
+
+        if not self.global_hof.enabled:
+            print("⚠ Global 50 not enabled (local mode or disabled)")
+            print("Cannot re-evaluate agents.")
+            return
+
+        # Load current Global 50 state
+        print("\nLoading current Global 50 state...")
+        self.global_hof._download_global_ledger()
+        self.global_hof._load_local_ledger()
+
+        if len(self.global_hof.entries) == 0:
+            print("✓ Global 50 is empty. Nothing to re-evaluate.")
+            return
+
+        print(f"\nFound {len(self.global_hof.entries)} agents to re-evaluate")
+        print(f"{'='*70}")
+
+        # Ask for confirmation before starting
+        print("\n⚠ This will:")
+        print("  1. Download and load each agent")
+        print("  2. Run full gauntlet evaluation for each agent")
+        print(f"  3. Update metrics in global50.json")
+        print("  4. Sync changes to cloud")
+        print(f"\nEstimated time: ~{len(self.global_hof.entries) * 2} minutes")
+
+        while True:
+            confirmation = input("\nProceed with re-evaluation? (yes/no): ").strip().lower()
+            if confirmation in ['yes', 'y']:
+                print("\n→ Starting re-evaluation...")
+                break
+            elif confirmation in ['no', 'n']:
+                print("\n→ Re-evaluation cancelled.")
+                return
+            else:
+                print("Please enter 'yes' or 'no'.")
+
+        # Re-evaluate each agent
+        results = []
+        updated_entries = []
+
+        print(f"\n{'='*70}")
+        print("Re-evaluating Agents")
+        print(f"{'='*70}")
+
+        for i, entry in enumerate(self.global_hof.entries, 1):
+            print(f"\n[{i}/{len(self.global_hof.entries)}] {entry.run_name} (Agent {entry.agent_id})")
+            print(f"  Current Score: {entry.gauntlet_score:.2f}")
+
+            try:
+                # Download agent if needed
+                filename = entry.get_filename()
+                local_agent_path = self.global_hof.local_agents_dir / filename
+
+                if not local_agent_path.exists():
+                    print(f"  Downloading agent...")
+                    cloud_path = f"{self.global_hof.cloud_base}/agents/{filename}"
+                    success = self.cloud_sync.download_file(cloud_path, str(local_agent_path))
+                    if not success:
+                        print(f"  ✗ Failed to download agent. Skipping.")
+                        results.append({
+                            'entry': entry,
+                            'success': False,
+                            'error': 'Failed to download'
+                        })
+                        continue
+
+                # Load agent
+                print(f"  Loading agent...")
+                agent = DDPGAgent(agent_id=entry.agent_id)
+                agent.load(str(local_agent_path))
+
+                # Run gauntlet
+                print(f"  Running gauntlet...")
+                new_score, metrics = self.run_gauntlet(agent, f"{entry.run_name}_{entry.agent_id}")
+
+                # Create updated entry
+                updated_entry = GlobalHoFEntry(
+                    agent_id=entry.agent_id,
+                    run_name=entry.run_name,
+                    gauntlet_score=new_score,
+                    generation=entry.generation,
+                    roi=metrics['roi'],
+                    expectancy=metrics['expectancy'],
+                    quality_ratio=metrics['quality_ratio'],
+                    win_ratio=metrics['win_ratio'],
+                    total_trades=metrics['total_trades']
+                )
+
+                # Show results
+                score_change = new_score - entry.gauntlet_score
+                score_symbol = "↑" if score_change > 0 else "↓" if score_change < 0 else "="
+                print(f"  New Score: {new_score:.2f} ({score_symbol} {abs(score_change):.2f})")
+                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f}")
+                print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
+
+                results.append({
+                    'entry': entry,
+                    'updated_entry': updated_entry,
+                    'old_score': entry.gauntlet_score,
+                    'new_score': new_score,
+                    'change': score_change,
+                    'success': True
+                })
+                updated_entries.append(updated_entry)
+
+            except Exception as e:
+                print(f"  ✗ Error: {e}")
+                import traceback
+                traceback.print_exc()
+                results.append({
+                    'entry': entry,
+                    'success': False,
+                    'error': str(e)
+                })
+
+        # Show summary
+        print(f"\n{'='*70}")
+        print("Re-evaluation Summary")
+        print(f"{'='*70}")
+
+        successful = [r for r in results if r['success']]
+        failed = [r for r in results if not r['success']]
+
+        print(f"\nTotal Agents:   {len(results)}")
+        print(f"Successful:     {len(successful)}")
+        print(f"Failed:         {len(failed)}")
+
+        if len(successful) > 0:
+            print(f"\nScore Changes:")
+            print(f"{'='*70}")
+            print(f"{'Run Name':<30} {'Old Score':<12} {'New Score':<12} {'Change':<12}")
+            print(f"{'-'*70}")
+
+            for r in sorted(successful, key=lambda x: x['change'], reverse=True):
+                change_str = f"{r['change']:+.2f}"
+                symbol = "↑" if r['change'] > 0 else "↓" if r['change'] < 0 else "="
+                print(f"{r['entry'].run_name:<30} {r['old_score']:<12.2f} {r['new_score']:<12.2f} {symbol} {change_str:<10}")
+
+            avg_change = sum(r['change'] for r in successful) / len(successful)
+            print(f"\nAverage Score Change: {avg_change:+.2f}")
+
+        if len(failed) > 0:
+            print(f"\nFailed Agents:")
+            for r in failed:
+                print(f"  - {r['entry'].run_name} (Agent {r['entry'].agent_id}): {r.get('error', 'Unknown error')}")
+
+        # Ask for confirmation to save
+        print(f"\n{'='*70}")
+        print("⚠ Update Global 50 with new scores?")
+        print(f"{'='*70}")
+
+        while True:
+            confirmation = input("\nSave updated scores? (yes/no): ").strip().lower()
+            if confirmation in ['yes', 'y']:
+                print("\n→ Updating Global 50...")
+                break
+            elif confirmation in ['no', 'n']:
+                print("\n→ Changes discarded. Global 50 unchanged.")
+                return
+            else:
+                print("Please enter 'yes' or 'no'.")
+
+        # Update entries (only successful ones, keep failed ones with old scores)
+        # Create a map of updated entries by (run_name, agent_id)
+        update_map = {
+            (r['updated_entry'].run_name, r['updated_entry'].agent_id): r['updated_entry']
+            for r in successful
+        }
+
+        # Update entries list
+        final_entries = []
+        for entry in self.global_hof.entries:
+            key = (entry.run_name, entry.agent_id)
+            if key in update_map:
+                final_entries.append(update_map[key])
+            else:
+                # Keep original entry (failed re-evaluation)
+                final_entries.append(entry)
+
+        # Sort by new scores
+        final_entries.sort(key=lambda e: e.gauntlet_score, reverse=True)
+
+        # Update global HoF
+        self.global_hof.entries = final_entries
+        self.global_hof._update_entry_threshold()
+
+        # Save and upload
+        print("\nSaving updated global50.json...")
+        self.global_hof._save_local_ledger()
+        self.global_hof._upload_global_ledger()
+
+        print(f"\n{'='*70}")
+        print("✓ Re-evaluation Complete!")
+        print(f"{'='*70}")
+        print(f"  Updated:        {len(successful)} agents")
+        print(f"  Failed:         {len(failed)} agents")
+        print(f"  New threshold:  {self.global_hof.entry_threshold:.2f}")
+        print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+        print(f"{'='*70}")
+
+    def trim_agents(self, threshold: float):
+        """
+        Remove agents below a specified score threshold from Global 50.
+
+        Args:
+            threshold: Minimum gauntlet score to keep (agents below this will be removed)
+        """
+        print(f"\n{'='*70}")
+        print(f"Trimming Global 50 - Threshold: {threshold:.2f}")
+        print(f"{'='*70}")
+
+        if not self.global_hof.enabled:
+            print("⚠ Global 50 not enabled (local mode or disabled)")
+            print("Cannot trim agents.")
+            return
+
+        # Load current Global 50 state
+        print("\nLoading current Global 50 state...")
+
+        # Re-download to ensure we have the latest
+        self.global_hof._download_global_ledger()
+        self.global_hof._load_local_ledger()
+
+        if len(self.global_hof.entries) == 0:
+            print("✓ Global 50 is empty. Nothing to trim.")
+            return
+
+        # Identify agents to remove
+        agents_to_remove = [
+            entry for entry in self.global_hof.entries
+            if entry.gauntlet_score < threshold
+        ]
+        agents_to_keep = [
+            entry for entry in self.global_hof.entries
+            if entry.gauntlet_score >= threshold
+        ]
+
+        if len(agents_to_remove) == 0:
+            print(f"\n✓ No agents below threshold {threshold:.2f}")
+            print(f"  All {len(self.global_hof.entries)} agents meet the minimum score requirement.")
+            return
+
+        # Show what will be removed
+        print(f"\n⚠ WARNING: {len(agents_to_remove)} agents will be REMOVED from Global 50:")
+        print(f"{'='*70}")
+        print(f"{'Score':<10} {'Run Name':<30} {'Agent ID':<10}")
+        print(f"{'-'*70}")
+
+        for entry in sorted(agents_to_remove, key=lambda e: e.gauntlet_score):
+            print(f"{entry.gauntlet_score:<10.2f} {entry.run_name:<30} {entry.agent_id:<10}")
+
+        print(f"\n{len(agents_to_keep)} agents will remain in Global 50.")
+
+        if len(agents_to_keep) > 0:
+            print(f"Score range after trim: {min(e.gauntlet_score for e in agents_to_keep):.2f} to {max(e.gauntlet_score for e in agents_to_keep):.2f}")
+
+        # Ask for confirmation
+        print(f"\n{'='*70}")
+        print("⚠ This action will:")
+        print("  1. Remove these agents from global50.json")
+        print("  2. Move their files to archive/ (locally and on cloud)")
+        print("  3. Update both local and cloud storage")
+        print(f"{'='*70}")
+
+        while True:
+            confirmation = input("\nProceed with trim? (yes/no): ").strip().lower()
+
+            if confirmation in ['yes', 'y']:
+                print("\n→ Proceeding with trim...")
+                break
+            elif confirmation in ['no', 'n']:
+                print("\n→ Trim cancelled. No changes made.")
+                return
+            else:
+                print("Please enter 'yes' or 'no'.")
+
+        # Perform the trim
+        import shutil
+
+        print("\nArchiving removed agents...")
+
+        # Move agents to archive
+        for entry in agents_to_remove:
+            filename = entry.get_filename()
+
+            # Local: Move from agents/ to archive/
+            local_src = self.global_hof.local_agents_dir / filename
+            local_dst = self.global_hof.local_archive_dir / filename
+
+            if local_src.exists():
+                shutil.move(str(local_src), str(local_dst))
+                print(f"   ✓ Archived locally: {filename}")
+            else:
+                # Download from cloud if not in local cache
+                cloud_src = f"{self.global_hof.cloud_base}/agents/{filename}"
+                try:
+                    self.cloud_sync.download_file(cloud_src, str(local_dst))
+                    print(f"   ✓ Downloaded and archived: {filename}")
+                except Exception as e:
+                    print(f"   ⚠ Could not download {filename}: {e}")
+
+            # Save metadata scoresheet
+            scoresheet_filename = filename.replace('.pth', '.json')
+            scoresheet_path = self.global_hof.local_archive_dir / scoresheet_filename
+            with open(scoresheet_path, 'w') as f:
+                json.dump(entry.to_dict(), f, indent=2)
+
+            # Cloud: Upload to archive/
+            cloud_archive_pth = f"{self.global_hof.cloud_base}/archive/{filename}"
+            cloud_archive_json = f"{self.global_hof.cloud_base}/archive/{scoresheet_filename}"
+
+            if local_dst.exists():
+                self.cloud_sync.upload_file(str(local_dst), cloud_archive_pth, background=False)
+            self.cloud_sync.upload_file(str(scoresheet_path), cloud_archive_json, background=False)
+
+        # Update entries list
+        self.global_hof.entries = agents_to_keep
+
+        # Update threshold
+        self.global_hof._update_entry_threshold()
+
+        # Save and upload updated ledger
+        print("\nUpdating global50.json...")
+        self.global_hof._save_local_ledger()
+        self.global_hof._upload_global_ledger()
+
+        print(f"\n{'='*70}")
+        print("✓ Trim Complete!")
+        print(f"{'='*70}")
+        print(f"  Removed:        {len(agents_to_remove)} agents")
+        print(f"  Remaining:      {len(agents_to_keep)} agents")
+        print(f"  New threshold:  {self.global_hof.entry_threshold:.2f}")
+        print(f"  Archived to:    {self.global_hof.local_archive_dir}")
+        print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.cloud_sync.project_name}/global50/")
+        print(f"{'='*70}")
 
     def print_summary(self, results: List[dict]):
         """
@@ -430,6 +1079,18 @@ Examples:
   # First-time setup (initialize Global 50 structure)
   python evaluate_for_global50.py --init
 
+  # Check mirror status between local and GCP
+  python evaluate_for_global50.py --mirror
+
+  # Re-evaluate all agents with current logic (updates metrics)
+  python evaluate_for_global50.py --eval
+
+  # Remove agents with scores below 0
+  python evaluate_for_global50.py --trim 0
+
+  # Remove agents with scores below 5.0
+  python evaluate_for_global50.py --trim 5.0
+
   # Evaluate agents from Hall of Fame directory
   python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
 
@@ -461,6 +1122,25 @@ Examples:
         help='Initialize Global 50 structure (first-time setup). Creates empty global50.json and validates cloud sync.'
     )
 
+    parser.add_argument(
+        '--mirror',
+        action='store_true',
+        help='Check mirror status between local and GCP. If mismatch detected, resolve conflict interactively.'
+    )
+
+    parser.add_argument(
+        '--trim',
+        type=float,
+        metavar='THRESHOLD',
+        help='Remove agents below specified score threshold (e.g., --trim 0 removes all agents with negative scores)'
+    )
+
+    parser.add_argument(
+        '--eval',
+        action='store_true',
+        help='Re-evaluate all agents in Global 50 with current evaluation logic. Updates all metrics.'
+    )
+
     args = parser.parse_args()
 
     # Initialize evaluator
@@ -482,9 +1162,14 @@ Examples:
             print(f"\n  Current Size: {stats['size']}/50")
             print(f"  Entry Threshold: {stats['entry_threshold']}")
 
-            print("\nGlobal 50 structure created:")
+            print("\nGlobal 50 structure created and mirrored:")
             print(f"  Local:  {evaluator.global_hof.local_dir}")
             print(f"  Cloud:  gs://{evaluator.cloud_sync.bucket_name}/{evaluator.cloud_sync.project_name}/global50/")
+            print(f"  Status: MIRRORED")
+
+            print("\n  Subdirectories:")
+            print(f"    - agents/  (active Global 50 agents)")
+            print(f"    - archive/ (retired agents)")
 
             print("\n✓ Setup complete! You can now run evaluations.")
             print("\nNext step:")
@@ -496,6 +1181,48 @@ Examples:
             print("  - CLOUD_PROVIDER=gcs")
             print("  - CLOUD_BUCKET=<your-bucket>")
             print("  - GOOGLE_APPLICATION_CREDENTIALS=<path-to-credentials>")
+
+        print("\n" + "="*70)
+        return
+
+    # Handle --mirror mode (check sync status)
+    if args.mirror:
+        print("\n" + "="*70)
+        print("MIRROR CHECK MODE")
+        print("="*70)
+
+        in_sync = evaluator.check_mirror_status()
+
+        if not in_sync:
+            evaluator.resolve_mirror_conflict()
+
+            # Verify sync after resolution
+            print("\n" + "="*70)
+            print("Verifying Sync Status")
+            print("="*70)
+            evaluator.check_mirror_status()
+
+        print("\n" + "="*70)
+        return
+
+    # Handle --trim mode (remove agents below threshold)
+    if args.trim is not None:
+        print("\n" + "="*70)
+        print("TRIM MODE")
+        print("="*70)
+
+        evaluator.trim_agents(threshold=args.trim)
+
+        print("\n" + "="*70)
+        return
+
+    # Handle --eval mode (re-evaluate all agents)
+    if args.eval:
+        print("\n" + "="*70)
+        print("RE-EVALUATION MODE")
+        print("="*70)
+
+        evaluator.reevaluate_global50()
 
         print("\n" + "="*70)
         return

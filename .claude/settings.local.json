@@ -30,7 +30,11 @@
       "Bash(test_results.txt)",
       "Bash(ulimit:*)",
       "Bash(df:*)",
-      "Bash(awk:*)"
+      "Bash(awk:*)",
+      "Bash(if [ -d \"workspace/global50\" ])",
+      "Bash(then echo \"G50 directory exists\")",
+      "Bash(else echo \"G50 directory does not exist - create with: python evaluate_for_global50.py --init\")",
+      "Bash(fi)"
     ],
     "deny": [],
     "ask": []

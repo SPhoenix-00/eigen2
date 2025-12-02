@@ -30,7 +30,7 @@ from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
 from models.ddpg_agent import DDPGAgent
 from models.replay_buffer import ReplayBuffer, OnDiskReplayBuffer
-from erl.genetic_ops import create_next_generation
+from erl.genetic_ops import create_next_generation, mutate
 from erl.hall_of_fame import HallOfFame
 from erl.global_hof import GlobalHallOfFame, LeagueRules
 from utils.config import Config
@@ -483,6 +483,10 @@ class ERLTrainer:
         # ROI hurdle EMA - smoothed target for ROI-based scoring adjustment
         # Uses EMA with α=0.2 (converges to static target in ~5 iterations)
         self.roi_hurdle_ema = None  # Initialized from first HoF median
+
+        # Quality threshold for QR calculation (trades with gain_pct >= threshold)
+        # Updated each generation based on HoF median ROI
+        self.quality_threshold = Config.ROI_QUALITY_THRESHOLD  # Default: 7.5%
 
         # Statistics
         self.fitness_history = []
@@ -1307,10 +1311,11 @@ class ERLTrainer:
         # 2. Calculate Core Metrics
         win_rate = stats.get('win_rate', 0.0) # 0.0 to 1.0
 
+        # Calculate Quality Ratio (QR): ratio of trades beating the HoF median ROI threshold
+        # This is dynamically updated each generation to reflect the rising bar of excellence
         closed_trades = stats.get('closed_trades', [])
-        quality_threshold = 0.2 # 0.2% gain
         if closed_trades:
-            quality_count = sum(1 for t in closed_trades if t.get('gain_pct', 0) > quality_threshold)
+            quality_count = sum(1 for t in closed_trades if t.get('gain_pct', 0) >= self.quality_threshold)
             qr = quality_count / total_trades
         else:
             qr = 0.0
@@ -2108,6 +2113,14 @@ class ERLTrainer:
 
         expectancy = self.calculate_expectancy(all_closed_trades)
 
+        # Calculate quality_count (trades with gain >= quality threshold)
+        # Use the current quality threshold (HoF median ROI or config default)
+        quality_threshold = self.quality_threshold
+        if all_closed_trades:
+            quality_count = sum(1 for t in all_closed_trades if t.get('gain_pct', 0) >= quality_threshold)
+        else:
+            quality_count = 0
+
         # Display detailed visualization of slice scores
         from utils.display import visualize_gauntlet_slices
         visualize_gauntlet_slices(fitness_scores, mean_score, min_score, max_score, gauntlet_score)
@@ -2119,6 +2132,7 @@ class ERLTrainer:
         print(f"  ROI:               {roi:>12.2f}%")
         print(f"  Win Rate:          {global_win_rate:>11.1%}")
         print(f"  Total Trades:      {total_trades:>12}")
+        print(f"  Quality Trades:    {quality_count:>12}")
         print(f"  Expectancy:        {expectancy:>11.2f}%")
         print(f"{'='*70}")
 
@@ -2132,6 +2146,7 @@ class ERLTrainer:
             'win_rate': global_win_rate,
             'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),
             'total_trades': total_trades,
+            'quality_count': quality_count,
             'expectancy': expectancy,
         }
 
@@ -2683,7 +2698,7 @@ class ERLTrainer:
                         agent_to_admit = self.breakthrough_candidate.agent
                         agent_roi = gauntlet_results['roi']
                         agent_expectancy = gauntlet_results['expectancy']
-                        quality_count = gauntlet_results.get('total_trades', 0)
+                        quality_count = gauntlet_results.get('quality_count', 0)
                         total_trades = gauntlet_results.get('total_trades', 0)
 
                         # Try to promote to Global 50
@@ -2893,11 +2908,18 @@ class ERLTrainer:
         val_results = self.validate_agent(self.best_agent)
         return val_results
 
-    def check_and_adjust_mutation(self, current_val_fitness: float):
+    def check_and_adjust_mutation(self, current_val_fitness: float, fitness_scores: List[float] = None):
         """
         Check for fitness plateau and adaptively increase mutation parameters.
         Plateau is detected if validation fitness doesn't improve by plateau_threshold
         over the last plateau_window generations.
+
+        When a plateau is detected and buffer is at least half full, inject a mutated
+        Global 50 agent to replace the worst agent in the population.
+
+        Args:
+            current_val_fitness: Current validation fitness
+            fitness_scores: Optional fitness scores of current population (for finding worst agent)
         """
         # Add current fitness to history
         self.validation_fitness_history.append(current_val_fitness)
@@ -2943,6 +2965,46 @@ class ERLTrainer:
                 print(f"\nBoosting mutation parameters:")
                 print(f"  Mutation Rate: {self.base_mutation_rate:.3f} → {self.current_mutation_rate:.3f}")
                 print(f"  Mutation STD:  {self.base_mutation_std:.4f} → {self.current_mutation_std:.4f}")
+
+                # Global 50 Injection: Replace worst agent with mutated Global 50 agent
+                # Only trigger if buffer is at least half full
+                buffer_half_full = len(self.replay_buffer) >= (self.replay_buffer.capacity // 2)
+
+                if buffer_half_full and fitness_scores is not None and len(fitness_scores) > 0:
+                    print(f"\n🧬 Global 50 Injection Protocol Activated")
+                    print(f"  Buffer status: {len(self.replay_buffer)}/{self.replay_buffer.capacity} (>50% full)")
+
+                    # Try to get a random Global 50 agent
+                    g50_agent = self.global_hof.get_random_agent()
+
+                    if g50_agent is not None:
+                        # Apply mutation to the Global 50 agent (safety valve)
+                        mutation_rate = Config.MUTATION_RATE_CONSISTENCY  # Use 0.2 as specified
+                        mutated_g50 = mutate(g50_agent, mutation_rate=mutation_rate, mutation_std=self.base_mutation_std)
+
+                        # Find worst agent in population
+                        worst_idx = np.argmin(fitness_scores)
+                        worst_fitness = fitness_scores[worst_idx]
+
+                        # Replace worst agent with mutated Global 50 agent
+                        mutated_g50.agent_id = worst_idx
+                        mutated_g50.is_elite = False  # Mark as exploratory
+                        self.population[worst_idx] = mutated_g50
+
+                        print(f"  ✓ Injected mutated Global 50 agent")
+                        print(f"  ✓ Replaced worst agent (ID: {worst_idx}, Fitness: {worst_fitness:.2f})")
+                        print(f"  ✓ Mutation applied: {mutation_rate:.2f} rate")
+
+                        # Clean up the original g50_agent to free memory
+                        del g50_agent
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        print(f"  ⚠ Global 50 injection skipped (no agents available)")
+                elif not buffer_half_full:
+                    print(f"\n  ⚠ Global 50 injection skipped (buffer < 50% full: {len(self.replay_buffer)}/{self.replay_buffer.capacity})")
+
                 print(f"{'='*60}\n")
 
             else:
@@ -3778,6 +3840,9 @@ class ERLTrainer:
             else:
                 quality_threshold = Config.ROI_QUALITY_THRESHOLD
 
+            # Update instance variable for use in fitness calculation
+            self.quality_threshold = quality_threshold
+
             for idx in tqdm(range(len(self.population)), desc="Validating agents"):
                 val_results = self.validate_agent_cached(self.population[idx], quality_threshold=quality_threshold)
                 val_fitness = val_results['fitness']
@@ -4129,7 +4194,8 @@ class ERLTrainer:
 
             # 4. Check for plateau and adjust mutation adaptively
             # Run this every generation to detect plateaus quickly
-            self.check_and_adjust_mutation(self.best_validation_fitness)
+            # Pass validation_scores to enable Global 50 injection (replaces worst agent)
+            self.check_and_adjust_mutation(self.best_validation_fitness, fitness_scores=validation_scores)
 
             # Tensorboard logging (less frequent to reduce I/O)
             if (gen + 1) % Config.LOG_FREQUENCY == 0:
