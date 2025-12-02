@@ -1539,8 +1539,9 @@ class ERLTrainer:
                 ))
 
         # Execute in parallel
-        num_workers = min(mp.cpu_count() - 1, 8)  # Leave 1 core free, cap at 8
-        print(f"Using {num_workers} parallel workers")
+        # Use all available cores (leave 1 for OS), with configurable safety cap
+        num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
+        print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs)")
 
         fitness_by_agent = [[] for _ in range(len(self.population))]
 
