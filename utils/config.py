@@ -134,8 +134,8 @@ class Config:
     """     NUM_PARENTS = 8  # Top performers to keep
     NUM_OFFSPRING = 6  # Generated via crossover
     NUM_MUTANTS = 2  # Random mutations """
-    ELITE_FRAC = 0.25       # 25% of population
-    OFFSPRING_FRAC = 0.25   # 25% of population
+    ELITE_FRAC = 0.4       # 25% of population
+    OFFSPRING_FRAC = 0.4   # 25% of population
     # MUTANT_FRAC will be the remainder (50%, massively increased for exploration)
 
     # Heroes mode - when loading pre-trained agents from Hall of Fame
@@ -151,9 +151,9 @@ class Config:
     # Genetic operators
     CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)
     CROSSOVER_ALPHA_MAX = 0.8  # Widened range for more diverse offspring (was 0.7)
-    MUTATION_RATE = 0.40  # Base mutation rate for normal mode (doubled from 0.20 for aggressive exploration)
-    MUTATION_RATE_CONSISTENCY = 0.20  # Mutation rate for consistency mode (lower to preserve stable traits)
-    MUTATION_STD = 0.05  # Base mutation magnitude (doubled from 0.025 for aggressive exploration)
+    MUTATION_RATE = 0.20  # Base mutation rate for normal mode (doubled from 0.20 for aggressive exploration)
+    MUTATION_RATE_CONSISTENCY = 0.15  # Mutation rate for consistency mode (lower to preserve stable traits)
+    MUTATION_STD = 0.025  # Base mutation magnitude (doubled from 0.025 for aggressive exploration)
     # NOTE: Adaptive mutation automatically boosts these values by 1.5x when validation fitness
     # plateaus for 3 consecutive generations (< 2% improvement), helping escape local optima
     # Max caps are set in ERLTrainer (0.8 for rate, 0.1 for std) to allow further increases
