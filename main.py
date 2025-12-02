@@ -125,10 +125,13 @@ def main():
         parser.add_argument(
             '--heroes',
             type=str,
+            nargs='?',
+            const='auto',
             default=None,
             metavar='HOF_DIR',
             help='Path to a Hall of Fame directory. Loads all agents, evaluates them with current '
-                 'reward function, and selects best 32 as initial population. Uses reduced mutant ratio.'
+                 'reward function, and selects best 32 as initial population. Uses reduced mutant ratio. '
+                 'If flag is used without a path, automatically uses global50 directory for current context window.'
         )
         parser.add_argument(
             '--cleanup',
@@ -138,6 +141,31 @@ def main():
         )
         args = parser.parse_args()
         # --------------------------------
+
+        # Auto-detect global50 directory if --heroes was used without a path
+        if args.heroes == 'auto':
+            from pathlib import Path
+            # Try Docker path first (global50/), then Windows path (workspace/global50/)
+            global50_candidates = [
+                Path("global50"),
+                Path("workspace/global50")
+            ]
+
+            global50_dir = None
+            for candidate in global50_candidates:
+                if candidate.exists() and (candidate / "agents").exists():
+                    global50_dir = candidate
+                    break
+
+            if global50_dir:
+                args.heroes = str(global50_dir)
+                print(f"\n✓ Auto-detected global50 directory: {args.heroes}")
+                print(f"  Context window: {Config.CONTEXT_WINDOW_DAYS} days")
+            else:
+                print("\n⚠ WARNING: --heroes auto-detect failed")
+                print("  Could not find global50/ or workspace/global50/ with agents/")
+                print("  Continuing with random initialization.")
+                args.heroes = None
 
         # NOTE: Seed will be set AFTER wandb init in ERLTrainer to ensure unique seeds per run
         # This prevents parallel runs from having identical behavior

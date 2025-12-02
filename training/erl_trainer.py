@@ -41,8 +41,10 @@ from torch.utils.data import DataLoader
 # from utils.memory_profiler import get_profiler, log_memory  # Memory profiling disabled
 
 
-# Global variable to store shared env_config in worker processes
-_worker_env_config = None
+# Global variables for worker processes
+_worker_env_config = None  # Shared environment configuration
+_worker_env = None  # Reusable environment instance (created once per worker)
+_worker_agent_cache = None  # Cache of reconstructed agents {state_hash: agent}
 
 
 def _init_worker(env_config):
@@ -53,52 +55,74 @@ def _init_worker(env_config):
     Stores the env_config in a global variable so it doesn't need to be
     pickled with every task (significant performance improvement).
 
+    OPTIMIZATION: Creates a reusable environment and agent cache per worker
+    to avoid recreating these expensive objects for every task.
+
     If env_config contains shared memory names (for data arrays), reconstructs
     the numpy arrays from shared memory to avoid pickling large arrays.
 
     Args:
         env_config: Environment configuration dict with data arrays or shared memory refs
     """
-    global _worker_env_config
+    global _worker_env_config, _worker_env, _worker_agent_cache
     _worker_env_config = env_config
+
+    # Create ONE environment per worker that will be reused for all tasks
+    # This avoids recreating the environment ~10 times per worker
+    from environment.trading_env import TradingEnvironment
+    _worker_env = TradingEnvironment(**env_config)
+
+    # Cache for reconstructed agents to avoid rebuilding same agent multiple times
+    # Key: hash of agent_state, Value: DDPGAgent instance
+    _worker_agent_cache = {}
 
 
 def _run_episode_worker(args):
     """
     Worker function for parallel episode execution.
 
+    OPTIMIZED: Reuses environment and caches agents per worker to minimize overhead.
+
     This function runs in a separate process, so it must:
-    1. Reconstruct the agent from CPU state dicts
-    2. Create its own environment instance (using global env_config)
+    1. Reconstruct the agent from CPU state dicts (cached for reuse)
+    2. Reuse the worker's environment instance (created once in initializer)
     3. Run the episode independently
     4. Write transitions directly to disk (parallel I/O)
 
     Args:
         args: Tuple of (agent_state, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start)
-              Note: env_config is accessed from global _worker_env_config (set by initializer)
+              Note: env_config, env, and agent_cache are accessed from globals (set by initializer)
 
     Returns:
         Tuple of (fitness, episode_info, transition_file_paths)
     """
-    global _worker_env_config
+    global _worker_env_config, _worker_env, _worker_agent_cache
     agent_state, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start = args
-    env_config = _worker_env_config
 
     # Set worker-specific seed for reproducibility
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # Reconstruct agent from state dict (agents with CUDA tensors are not picklable)
-    from models.ddpg_agent import DDPGAgent
-    agent = DDPGAgent(agent_id=0)
-    agent.actor.load_state_dict(agent_state['actor'])
-    agent.critic.load_state_dict(agent_state['critic'])
-    agent.actor.eval()
-    agent.critic.eval()
+    # OPTIMIZATION: Check agent cache first before reconstructing
+    # Create a hashable key from agent state (using actor weights as proxy)
+    import hashlib
+    actor_bytes = str(agent_state['actor']).encode()
+    state_hash = hashlib.md5(actor_bytes).hexdigest()
 
-    # Create environment for this worker
-    from environment.trading_env import TradingEnvironment
-    env = TradingEnvironment(**env_config)
+    if state_hash not in _worker_agent_cache:
+        # Reconstruct agent from state dict (agents with CUDA tensors are not picklable)
+        from models.ddpg_agent import DDPGAgent
+        agent = DDPGAgent(agent_id=0)
+        agent.actor.load_state_dict(agent_state['actor'])
+        agent.critic.load_state_dict(agent_state['critic'])
+        agent.actor.eval()
+        agent.critic.eval()
+        _worker_agent_cache[state_hash] = agent
+    else:
+        agent = _worker_agent_cache[state_hash]
+
+    # OPTIMIZATION: Reuse worker's environment instead of creating new one
+    env = _worker_env
 
     # Run episode
     trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
@@ -199,35 +223,44 @@ def _run_validation_worker(args):
     """
     Worker function for parallel validation execution.
 
+    OPTIMIZED: Reuses environment and caches agents per worker to minimize overhead.
+
     Validates a single agent across all validation slices (typically 7).
     Similar to _run_episode_worker but focused on validation-only tasks.
 
     Args:
         args: Tuple of (agent_state, validation_slices, quality_threshold, seed)
-              Note: env_config is accessed from global _worker_env_config
+              Note: env_config, env, and agent_cache are accessed from globals
 
     Returns:
         Dict with validation results (fitness, metrics, etc.)
     """
-    global _worker_env_config
+    global _worker_env_config, _worker_env, _worker_agent_cache
     agent_state, validation_slices, quality_threshold, seed = args
-    env_config = _worker_env_config
 
     # Set worker-specific seed for reproducibility
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # Reconstruct agent from state dict
-    from models.ddpg_agent import DDPGAgent
-    agent = DDPGAgent(agent_id=0)
-    agent.actor.load_state_dict(agent_state['actor'])
-    agent.critic.load_state_dict(agent_state['critic'])
-    agent.actor.eval()
-    agent.critic.eval()
+    # OPTIMIZATION: Check agent cache first before reconstructing
+    import hashlib
+    actor_bytes = str(agent_state['actor']).encode()
+    state_hash = hashlib.md5(actor_bytes).hexdigest()
 
-    # Create environment for this worker
-    from environment.trading_env import TradingEnvironment
-    env = TradingEnvironment(**env_config)
+    if state_hash not in _worker_agent_cache:
+        # Reconstruct agent from state dict
+        from models.ddpg_agent import DDPGAgent
+        agent = DDPGAgent(agent_id=0)
+        agent.actor.load_state_dict(agent_state['actor'])
+        agent.critic.load_state_dict(agent_state['critic'])
+        agent.actor.eval()
+        agent.critic.eval()
+        _worker_agent_cache[state_hash] = agent
+    else:
+        agent = _worker_agent_cache[state_hash]
+
+    # OPTIMIZATION: Reuse worker's environment instead of creating new one
+    env = _worker_env
 
     # Run agent on all validation slices
     slice_results = []
@@ -1055,13 +1088,62 @@ class ERLTrainer:
                     print(f"   ... and {len(admitted) - 5} more")
                 print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
         else:
-            # Consistency mode: Heroes loaded but not admitted to HoF
-            # They must earn their place through gauntlet validation
-            print(f"\n📊 Consistency Mode - Heroes Loaded (HoF Empty)")
-            print(f"   {len(self.population)} heroes loaded into population")
-            print(f"   Heroes must gauntlet their way into Hall of Fame")
-            print(f"   Goal: {self.target_hof_turnovers} complete turnovers")
-            print(f"   Each turnover raises the quality bar (all HoF agents must exceed previous median)")
+            # Consistency mode: Validate heroes and seed HoF with top 10
+            # This prevents the "all heroes must gauntlet" queue problem
+            print("\n--- Validating heroes for Hall of Fame (Consistency Mode) ---")
+
+            # Generate validation slices for hero evaluation
+            self.current_generation_val_slices = self.generate_validation_slices()
+
+            # Validate top heroes and add to HoF
+            num_to_validate = min(len(self.population), 42)  # Validate enough to ensure good HoF seeding
+            hero_validation_results = []
+
+            for idx in tqdm(range(num_to_validate), desc="Validating heroes for HoF"):
+                val_results = self.validate_agent_cached(self.population[idx])
+                val_fitness = val_results['fitness']
+                agent_roi = val_results.get('roi', 0.0)
+
+                # Use validation fitness as combined score (no training penalty for initial heroes)
+                combined_fitness = val_fitness
+
+                hero_validation_results.append({
+                    'idx': idx,
+                    'combined_fitness': combined_fitness,
+                    'roi': agent_roi,
+                    'raw_pnl': val_results.get('raw_pnl', 0.0),
+                    'expectancy': val_results.get('expectancy', 0.0)
+                })
+
+            # Sort by combined fitness and add top 10 to HoF
+            hero_validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
+
+            # Build candidates for HoF (top 10 only)
+            hof_candidates = []
+            for result in hero_validation_results[:10]:  # Only top 10 for HoF
+                agent_idx = result['idx']
+                combined_score = result['combined_fitness']
+                agent_roi = result['roi']
+                agent_expectancy = result['expectancy']
+                hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy))
+
+            # Add heroes to Hall of Fame
+            admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
+
+            # Print HoF initialization summary
+            admitted = [(idx, score, action) for idx, score, action in admission_results
+                       if action == 'admitted' or action.startswith('replaced_')]
+            if admitted:
+                hof_stats = self.hall_of_fame.get_stats()
+                print(f"\n⭐ Hall of Fame seeded with {len(admitted)} heroes (Consistency Mode):")
+                for agent_idx, score, _ in admitted[:5]:  # Show top 5
+                    roi = next((r['roi'] for r in hero_validation_results if r['idx'] == agent_idx), 0.0)
+                    print(f"   + Agent {agent_idx}: Combined={score:.2f}, ROI={roi:.2f}%")
+                if len(admitted) > 5:
+                    print(f"   ... and {len(admitted) - 5} more")
+                print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
+                print(f"\n   Goal: {self.target_hof_turnovers} complete turnovers")
+                print(f"   Each turnover raises the quality bar (all HoF agents must exceed previous median)")
 
         print(f"\nUsing heroes mode elite/offspring fractions:")
         print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_ELITE_FRAC)} agents)")
