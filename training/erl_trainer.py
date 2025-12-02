@@ -192,6 +192,150 @@ def _run_episode_worker(args):
     return final_fitness, episode_summary, transition_file_paths
 
 
+def _run_validation_worker(args):
+    """
+    Worker function for parallel validation execution.
+
+    Validates a single agent across all validation slices (typically 7).
+    Similar to _run_episode_worker but focused on validation-only tasks.
+
+    Args:
+        args: Tuple of (agent_state, validation_slices, quality_threshold, seed)
+              Note: env_config is accessed from global _worker_env_config
+
+    Returns:
+        Dict with validation results (fitness, metrics, etc.)
+    """
+    global _worker_env_config
+    agent_state, validation_slices, quality_threshold, seed = args
+    env_config = _worker_env_config
+
+    # Set worker-specific seed for reproducibility
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    # Reconstruct agent from state dict
+    from models.ddpg_agent import DDPGAgent
+    agent = DDPGAgent(agent_id=0)
+    agent.actor.load_state_dict(agent_state['actor'])
+    agent.critic.load_state_dict(agent_state['critic'])
+    agent.actor.eval()
+    agent.critic.eval()
+
+    # Create environment for this worker
+    from environment.trading_env import TradingEnvironment
+    env = TradingEnvironment(**env_config)
+
+    # Run agent on all validation slices
+    slice_results = []
+    all_closed_trades = []
+
+    for start_idx, end_idx, _ in validation_slices:
+        # Run episode (validation mode: no training, no noise, no buffer saving)
+        trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+        env.set_training_mode(False)
+        state, _ = env.reset(start_idx=start_idx, end_idx=end_idx, trading_end_idx=trading_end_idx)
+
+        cumulative_reward = 0.0
+        steps = 0
+
+        while True:
+            action = agent.select_action(state, add_noise=False)
+            next_state, reward, terminated, truncated, info = env.step(action)
+
+            cumulative_reward += reward
+            steps += 1
+            state = next_state
+
+            if terminated or truncated:
+                break
+
+        # Get episode summary
+        episode_info = env.get_episode_summary()
+        episode_info['steps'] = steps
+
+        # Calculate fitness for this slice
+        fitness = float(cumulative_reward)
+
+        # Apply zero trades penalty
+        if episode_info['num_trades'] == 0:
+            fitness -= episode_info['zero_trades_penalty']
+
+        # Apply win rate bonus if applicable
+        if episode_info['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:
+            win_rate_pct = episode_info['win_rate'] * 100.0
+            if win_rate_pct > Config.WIN_RATE_BONUS_THRESHOLD:
+                bonus = (win_rate_pct - Config.WIN_RATE_BONUS_THRESHOLD) ** 2
+                fitness += bonus
+                episode_info['win_rate_bonus'] = bonus
+            else:
+                episode_info['win_rate_bonus'] = 0.0
+        else:
+            episode_info['win_rate_bonus'] = 0.0
+
+        # Apply zero-trades gradient (for agents that don't trade)
+        if episode_info['num_trades'] == 0:
+            max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
+            fitness = fitness + max_coeff
+
+        slice_results.append({
+            'fitness': fitness,
+            'win_rate': episode_info['win_rate'],
+            'num_trades': episode_info['num_trades'],
+            'num_wins': episode_info['num_wins'],
+            'num_losses': episode_info['num_losses'],
+            'avg_reward_per_trade': episode_info['avg_reward_per_trade'],
+            'raw_pnl': episode_info.get('raw_pnl', 0.0),
+            'total_investment': episode_info.get('total_investment', 0.0)
+        })
+
+        # Collect closed trades
+        if 'closed_trades' in episode_info and episode_info['closed_trades']:
+            all_closed_trades.extend(episode_info['closed_trades'])
+
+    # Calculate aggregated validation fitness (0.4*mean + 0.6*min)
+    fitness_scores = [result['fitness'] for result in slice_results]
+    mean_score = np.mean(fitness_scores)
+    min_score = np.min(fitness_scores)
+    validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
+
+    # Aggregate metrics
+    total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
+    total_investment = sum([r['total_investment'] for r in slice_results])
+    roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
+
+    total_wins = sum([r['num_wins'] for r in slice_results])
+    total_losses = sum([r['num_losses'] for r in slice_results])
+    total_trades = total_wins + total_losses
+    global_win_rate = (total_wins / total_trades) if total_trades > 0 else 0.0
+
+    # Calculate quality metrics
+    quality_count = 0
+    quality_roi_sum = 0.0
+    if quality_threshold is not None and all_closed_trades:
+        for trade in all_closed_trades:
+            gain_pct = trade.get('gain_pct', 0.0)
+            if gain_pct >= quality_threshold:
+                quality_count += 1
+                quality_roi_sum += gain_pct
+
+    quality_roi = (quality_roi_sum / quality_count) if quality_count > 0 else 0.0
+
+    sample_trade = all_closed_trades[0] if all_closed_trades else None
+
+    return {
+        'fitness': validation_fitness,
+        'fitness_mean': mean_score,
+        'fitness_min': min_score,
+        'roi': roi,
+        'total_trades': total_trades,
+        'win_rate': global_win_rate,
+        'quality_count': quality_count,
+        'quality_roi': quality_roi,
+        'sample_trade': sample_trade
+    }
+
+
 class BreakthroughState(Enum):
     """
     State machine for Gauntlet Mode breakthrough validation.
@@ -2023,6 +2167,125 @@ class ERLTrainer:
 
         return val_results
 
+    def validate_population_parallel(self, quality_threshold: float = None) -> List[Dict]:
+        """
+        Validate entire population in parallel using ProcessPoolExecutor.
+
+        Similar to evaluate_population_parallel but for validation phase.
+        Checks cache first to skip validation for unchanged agents.
+
+        Args:
+            quality_threshold: Optional threshold for counting quality trades
+
+        Returns:
+            List of validation results for each agent in population
+        """
+        print(f"\n--- Walk-Forward Validation (Generation {self.current_generation}) ---")
+
+        # Prepare validation slices (shared across all agents)
+        if not self.current_generation_val_slices:
+            raise ValueError("No validation slices generated for this generation")
+
+        validation_slices = self.current_generation_val_slices
+        slice_hash = self.val_slice_hash
+        threshold_key = f"{quality_threshold:.4f}" if quality_threshold is not None else "none"
+
+        # Check cache and prepare tasks only for agents that need validation
+        validation_results = [None] * len(self.population)  # Pre-allocate results list
+        tasks = []
+        agent_indices_to_validate = []
+
+        for idx, agent in enumerate(self.population):
+            agent_hash = self._hash_agent(agent)
+            cache_key = f"{agent_hash}_{slice_hash}_{threshold_key}"
+
+            if cache_key in self.validation_cache:
+                # Cache hit - use cached results
+                validation_results[idx] = self.validation_cache[cache_key]
+            else:
+                # Cache miss - need to validate this agent
+                agent_state = {
+                    'actor': agent.actor.state_dict(),
+                    'critic': agent.critic.state_dict()
+                }
+
+                # Create unique seed for this validation task
+                task_seed = self.base_seed + self.current_generation * 10000 + idx * 100
+
+                tasks.append((agent_state, validation_slices, quality_threshold, task_seed))
+                agent_indices_to_validate.append((idx, agent_hash, cache_key))
+
+        # If all agents were cached, return early
+        if not tasks:
+            print(f"✓ All {len(self.population)} agents validated (100% cache hit rate)")
+            return validation_results
+
+        # Prepare environment config for workers (same as evaluation)
+        env_config = {
+            'data_array': self.data_loader.data_array,
+            'dates': self.data_loader.dates,
+            'train_end': self.train_end,
+            'val_end': self.val_end
+        }
+
+        # Execute validation in parallel
+        num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
+        cache_hits = len(self.population) - len(tasks)
+        print(f"Validating {len(tasks)} agents ({cache_hits} cached, {len(tasks)} fresh)")
+        print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs)")
+
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=mp.get_context('spawn'),
+            initializer=_init_worker,
+            initargs=(env_config,)
+        ) as executor:
+            # Submit all validation tasks
+            future_to_idx = {
+                executor.submit(_run_validation_worker, task): agent_info
+                for task, agent_info in zip(tasks, agent_indices_to_validate)
+            }
+
+            # Collect results as they complete
+            for future in tqdm(
+                as_completed(future_to_idx),
+                total=len(tasks),
+                desc="Validating (parallel)",
+                disable=False
+            ):
+                idx, agent_hash, cache_key = future_to_idx[future]
+
+                try:
+                    val_results = future.result()
+
+                    # Store results
+                    validation_results[idx] = val_results
+
+                    # Update cache
+                    self.validation_cache[cache_key] = val_results
+
+                    # Keep cache bounded
+                    if len(self.validation_cache) > 100:
+                        oldest_key = next(iter(self.validation_cache))
+                        del self.validation_cache[oldest_key]
+
+                except Exception as e:
+                    print(f"\n⚠ Validation failed for agent {idx}: {e}")
+                    # Return empty results for failed validation
+                    validation_results[idx] = {
+                        'fitness': -1000.0,
+                        'fitness_mean': -1000.0,
+                        'fitness_min': -1000.0,
+                        'roi': 0.0,
+                        'total_trades': 0,
+                        'win_rate': 0.0,
+                        'quality_count': 0,
+                        'quality_roi': 0.0,
+                        'sample_trade': None
+                    }
+
+        return validation_results
+
     def run_gauntlet_validation(self, agent: DDPGAgent) -> Dict:
         """
         Run rigorous Gauntlet validation on candidate agent.
@@ -3820,7 +4083,6 @@ class ERLTrainer:
             wandb.log(fitness_log, step=gen)
 
             # Generate validation slices for this generation
-            print(f"\n--- Walk-Forward Validation (Generation {gen + 1}) ---")
             self.current_generation_val_slices = self.generate_validation_slices()
             self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
 
@@ -3849,8 +4111,11 @@ class ERLTrainer:
             # Update instance variable for use in fitness calculation
             self.quality_threshold = quality_threshold
 
-            for idx in tqdm(range(len(self.population)), desc="Validating agents"):
-                val_results = self.validate_agent_cached(self.population[idx], quality_threshold=quality_threshold)
+            # Validate entire population in parallel
+            all_val_results = self.validate_population_parallel(quality_threshold=quality_threshold)
+
+            # Process validation results and calculate combined fitness
+            for idx, val_results in enumerate(all_val_results):
                 val_fitness = val_results['fitness']
                 val_fitness_mean = val_results.get('fitness_mean', 0.0)
                 val_fitness_min = val_results.get('fitness_min', 0.0)

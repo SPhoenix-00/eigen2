@@ -182,7 +182,7 @@ class Config:
     
     # ============ Validation Parameters ============
     EVAL_EPISODES = 5  # Number of episodes for evaluation
-    EVAL_NUM_WORKERS = 24  # Maximum parallel workers for evaluation (actual: min(cpu_count-1, this value))
+    EVAL_NUM_WORKERS = 48  # Maximum parallel workers for evaluation (actual: min(cpu_count-1, this value))
 
     # ============ Gauntlet Mode Parameters ============
     # Shift from "Run for N Generations" to "Achieve N Confirmed Breakthroughs"
