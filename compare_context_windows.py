@@ -180,13 +180,15 @@ class ContextWindowComparator:
         print(f"   Gauntlet: {len(slices)} slices total (using ERLTrainer.generate_gauntlet_slices)")
         return slices
 
-    def evaluate_agent_with_context(self, agent: DDPGAgent, context_window_days: int) -> ContextWindowResult:
+    def evaluate_agent_with_context(self, agent: DDPGAgent, context_window_days: int,
+                                   shared_slices: List[Tuple[int, int, int]] = None) -> ContextWindowResult:
         """
         Evaluate an agent using a specific context window size.
 
         Args:
             agent: DDPG agent to evaluate
             context_window_days: Context window size (151 or 504)
+            shared_slices: Pre-generated slices to use (ensures same episodes tested). If None, generates new slices.
 
         Returns:
             ContextWindowResult with aggregated metrics
@@ -202,8 +204,11 @@ class ContextWindowComparator:
         env = self.create_environment_with_context(context_window_days)
         print(f"   Environment observation space: {env.observation_space.shape}")
 
-        # Generate test slices (gauntlet or regular)
-        if self.use_gauntlet:
+        # Use shared slices if provided, otherwise generate new ones
+        if shared_slices is not None:
+            slices = shared_slices
+            print(f"   Using {len(slices)} pre-generated slices (SAME episodes as other test)")
+        elif self.use_gauntlet:
             slices = self.generate_gauntlet_slices()
         else:
             slices = self.generate_test_slices(context_window_days)
@@ -291,6 +296,7 @@ class ContextWindowComparator:
         std_roi = float(np.std(slice_rois))
         win_rate = float((total_wins / total_trades * 100) if total_trades > 0 else 0.0)
         avg_gain_pct = float(np.mean(all_gain_pcts)) if len(all_gain_pcts) > 0 else 0.0
+        max_drawdown = float(max_drawdown)  # Ensure max_drawdown is also Python float
 
         # Restore config
         print(f"   Restoring Config.CONTEXT_WINDOW_DAYS: {context_window_days} → {original_context}")
@@ -330,13 +336,26 @@ class ContextWindowComparator:
 
         print("\n3. Running evaluations...")
 
+        # CRITICAL: Generate slices ONCE using 504-day constraints
+        # Then use the SAME slices for both tests (only observation window differs)
+        if self.use_gauntlet:
+            print("\n   Generating gauntlet slices (using 504-day constraints for both tests)...")
+            # Temporarily set to 504 to generate slices
+            original_context = Config.CONTEXT_WINDOW_DAYS
+            Config.CONTEXT_WINDOW_DAYS = 504
+            shared_slices = self.generate_gauntlet_slices()
+            Config.CONTEXT_WINDOW_DAYS = original_context
+            print(f"   Will test SAME {len(shared_slices)} slices with both 504-day and 151-day observations")
+        else:
+            shared_slices = None
+
         # Test with 504-day context (original training window)
         print("\n   [1/2] Evaluating with 504-day context window (TRAINED)")
-        result_504 = self.evaluate_agent_with_context(agent, context_window_days=504)
+        result_504 = self.evaluate_agent_with_context(agent, context_window_days=504, shared_slices=shared_slices)
 
         # Test with 151-day context (reduced window)
         print("\n   [2/2] Evaluating with 151-day context window (OUT-OF-DISTRIBUTION)")
-        result_151 = self.evaluate_agent_with_context(agent, context_window_days=151)
+        result_151 = self.evaluate_agent_with_context(agent, context_window_days=151, shared_slices=shared_slices)
 
         # Calculate performance degradation
         if result_504 and result_151:
