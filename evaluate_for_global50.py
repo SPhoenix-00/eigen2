@@ -4,7 +4,7 @@ Evaluate existing agents for Global 50 promotion.
 This script loads agents from a specified folder, runs them through gauntlet
 validation, and promotes qualifying agents to the Global Hall of Fame.
 
-The script maintains a mirrored directory structure between local (workspace/global50/)
+The script maintains a mirrored directory structure between local (global50/)
 and GCP cloud storage. Use --mirror to check and resolve any sync conflicts.
 
 Usage:
@@ -75,8 +75,8 @@ class AgentEvaluator:
         print("\n3. Initializing Global Hall of Fame...")
         league_rules = LeagueRules(context_window_days=Config.CONTEXT_WINDOW_DAYS)
 
-        # Use workspace/global50 directory (mirrored with GCP)
-        checkpoint_dir = Path("workspace") / "global50"
+        # Use global50 directory (mirrored with GCP)
+        checkpoint_dir = Path("global50")
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         self.global_hof = GlobalHallOfFame(
@@ -419,7 +419,7 @@ class AgentEvaluator:
         # Final sync to ensure everything is mirrored to GCP
         if self.global_hof.enabled:
             print(f"\n{'='*70}")
-            print("Syncing workspace/global50/ to GCP...")
+            print("Syncing global50/ to GCP...")
             print(f"{'='*70}")
             self._sync_to_cloud()
 
@@ -427,7 +427,7 @@ class AgentEvaluator:
 
     def _sync_to_cloud(self):
         """
-        Sync the entire workspace/global50/ directory to GCP.
+        Sync the entire global50/ directory to GCP.
         Ensures local and cloud are mirrored.
         """
         if not self.global_hof.enabled:
@@ -677,8 +677,11 @@ class AgentEvaluator:
             local_path = self.global_hof.local_agents_dir / filename
 
             try:
-                self.cloud_sync.download_file(cloud_path, str(local_path))
-                agents_downloaded += 1
+                success = self.cloud_sync.download_file(cloud_path, str(local_path))
+                if success:
+                    agents_downloaded += 1
+                else:
+                    print(f"   ⚠ Could not download {filename}: File not found in cloud")
             except Exception as e:
                 print(f"   ⚠ Could not download {filename}: {e}")
 
@@ -991,8 +994,11 @@ class AgentEvaluator:
                 # Download from cloud if not in local cache
                 cloud_src = f"{self.global_hof.cloud_base}/agents/{filename}"
                 try:
-                    self.cloud_sync.download_file(cloud_src, str(local_dst))
-                    print(f"   ✓ Downloaded and archived: {filename}")
+                    success = self.cloud_sync.download_file(cloud_src, str(local_dst))
+                    if success:
+                        print(f"   ✓ Downloaded and archived: {filename}")
+                    else:
+                        print(f"   ⚠ Could not download {filename}: File not found in cloud")
                 except Exception as e:
                     print(f"   ⚠ Could not download {filename}: {e}")
 

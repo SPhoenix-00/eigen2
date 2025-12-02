@@ -75,9 +75,9 @@ class GlobalHoFEntry:
 
     def get_filename(self) -> str:
         """Generate unique filename for this agent's weights."""
-        # Format: [Score]_[RunName]_[AgentID].pth
-        # Use 2 decimal places for score to keep filenames reasonable
-        return f"{self.gauntlet_score:.2f}_{self.run_name}_{self.agent_id}.pth"
+        # Format: [RunName]_[AgentID].pth
+        # Note: Do NOT include score - it changes during re-evaluation!
+        return f"{self.run_name}_{self.agent_id}.pth"
 
 
 class GlobalHallOfFame:
@@ -91,7 +91,7 @@ class GlobalHallOfFame:
     """
 
     CAPACITY = 50
-    LOCAL_BASE_DIR = Path("workspace/global50")
+    LOCAL_BASE_DIR = Path("global50")
 
     def __init__(self, cloud_sync, run_name: str, league_rules: LeagueRules,
                  checkpoint_dir: Path, disable_global50: bool = False):

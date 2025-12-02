@@ -210,26 +210,40 @@ class ContextWindowComparator:
                 done = terminated or truncated
                 episode_reward += reward
 
-            # Collect metrics
-            final_info = info
-            fitness = final_info.get('fitness', 0.0)
-            roi = final_info.get('roi_pct', 0.0)
+            # Get full episode summary (contains all metrics)
+            episode_summary = env.get_episode_summary()
+
+            # Calculate fitness (same logic as ERLTrainer)
+            fitness = episode_reward  # Start with cumulative reward
+
+            # Apply zero trades penalty
+            if episode_summary['num_trades'] == 0:
+                fitness -= episode_summary['zero_trades_penalty']
+
+            # Apply win rate bonus if enough trades
+            if episode_summary['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:
+                win_rate_pct = episode_summary['win_rate'] * 100.0
+                if win_rate_pct > Config.WIN_RATE_BONUS_THRESHOLD:
+                    bonus = (win_rate_pct - Config.WIN_RATE_BONUS_THRESHOLD) ** 2
+                    fitness += bonus
+
+            # Extract metrics
+            roi = episode_summary.get('roi', 0.0)  # ROI already in percentage
+            num_trades = episode_summary.get('num_trades', 0)
+            num_wins = episode_summary.get('num_wins', 0)
+            closed_trades = episode_summary.get('closed_trades', [])
 
             slice_scores.append(fitness)
             slice_rois.append(roi)
 
             # Aggregate trade statistics
-            num_trades = final_info.get('num_trades', 0)
-            num_wins = final_info.get('num_wins', 0)
-            closed_positions = final_info.get('closed_positions', [])
-
             total_trades += num_trades
             total_wins += num_wins
 
-            for pos in closed_positions:
-                all_gain_pcts.append(pos.get('gain_pct', 0.0))
+            for trade in closed_trades:
+                all_gain_pcts.append(trade.get('gain_pct', 0.0))
 
-            # Track max drawdown
+            # Track max drawdown (most negative ROI)
             if roi < max_drawdown:
                 max_drawdown = roi
 
