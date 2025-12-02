@@ -163,10 +163,12 @@ class ContextWindowComparator:
 
         # Save and temporarily modify config
         original_context = Config.CONTEXT_WINDOW_DAYS
+        print(f"   Setting Config.CONTEXT_WINDOW_DAYS: {original_context} → {context_window_days}")
         Config.CONTEXT_WINDOW_DAYS = context_window_days
 
         # Create environment with modified context window
         env = self.create_environment_with_context(context_window_days)
+        print(f"   Environment observation space: {env.observation_space.shape}")
 
         # Generate test slices
         slices = self.generate_test_slices(context_window_days)
@@ -256,6 +258,7 @@ class ContextWindowComparator:
         avg_gain_pct = float(np.mean(all_gain_pcts)) if len(all_gain_pcts) > 0 else 0.0
 
         # Restore config
+        print(f"   Restoring Config.CONTEXT_WINDOW_DAYS: {context_window_days} → {original_context}")
         Config.CONTEXT_WINDOW_DAYS = original_context
 
         result = ContextWindowResult(
