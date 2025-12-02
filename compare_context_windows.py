@@ -405,9 +405,12 @@ def main():
 
     if args.test_all_g50:
         # Test all G50 agents
-        g50_dir = Path("workspace/global50/agents")
+        # Try both possible paths (workspace/global50 for Windows, global50 for Docker)
+        g50_dir = Path("global50/agents") if Path("global50/agents").exists() else Path("workspace/global50/agents")
         if not g50_dir.exists():
-            print(f"\nERROR: Global 50 directory not found: {g50_dir}")
+            print(f"\nERROR: Global 50 directory not found. Tried:")
+            print("  - global50/agents")
+            print("  - workspace/global50/agents")
             sys.exit(1)
 
         agent_files = sorted(g50_dir.glob("*.pth"))
@@ -443,14 +446,17 @@ def main():
 
     else:
         # Default: test best G50 agent
-        g50_dir = Path("workspace/global50/agents")
+        # Try both possible paths (workspace/global50 for Windows, global50 for Docker)
+        g50_dir = Path("global50/agents") if Path("global50/agents").exists() else Path("workspace/global50/agents")
         if not g50_dir.exists():
-            print(f"\nERROR: Global 50 directory not found: {g50_dir}")
+            print(f"\nERROR: Global 50 directory not found. Tried:")
+            print("  - global50/agents")
+            print("  - workspace/global50/agents")
             print("Please specify an agent with --agent-path")
             sys.exit(1)
 
         # Load global50.json to find best agent
-        metadata_file = Path("workspace/global50/global50.json")
+        metadata_file = Path("global50/global50.json") if Path("global50/global50.json").exists() else Path("workspace/global50/global50.json")
         if metadata_file.exists():
             with open(metadata_file, 'r') as f:
                 metadata = json.load(f)
