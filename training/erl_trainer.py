@@ -2207,9 +2207,10 @@ class ERLTrainer:
                 validation_results[idx] = self.validation_cache[cache_key]
             else:
                 # Cache miss - need to validate this agent
+                # Extract agent state (CPU tensors only to avoid CUDA sharing issues)
                 agent_state = {
-                    'actor': agent.actor.state_dict(),
-                    'critic': agent.critic.state_dict()
+                    'actor': {k: v.cpu() for k, v in agent.actor.state_dict().items()},
+                    'critic': {k: v.cpu() for k, v in agent.critic.state_dict().items()}
                 }
 
                 # Create unique seed for this validation task
