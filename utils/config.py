@@ -16,7 +16,7 @@ class Config:
     TOTAL_COLUMNS = 117  # Skinny dataset: only loading first 117 columns (columns 0-116) from the pkl
     FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
-    CONTEXT_WINDOW_DAYS = 504  # 2 years of trading days
+    CONTEXT_WINDOW_DAYS = 151  # Used to be 504 (2 years of trading days)
     TRAIN_TEST_SPLIT = 0.95  # DEPRECATED - Use VALIDATION_DAYS and COMMITTEE_HOLDOUT_DAYS instead
 
     # ============ Data Split Configuration ============
@@ -126,7 +126,7 @@ class Config:
     MIN_NOISE = 0.01
     
     # ============ ERL Parameters ============
-    POPULATION_SIZE = 32
+    POPULATION_SIZE = 96 # Used to be 32 when context was 504 days 
     NUM_GENERATIONS = 150
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
@@ -164,8 +164,8 @@ class Config:
     
     # ============ Training Parameters ============
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    NUM_WORKERS = 4  # For data loading (deprecated, kept for compatibility)
-    NUM_DATALOADER_WORKERS = 4  # Number of background workers for async batch loading
+    NUM_WORKERS = 6  # For data loading (deprecated, kept for compatibility)
+    NUM_DATALOADER_WORKERS = 6  # Number of background workers for async batch loading
     # With 4 workers, batches are prepared in parallel while GPU trains
     # Higher = more CPU usage but better GPU utilization
     # NOTE: Random seed is now set dynamically per wandb run in ERLTrainer
@@ -212,7 +212,7 @@ class Config:
     TARGET_BREAKTHROUGHS_CONSISTENCY = 8  # Deprecated - not used in consistency mode (uses turnovers instead)
 
     # Hall of Fame turnover goals (consistency mode only)
-    TARGET_HOF_TURNOVERS = 3  # Number of complete HoF turnovers required (minimum 2)
+    TARGET_HOF_TURNOVERS = 4  # Number of complete HoF turnovers required (minimum 2)
     # Unified turnover logic: All 10 HoF agents must have ROI >= previous median
     # Initial median is 0 (first breakthrough establishes baseline from gauntlet score)
     # Each turnover raises the bar: median₀=0 → median₁ → median₂ → median₃...
