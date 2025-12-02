@@ -303,18 +303,46 @@ class GlobalHallOfFame:
                 except Exception:
                     pass  # Doesn't exist, skip
 
-        # Try common context window values: 504 (new structure), 252, 377, 125, etc.
-        common_windows = [504, 252, 377, 125, 100, 200, 300]
+        # Dynamically discover available context window leagues from GCS
+        available_windows = []
 
-        # Remove our own context window from the list
-        common_windows = [w for w in common_windows if w != self.league_rules.context_window_days]
+        if self.cloud_sync.provider == "gcs":
+            try:
+                # List all directories under eigen2/global50/
+                prefix = f"{self.cloud_sync.project_name}/global50/"
+                blobs = self.cloud_sync.bucket.list_blobs(prefix=prefix, delimiter='/')
 
-        for window_days in common_windows:
+                # Extract context window IDs from directory names
+                for page in blobs.pages:
+                    for prefix_path in page.prefixes:
+                        # Extract directory name (e.g., "cw504" from "eigen2/global50/cw504/")
+                        dir_name = prefix_path.rstrip('/').split('/')[-1]
+                        if dir_name.startswith('cw'):
+                            try:
+                                window_days = int(dir_name[2:])  # Extract number from "cw504"
+                                if window_days != self.league_rules.context_window_days:
+                                    available_windows.append(window_days)
+                            except ValueError:
+                                pass  # Skip if not a valid number
+
+                print(f"  Found {len(available_windows)} context window leagues in bucket: {sorted(available_windows)}")
+            except Exception as e:
+                print(f"  Warning: Could not list bucket directories: {e}")
+                print(f"  Falling back to default common windows")
+                # Fallback to common windows if bucket listing fails
+                available_windows = [504, 252, 377, 125, 100, 200, 300]
+                available_windows = [w for w in available_windows if w != self.league_rules.context_window_days]
+        else:
+            # For non-GCS providers, use common windows as fallback
+            available_windows = [504, 252, 377, 125, 100, 200, 300]
+            available_windows = [w for w in available_windows if w != self.league_rules.context_window_days]
+
+        # Try to download JSON for each discovered context window
+        import tempfile
+        for window_days in available_windows:
             fallback_id = f"cw{window_days}"
             cloud_json_path = f"{self.cloud_sync.project_name}/global50/{fallback_id}/global50.json"
 
-            # Try to download the JSON (just check if it exists, don't save)
-            import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=True) as tmp:
                 try:
                     success = self.cloud_sync.download_file(cloud_json_path, tmp.name)

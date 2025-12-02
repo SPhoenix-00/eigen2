@@ -36,7 +36,8 @@
       "Bash(else echo \"G50 directory does not exist - create with: python evaluate_for_global50.py --init\")",
       "Bash(fi)",
       "Bash(if exist .env type .env)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "Bash(gsutil ls:*)"
     ],
     "deny": [],
     "ask": []

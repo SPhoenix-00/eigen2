@@ -19,7 +19,6 @@ import math
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-from multiprocessing import shared_memory
 from enum import Enum
 from dataclasses import dataclass
 
@@ -61,41 +60,6 @@ def _init_worker(env_config):
         env_config: Environment configuration dict with data arrays or shared memory refs
     """
     global _worker_env_config
-
-    # If using shared memory, reconstruct arrays from shared memory segments
-    if 'data_array_shm_name' in env_config:
-        from multiprocessing import shared_memory
-        import numpy as np
-
-        # Reconstruct data_array from shared memory
-        data_shm = shared_memory.SharedMemory(name=env_config['data_array_shm_name'])
-        data_array = np.ndarray(
-            shape=env_config['data_array_shape'],
-            dtype=env_config['data_array_dtype'],
-            buffer=data_shm.buf
-        )
-
-        # Reconstruct data_array_full from shared memory
-        data_full_shm = shared_memory.SharedMemory(name=env_config['data_array_full_shm_name'])
-        data_array_full = np.ndarray(
-            shape=env_config['data_array_full_shape'],
-            dtype=env_config['data_array_full_dtype'],
-            buffer=data_full_shm.buf
-        )
-
-        # Replace shared memory references with actual arrays in env_config
-        env_config = env_config.copy()
-        env_config['data_array'] = data_array
-        env_config['data_array_full'] = data_array_full
-
-        # Remove shared memory metadata (no longer needed)
-        del env_config['data_array_shm_name']
-        del env_config['data_array_shape']
-        del env_config['data_array_dtype']
-        del env_config['data_array_full_shm_name']
-        del env_config['data_array_full_shape']
-        del env_config['data_array_full_dtype']
-
     _worker_env_config = env_config
 
 
@@ -1670,35 +1634,15 @@ class ERLTrainer:
         num_exploratory = len(self.population) - num_elites
         print(f"Teacher Forcing enabled: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
 
-        # Create shared memory for large data arrays (avoids pickling ~600 MB across 48 workers)
-        # This reduces memory from 612 MB to 12.5 MB (48x reduction)
-        data_array = self.data_loader.data_array
-        data_array_full = self.data_loader.data_array_full
-
-        # Create shared memory segment for data_array
-        data_shm = shared_memory.SharedMemory(create=True, size=data_array.nbytes)
-        shared_data_array = np.ndarray(data_array.shape, dtype=data_array.dtype, buffer=data_shm.buf)
-        shared_data_array[:] = data_array[:]  # Copy data into shared memory
-
-        # Create shared memory segment for data_array_full
-        data_full_shm = shared_memory.SharedMemory(create=True, size=data_array_full.nbytes)
-        shared_data_array_full = np.ndarray(data_array_full.shape, dtype=data_array_full.dtype, buffer=data_full_shm.buf)
-        shared_data_array_full[:] = data_array_full[:]  # Copy data into shared memory
-
         # Prepare environment config (shared across all workers)
-        # Pass shared memory names instead of actual arrays
         env_config = {
-            'data_array_shm_name': data_shm.name,
-            'data_array_shape': data_array.shape,
-            'data_array_dtype': data_array.dtype,
-            'data_array_full_shm_name': data_full_shm.name,
-            'data_array_full_shape': data_array_full.shape,
-            'data_array_full_dtype': data_array_full.dtype,
+            'data_array': self.data_loader.data_array,
             'dates': self.data_loader.dates,
             'normalization_stats': self.normalization_stats,
             'start_idx': self.train_start_idx,
             'end_idx': self.train_end_idx,
             'trading_end_idx': self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+            'data_array_full': self.data_loader.data_array_full,
             'consistency_mode': self.consistency_mode
         }
 
@@ -1752,61 +1696,59 @@ class ERLTrainer:
         # Fork method doesn't work with CUDA after initialization
         all_transition_file_paths = []  # Collect all file paths written by workers
 
-        # Wrap in try/finally to ensure shared memory cleanup even on exceptions
-        try:
-            # Use initializer to pass env_config once per worker (not once per task)
-            # This significantly reduces serialization overhead, especially in consistency mode
-            # where we have 160 tasks (32 agents x 5 episodes) vs 96 in normal mode
-            with ProcessPoolExecutor(
-                max_workers=num_workers,
-                mp_context=mp.get_context('spawn'),
-                initializer=_init_worker,
-                initargs=(env_config,)
-            ) as executor:
-                # Submit all tasks
-                futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
+        # Use initializer to pass env_config once per worker (not once per task)
+        # This significantly reduces serialization overhead, especially in consistency mode
+        # where we have 160 tasks (32 agents x 5 episodes) vs 96 in normal mode
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=mp.get_context('spawn'),
+            initializer=_init_worker,
+            initargs=(env_config,)
+        ) as executor:
+            # Submit all tasks
+            futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
-                # Collect results as they complete
-                completed_tasks = 0
-                for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating (parallel)"):
-                    task_idx = futures[future]
-                    agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
+            # Collect results as they complete
+            completed_tasks = 0
+            for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating (parallel)"):
+                task_idx = futures[future]
+                agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
 
-                    try:
-                        # raw_fitness is the sum of rewards from env (good for RL, bad for Evolution)
-                        raw_fitness, episode_info, transition_file_paths = future.result(timeout=300)  # 5 min timeout
+                try:
+                    # raw_fitness is the sum of rewards from env (good for RL, bad for Evolution)
+                    raw_fitness, episode_info, transition_file_paths = future.result(timeout=300)  # 5 min timeout
 
-                        # Calculate Structural Fitness for Evolution
-                        triad_fitness = self.calculate_triad_fitness(episode_info)
+                    # Calculate Structural Fitness for Evolution
+                    triad_fitness = self.calculate_triad_fitness(episode_info)
 
-                        # Store triad_fitness instead of raw_fitness
-                        fitness_by_agent[agent_idx].append((triad_fitness, episode_info))
+                    # Store triad_fitness instead of raw_fitness
+                    fitness_by_agent[agent_idx].append((triad_fitness, episode_info))
 
-                        # Collect transition file paths from exploratory agents
-                        if transition_file_paths:
-                            all_transition_file_paths.extend(transition_file_paths)
+                    # Collect transition file paths from exploratory agents
+                    if transition_file_paths:
+                        all_transition_file_paths.extend(transition_file_paths)
 
-                        completed_tasks += 1
+                    completed_tasks += 1
 
-                    except TimeoutError:
-                        print(f"\n⚠ Worker TIMEOUT for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)})")
-                        print(f"  This may indicate a deadlock or infinite loop in worker process")
-                        # Use penalty fitness for failed episodes
-                        fitness_by_agent[agent_idx].append((-10000.0, {
-                            'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
-                        }))
-                        completed_tasks += 1
-                    except Exception as e:
-                        print(f"\n⚠ Worker EXCEPTION for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)}): {e}")
-                        import traceback
-                        traceback.print_exc()
-                        import sys
-                        sys.stdout.flush()  # Force flush to ensure error is logged
-                        # Use penalty fitness for failed episodes
-                        fitness_by_agent[agent_idx].append((-10000.0, {
-                            'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
-                        }))
-                        completed_tasks += 1
+                except TimeoutError:
+                    print(f"\n⚠ Worker TIMEOUT for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)})")
+                    print(f"  This may indicate a deadlock or infinite loop in worker process")
+                    # Use penalty fitness for failed episodes
+                    fitness_by_agent[agent_idx].append((-10000.0, {
+                        'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
+                    }))
+                    completed_tasks += 1
+                except Exception as e:
+                    print(f"\n⚠ Worker EXCEPTION for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)}): {e}")
+                    import traceback
+                    traceback.print_exc()
+                    import sys
+                    sys.stdout.flush()  # Force flush to ensure error is logged
+                    # Use penalty fitness for failed episodes
+                    fitness_by_agent[agent_idx].append((-10000.0, {
+                        'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
+                    }))
+                    completed_tasks += 1
 
             # Aggregate results (same logic as sequential version)
             fitness_scores = []
@@ -1890,17 +1832,7 @@ class ERLTrainer:
                 'agents_with_positive_fitness': int(sum(1 for f in fitness_scores if f > 0)),
             }
 
-        finally:
-            # Clean up shared memory segments (ALWAYS runs, even on exceptions)
-            try:
-                data_shm.close()
-                data_shm.unlink()
-                data_full_shm.close()
-                data_full_shm.unlink()
-            except Exception as e:
-                print(f"⚠ Warning: Failed to cleanup shared memory: {e}")
-
-        # Clean up other resources
+        # Clean up
         del all_episode_stats
         del all_transition_file_paths
         gc.collect()
@@ -2291,33 +2223,15 @@ class ERLTrainer:
             print(f"✓ All {len(self.population)} agents validated (100% cache hit rate)")
             return validation_results
 
-        # Create shared memory for large data arrays (same optimization as evaluation)
-        data_array = self.data_loader.data_array
-        data_array_full = self.data_loader.data_array_full
-
-        # Create shared memory segment for data_array
-        data_shm = shared_memory.SharedMemory(create=True, size=data_array.nbytes)
-        shared_data_array = np.ndarray(data_array.shape, dtype=data_array.dtype, buffer=data_shm.buf)
-        shared_data_array[:] = data_array[:]  # Copy data into shared memory
-
-        # Create shared memory segment for data_array_full
-        data_full_shm = shared_memory.SharedMemory(create=True, size=data_array_full.nbytes)
-        shared_data_array_full = np.ndarray(data_array_full.shape, dtype=data_array_full.dtype, buffer=data_full_shm.buf)
-        shared_data_array_full[:] = data_array_full[:]  # Copy data into shared memory
-
-        # Prepare environment config for workers (pass shared memory names instead of arrays)
+        # Prepare environment config for workers (same as evaluation)
         env_config = {
-            'data_array_shm_name': data_shm.name,
-            'data_array_shape': data_array.shape,
-            'data_array_dtype': data_array.dtype,
-            'data_array_full_shm_name': data_full_shm.name,
-            'data_array_full_shape': data_array_full.shape,
-            'data_array_full_dtype': data_array_full.dtype,
+            'data_array': self.data_loader.data_array,
             'dates': self.data_loader.dates,
             'normalization_stats': self.normalization_stats,
             'start_idx': self.val_start_idx,  # Dummy value, overridden per slice in reset()
             'end_idx': self.val_end_idx,  # Dummy value, overridden per slice in reset()
             'trading_end_idx': self.val_start_idx + Config.TRADING_PERIOD_DAYS,  # Dummy value
+            'data_array_full': self.data_loader.data_array_full,
             'is_training': False,  # Validation mode: no noise
             'consistency_mode': self.consistency_mode
         }
@@ -2328,67 +2242,55 @@ class ERLTrainer:
         print(f"Validating {len(tasks)} agents ({cache_hits} cached, {len(tasks)} fresh)")
         print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs)")
 
-        # Wrap in try/finally to ensure shared memory cleanup even on exceptions
-        try:
-            with ProcessPoolExecutor(
-                max_workers=num_workers,
-                mp_context=mp.get_context('spawn'),
-                initializer=_init_worker,
-                initargs=(env_config,)
-            ) as executor:
-                # Submit all validation tasks
-                future_to_idx = {
-                    executor.submit(_run_validation_worker, task): agent_info
-                    for task, agent_info in zip(tasks, agent_indices_to_validate)
-                }
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=mp.get_context('spawn'),
+            initializer=_init_worker,
+            initargs=(env_config,)
+        ) as executor:
+            # Submit all validation tasks
+            future_to_idx = {
+                executor.submit(_run_validation_worker, task): agent_info
+                for task, agent_info in zip(tasks, agent_indices_to_validate)
+            }
 
-                # Collect results as they complete
-                for future in tqdm(
-                    as_completed(future_to_idx),
-                    total=len(tasks),
-                    desc="Validating (parallel)",
-                    disable=False
-                ):
-                    idx, agent_hash, cache_key = future_to_idx[future]
+            # Collect results as they complete
+            for future in tqdm(
+                as_completed(future_to_idx),
+                total=len(tasks),
+                desc="Validating (parallel)",
+                disable=False
+            ):
+                idx, agent_hash, cache_key = future_to_idx[future]
 
-                    try:
-                        val_results = future.result()
+                try:
+                    val_results = future.result()
 
-                        # Store results
-                        validation_results[idx] = val_results
+                    # Store results
+                    validation_results[idx] = val_results
 
-                        # Update cache
-                        self.validation_cache[cache_key] = val_results
+                    # Update cache
+                    self.validation_cache[cache_key] = val_results
 
-                        # Keep cache bounded
-                        if len(self.validation_cache) > 100:
-                            oldest_key = next(iter(self.validation_cache))
-                            del self.validation_cache[oldest_key]
+                    # Keep cache bounded
+                    if len(self.validation_cache) > 100:
+                        oldest_key = next(iter(self.validation_cache))
+                        del self.validation_cache[oldest_key]
 
-                    except Exception as e:
-                        print(f"\n⚠ Validation failed for agent {idx}: {e}")
-                        # Return empty results for failed validation
-                        validation_results[idx] = {
-                            'fitness': -1000.0,
-                            'fitness_mean': -1000.0,
-                            'fitness_min': -1000.0,
-                            'roi': 0.0,
-                            'total_trades': 0,
-                            'win_rate': 0.0,
-                            'quality_count': 0,
-                            'quality_roi': 0.0,
-                            'sample_trade': None
-                        }
-
-        finally:
-            # Clean up shared memory segments (ALWAYS runs, even on exceptions)
-            try:
-                data_shm.close()
-                data_shm.unlink()
-                data_full_shm.close()
-                data_full_shm.unlink()
-            except Exception as e:
-                print(f"⚠ Warning: Failed to cleanup shared memory: {e}")
+                except Exception as e:
+                    print(f"\n⚠ Validation failed for agent {idx}: {e}")
+                    # Return empty results for failed validation
+                    validation_results[idx] = {
+                        'fitness': -1000.0,
+                        'fitness_mean': -1000.0,
+                        'fitness_min': -1000.0,
+                        'roi': 0.0,
+                        'total_trades': 0,
+                        'win_rate': 0.0,
+                        'quality_count': 0,
+                        'quality_roi': 0.0,
+                        'sample_trade': None
+                    }
 
         return validation_results
 
