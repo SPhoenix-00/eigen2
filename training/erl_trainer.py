@@ -2700,6 +2700,10 @@ class ERLTrainer:
                         agent_expectancy = gauntlet_results['expectancy']
                         quality_count = gauntlet_results.get('quality_count', 0)
                         total_trades = gauntlet_results.get('total_trades', 0)
+                        win_rate = gauntlet_results.get('win_rate', 0.0)
+
+                        # Calculate quality_ratio from quality_count and total_trades
+                        quality_ratio = quality_count / total_trades if total_trades > 0 else 0.0
 
                         # Try to promote to Global 50
                         promoted = self.global_hof.check_and_promote(
@@ -2708,7 +2712,8 @@ class ERLTrainer:
                             generation=self.generation,
                             roi=agent_roi,
                             expectancy=agent_expectancy,
-                            quality_count=quality_count,
+                            quality_ratio=quality_ratio,
+                            win_ratio=win_rate,
                             total_trades=total_trades
                         )
 
