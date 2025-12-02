@@ -54,7 +54,7 @@ def download_all_global50():
     for i, entry in enumerate(entries, 1):
         run_name = entry.get('run_name', 'unknown')
         agent_id = entry.get('agent_id', 0)
-        filename = f"{run_name}_agent_{agent_id}.pth"
+        filename = f"{run_name}_{agent_id}.pth"
 
         cloud_path = f"eigen2/global50/agents/{filename}"
         local_path = local_agents_dir / filename

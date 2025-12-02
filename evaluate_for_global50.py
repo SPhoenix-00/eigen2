@@ -566,7 +566,7 @@ class AgentEvaluator:
                     # Construct filename from entry
                     run_name = entry.get('run_name', 'unknown')
                     agent_id = entry.get('agent_id', 0)
-                    filename = f"{run_name}_agent_{agent_id}.pth"
+                    filename = f"{run_name}_{agent_id}.pth"
 
                     local_agent_path = self.global_hof.local_agents_dir / filename
                     cloud_path = f"{self.global_hof.cloud_base}/agents/{filename}"
