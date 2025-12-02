@@ -49,14 +49,16 @@ class ContextWindowResult:
 class ContextWindowComparator:
     """Compare agent performance across different context window sizes."""
 
-    def __init__(self, num_slices: int = 20):
+    def __init__(self, num_slices: int = 20, use_gauntlet: bool = False):
         """
         Initialize comparator.
 
         Args:
             num_slices: Number of validation slices to test (default 20 for thorough testing)
+            use_gauntlet: If True, use exact gauntlet validation (10 training + 10 validation slices)
         """
         self.num_slices = num_slices
+        self.use_gauntlet = use_gauntlet
 
         print("\n" + "="*80)
         print("Context Window Comparison Tool")
@@ -148,6 +150,32 @@ class ContextWindowComparator:
 
         return slices
 
+    def generate_gauntlet_slices(self) -> List[Tuple[int, int, int]]:
+        """
+        Generate gauntlet validation slices using the ORIGINAL ERLTrainer method.
+
+        This delegates to ERLTrainer.generate_gauntlet_slices() to ensure
+        100% identical logic to actual G50 evaluation.
+
+        Returns:
+            List of (start_idx, end_idx, trading_end_idx) tuples
+        """
+        # Import here to avoid circular dependency
+        from training.erl_trainer import ERLTrainer
+
+        # Use a dummy trainer just to call the static-ish method
+        # We need to create a minimal trainer instance
+        dummy_trainer = ERLTrainer.__new__(ERLTrainer)
+        dummy_trainer.data_loader = self.data_loader
+        dummy_trainer.val_start_idx = self.data_loader.val_start_idx
+        dummy_trainer.val_end_idx = self.data_loader.val_end_idx
+
+        # Call the original method
+        slices = dummy_trainer.generate_gauntlet_slices()
+
+        print(f"   Gauntlet: {len(slices)} slices total (using ERLTrainer.generate_gauntlet_slices)")
+        return slices
+
     def evaluate_agent_with_context(self, agent: DDPGAgent, context_window_days: int) -> ContextWindowResult:
         """
         Evaluate an agent using a specific context window size.
@@ -170,9 +198,12 @@ class ContextWindowComparator:
         env = self.create_environment_with_context(context_window_days)
         print(f"   Environment observation space: {env.observation_space.shape}")
 
-        # Generate test slices
-        slices = self.generate_test_slices(context_window_days)
-        print(f"   Generated {len(slices)} validation slices")
+        # Generate test slices (gauntlet or regular)
+        if self.use_gauntlet:
+            slices = self.generate_gauntlet_slices()
+        else:
+            slices = self.generate_test_slices(context_window_days)
+            print(f"   Generated {len(slices)} validation slices")
 
         if len(slices) == 0:
             print(f"   ERROR: No valid slices for {context_window_days}-day window")
@@ -347,6 +378,10 @@ class ContextWindowComparator:
 
         print(f"\nAgent: {Path(comparison['agent_path']).name}")
         print(f"Slices Tested: {comparison['num_slices']}")
+        if self.use_gauntlet:
+            print(f"Validation Mode: ⚔️ GAUNTLET (10 training + 10 validation slices)")
+        else:
+            print(f"Validation Mode: Standard (validation data only)")
 
         print("\n" + "-"*80)
         print(f"{'Metric':<30} {'504-day':<20} {'151-day':<20} {'Delta':<10}")
@@ -400,11 +435,18 @@ def main():
     parser.add_argument('--num-slices', type=int, default=20, help='Number of validation slices to test')
     parser.add_argument('--output', type=str, default='context_window_comparison.json', help='Output JSON file path')
     parser.add_argument('--test-all-g50', action='store_true', help='Test all Global 50 agents')
+    parser.add_argument('--gauntlet', action='store_true', help='Use exact gauntlet validation (20 slices: 10 training + 10 validation)')
 
     args = parser.parse_args()
 
     # Initialize comparator
-    comparator = ContextWindowComparator(num_slices=args.num_slices)
+    comparator = ContextWindowComparator(num_slices=args.num_slices, use_gauntlet=args.gauntlet)
+
+    if args.gauntlet:
+        print("\n⚔️  GAUNTLET MODE: Using exact G50 validation methodology")
+        print("   - 10 slices from training data (generalization test)")
+        print("   - 10 slices from validation data (held-out test)")
+        print("   - Same slice generation as ERLTrainer.generate_gauntlet_slices()")
 
     if args.test_all_g50:
         # Test all G50 agents

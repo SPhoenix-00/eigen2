@@ -34,6 +34,16 @@ python compare_context_windows.py --test-all-g50
 python compare_context_windows.py --num-slices 10
 ```
 
+### Use exact gauntlet validation (same as G50)
+```bash
+python compare_context_windows.py --gauntlet
+```
+
+This uses the **exact same validation methodology** as your Global 50 evaluation:
+- ⚔️ 10 slices from training data (tests generalization)
+- ⚔️ 10 slices from validation data (tests on held-out data)
+- Same logic as `ERLTrainer.generate_gauntlet_slices()`
+
 ---
 
 ## What It Does
