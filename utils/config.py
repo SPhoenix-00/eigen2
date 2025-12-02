@@ -16,7 +16,7 @@ class Config:
     TOTAL_COLUMNS = 117  # Skinny dataset: only loading first 117 columns (columns 0-116) from the pkl
     FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
-    CONTEXT_WINDOW_DAYS = 504  # Used to be 504 (2 years of trading days)
+    CONTEXT_WINDOW_DAYS = 151  # Used to be 504 (2 years of trading days)
     TRAIN_TEST_SPLIT = 0.95  # DEPRECATED - Use VALIDATION_DAYS and COMMITTEE_HOLDOUT_DAYS instead
 
     # ============ Data Split Configuration ============
