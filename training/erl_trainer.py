@@ -4201,7 +4201,7 @@ class ERLTrainer:
                     'base_combined_fitness': base_combined_fitness,
                     'roi_adjustment': roi_adjustment,
                     'win_rate': val_results['win_rate'],
-                    'num_trades': val_results['num_trades'],
+                    'num_trades': total_trades,  # Use total_trades (already extracted from val_results)
                     'total_trades': total_trades,  # Total across all slices (for quality ratio)
                     'quality_count': quality_count,
                     'raw_pnl': val_results.get('raw_pnl', 0.0),
