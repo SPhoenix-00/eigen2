@@ -2210,7 +2210,7 @@ class ERLTrainer:
                 }
 
                 # Create unique seed for this validation task
-                task_seed = self.base_seed + self.current_generation * 10000 + idx * 100
+                task_seed = self.seed + self.current_generation * 10000 + idx * 100
 
                 tasks.append((agent_state, validation_slices, quality_threshold, task_seed))
                 agent_indices_to_validate.append((idx, agent_hash, cache_key))
