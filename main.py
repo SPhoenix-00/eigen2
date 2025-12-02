@@ -144,10 +144,15 @@ def main():
 
         # Auto-detect global50 directory if --heroes was used without a path
         if args.heroes == 'auto':
-            # Try Docker path first (global50/), then Windows path (workspace/global50/)
+            # Context window identifier (e.g., "cw151" for 151-day window)
+            context_window_id = f"cw{Config.CONTEXT_WINDOW_DAYS}"
+
+            # Try context-window-specific paths first, then fall back to legacy paths
             global50_candidates = [
-                Path("global50"),
-                Path("workspace/global50")
+                Path("global50") / context_window_id,           # Docker: global50/cw151/
+                Path("workspace/global50") / context_window_id, # Windows: workspace/global50/cw151/
+                Path("global50"),                               # Legacy: global50/
+                Path("workspace/global50")                      # Legacy: workspace/global50/
             ]
 
             global50_dir = None
@@ -162,7 +167,9 @@ def main():
                 print(f"  Context window: {Config.CONTEXT_WINDOW_DAYS} days")
             else:
                 print("\n⚠ WARNING: --heroes auto-detect failed")
-                print("  Could not find global50/ or workspace/global50/ with agents/")
+                print(f"  Could not find global50/{context_window_id}/ or workspace/global50/{context_window_id}/ with agents/")
+                print(f"  Also tried legacy paths: global50/, workspace/global50/")
+                print(f"  You may need to run: python download_global50.py")
                 print("  Continuing with random initialization.")
                 args.heroes = None
 
