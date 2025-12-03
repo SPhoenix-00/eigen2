@@ -426,7 +426,8 @@ class ERLTrainer:
     """
 
     def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
-                 consistency_mode: bool = False, heroes_hof_dir: str = None, original_stdout=None, original_stderr=None):
+                 consistency_mode: bool = False, heroes_hof_dir: str = None, buffer_storage_path: str = None,
+                 original_stdout=None, original_stderr=None):
         """
         Initialize ERL trainer.
 
@@ -436,6 +437,7 @@ class ERLTrainer:
             enable_leverage: If True, enable leverage mode (replaces bottom 5 with top 5 HoF agents with 1.5x coefficients)
             consistency_mode: If True, evaluate with 5 episodes (sum) and loss magnification (see Config.CONSISTENCY_LOSS_MULTIPLIER)
             heroes_hof_dir: Path to Hall of Fame directory to load pre-trained agents from
+            buffer_storage_path: Optional path to existing buffer_storage folder to reuse (e.g., "checkpoints/run-123/buffer_storage")
             original_stdout: Original stdout before any redirection (for wandb console capture)
             original_stderr: Original stderr before any redirection (for wandb console capture)
         """
@@ -444,6 +446,7 @@ class ERLTrainer:
         self.enable_leverage = enable_leverage
         self.consistency_mode = consistency_mode
         self.heroes_hof_dir = heroes_hof_dir
+        self.external_buffer_storage_path = buffer_storage_path  # Optional path to reuse existing buffer
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -633,12 +636,74 @@ class ERLTrainer:
 
         # Create replay buffer with storage INSIDE checkpoint directory
         # This ensures buffer files are synced to cloud along with checkpoints
-        buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
-        print(f"Buffer storage: {buffer_storage_path}")
-        self.replay_buffer = OnDiskReplayBuffer(
-            capacity=Config.BUFFER_SIZE,
-            storage_path=buffer_storage_path
-        )
+        # If external buffer path provided (via --buffer), use it to copy/load existing buffer
+        if self.external_buffer_storage_path:
+            # User provided an external buffer path - use it to initialize buffer
+            from pathlib import Path
+            external_path = Path(self.external_buffer_storage_path)
+
+            if external_path.exists():
+                print(f"Loading external buffer from: {external_path}")
+
+                # New buffer will be stored in current run's checkpoint dir
+                new_buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
+
+                # Try to load buffer metadata from external path
+                # Check if there's a replay_buffer.pkl file in parent directory
+                metadata_path = external_path.parent / "replay_buffer.pkl"
+
+                if metadata_path.exists():
+                    print(f"  Found buffer metadata: {metadata_path}")
+                    try:
+                        # Load buffer metadata, but override storage path to point to external location
+                        self.replay_buffer = OnDiskReplayBuffer.load(
+                            str(metadata_path),
+                            storage_path_override=str(external_path)
+                        )
+                        print(f"  ✓ Loaded {len(self.replay_buffer)} transitions from external buffer")
+
+                        # Update the buffer's storage path to the new location for future writes
+                        # This way, new transitions will be added to the current run's buffer_storage
+                        self.replay_buffer.storage_path = Path(new_buffer_storage_path)
+                        self.replay_buffer.storage_path.mkdir(parents=True, exist_ok=True)
+                        print(f"  New transitions will be saved to: {new_buffer_storage_path}")
+                    except Exception as e:
+                        print(f"  ⚠ Error loading buffer metadata: {e}")
+                        print(f"  Creating new buffer with storage in: {new_buffer_storage_path}")
+                        self.replay_buffer = OnDiskReplayBuffer(
+                            capacity=Config.BUFFER_SIZE,
+                            storage_path=new_buffer_storage_path
+                        )
+                else:
+                    print(f"  ⚠ No replay_buffer.pkl found at {metadata_path}")
+                    print(f"  Creating new buffer (will still use external files if they exist)")
+                    # Create buffer pointing to external storage
+                    # This allows reusing the files even without metadata
+                    self.replay_buffer = OnDiskReplayBuffer(
+                        capacity=Config.BUFFER_SIZE,
+                        storage_path=str(external_path)
+                    )
+                    # Update to new path for future writes
+                    new_buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
+                    self.replay_buffer.storage_path = Path(new_buffer_storage_path)
+                    self.replay_buffer.storage_path.mkdir(parents=True, exist_ok=True)
+                    print(f"  New transitions will be saved to: {new_buffer_storage_path}")
+            else:
+                print(f"⚠ External buffer path does not exist: {external_path}")
+                print(f"  Creating new buffer instead")
+                buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
+                self.replay_buffer = OnDiskReplayBuffer(
+                    capacity=Config.BUFFER_SIZE,
+                    storage_path=buffer_storage_path
+                )
+        else:
+            # No external buffer - create new buffer in checkpoint directory
+            buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
+            print(f"Buffer storage: {buffer_storage_path}")
+            self.replay_buffer = OnDiskReplayBuffer(
+                capacity=Config.BUFFER_SIZE,
+                storage_path=buffer_storage_path
+            )
 
         # Create DataLoader for asynchronous batch prefetching
         # Background workers prepare batches in parallel while GPU trains
@@ -2483,12 +2548,12 @@ class ERLTrainer:
         # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Slightly forgiving aggregator: 0.75*mean + 0.25*min
+        # Slightly forgiving aggregator: 0.5*mean + 0.5*min
         # Balances robustness with average performance
         mean_score = np.mean(fitness_scores)
         min_score = np.min(fitness_scores)
         max_score = np.max(fitness_scores)
-        gauntlet_score = (0.75 * mean_score) + (0.25 * min_score)
+        gauntlet_score = (0.5 * mean_score) + (0.5 * min_score)
 
         # Calculate aggregate metrics
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])

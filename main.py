@@ -139,6 +139,14 @@ def main():
             help='Clean up orphaned replay buffer files before resuming. Use with --resume or --resume-run. '
                  'Scans buffer_storage directory and removes files not tracked in metadata (zombie files from crashes).'
         )
+        parser.add_argument(
+            '--buffer',
+            type=str,
+            default=None,
+            metavar='BUFFER_PATH',
+            help='Path to an existing buffer_storage folder to reuse (e.g., "checkpoints/run-123/buffer_storage"). '
+                 'Allows starting a new run with pre-filled replay buffer instead of starting from zero.'
+        )
         args = parser.parse_args()
         # --------------------------------
 
@@ -265,6 +273,7 @@ def main():
             enable_leverage=args.leverage,
             consistency_mode=args.consistency,
             heroes_hof_dir=args.heroes,
+            buffer_storage_path=args.buffer,
             original_stdout=tee_logger.terminal,
             original_stderr=tee_logger.terminal
         )

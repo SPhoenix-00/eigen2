@@ -255,11 +255,11 @@ class AgentEvaluator:
         # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Use same aggregator as ERLTrainer: 0.75*mean + 0.25*min
+        # Use same aggregator as ERLTrainer: 0.5*mean + 0.5*min
         mean_score = float(np.mean(fitness_scores))
         min_score = float(np.min(fitness_scores))
         max_score = float(np.max(fitness_scores))
-        gauntlet_score = float((0.75 * mean_score) + (0.25 * min_score))
+        gauntlet_score = float((0.5 * mean_score) + (0.5 * min_score))
 
         # Aggregate metrics (same calculations as ERLTrainer)
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])

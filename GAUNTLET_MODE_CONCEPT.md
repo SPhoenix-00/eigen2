@@ -29,7 +29,7 @@ The Protocol
     Once stabilized, the candidate faces The Gauntlet:
     - Standard Validation: 7 random data slices.
     - The Gauntlet: 20 rigorously randomized slices covering different market regimes across all training and validation data
-    - Scoring: We use a "Slightly Forgiving Aggregator" (0.75*mean + 0.25*min) to balance robustness with average performance
+    - Scoring: We use a "Slightly Forgiving Aggregator" (0.5*mean + 0.5*min) to balance robustness with average performance
 - Step 4: The Ratchet (The Fix)This is the most critical change.
     FIRST BREAKTHROUGH: We "give away" the first breakthrough - any gauntlet score (even negative) becomes the baseline.
     This provides a realistic starting point since we don't know in advance what performance level is achievable.

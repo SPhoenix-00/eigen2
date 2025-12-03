@@ -404,7 +404,7 @@ def visualize_gauntlet_slices(fitness_scores: List[float], mean_score: float, mi
         mean_score: Mean fitness across all slices
         min_score: Minimum fitness score
         max_score: Maximum fitness score
-        gauntlet_score: Final aggregated gauntlet score (0.75*mean + 0.25*min)
+        gauntlet_score: Final aggregated gauntlet score (0.5*mean + 0.5*min)
     """
     print("\n" + "="*70)
     print(f"{'GAUNTLET SLICE ANALYSIS':^70}")
@@ -418,7 +418,7 @@ def visualize_gauntlet_slices(fitness_scores: List[float], mean_score: float, mi
 
     print("\n📊 STATISTICAL SUMMARY")
     print("-" * 70)
-    print(f"  Gauntlet Score:    {gauntlet_score:>12.2f}  (0.75*mean + 0.25*min)")
+    print(f"  Gauntlet Score:    {gauntlet_score:>12.2f}  (0.5*mean + 0.5*min)")
     print(f"  Mean:              {mean_score:>12.2f}")
     print(f"  Min:               {min_score:>12.2f}")
     print(f"  Max:               {max_score:>12.2f}")
