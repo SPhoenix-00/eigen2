@@ -37,7 +37,10 @@
       "Bash(fi)",
       "Bash(if exist .env type .env)",
       "Bash(echo:*)",
-      "Bash(gsutil ls:*)"
+      "Bash(gsutil ls:*)",
+      "Bash(if [ -d \"global50\" ])",
+      "Bash(then echo \"Global 50 directory exists:\")",
+      "Bash(else echo \"Global 50 directory does not exist\")"
     ],
     "deny": [],
     "ask": []

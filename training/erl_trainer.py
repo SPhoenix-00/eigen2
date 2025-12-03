@@ -1060,7 +1060,7 @@ class ERLTrainer:
                 ))
 
         # Execute in parallel
-        num_workers = min(mp.cpu_count() - 1, 8)
+        num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
         print(f"  Using {num_workers} parallel workers for {len(tasks)} tasks")
 
         fitness_by_agent = [[] for _ in range(len(loaded_agents))]

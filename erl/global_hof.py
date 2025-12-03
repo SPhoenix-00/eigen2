@@ -342,14 +342,12 @@ class GlobalHallOfFame:
                 print(f"  Found {len(available_windows)} context window leagues in bucket: {sorted(available_windows)}")
             except Exception as e:
                 print(f"  Warning: Could not list bucket directories: {e}")
-                print(f"  Falling back to default common windows")
-                # Fallback to common windows if bucket listing fails
-                available_windows = [504, 252, 377, 125, 100, 200, 300]
-                available_windows = [w for w in available_windows if w != self.league_rules.context_window_days]
+                print(f"  No fallback leagues will be available")
+                available_windows = []
         else:
-            # For non-GCS providers, use common windows as fallback
-            available_windows = [504, 252, 377, 125, 100, 200, 300]
-            available_windows = [w for w in available_windows if w != self.league_rules.context_window_days]
+            # For non-GCS providers, no discovery available
+            print(f"  Note: Fallback league discovery only supported for GCS provider")
+            available_windows = []
 
         # Try to download JSON for each discovered context window
         import tempfile
@@ -548,7 +546,7 @@ class GlobalHallOfFame:
         This is used for diversity injection during plateau detection.
         Downloads the agent file from cloud storage if not in local cache.
 
-        If our league is empty but fallback leagues exist, we download from those instead.
+        If our league is empty or download fails, we try fallback leagues (other context windows).
 
         Returns:
             Random DDPGAgent from Global 50, or None if Global 50 is empty/disabled
@@ -559,6 +557,7 @@ class GlobalHallOfFame:
         import random
 
         # Try our own league first
+        agent = None
         if len(self.entries) > 0:
             random_entry = random.choice(self.entries)
             filename = random_entry.get_filename()
@@ -569,21 +568,31 @@ class GlobalHallOfFame:
             if not local_agent_path.exists():
                 success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
                 if not success:
-                    print(f"⚠ Failed to download Global 50 agent: {filename}")
-                    return None
+                    print(f"⚠ Failed to download Global 50 agent from current league: {filename}")
+                    agent = None  # Will try fallback leagues below
+                else:
+                    # Load agent
+                    try:
+                        agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
+                        agent.load(str(local_agent_path))
+                        return agent
+                    except Exception as e:
+                        print(f"⚠ Failed to load Global 50 agent from current league: {e}")
+                        agent = None  # Will try fallback leagues below
+            else:
+                # File exists locally, load it
+                try:
+                    agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
+                    agent.load(str(local_agent_path))
+                    return agent
+                except Exception as e:
+                    print(f"⚠ Failed to load Global 50 agent from current league: {e}")
+                    agent = None  # Will try fallback leagues below
 
-            # Load agent
-            try:
-                agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
-                agent.load(str(local_agent_path))
-                return agent
-            except Exception as e:
-                print(f"⚠ Failed to load Global 50 agent: {e}")
-                return None
-
-        # Our league is empty - try fallback leagues
-        if len(self.fallback_leagues) > 0:
-            print(f"⚠ Current league ({self.league_rules.context_window_days} days) is empty.")
+        # Current league failed (empty, download failed, or load failed) - try fallback leagues
+        if agent is None and len(self.fallback_leagues) > 0:
+            if len(self.entries) == 0:
+                print(f"⚠ Current league ({self.league_rules.context_window_days} days) is empty.")
             print(f"  Attempting diversity injection from fallback league...")
 
             # Pick a random fallback league
