@@ -359,14 +359,38 @@ def _run_validation_worker(args):
 
     sample_trade = all_closed_trades[0] if all_closed_trades else None
 
+    # Calculate expectancy from all closed trades
+    # Expectancy = (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
+    if not all_closed_trades:
+        expectancy = 0.0
+    else:
+        wins = [t['gain_pct'] for t in all_closed_trades if t['gain_pct'] > 0]
+        losses = [abs(t['gain_pct']) for t in all_closed_trades if t['gain_pct'] <= 0]
+
+        if not wins and not losses:
+            expectancy = 0.0
+        else:
+            avg_win = np.mean(wins) if wins else 0.0
+            avg_loss = np.mean(losses) if losses else 0.0
+            win_rate_calc = len(wins) / len(all_closed_trades)
+            loss_rate = 1.0 - win_rate_calc
+            expectancy = (win_rate_calc * avg_win) - (loss_rate * avg_loss)
+
     return {
         'fitness': validation_fitness,
+        'fitness_all_slices': fitness_scores,  # For debugging
         'fitness_mean': mean_score,
         'fitness_min': min_score,
         'roi': roi,
         'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),  # Mean trades per slice
+        'num_wins': int(np.mean([r['num_wins'] for r in slice_results])),
+        'num_losses': int(np.mean([r['num_losses'] for r in slice_results])),
+        'avg_reward_per_trade': np.mean([r['avg_reward_per_trade'] for r in slice_results]),
+        'raw_pnl': total_raw_pnl,  # Total raw P&L across slices
+        'total_investment': total_investment,  # Total investment across slices
         'total_trades': total_trades,  # Total across all slices
         'win_rate': global_win_rate,
+        'expectancy': expectancy,  # Expectancy metric: (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
         'quality_count': quality_count,
         'quality_roi': quality_roi,
         'sample_trade': sample_trade
