@@ -501,7 +501,7 @@ class ERLTrainer:
         self.val_end_idx = self.val_start_idx + len(data_loader.val_indices)
 
         # Walk-forward validation slices (generated per generation)
-        # Each generation uses 7 random validation slices from validation set (4 from quarters + 3 straddling)
+        # Each generation uses 10 validation slices from validation set (4 from quarters + 3 straddling + 3 random)
         # Format: list of (start_idx, end_idx, trading_end_idx) tuples
         self.current_generation_val_slices = []
         
@@ -847,7 +847,7 @@ class ERLTrainer:
 
         print(f"Training: days {self.train_start_idx}-{self.train_end_idx}, "
               f"Validation: days {self.val_start_idx}-{self.val_end_idx}")
-        print(f"Walk-forward: 7 random validation slices/generation (4 from quarters + 3 straddling)")
+        print(f"Walk-forward: 10 validation slices/generation (4 from quarters + 3 straddling + 3 random)")
 
         # Create persistent environment (reused across episodes to prevent memory leaks)
         print("Initializing environment...")
@@ -1486,24 +1486,25 @@ class ERLTrainer:
 
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
         """
-        Generate 7 random validation slices from validation set.
+        Generate 10 validation slices from validation set.
 
         Divides validation period into 4 equal quarters, then samples:
         - 4 slices from within each quarter
         - 3 straddling slices between quarters (Q1-Q2, Q2-Q3, Q3-Q4)
+        - 3 random slices from anywhere in the validation period
 
         This ensures comprehensive coverage with overlapping windows across different market conditions.
 
         Each slice consists of:
-        - CONTEXT_WINDOW_DAYS (504) of prior data (may come from training data for context)
+        - CONTEXT_WINDOW_DAYS (151) of prior data (may come from training data for context)
         - TRADING_PERIOD_DAYS (125) where agent can trade (from validation set)
         - SETTLEMENT_PERIOD_DAYS (30) to close positions (from validation set)
 
         Returns:
-            List of 7 tuples: (start_idx, end_idx, trading_end_idx)
+            List of 10 tuples: (start_idx, end_idx, trading_end_idx)
         """
         # NOTE: start_idx is the first day of TRADING (not context)
-        # The environment automatically looks back 504 days from start_idx for context
+        # The environment automatically looks back CONTEXT_WINDOW_DAYS from start_idx for context
         # So we just need to ensure trading + settlement fit within validation set
 
         # Trading must start at or after val_start_idx
@@ -1551,6 +1552,14 @@ class ERLTrainer:
                 trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
 
                 slices.append((start_idx, end_idx, trading_end_idx))
+
+        # 3. Sample 3 completely random slices from entire validation range (3 slices)
+        for _ in range(3):
+            start_idx = np.random.randint(min_start, max_start + 1)
+            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+            trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+
+            slices.append((start_idx, end_idx, trading_end_idx))
 
         return slices
 
@@ -1998,28 +2007,22 @@ class ERLTrainer:
             if all_transition_file_paths:
                 # Transitions were written to disk during parallel evaluation - just add paths to buffer
                 print(f"  Transitions already written to disk by workers (parallel I/O)")
+
+                # CRITICAL FIX: Track if buffer was full BEFORE adding new data
+                # The deque auto-truncates when appending to maxlen, so we must check BEFORE append
+                buffer_was_full = len(self.replay_buffer.buffer) >= self.replay_buffer.capacity
+
                 for file_path in all_transition_file_paths:
                     self.replay_buffer.buffer.append(file_path)
 
                 # Update total_added counter
                 self.replay_buffer.total_added = file_id_counter
 
-                # Handle buffer overflow - remove oldest files if we exceeded capacity
-                if len(self.replay_buffer.buffer) > self.replay_buffer.capacity:
-                    num_to_remove = len(self.replay_buffer.buffer) - self.replay_buffer.capacity
-                    print(f"  Buffer overflow: removing {num_to_remove} oldest transitions")
-
-                    import os
-                    for _ in range(num_to_remove):
-                        old_path = self.replay_buffer.buffer.popleft()
-                        try:
-                            os.remove(old_path)
-                        except OSError:
-                            pass
-
-                    # CRITICAL FIX: Reset DataLoader after buffer overflow to prevent worker crashes
-                    # Persistent workers hold references to deleted file paths, causing silent crashes
-                    print("  Resetting DataLoader workers to clear stale file references...")
+                # FIX: Force DataLoader reset if we added data to a full buffer
+                # This ensures workers get the new file paths and stop looking for old ones
+                # that will be deleted by cleanup_orphans
+                if buffer_was_full:
+                    print("  Buffer rotated: Resetting DataLoader workers to refresh file references...")
                     self._create_dataloader()
                     print("  ✓ DataLoader reset complete")
 
@@ -2225,11 +2228,11 @@ class ERLTrainer:
 
     def validate_agent(self, agent, quality_threshold: float = None) -> Dict:
         """
-        Validate agent using walk-forward validation on 7 random slices.
+        Validate agent using walk-forward validation on 10 validation slices.
 
         Walk-forward validation strategy:
-        - Runs agent on 7 validation slices (same slices for all agents in this generation)
-        - 4 slices from quarters + 3 straddling slices between quarters
+        - Runs agent on 10 validation slices (same slices for all agents in this generation)
+        - 4 slices from quarters + 3 straddling slices + 3 random slices
         - Uses weighted aggregation: fitness = (0.4 * mean) + (0.6 * worst_case)
         - This rewards consistency and penalizes agents that fail in any market condition
 
@@ -2246,7 +2249,7 @@ class ERLTrainer:
         if not self.current_generation_val_slices:
             raise ValueError("No validation slices generated for this generation")
 
-        # Run agent on all 7 validation slices
+        # Run agent on all 10 validation slices
         slice_results = []
         all_closed_trades = []  # Collect closed trades for metrics calculation only
 
@@ -2286,7 +2289,7 @@ class ERLTrainer:
             if 'closed_trades' in episode_info and episode_info['closed_trades']:
                 all_closed_trades.extend(episode_info['closed_trades'])
 
-        # Extract fitness scores from all 7 slices
+        # Extract fitness scores from all 10 slices
         fitness_scores = [result['fitness'] for result in slice_results]
 
         # Weighted aggregation: emphasize worst-case performance to reward consistency
@@ -2727,7 +2730,7 @@ class ERLTrainer:
         "Winner-Takes-All" problems:
         - All qualifying agents are added to a candidate queue
         - Agents are tested one at a time through the Gauntlet
-        - Failed agents trigger snapback and the next candidate is selected
+        - Failed agents are weeded out by natural selection and the next candidate is selected
         - Baseline only ratchets after ALL candidates have been exhausted
 
         Args:
@@ -2853,8 +2856,8 @@ class ERLTrainer:
 
             print(f"{'='*60}")
 
-            # SNAPBACK MECHANISM: Save snapshot before entering Gauntlet
-            # This allows us to restore the population if the Gauntlet fails
+            # Save snapshot before entering Gauntlet (for debugging/safety backup)
+            # NOTE: No longer used for automatic restoration on failure (soft penalty approach)
             self.save_gauntlet_snapshot()
 
             if self.use_candidate_queue:
@@ -2894,7 +2897,7 @@ class ERLTrainer:
         Select the next untested candidate from the queue.
 
         This helper method handles the queue-based candidate selection to prevent
-        the Ghost Loop problem. After a snapback, we move to the next candidate
+        the Ghost Loop problem. After a rejection, we move to the next candidate
         instead of re-selecting the same agent.
 
         Returns:
@@ -3398,7 +3401,8 @@ class ERLTrainer:
                     print(f"  Spike Score: {self.breakthrough_candidate.spike_score:.2f} (Ghost Score!)")
                     print(f"  Gauntlet Score: {gauntlet_score:.2f} (Reality)")
                     print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
-                    print(f"  Agent failed stress test")
+                    print(f"  Agent failed stress test - applying soft penalty")
+                    print(f"  Population keeps evolutionary progress (no snapback)")
                     if self.use_candidate_queue and self.candidate_queue:
                         print(f"  Trying next candidate from queue ({len(self.candidate_queue)} remaining)")
                     else:
@@ -3415,11 +3419,12 @@ class ERLTrainer:
                         'gauntlet/rejected_gauntlet_score': gauntlet_score,
                     }, step=self.generation)
 
-                    # SNAPBACK MECHANISM: Restore pre-Gauntlet state
-                    # This prevents population poisoning from the failed Ghost strategy
-                    self.restore_gauntlet_snapshot()
+                    # SOFT PENALTY APPROACH: No population snapback
+                    # The failed candidate will naturally be weeded out by selection pressure
+                    # The rest of the population keeps their evolutionary progress
+                    # This allows the model to continue forward instead of being trapped in the past
 
-                    # Return to NORMAL state (already set by restore_gauntlet_snapshot, but kept for clarity)
+                    # Return to NORMAL state
                     self.breakthrough_state = BreakthroughState.NORMAL
                     self.breakthrough_candidate = None
                     self.stabilization_generations_elapsed = 0
@@ -4017,7 +4022,10 @@ class ERLTrainer:
     def save_gauntlet_snapshot(self):
         """
         Save a snapshot of the trainer state before entering the Gauntlet.
-        This allows us to restore the population if the Gauntlet fails.
+        Currently used for debugging and safety backup purposes.
+
+        NOTE: Snapshots are no longer used for automatic restoration on Gauntlet failure.
+        The soft penalty approach allows the population to keep evolutionary progress.
 
         The snapshot includes:
         - Population (all agents)
@@ -4057,8 +4065,8 @@ class ERLTrainer:
             'confirmed_breakthroughs': self.confirmed_breakthroughs,
             'breakthrough_history': self.breakthrough_history,
             'stabilization_generations_elapsed': 0,  # Reset stabilization counter
-            # Queue-based candidate tracking (save for snapback)
-            'candidate_queue': self.candidate_queue.copy(),  # Preserve queue across snapback
+            # Queue-based candidate tracking (save for debugging)
+            'candidate_queue': self.candidate_queue.copy(),  # Preserve queue state
             'tested_candidate_indices': list(self.tested_candidate_indices),  # Convert set to list for JSON
             'pending_baseline_update': self.pending_baseline_update,
             # Hall of Fame turnover tracking (for consistency mode)
@@ -4092,7 +4100,11 @@ class ERLTrainer:
     def restore_gauntlet_snapshot(self):
         """
         Restore the trainer state from the Gauntlet snapshot.
-        This is called when a Gauntlet fails (REJECTED state).
+
+        NOTE: This function is retained for manual debugging but is NO LONGER
+        automatically called when a Gauntlet fails. The soft penalty approach
+        allows the population to keep their evolutionary progress instead of
+        resetting to the past.
 
         Restores:
         - Population (all agents)
@@ -4105,10 +4117,10 @@ class ERLTrainer:
             print("⚠ No Gauntlet snapshot found - cannot restore")
             return
 
-        print(f"\n🔄 RESTORING Gauntlet Snapshot (Snapback Mechanism)...")
+        print(f"\n🔄 RESTORING Gauntlet Snapshot (Manual Restore)...")
         print(f"{'='*60}")
-        print(f"  Population Poisoning Detected!")
-        print(f"  Reverting to pre-Gauntlet state to protect genetic diversity")
+        print(f"  NOTE: This is a manual/debug restore operation")
+        print(f"  Reverting to pre-Gauntlet state")
         print(f"{'='*60}")
 
         # 1. Restore Population
@@ -4185,7 +4197,7 @@ class ERLTrainer:
             except Exception as e:
                 print(f"❌ Error restoring Hall of Fame: {e}")
 
-        print(f"✓ Snapback Complete - Population restored to healthy state")
+        print(f"✓ Manual Restore Complete - Population restored to snapshot state")
         print(f"{'='*60}\n")
 
     def update_feature_importance(self, attention_weights: torch.Tensor):

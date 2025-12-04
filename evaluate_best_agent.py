@@ -3,7 +3,7 @@ Evaluation script for best agent from last training run.
 
 This script:
 1. Loads the best agent from the last run (using last_run.json or specified run name)
-2. Evaluates on 7 validation slices (as done in training: 4 from quarters + 3 straddling)
+2. Evaluates on 10 validation slices (as done in training: 4 from quarters + 3 straddling + 3 random)
 3. Outputs detailed trade information including:
    - Stock purchased, entry/exit dates, prices
    - Whether it was an active sell or automatic liquidation
@@ -126,14 +126,15 @@ class AgentEvaluator:
 
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
         """
-        Generate 7 random validation slices from validation set.
+        Generate 10 validation slices from validation set.
 
         Divides validation period into 4 equal quarters, then samples:
         - 4 slices from within each quarter
         - 3 straddling slices between quarters
+        - 3 random slices from anywhere in the validation period
 
         Returns:
-            List of 7 tuples: (start_idx, end_idx, trading_end_idx)
+            List of 10 tuples: (start_idx, end_idx, trading_end_idx)
         """
         # Set seed for reproducibility
         np.random.seed(42)
@@ -178,6 +179,13 @@ class AgentEvaluator:
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
                 trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
                 slices.append((start_idx, end_idx, trading_end_idx))
+
+        # 3. Sample 3 completely random slices from entire validation range (3 slices)
+        for _ in range(3):
+            start_idx = np.random.randint(min_start, max_start + 1)
+            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+            trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+            slices.append((start_idx, end_idx, trading_end_idx))
 
         return slices
 
@@ -302,7 +310,7 @@ class AgentEvaluator:
         val_slices = self.generate_validation_slices()
 
         # Evaluate on validation slices
-        print("Evaluating on 7 Validation Slices (4 from quarters + 3 straddling)...")
+        print("Evaluating on 10 Validation Slices (4 from quarters + 3 straddling + 3 random)...")
         print("-" * 80)
 
         for i, (start, end, trading_end) in enumerate(val_slices, 1):

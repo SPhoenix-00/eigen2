@@ -4,7 +4,7 @@ Evaluation script for best agent and all Hall of Fame agents from last training 
 This script:
 1. Loads the best agent from the last run (using last_run.json or specified run name)
 2. Loads all agents from the Hall of Fame
-3. Evaluates each agent on 7 validation slices (as done in training: 4 from quarters + 3 straddling)
+3. Evaluates each agent on 10 validation slices (as done in training: 4 from quarters + 3 straddling + 3 random)
 4. Outputs summary comparison of all agents (no detailed trades file)
 """
 
@@ -149,7 +149,7 @@ class HallOfFameEvaluator:
         return agents
 
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
-        """Generate 7 random validation slices from validation set (4 from quarters + 3 straddling)."""
+        """Generate 10 validation slices from validation set (4 from quarters + 3 straddling + 3 random)."""
         # Set seed for reproducibility
         np.random.seed(42)
 
@@ -193,6 +193,13 @@ class HallOfFameEvaluator:
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
                 trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
                 slices.append((start_idx, end_idx, trading_end_idx))
+
+        # 3. Sample 3 completely random slices from entire validation range (3 slices)
+        for _ in range(3):
+            start_idx = np.random.randint(min_start, max_start + 1)
+            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+            trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+            slices.append((start_idx, end_idx, trading_end_idx))
 
         return slices
 
@@ -255,6 +262,9 @@ class HallOfFameEvaluator:
             ("Val_5", val_slices[4]),
             ("Val_6", val_slices[5]),
             ("Val_7", val_slices[6]),
+            ("Val_8", val_slices[7]),
+            ("Val_9", val_slices[8]),
+            ("Val_10", val_slices[9]),
         ]
 
         # Evaluate each agent
@@ -374,7 +384,7 @@ class HallOfFameEvaluator:
             f.write("="*80 + "\n\n")
 
             # Header
-            slice_names = ['Val_1', 'Val_2', 'Val_3', 'Val_4', 'Val_5', 'Val_6', 'Val_7', 'Average']
+            slice_names = ['Val_1', 'Val_2', 'Val_3', 'Val_4', 'Val_5', 'Val_6', 'Val_7', 'Val_8', 'Val_9', 'Val_10', 'Average']
             header = f"{'Agent':<50} " + " ".join([f"{s:>12}" for s in slice_names])
             f.write(header + "\n")
             f.write("-" * len(header) + "\n")

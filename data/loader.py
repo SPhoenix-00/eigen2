@@ -302,7 +302,7 @@ class StockDataLoader:
 
         THREE-TIER STRATEGY (strict separation):
         1. Training data: Used for training episodes only
-        2. Validation data: Used for walk-forward validation during training (7 slices per generation)
+        2. Validation data: Used for walk-forward validation during training (10 slices per generation)
         3. Committee holdout: Reserved EXCLUSIVELY for committee.py (NEVER used during training)
 
         The last Config.COMMITTEE_HOLDOUT_DAYS are completely excluded from training/validation.
@@ -343,7 +343,7 @@ class StockDataLoader:
         print(f"             It is reserved EXCLUSIVELY for committee.py")
         print(f"\n  Validation strategy:")
         print(f"    - Training episodes: Sample from training data only")
-        print(f"    - Walk-forward validation: 7 slices from validation set each generation")
+        print(f"    - Walk-forward validation: 10 slices from validation set each generation")
         print(f"    - Committee testing: Holdout set (separate from training/validation)")
 
         return self.train_indices, self.val_indices

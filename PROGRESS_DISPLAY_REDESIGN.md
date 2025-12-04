@@ -87,7 +87,7 @@ Added a new section showing gauntlet state when in gauntlet mode:
 - 🟠 STABILIZATION - Locking training on candidate (shows progress bar)
 - 🔴 GAUNTLET - Running rigorous 20-slice validation
 - 🟢 CONFIRMED - Breakthrough confirmed (shows briefly)
-- ⚫ REJECTED - Breakthrough rejected, snapback triggered (shows briefly)
+- ⚫ REJECTED - Breakthrough rejected, soft penalty applied (shows briefly)
 
 **Consistency Mode Shows:**
 - HoF Turnovers: X / Y

@@ -159,7 +159,7 @@ class AgentEvaluator:
 
     def discover_agents(self, agent_dir: Path) -> List[Path]:
         """
-        Discover all agent .pth files in directory.
+        Discover all agent .pth files in directory (searches recursively).
 
         Args:
             agent_dir: Directory to search for agents
@@ -167,19 +167,25 @@ class AgentEvaluator:
         Returns:
             List of agent file paths
         """
-        print(f"\nDiscovering agents in: {agent_dir}")
+        print(f"\nDiscovering agents in: {agent_dir} (recursive search)")
 
         if not agent_dir.exists():
             print(f"   ERROR: Directory does not exist: {agent_dir}")
             return []
 
-        # Find all .pth files
-        agent_files = list(agent_dir.glob("*.pth"))
+        # Find all .pth files recursively using **/*.pth
+        agent_files = list(agent_dir.glob("**/*.pth"))
 
-        print(f"   Found {len(agent_files)} agent files")
-
-        if len(agent_files) == 0:
-            print("   No .pth files found in directory")
+        # Show which subdirectories contain agents
+        if len(agent_files) > 0:
+            subdirs = set(f.parent.relative_to(agent_dir) for f in agent_files)
+            print(f"   Found {len(agent_files)} agent files across {len(subdirs)} subdirectories")
+            if len(subdirs) <= 10:  # Show subdirs if not too many
+                for subdir in sorted(subdirs):
+                    subdir_files = [f for f in agent_files if f.parent.relative_to(agent_dir) == subdir]
+                    print(f"      {subdir}: {len(subdir_files)} agents")
+        else:
+            print("   No .pth files found in directory or subdirectories")
             print("   Make sure the directory contains agent checkpoint files")
 
         return agent_files
