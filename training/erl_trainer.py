@@ -3811,6 +3811,22 @@ class ERLTrainer:
                     storage_path_override=buffer_storage_path
                 )
                 print(f"✓ Loaded on-disk replay buffer metadata ({len(self.replay_buffer)} transitions)")
+
+                # Resize buffer if config has changed since checkpoint was saved
+                # The deque's maxlen is baked into the saved object, so we need to
+                # explicitly create a new deque with the updated capacity
+                if self.replay_buffer.capacity != Config.BUFFER_SIZE:
+                    print(f"⚠️ Resizing buffer: {self.replay_buffer.capacity:,} -> {Config.BUFFER_SIZE:,}")
+                    from collections import deque
+
+                    # Create new deque with NEW capacity and copy old data
+                    new_deque = deque(self.replay_buffer.buffer, maxlen=Config.BUFFER_SIZE)
+
+                    # Update buffer object
+                    self.replay_buffer.buffer = new_deque
+                    self.replay_buffer.capacity = Config.BUFFER_SIZE
+                    print(f"✓ Buffer resized successfully ({len(self.replay_buffer):,} transitions preserved)")
+
                 buffer_loaded = True
             except Exception as e:
                 print(f"❌ Error loading buffer: {e}")
