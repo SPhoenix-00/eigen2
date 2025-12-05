@@ -2208,14 +2208,23 @@ class ERLTrainer:
         #         self.buffer_saved_on_first_fill = True
 
         print(f"\n--- Training Population (Buffer: {len(self.replay_buffer)}) ---")
-        
+
+        # Use reduced gradient steps during stabilization phase for faster iteration
+        # Normal: 32 steps × 192 batch = 6,144 samples (full exploration)
+        # Stabilization: 10 steps × 192 batch = 1,920 samples (maintenance training)
+        if self.breakthrough_state == BreakthroughState.STABILIZATION:
+            gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION_STABILIZATION
+            print(f"  [Stabilization Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} normal)]")
+        else:
+            gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION
+
         # Train each agent
         for agent in tqdm(self.population, desc="Training agents"):
             actor_losses = []
             critic_losses = []
 
             # Multiple gradient steps per agent
-            for step in range(Config.GRADIENT_STEPS_PER_GENERATION):
+            for step in range(gradient_steps):
                 # Gradient accumulation loop
                 for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
                     # Get next batch from DataLoader (already prefetched by workers)
