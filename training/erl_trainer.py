@@ -691,6 +691,9 @@ class ERLTrainer:
                         self.replay_buffer.storage_path = Path(new_buffer_storage_path)
                         self.replay_buffer.storage_path.mkdir(parents=True, exist_ok=True)
                         print(f"  New transitions will be saved to: {new_buffer_storage_path}")
+
+                        # Enable gradual migration: as old transitions are evicted, delete them from external source
+                        self.replay_buffer.set_external_source_for_migration(str(external_path))
                     except Exception as e:
                         print(f"  ⚠ Error loading buffer metadata: {e}")
                         print(f"  Creating new buffer with storage in: {new_buffer_storage_path}")
@@ -712,6 +715,9 @@ class ERLTrainer:
                     self.replay_buffer.storage_path = Path(new_buffer_storage_path)
                     self.replay_buffer.storage_path.mkdir(parents=True, exist_ok=True)
                     print(f"  New transitions will be saved to: {new_buffer_storage_path}")
+
+                    # Enable gradual migration: as old transitions are evicted, delete them from external source
+                    self.replay_buffer.set_external_source_for_migration(str(external_path))
             else:
                 print(f"⚠ External buffer path does not exist: {external_path}")
                 print(f"  Creating new buffer instead")

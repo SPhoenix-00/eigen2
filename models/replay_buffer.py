@@ -406,7 +406,53 @@ class OnDiskReplayBuffer(IterableDataset):
         # Statistics
         self.total_added = 0
 
+        # Migration tracking: external source path for gradual migration
+        # When set, transitions from this path will be deleted as they're evicted
+        self.external_source_path = None
+        self.migrated_count = 0  # Track how many external files have been cleaned up
+
         print(f"OnDiskReplayBuffer initialized. Capacity: {self.capacity}, Storage: {self.storage_path}")
+
+    def set_external_source_for_migration(self, external_path: str):
+        """
+        Set up gradual migration from an external buffer source.
+
+        When transitions are evicted from the buffer, if they originated from the
+        external source path, they will be deleted. This gradually moves all data
+        to the current run's storage and cleans up the external source.
+
+        Args:
+            external_path: Path to the external buffer_storage folder being migrated from
+        """
+        self.external_source_path = Path(external_path).resolve()
+        self.migrated_count = 0
+
+        # Count how many current buffer entries are from external source
+        external_count = sum(1 for p in self.buffer if self._is_from_external_source(p))
+        print(f"  Migration enabled: {external_count} transitions will be migrated from {external_path}")
+        print(f"  External files will be deleted as they are evicted from the buffer")
+
+    def _is_from_external_source(self, file_path: str) -> bool:
+        """Check if a file path is from the external source (for migration cleanup)."""
+        if self.external_source_path is None:
+            return False
+        try:
+            path = Path(file_path).resolve()
+            return path.parent == self.external_source_path or str(self.external_source_path) in str(path)
+        except Exception:
+            return False
+
+    def _delete_if_external(self, file_path: str):
+        """Delete file if it's from the external source being migrated."""
+        if self._is_from_external_source(file_path):
+            try:
+                os.remove(file_path)
+                self.migrated_count += 1
+                # Log progress periodically
+                if self.migrated_count % 10000 == 0:
+                    print(f"  Migration progress: {self.migrated_count} external files cleaned up")
+            except OSError:
+                pass  # File might already be gone
 
     def add(self, state: np.ndarray, action: np.ndarray, reward: float,
             next_state: np.ndarray, done: bool):
@@ -441,10 +487,14 @@ class OnDiskReplayBuffer(IterableDataset):
 
             # If an old file was popped, delete it from disk
             if old_path_to_remove:
-                try:
-                    os.remove(old_path_to_remove)
-                except OSError:
-                    pass # File might already be gone
+                # Check if this is from external source (migration cleanup)
+                if self._is_from_external_source(old_path_to_remove):
+                    self._delete_if_external(old_path_to_remove)
+                else:
+                    try:
+                        os.remove(old_path_to_remove)
+                    except OSError:
+                        pass  # File might already be gone
 
             self.total_added += 1
 
@@ -513,6 +563,10 @@ class OnDiskReplayBuffer(IterableDataset):
 
         # Delete old files from disk in parallel
         if old_paths_to_remove:
+            # Track migration cleanup separately
+            external_paths = [p for p in old_paths_to_remove if self._is_from_external_source(p)]
+            local_paths = [p for p in old_paths_to_remove if not self._is_from_external_source(p)]
+
             def delete_file(path):
                 try:
                     os.remove(path)
@@ -520,7 +574,14 @@ class OnDiskReplayBuffer(IterableDataset):
                     pass
 
             with ThreadPoolExecutor(max_workers=4) as executor:
-                executor.map(delete_file, old_paths_to_remove)
+                executor.map(delete_file, local_paths)
+                executor.map(delete_file, external_paths)
+
+            # Update migration counter
+            if external_paths:
+                self.migrated_count += len(external_paths)
+                if self.migrated_count % 10000 < len(external_paths):
+                    print(f"  Migration progress: {self.migrated_count} external files cleaned up")
 
         elapsed = time.time() - start_time
         rate = num_transitions / elapsed if elapsed > 0 else 0
