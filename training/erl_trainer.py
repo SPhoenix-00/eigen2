@@ -19,6 +19,7 @@ import math
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
+from multiprocessing import shared_memory
 from enum import Enum
 from dataclasses import dataclass
 
@@ -45,6 +46,7 @@ from torch.utils.data import DataLoader
 _worker_env_config = None  # Shared environment configuration
 _worker_env = None  # Reusable environment instance (created once per worker)
 _worker_agent_cache = None  # Cache of reconstructed agents {state_hash: agent}
+_worker_shm_refs = []  # Keep references to shared memory objects to prevent cleanup
 
 
 def _init_worker(env_config):
@@ -55,22 +57,57 @@ def _init_worker(env_config):
     Stores the env_config in a global variable so it doesn't need to be
     pickled with every task (significant performance improvement).
 
-    OPTIMIZATION: Creates a reusable environment and agent cache per worker
-    to avoid recreating these expensive objects for every task.
-
-    If env_config contains shared memory names (for data arrays), reconstructs
-    the numpy arrays from shared memory to avoid pickling large arrays.
+    OPTIMIZATION: Uses shared memory for large numpy arrays to avoid serialization.
+    The env_config contains shared memory names instead of actual arrays, and we
+    reconstruct the arrays from shared memory here (zero-copy).
 
     Args:
-        env_config: Environment configuration dict with data arrays or shared memory refs
+        env_config: Environment configuration dict with shared memory refs for arrays
     """
-    global _worker_env_config, _worker_env, _worker_agent_cache
-    _worker_env_config = env_config
+    global _worker_env_config, _worker_env, _worker_agent_cache, _worker_shm_refs
+
+    # Reconstruct arrays from shared memory if using shared memory mode
+    if 'shm_data_array_name' in env_config:
+        # Shared memory mode - reconstruct arrays from shared memory (zero-copy)
+        shm_data = shared_memory.SharedMemory(name=env_config['shm_data_array_name'])
+        shm_data_full = shared_memory.SharedMemory(name=env_config['shm_data_array_full_name'])
+
+        # Keep references to prevent garbage collection
+        _worker_shm_refs = [shm_data, shm_data_full]
+
+        # Reconstruct numpy arrays from shared memory buffers
+        data_array = np.ndarray(
+            env_config['data_array_shape'],
+            dtype=env_config['data_array_dtype'],
+            buffer=shm_data.buf
+        )
+        data_array_full = np.ndarray(
+            env_config['data_array_full_shape'],
+            dtype=env_config['data_array_full_dtype'],
+            buffer=shm_data_full.buf
+        )
+
+        # Build actual env_config for TradingEnvironment
+        actual_env_config = {
+            'data_array': data_array,
+            'data_array_full': data_array_full,
+            'dates': env_config['dates'],
+            'normalization_stats': env_config['normalization_stats'],
+            'start_idx': env_config['start_idx'],
+            'end_idx': env_config['end_idx'],
+            'trading_end_idx': env_config['trading_end_idx'],
+            'is_training': env_config.get('is_training', True),
+            'consistency_mode': env_config.get('consistency_mode', False)
+        }
+        _worker_env_config = actual_env_config
+    else:
+        # Legacy mode - arrays passed directly (fallback)
+        _worker_env_config = env_config
 
     # Create ONE environment per worker that will be reused for all tasks
     # This avoids recreating the environment ~10 times per worker
     from environment.trading_env import TradingEnvironment
-    _worker_env = TradingEnvironment(**env_config)
+    _worker_env = TradingEnvironment(**_worker_env_config)
 
     # Cache for reconstructed agents to avoid rebuilding same agent multiple times
     # Key: hash of agent_state, Value: DDPGAgent instance
@@ -879,6 +916,11 @@ class ERLTrainer:
             consistency_mode=self.consistency_mode
         )
 
+        # Initialize shared memory for parallel worker data (eliminates serialization overhead)
+        # This creates shared memory blocks for data arrays that workers can access directly
+        print("Initializing shared memory for parallel workers...")
+        self._init_shared_memory()
+
         # Load heroes from Hall of Fame if specified (must happen after env creation, before checkpoint load)
         if self.heroes_hof_dir:
             self.load_heroes_from_hof()
@@ -910,6 +952,119 @@ class ERLTrainer:
             print(f"✓ Wrote run info to {last_run_file}")
         except Exception as e:
             print(f"⚠ Could not write last_run.json: {e}")
+
+    def _init_shared_memory(self):
+        """
+        Initialize shared memory blocks for data arrays used by parallel workers.
+
+        This eliminates the serialization overhead when spawning workers by storing
+        the large numpy arrays in shared memory. Workers can then access the data
+        directly without copying (zero-copy access).
+
+        Creates:
+        - shm_data_array: Shared memory for reduced feature array (for observations)
+        - shm_data_array_full: Shared memory for full feature array (for rewards)
+        """
+        # Store references to prevent garbage collection
+        self._shm_blocks = []
+
+        # Create shared memory for data_array (reduced features for model)
+        data_array = self.data_loader.data_array
+        self._shm_data_array = shared_memory.SharedMemory(
+            create=True,
+            size=data_array.nbytes
+        )
+        # Copy data into shared memory
+        shm_data_view = np.ndarray(
+            data_array.shape,
+            dtype=data_array.dtype,
+            buffer=self._shm_data_array.buf
+        )
+        shm_data_view[:] = data_array[:]
+        self._shm_blocks.append(self._shm_data_array)
+
+        # Create shared memory for data_array_full (full features for environment)
+        data_array_full = self.data_loader.data_array_full
+        self._shm_data_array_full = shared_memory.SharedMemory(
+            create=True,
+            size=data_array_full.nbytes
+        )
+        # Copy data into shared memory
+        shm_full_view = np.ndarray(
+            data_array_full.shape,
+            dtype=data_array_full.dtype,
+            buffer=self._shm_data_array_full.buf
+        )
+        shm_full_view[:] = data_array_full[:]
+        self._shm_blocks.append(self._shm_data_array_full)
+
+        # Store metadata for workers
+        self._shm_metadata = {
+            'shm_data_array_name': self._shm_data_array.name,
+            'data_array_shape': data_array.shape,
+            'data_array_dtype': str(data_array.dtype),
+            'shm_data_array_full_name': self._shm_data_array_full.name,
+            'data_array_full_shape': data_array_full.shape,
+            'data_array_full_dtype': str(data_array_full.dtype),
+        }
+
+        data_mb = data_array.nbytes / (1024 * 1024)
+        full_mb = data_array_full.nbytes / (1024 * 1024)
+        print(f"  ✓ Shared memory initialized: {data_mb:.1f}MB + {full_mb:.1f}MB = {data_mb + full_mb:.1f}MB total")
+
+    def _cleanup_shared_memory(self):
+        """
+        Clean up shared memory blocks when trainer is done.
+
+        IMPORTANT: Must be called before trainer exits to avoid memory leaks.
+        Shared memory persists beyond process lifetime if not explicitly freed.
+        """
+        if hasattr(self, '_shm_blocks'):
+            for shm in self._shm_blocks:
+                try:
+                    shm.close()
+                    shm.unlink()  # Remove the shared memory block
+                except Exception as e:
+                    print(f"⚠ Error cleaning up shared memory: {e}")
+            self._shm_blocks = []
+            print("✓ Shared memory cleaned up")
+
+    def __del__(self):
+        """Destructor - ensure shared memory is cleaned up even if train() doesn't complete."""
+        try:
+            self._cleanup_shared_memory()
+        except Exception:
+            pass  # Ignore errors during destruction
+
+    def _get_shared_env_config(self, start_idx: int, end_idx: int, trading_end_idx: int,
+                               is_training: bool = True) -> dict:
+        """
+        Build environment config dict using shared memory references.
+
+        This config is passed to worker initializers and contains shared memory
+        names instead of actual arrays, eliminating serialization overhead.
+
+        Args:
+            start_idx: Episode start index
+            end_idx: Episode end index
+            trading_end_idx: Last day to open new positions
+            is_training: Whether environment is in training mode
+
+        Returns:
+            Dict with shared memory references and other config
+        """
+        return {
+            # Shared memory references (no serialization needed)
+            **self._shm_metadata,
+            # Small data that must be pickled (but fast)
+            'dates': self.data_loader.dates,
+            'normalization_stats': self.normalization_stats,
+            'start_idx': start_idx,
+            'end_idx': end_idx,
+            'trading_end_idx': trading_end_idx,
+            'is_training': is_training,
+            'consistency_mode': self.consistency_mode
+        }
 
     def _create_dataloader(self):
         """
@@ -1029,17 +1184,13 @@ class ERLTrainer:
         else:
             print(f"  Using standard mode: {num_episodes} episodes, 0.4*mean + 0.6*min")
 
-        # Prepare environment config for parallel workers
-        env_config = {
-            'data_array': self.data_loader.data_array,
-            'dates': self.data_loader.dates,
-            'normalization_stats': self.normalization_stats,
-            'start_idx': self.train_start_idx,
-            'end_idx': self.train_end_idx,
-            'trading_end_idx': self.train_start_idx + Config.TRADING_PERIOD_DAYS,
-            'data_array_full': self.data_loader.data_array_full,
-            'consistency_mode': self.consistency_mode
-        }
+        # Prepare environment config using shared memory (eliminates serialization overhead)
+        env_config = self._get_shared_env_config(
+            start_idx=self.train_start_idx,
+            end_idx=self.train_end_idx,
+            trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+            is_training=True
+        )
 
         # Prepare tasks for parallel evaluation
         tasks = []
@@ -1812,17 +1963,14 @@ class ERLTrainer:
         num_exploratory = len(self.population) - num_elites
         print(f"Teacher Forcing enabled: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
 
-        # Prepare environment config (shared across all workers)
-        env_config = {
-            'data_array': self.data_loader.data_array,
-            'dates': self.data_loader.dates,
-            'normalization_stats': self.normalization_stats,
-            'start_idx': self.train_start_idx,
-            'end_idx': self.train_end_idx,
-            'trading_end_idx': self.train_start_idx + Config.TRADING_PERIOD_DAYS,
-            'data_array_full': self.data_loader.data_array_full,
-            'consistency_mode': self.consistency_mode
-        }
+        # Prepare environment config using shared memory (eliminates serialization overhead)
+        # Workers reconstruct arrays from shared memory names (zero-copy access)
+        env_config = self._get_shared_env_config(
+            start_idx=self.train_start_idx,
+            end_idx=self.train_end_idx,
+            trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+            is_training=True
+        )
 
         # Prepare all evaluation tasks with file ID allocation
         # Pre-allocate file IDs for each worker to avoid conflicts
@@ -2413,18 +2561,14 @@ class ERLTrainer:
             print(f"✓ All {len(self.population)} agents validated (100% cache hit rate)")
             return validation_results
 
-        # Prepare environment config for workers (same as evaluation)
-        env_config = {
-            'data_array': self.data_loader.data_array,
-            'dates': self.data_loader.dates,
-            'normalization_stats': self.normalization_stats,
-            'start_idx': self.val_start_idx,  # Dummy value, overridden per slice in reset()
-            'end_idx': self.val_end_idx,  # Dummy value, overridden per slice in reset()
-            'trading_end_idx': self.val_start_idx + Config.TRADING_PERIOD_DAYS,  # Dummy value
-            'data_array_full': self.data_loader.data_array_full,
-            'is_training': False,  # Validation mode: no noise
-            'consistency_mode': self.consistency_mode
-        }
+        # Prepare environment config using shared memory (eliminates serialization overhead)
+        # Note: start_idx/end_idx are dummy values here, overridden per slice in worker reset()
+        env_config = self._get_shared_env_config(
+            start_idx=self.val_start_idx,
+            end_idx=self.val_end_idx,
+            trading_end_idx=self.val_start_idx + Config.TRADING_PERIOD_DAYS,
+            is_training=False  # Validation mode: no noise
+        )
 
         # Execute validation in parallel
         num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
@@ -2863,10 +3007,7 @@ class ERLTrainer:
 
                 # Log breakthrough detection to wandb
                 wandb.log({
-                    'gauntlet/state': 'DETECTION',
-                    'gauntlet/candidate_spike_score': best_fitness,
-                    'gauntlet/detection_generation': self.generation,
-                    'gauntlet/quorum_size': len(top_breaching),
+                    'gauntlet/stabilization_phase': 0,
                 }, step=self.generation)
 
                 return True
@@ -2923,10 +3064,7 @@ class ERLTrainer:
 
             # Log queue-based breakthrough detection to wandb
             wandb.log({
-                'gauntlet/state': 'DETECTION',
-                'gauntlet/candidate_spike_score': best_fitness,
-                'gauntlet/detection_generation': self.generation,
-                'heroes/queue_selection': 1,
+                'gauntlet/stabilization_phase': 0,
             }, step=self.generation)
 
             return True
@@ -2995,9 +3133,7 @@ class ERLTrainer:
 
             # Log stabilization start to wandb
             wandb.log({
-                'gauntlet/state': 'STABILIZATION',
-                'gauntlet/stabilization_started': self.generation,
-                'gauntlet/candidate_spike_score': self.breakthrough_candidate.spike_score,
+                'gauntlet/stabilization_phase': 0,
             }, step=self.generation)
 
         elif self.breakthrough_state == BreakthroughState.STABILIZATION:
@@ -3024,11 +3160,7 @@ class ERLTrainer:
 
                     # Log ghost detection to wandb
                     wandb.log({
-                        'gauntlet/ghost_detected': 1,
-                        'gauntlet/stabilization_aborted_at': self.stabilization_generations_elapsed,
-                        'gauntlet/collapse_fitness': best_val_fitness,
-                        'gauntlet/baseline': self.confirmed_baseline,
-                        'gauntlet/state': 'NORMAL',
+                        'gauntlet/stabilization_phase': 0,
                     }, step=self.generation)
 
                     # Reset to NORMAL state
@@ -3039,9 +3171,7 @@ class ERLTrainer:
 
             # Log stabilization progress to wandb
             wandb.log({
-                'gauntlet/stabilization_progress': self.stabilization_generations_elapsed,
-                'gauntlet/stabilization_target': Config.STABILIZATION_GENERATIONS,
-                'gauntlet/current_best_fitness': best_val_fitness if validation_results and len(validation_results) > 0 else None,
+                'gauntlet/stabilization_phase': self.stabilization_generations_elapsed,
             }, step=self.generation)
 
             if self.stabilization_generations_elapsed >= Config.STABILIZATION_GENERATIONS:
@@ -3055,8 +3185,7 @@ class ERLTrainer:
                     print(f"\n⚠️ WARNING: No validation results available at gauntlet entry!")
                     print(f"  Returning to NORMAL state.\n")
                     wandb.log({
-                        'gauntlet/error': 'no_validation_results',
-                        'gauntlet/state': 'NORMAL',
+                        'gauntlet/stabilization_phase': 0,
                     }, step=self.generation)
                     self.breakthrough_state = BreakthroughState.NORMAL
                     self.stabilization_generations_elapsed = 0
@@ -3141,13 +3270,6 @@ class ERLTrainer:
                                     # Set a flag to skip the normal agent selection below
                                     fallback_used = True
 
-                                    # Log fallback success
-                                    wandb.log({
-                                        'gauntlet/fallback_used': 1,
-                                        'gauntlet/fallback_agent_idx': original_agent_idx,
-                                        'gauntlet/fallback_val_fitness': original_val_fitness,
-                                        'gauntlet/fallback_improvement': original_improvement,
-                                    }, step=self.generation)
                                 else:
                                     print(f"  Original agent also fails to clear hurdle ({original_improvement*100:.1f}% < {self.breakthrough_threshold*100:.0f}%)")
                                     fallback_used = False
@@ -3172,10 +3294,7 @@ class ERLTrainer:
 
                         # Log failure to wandb
                         wandb.log({
-                            'gauntlet/failed_to_enter': 1,
-                            'gauntlet/best_val_fitness': best_val_fitness,
-                            'gauntlet/improvement': improvement,
-                            'gauntlet/state': 'NORMAL',
+                            'gauntlet/stabilization_phase': 0,
                         }, step=self.generation)
 
                         # Return to NORMAL state
@@ -3219,10 +3338,7 @@ class ERLTrainer:
 
                 # Log gauntlet test start to wandb
                 wandb.log({
-                    'gauntlet/state': 'GAUNTLET',
-                    'gauntlet/test_started': self.generation,
-                    'gauntlet/candidate_val_fitness': best_val_fitness,
-                    'gauntlet/candidate_improvement': improvement,
+                    'gauntlet/stabilization_phase': 0,
                 }, step=self.generation)
 
                 # Run Gauntlet validation on the current best agent
@@ -3319,8 +3435,7 @@ class ERLTrainer:
                         )
 
                         if promoted:
-                            # Log Global 50 promotion
-                            wandb.log({'gauntlet/global50_promotion': 1}, step=self.generation)
+                            pass  # Global 50 promotion succeeded
                     else:
                         # Normal mode: Can compare scores but cannot promote to Global 50
                         print(f"   ⓘ Global 50 promotion skipped (requires --consistency mode)")
@@ -3354,18 +3469,11 @@ class ERLTrainer:
                             self.check_hof_turnover()
 
                     # Log to wandb
-                    log_data = {
-                        'gauntlet/breakthrough_confirmed': 1,
+                    wandb.log({
                         'gauntlet/confirmed_breakthroughs': self.confirmed_breakthroughs,
                         'gauntlet/confirmed_baseline': self.confirmed_baseline,
-                        'gauntlet/gauntlet_score': gauntlet_score,
-                        'gauntlet/spike_score': self.breakthrough_candidate.spike_score,
-                        'gauntlet/first_breakthrough': 1 if is_first_breakthrough else 0,
-                    }
-                    if self.use_candidate_queue:
-                        log_data['gauntlet/pending_baseline'] = self.pending_baseline_update if self.pending_baseline_update else 0.0
-                        log_data['gauntlet/candidates_remaining'] = len(self.candidate_queue)
-                    wandb.log(log_data, step=self.generation)
+                        'gauntlet/stabilization_phase': 0,
+                    }, step=self.generation)
 
                     # Return to NORMAL state
                     self.breakthrough_state = BreakthroughState.NORMAL
@@ -3395,9 +3503,7 @@ class ERLTrainer:
 
                     # Log to wandb
                     wandb.log({
-                        'gauntlet/breakthrough_rejected': 1,
-                        'gauntlet/rejected_spike_score': self.breakthrough_candidate.spike_score,
-                        'gauntlet/rejected_gauntlet_score': gauntlet_score,
+                        'gauntlet/stabilization_phase': 0,
                     }, step=self.generation)
 
                     # SOFT PENALTY APPROACH: No population snapback
@@ -4454,13 +4560,12 @@ class ERLTrainer:
                 "fitness/best_ever": self.best_fitness,
             }
 
-            # Add gauntlet state machine overview tracking
+            # Add gauntlet metrics
             if self.gauntlet_mode_enabled:
                 fitness_log.update({
-                    "gauntlet/current_state": self.breakthrough_state.value,
-                    "gauntlet/baseline": self.confirmed_baseline,
-                    "gauntlet/breakthrough_count": self.confirmed_breakthroughs,
-                    "gauntlet/target_breakthroughs": self.target_breakthroughs,
+                    "gauntlet/confirmed_baseline": self.confirmed_baseline,
+                    "gauntlet/confirmed_breakthroughs": self.confirmed_breakthroughs,
+                    "gauntlet/stabilization_phase": self.stabilization_generations_elapsed if self.breakthrough_state == BreakthroughState.STABILIZATION else 0,
                 })
 
             wandb.log(fitness_log, step=gen)
@@ -4661,8 +4766,7 @@ class ERLTrainer:
                 validation_log.update({
                     "gauntlet/confirmed_baseline": self.confirmed_baseline,
                     "gauntlet/confirmed_breakthroughs": self.confirmed_breakthroughs,
-                    "gauntlet/state": self.breakthrough_state.value,
-                    "gauntlet/stabilization_progress": self.stabilization_generations_elapsed,
+                    "gauntlet/stabilization_phase": self.stabilization_generations_elapsed if self.breakthrough_state == BreakthroughState.STABILIZATION else 0,
                 })
 
             wandb.log(validation_log, step=gen)
@@ -4774,21 +4878,12 @@ class ERLTrainer:
                 "mutation/plateau_detected": int(self.plateau_detected),
             }
 
-            # Add HoF turnover tracking (for consistency mode)
-            if self.consistency_mode:
-                log_data.update({
-                    "hall_of_fame/turnover_count": self.hof_turnover_count,
-                    "hall_of_fame/current_median": self.hof_current_median or 0.0,
-                    "hall_of_fame/target_turnovers": self.target_hof_turnovers,
-                    "hall_of_fame/turnover_progress": self.hof_turnover_count / self.target_hof_turnovers if self.target_hof_turnovers > 0 else 0.0,
-                })
 
             # Add heroes queue tracking (for consistency mode with heroes)
             if self.use_candidate_queue:
                 log_data.update({
                     "heroes/queue_size": len(self.candidate_queue),
                     "heroes/tested_count": len(self.tested_candidate_indices),
-                    "heroes/pending_baseline": self.pending_baseline_update or 0.0,
                 })
 
             wandb.log(log_data, step=gen)
@@ -5028,6 +5123,9 @@ class ERLTrainer:
 
         # Shutdown cloud sync
         self.cloud_sync.shutdown(wait=False)
+
+        # Clean up shared memory (must be done before process exits)
+        self._cleanup_shared_memory()
 
         # Finish wandb run
         wandb.finish()

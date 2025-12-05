@@ -116,7 +116,7 @@ class Config:
     
     # Replay buffer
     BUFFER_SIZE = 2000000  # Maximum buffer size
-    BATCH_SIZE = 192
+    BATCH_SIZE = 96
     MIN_BUFFER_SIZE = 23200  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     
@@ -160,7 +160,7 @@ class Config:
     
     # Training
     GRADIENT_STEPS_PER_GENERATION = 32
-    GRADIENT_ACCUMULATION_STEPS = 1
+    GRADIENT_ACCUMULATION_STEPS = 2
     
     # ============ Training Parameters ============
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
