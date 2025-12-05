@@ -159,7 +159,9 @@ def create_next_generation(population: List[DDPGAgent],
                           elite_scores: List[float] = None,
                           mutation_rate: float = None,
                           mutation_std: float = None,
-                          heroes_mode: bool = False) -> List[DDPGAgent]:
+                          heroes_mode: bool = False,
+                          injection_pool: List[DDPGAgent] = None,
+                          injection_count: int = 0) -> List[DDPGAgent]:
     """
     Create next generation using selection, crossover, and mutation.
     Calculates population segments dynamically using Config.POPULATION_SIZE.
@@ -171,11 +173,15 @@ def create_next_generation(population: List[DDPGAgent],
         mutation_rate: Fraction of weights to mutate. If None, uses Config.MUTATION_RATE
         mutation_std: Standard deviation of mutation noise. If None, uses Config.MUTATION_STD
         heroes_mode: If True, use heroes mode fractions (more elites, fewer mutants)
+        injection_pool: Optional list of agents to inject (mutated) instead of random mutants
+        injection_count: Number of agents to inject from the pool (replaces mutants)
 
     Note:
         - Training fitness (fitness_scores): Used for tournament selection to maintain diversity
         - Validation fitness (elite_scores): Used for selecting elites to prevent overfitting
         - DDPG weight updates use training data from the replay buffer (separate process)
+        - injection_pool/injection_count: Used in heroes+consistency mode to inject mutated
+          Global50 agents until first breakthrough (prevents HoF poisoning)
     """
     pop_size = Config.POPULATION_SIZE
 
@@ -249,19 +255,44 @@ def create_next_generation(population: List[DDPGAgent],
     next_gen.extend(offspring)
     print(f"  Offspring: {len(offspring)} agents via crossover")
     
-    # 3. Mutation: Create mutants from elites
+    # 3. Mutation: Create mutants from elites (or inject Global50 agents if pool provided)
     # Use the new dynamic 'num_mutants'
     mutants = []
-    if num_mutants > 0 and len(elites) > 0: # Must have mutants to create and elites to mutate from
-        for _ in range(num_mutants):
-            # Select elite to mutate
-            elite = elites[np.random.randint(len(elites))]
-            mutant = mutate(elite, mutation_rate=mutation_rate, mutation_std=mutation_std)
-            mutant.is_elite = False  # Mark as exploratory for replay buffer diversity
-            mutants.append(mutant)
+    injected_count = 0
+
+    # Determine how many to inject from Global50 pool vs standard mutation
+    effective_injection_count = 0
+    if injection_pool and injection_count > 0 and len(injection_pool) > 0:
+        # Cap injection at available mutant slots and pool size
+        effective_injection_count = min(injection_count, num_mutants, len(injection_pool))
+
+    if num_mutants > 0:
+        # First, inject mutated Global50 agents if pool is provided
+        if effective_injection_count > 0:
+            for _ in range(effective_injection_count):
+                # Select random agent from injection pool
+                pool_agent = injection_pool[np.random.randint(len(injection_pool))]
+                # Apply mutation to the cloned agent
+                injected = mutate(pool_agent, mutation_rate=mutation_rate, mutation_std=mutation_std)
+                injected.is_elite = False  # Mark as exploratory for replay buffer diversity
+                mutants.append(injected)
+                injected_count += 1
+
+        # Fill remaining mutant slots with standard mutations from elites
+        remaining_mutants = num_mutants - effective_injection_count
+        if remaining_mutants > 0 and len(elites) > 0:
+            for _ in range(remaining_mutants):
+                # Select elite to mutate
+                elite = elites[np.random.randint(len(elites))]
+                mutant = mutate(elite, mutation_rate=mutation_rate, mutation_std=mutation_std)
+                mutant.is_elite = False  # Mark as exploratory for replay buffer diversity
+                mutants.append(mutant)
 
     next_gen.extend(mutants)
-    print(f"  Mutants: {len(mutants)} agents via mutation")
+    if injected_count > 0:
+        print(f"  Mutants: {len(mutants)} agents ({injected_count} from Global50 pool, {len(mutants) - injected_count} from elites)")
+    else:
+        print(f"  Mutants: {len(mutants)} agents via mutation")
     
     # --- Fill remaining slots if any due to rounding ---
     # This is a robust way to ensure size match

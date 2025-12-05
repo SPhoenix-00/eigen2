@@ -813,6 +813,12 @@ class ERLTrainer:
         self.tested_candidate_indices = set()  # Set of agent indices that have been tested in Gauntlet
         self.pending_baseline_update = None  # Store baseline update until all candidates exhausted
 
+        # Global50 injection pool (for heroes+consistency mode)
+        # Instead of seeding HoF with Global50 agents (which can poison the HoF),
+        # we inject mutated Global50 agents into the population until first breakthrough
+        self.global50_injection_pool = []  # Stores loaded Global50 agents for injection
+        self.global50_injection_count = 20  # Number of Global50 agents to inject per generation
+
         # Breakthrough threshold based on mode
         self.breakthrough_threshold = (Config.BREAKTHROUGH_THRESHOLD_CONSISTENCY
                                       if self.consistency_mode
@@ -1202,70 +1208,22 @@ class ERLTrainer:
                     print(f"   ... and {len(admitted) - 5} more")
                 print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
         else:
-            # Consistency mode: Validate heroes and seed HoF with top 10
-            # This prevents the "all heroes must gauntlet" queue problem
-            print("\n--- Validating heroes for Hall of Fame (Consistency Mode) ---")
+            # Consistency mode: DO NOT seed HoF with heroes (prevents HoF poisoning)
+            # Instead, store heroes for population injection until first breakthrough
+            print("\n--- Consistency Mode: HoF starts EMPTY (gauntlet-only admission) ---")
+            print("  Heroes will NOT be added to HoF directly.")
+            print("  Only agents that pass the Gauntlet can enter the HoF.")
+            print("  This prevents HoF poisoning from lucky validation scores.")
 
-            # Generate validation slices for hero evaluation
-            self.current_generation_val_slices = self.generate_validation_slices()
+            # Store all loaded heroes in the injection pool for use during evolution
+            # These will be used to inject mutated Global50 agents until first breakthrough
+            self.global50_injection_pool = [agent.clone() for agent in self.population]
+            print(f"\n  Stored {len(self.global50_injection_pool)} heroes in injection pool")
+            print(f"  Will inject {self.global50_injection_count} mutated heroes per generation until first breakthrough")
 
-            # Validate top heroes and add to HoF
-            num_to_validate = min(len(self.population), 42)  # Validate enough to ensure good HoF seeding
-            hero_validation_results = []
-
-            for idx in tqdm(range(num_to_validate), desc="Validating heroes for HoF"):
-                val_results = self.validate_agent_cached(self.population[idx])
-                val_fitness = val_results['fitness']
-                agent_roi = val_results.get('roi', 0.0)
-
-                # Use validation fitness as combined score (no training penalty for initial heroes)
-                combined_fitness = val_fitness
-
-                hero_validation_results.append({
-                    'idx': idx,
-                    'combined_fitness': combined_fitness,
-                    'roi': agent_roi,
-                    'raw_pnl': val_results.get('raw_pnl', 0.0),
-                    'expectancy': val_results.get('expectancy', 0.0),
-                    'quality_count': val_results.get('quality_count', 0),
-                    'total_trades': val_results.get('total_trades', 0)
-                })
-
-            # Sort by combined fitness and add top 10 to HoF
-            hero_validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
-
-            # Build candidates for HoF (top 10 only)
-            hof_candidates = []
-            for result in hero_validation_results[:10]:  # Only top 10 for HoF
-                agent_idx = result['idx']
-                combined_score = result['combined_fitness']
-                agent_roi = result['roi']
-                agent_expectancy = result['expectancy']
-                train_fitness = 0.0  # Heroes don't have training fitness
-                quality_count = result.get('quality_count', 0)
-                total_trades = result.get('total_trades', 0)
-                val_fitness = combined_score  # Use combined fitness as validation fitness
-                base_combined_fitness = combined_score
-                hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
-                                     train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
-
-            # Add heroes to Hall of Fame
-            admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
-
-            # Print HoF initialization summary
-            admitted = [(idx, score, action) for idx, score, action in admission_results
-                       if action == 'admitted' or action.startswith('replaced_')]
-            if admitted:
-                hof_stats = self.hall_of_fame.get_stats()
-                print(f"\n⭐ Hall of Fame seeded with {len(admitted)} heroes (Consistency Mode):")
-                for agent_idx, score, _ in admitted[:5]:  # Show top 5
-                    roi = next((r['roi'] for r in hero_validation_results if r['idx'] == agent_idx), 0.0)
-                    print(f"   + Agent {agent_idx}: Combined={score:.2f}, ROI={roi:.2f}%")
-                if len(admitted) > 5:
-                    print(f"   ... and {len(admitted) - 5} more")
-                print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
-                print(f"\n   Goal: {self.target_hof_turnovers} complete turnovers")
-                print(f"   Each turnover raises the quality bar (all HoF agents must exceed previous median)")
+            print(f"\n   Goal: {self.target_hof_turnovers} complete turnovers")
+            print(f"   Each turnover raises the quality bar (all HoF agents must exceed previous median)")
+            print(f"   HoF will fill organically through gauntlet-confirmed breakthroughs")
 
         print(f"\nUsing heroes mode elite/offspring fractions:")
         print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_ELITE_FRAC)} agents)")
@@ -2174,6 +2132,16 @@ class ERLTrainer:
         # Use validation scores for elite selection if provided, otherwise fall back to training fitness
         elite_scores = validation_scores if validation_scores is not None else fitness_scores
 
+        # Determine if we should inject Global50 agents
+        # Only inject until first breakthrough in heroes+consistency mode
+        injection_pool = None
+        injection_count = 0
+        if (self.consistency_mode and self.heroes_hof_dir is not None and
+            self.confirmed_breakthroughs == 0 and len(self.global50_injection_pool) > 0):
+            injection_pool = self.global50_injection_pool
+            injection_count = self.global50_injection_count
+            print(f"  Global50 injection active (until first breakthrough): {injection_count} agents")
+
         # Create next generation with adaptive mutation parameters
         # Elitism uses validation fitness for robustness and generalization
         # Tournament selection uses training fitness to maintain exploration
@@ -2183,7 +2151,9 @@ class ERLTrainer:
             elite_scores=elite_scores,
             mutation_rate=self.current_mutation_rate,
             mutation_std=self.current_mutation_std,
-            heroes_mode=self.heroes_hof_dir is not None
+            heroes_mode=self.heroes_hof_dir is not None,
+            injection_pool=injection_pool,
+            injection_count=injection_count
         )
 
         # Explicitly delete old agents and force GC
