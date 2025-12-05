@@ -2008,9 +2008,16 @@ class ERLTrainer:
                 # Transitions were written to disk during parallel evaluation - just add paths to buffer
                 print(f"  Transitions already written to disk by workers (parallel I/O)")
 
-                # CRITICAL FIX: Track if buffer was full BEFORE adding new data
-                # The deque auto-truncates when appending to maxlen, so we must check BEFORE append
-                buffer_was_full = len(self.replay_buffer.buffer) >= self.replay_buffer.capacity
+                # CRITICAL FIX: Reset if buffer IS full OR WILL overflow during this update
+                # We must catch the specific generation where we cross the threshold (e.g. 967k -> 1.04M)
+                # The previous fix checked if buffer was already full, but failed to account for
+                # the generation where the buffer becomes full for the first time.
+                current_size = len(self.replay_buffer.buffer)
+                num_new = len(all_transition_file_paths)
+                capacity = self.replay_buffer.capacity
+
+                # Reset if we are about to drop files (overflow) OR if we are already at capacity
+                should_reset_workers = (current_size + num_new > capacity) or (current_size >= capacity)
 
                 for file_path in all_transition_file_paths:
                     self.replay_buffer.buffer.append(file_path)
@@ -2018,11 +2025,9 @@ class ERLTrainer:
                 # Update total_added counter
                 self.replay_buffer.total_added = file_id_counter
 
-                # FIX: Force DataLoader reset if we added data to a full buffer
-                # This ensures workers get the new file paths and stop looking for old ones
-                # that will be deleted by cleanup_orphans
-                if buffer_was_full:
-                    print("  Buffer rotated: Resetting DataLoader workers to refresh file references...")
+                # Force DataLoader reset to ensure workers drop references to files we just pushed out
+                if should_reset_workers:
+                    print("  Buffer rotation detected: Resetting DataLoader workers to refresh file references...")
                     self._create_dataloader()
                     print("  ✓ DataLoader reset complete")
 
