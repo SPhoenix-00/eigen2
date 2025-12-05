@@ -197,10 +197,10 @@ class ReplayBuffer:
             print(f"  ✓ Buffer loaded (size: {len(new_buffer.buffer)}).")
             return new_buffer
         except Exception as e:
-            print(f"  ❌ ERROR loading buffer: {e}")
-            print("  Could not load buffer. Creating a new empty one.")
-            # Return a new, empty buffer as a fallback
-            return ReplayBuffer(capacity=Config.REPLAY_BUFFER_SIZE)
+            print(f"  ❌ FATAL ERROR loading buffer: {e}")
+            print("  Buffer checkpoint exists but is corrupted. Cannot resume safely.")
+            print("  Fix or remove the corrupted file manually before resuming.")
+            raise RuntimeError(f"Failed to load existing buffer checkpoint: {e}") from e
 
 
 class PrioritizedReplayBuffer(ReplayBuffer):
@@ -724,6 +724,8 @@ class OnDiskReplayBuffer(IterableDataset):
             
             return new_buffer
         except Exception as e:
-            print(f"  ❌ ERROR loading buffer metadata: {e}")
-            print("  Could not load. Creating a new empty one.")
-            return OnDiskReplayBuffer(capacity=Config.BUFFER_SIZE, storage_path=storage_path_override or 'buffer_storage')
+            print(f"  ❌ FATAL ERROR loading buffer metadata: {e}")
+            print("  Buffer checkpoint exists but is corrupted. Cannot resume safely.")
+            print("  Resuming with an empty buffer would cause cleanup_orphans to delete all existing transition files!")
+            print("  Fix or remove the corrupted file manually before resuming.")
+            raise RuntimeError(f"Failed to load existing buffer checkpoint: {e}") from e
