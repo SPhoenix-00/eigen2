@@ -426,11 +426,7 @@ class OnDiskReplayBuffer(IterableDataset):
         """
         self.external_source_path = Path(external_path).resolve()
         self.migrated_count = 0
-
-        # Count how many current buffer entries are from external source
-        external_count = sum(1 for p in self.buffer if self._is_from_external_source(p))
-        print(f"  Migration enabled: {external_count} transitions will be migrated from {external_path}")
-        print(f"  External files will be deleted as they are evicted from the buffer")
+        print(f"  Migration enabled: external files will be deleted as they are evicted")
 
     def _is_from_external_source(self, file_path: str) -> bool:
         """Check if a file path is from the external source (for migration cleanup)."""
