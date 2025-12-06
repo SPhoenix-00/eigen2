@@ -527,17 +527,23 @@ class GlobalHallOfFame:
             with open(scoresheet_path, 'w') as f:
                 json.dump(dropout.to_dict(), f, indent=2)
 
-            # Cloud: Upload to archive/ and delete from agents/
+            # Cloud: Upload to archive/
             cloud_archive_pth = f"{self.cloud_base}/archive/{filename}"
             cloud_archive_json = f"{self.cloud_base}/archive/{scoresheet_filename}"
+            cloud_agents_pth = f"{self.cloud_base}/agents/{filename}"
 
             if local_dst.exists():
                 self.cloud_sync.upload_file(str(local_dst), cloud_archive_pth, background=False)
             self.cloud_sync.upload_file(str(scoresheet_path), cloud_archive_json, background=False)
 
-            # Delete from cloud agents/ (handled by next sync or manually)
-            # Note: Most cloud APIs require explicit delete, but we can let it accumulate
-            # or clean up in a separate maintenance script
+            # Delete from cloud agents/ ONLY after confirming archive exists
+            if self.cloud_sync.file_exists(cloud_archive_pth):
+                if self.cloud_sync.delete_file(cloud_agents_pth):
+                    print(f"  ✓ Archived and deleted: {filename}")
+                else:
+                    print(f"  ⚠ Archived but failed to delete from agents/: {filename}")
+            else:
+                print(f"  ⚠ Archive upload failed, keeping in agents/: {filename}")
 
     def get_random_agent(self) -> Optional[DDPGAgent]:
         """

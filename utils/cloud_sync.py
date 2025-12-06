@@ -227,6 +227,68 @@ class CloudSync:
             print(f"Warning: Failed to download {cloud_path}: {e}")
             return False
 
+    def delete_file(self, cloud_path: str) -> bool:
+        """
+        Delete a file from cloud storage.
+
+        Args:
+            cloud_path: Path in cloud storage to delete
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        if self.provider == "local":
+            return False
+
+        try:
+            if self.provider == "s3":
+                self.client.delete_object(Bucket=self.bucket_name, Key=cloud_path)
+
+            elif self.provider == "gcs":
+                blob = self.bucket.blob(cloud_path)
+                blob.delete()
+
+            elif self.provider == "azure":
+                blob_client = self.container_client.get_blob_client(cloud_path)
+                blob_client.delete_blob()
+
+            return True
+
+        except Exception as e:
+            print(f"Warning: Failed to delete {cloud_path}: {e}")
+            return False
+
+    def file_exists(self, cloud_path: str) -> bool:
+        """
+        Check if a file exists at the given cloud path.
+
+        Args:
+            cloud_path: Full path in cloud storage
+
+        Returns:
+            True if file exists, False otherwise
+        """
+        if self.provider == "local":
+            return False
+
+        try:
+            if self.provider == "s3":
+                self.client.head_object(Bucket=self.bucket_name, Key=cloud_path)
+                return True
+
+            elif self.provider == "gcs":
+                blob = self.bucket.blob(cloud_path)
+                return blob.exists()
+
+            elif self.provider == "azure":
+                blob_client = self.container_client.get_blob_client(cloud_path)
+                return blob_client.exists()
+
+        except Exception:
+            return False
+
+        return False
+
     def wait_for_uploads(self, timeout: Optional[float] = None):
         """
         Wait for all background uploads to complete.

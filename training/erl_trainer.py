@@ -2303,7 +2303,7 @@ class ERLTrainer:
             self.confirmed_breakthroughs == 0 and len(self.global50_injection_pool) > 0):
             injection_pool = self.global50_injection_pool
             injection_count = self.global50_injection_count
-            print(f"  Global50 injection active (until first breakthrough): {injection_count} agents")
+            print(f"  Global50 injection active (until first breakthrough): max {injection_count} agents")
 
         # Create next generation with adaptive mutation parameters
         # Elitism uses validation fitness for robustness and generalization
@@ -3136,6 +3136,49 @@ class ERLTrainer:
             print(f"  Goal: Allow Actor/Critic networks to converge on new behavior")
             print(f"{'='*60}")
 
+            # LOCK THE POPULATION: Replace all agents with mutants of the breakthrough candidate
+            # This ensures the "Siege" actually happens - the candidate survives and the population
+            # focuses on fine-tuning that specific strategy rather than evolving away from it
+            print(f"\n  🔒 LOCKING POPULATION: Replacing all agents with mutants of Candidate (Agent {self.breakthrough_candidate.agent_idx})")
+
+            # Store old population for cleanup
+            old_population = self.population
+
+            # Keep the candidate itself as the first agent (Elite)
+            new_population = [self.breakthrough_candidate.agent.clone()]
+            new_population[0].agent_id = 0
+            new_population[0].is_elite = True
+
+            # Use a tighter mutation rate for stabilization (fine-tuning, not exploration)
+            # This creates small variations to find the optimal point in the strategy's neighborhood
+            stabilization_mutation_rate = 0.05  # 5% of weights mutated (vs typical 10-20%)
+            stabilization_mutation_std = self.current_mutation_std * 0.5  # Half the normal noise
+
+            # Fill the rest of the population with mutants of the candidate
+            for i in range(1, Config.POPULATION_SIZE):
+                mutant = mutate(
+                    self.breakthrough_candidate.agent,
+                    mutation_rate=stabilization_mutation_rate,
+                    mutation_std=stabilization_mutation_std
+                )
+                mutant.agent_id = i
+                mutant.is_elite = False
+                new_population.append(mutant)
+
+            # Replace the trainer's population
+            self.population = new_population
+
+            print(f"  ✓ Population locked: 1 elite + {Config.POPULATION_SIZE - 1} mutants")
+            print(f"  ✓ Stabilization mutation: rate={stabilization_mutation_rate}, std={stabilization_mutation_std:.4f}")
+
+            # Cleanup old population to free memory
+            for agent in old_population:
+                del agent
+            del old_population
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             self.breakthrough_state = BreakthroughState.STABILIZATION
             self.breakthrough_candidate.stabilization_start_gen = self.generation
             self.stabilization_generations_elapsed = 0
@@ -3172,10 +3215,35 @@ class ERLTrainer:
                         'gauntlet/stabilization_phase': 0,
                     }, step=self.generation)
 
-                    # Reset to NORMAL state
-                    self.breakthrough_state = BreakthroughState.NORMAL
+                    # Clear the current candidate
                     self.breakthrough_candidate = None
                     self.stabilization_generations_elapsed = 0
+
+                    # CRITICAL: Try next candidate from queue BEFORE evolution scrambles indices
+                    if self.use_candidate_queue and self.candidate_queue:
+                        print(f"\n  ⏩ Immediately switching to next candidate ({len(self.candidate_queue)} remaining)...")
+                        next_candidate_found = self._select_next_candidate_from_queue()
+
+                        if next_candidate_found:
+                            print(f"  ✓ Next candidate loaded - will enter STABILIZATION on next state machine cycle")
+                            return  # Exit early - stay in DETECTION state
+                        else:
+                            print(f"  ✗ Queue exhausted - returning to normal evolution")
+
+                    # FIX: If we have a pending update from a previous candidate in this batch, apply it now!
+                    if self.pending_baseline_update is not None:
+                        old_baseline = self.confirmed_baseline
+                        self.confirmed_baseline = self.pending_baseline_update
+                        self.confirmed_breakthroughs += 1
+                        print(f"\n  ⚠️ Candidate failed stabilization, but recovering pending breakthrough...")
+                        print(f"     Old Baseline: {old_baseline:.2f}")
+                        print(f"     New Baseline: {self.confirmed_baseline:.2f}")
+                        print(f"  ✓ Breakthrough recovered! Count: {self.confirmed_breakthroughs}")
+                        self.pending_baseline_update = None
+                        self.tested_candidate_indices.clear()
+
+                    # Only reach here if no next candidate was found
+                    self.breakthrough_state = BreakthroughState.NORMAL
                     return
 
             # Log stabilization progress to wandb
@@ -3192,12 +3260,39 @@ class ERLTrainer:
                 # Get the current best agent from this generation's validation
                 if validation_results is None or len(validation_results) == 0:
                     print(f"\n⚠️ WARNING: No validation results available at gauntlet entry!")
-                    print(f"  Returning to NORMAL state.\n")
                     wandb.log({
                         'gauntlet/stabilization_phase': 0,
                     }, step=self.generation)
-                    self.breakthrough_state = BreakthroughState.NORMAL
+
+                    # Clear the current candidate
+                    self.breakthrough_candidate = None
                     self.stabilization_generations_elapsed = 0
+
+                    # CRITICAL: Try next candidate from queue BEFORE evolution scrambles indices
+                    if self.use_candidate_queue and self.candidate_queue:
+                        print(f"\n  ⏩ Immediately switching to next candidate ({len(self.candidate_queue)} remaining)...")
+                        next_candidate_found = self._select_next_candidate_from_queue()
+
+                        if next_candidate_found:
+                            print(f"  ✓ Next candidate loaded - will enter STABILIZATION on next state machine cycle")
+                            return  # Exit early - stay in DETECTION state
+                        else:
+                            print(f"  ✗ Queue exhausted - returning to normal evolution")
+
+                    # FIX: If we have a pending update from a previous candidate in this batch, apply it now!
+                    if self.pending_baseline_update is not None:
+                        old_baseline = self.confirmed_baseline
+                        self.confirmed_baseline = self.pending_baseline_update
+                        self.confirmed_breakthroughs += 1
+                        print(f"\n  ⚠️ No validation results, but recovering pending breakthrough...")
+                        print(f"     Old Baseline: {old_baseline:.2f}")
+                        print(f"     New Baseline: {self.confirmed_baseline:.2f}")
+                        print(f"  ✓ Breakthrough recovered! Count: {self.confirmed_breakthroughs}")
+                        self.pending_baseline_update = None
+                        self.tested_candidate_indices.clear()
+
+                    # Only reach here if no next candidate was found
+                    self.breakthrough_state = BreakthroughState.NORMAL
                     return
 
                 # Best agent is first in validation_results (already sorted by combined_fitness)
@@ -3292,13 +3387,12 @@ class ERLTrainer:
                         print(f"  No original breakthrough candidate available for fallback")
                         fallback_used = False
 
-                    # If fallback was not used or failed, return to NORMAL
+                    # If fallback was not used or failed, try next candidate or return to NORMAL
                     if not fallback_used:
                         print(f"\n{'='*60}")
                         print(f"❌ FAILED TO ENTER GAUNTLET")
                         print(f"{'='*60}")
                         print(f"  No agent clears the hurdle")
-                        print(f"  Returning to NORMAL state")
                         print(f"{'='*60}")
 
                         # Log failure to wandb
@@ -3306,10 +3400,35 @@ class ERLTrainer:
                             'gauntlet/stabilization_phase': 0,
                         }, step=self.generation)
 
-                        # Return to NORMAL state
-                        self.breakthrough_state = BreakthroughState.NORMAL
+                        # Clear the current candidate
                         self.breakthrough_candidate = None
                         self.stabilization_generations_elapsed = 0
+
+                        # CRITICAL: Try next candidate from queue BEFORE evolution scrambles indices
+                        if self.use_candidate_queue and self.candidate_queue:
+                            print(f"\n  ⏩ Immediately switching to next candidate ({len(self.candidate_queue)} remaining)...")
+                            next_candidate_found = self._select_next_candidate_from_queue()
+
+                            if next_candidate_found:
+                                print(f"  ✓ Next candidate loaded - will enter STABILIZATION on next state machine cycle")
+                                return  # Exit early - stay in DETECTION state
+                            else:
+                                print(f"  ✗ Queue exhausted - returning to normal evolution")
+
+                        # FIX: If we have a pending update from a previous candidate in this batch, apply it now!
+                        if self.pending_baseline_update is not None:
+                            old_baseline = self.confirmed_baseline
+                            self.confirmed_baseline = self.pending_baseline_update
+                            self.confirmed_breakthroughs += 1
+                            print(f"\n  ⚠️ Candidate failed hurdle, but recovering pending breakthrough...")
+                            print(f"     Old Baseline: {old_baseline:.2f}")
+                            print(f"     New Baseline: {self.confirmed_baseline:.2f}")
+                            print(f"  ✓ Breakthrough recovered! Count: {self.confirmed_breakthroughs}")
+                            self.pending_baseline_update = None
+                            self.tested_candidate_indices.clear()
+
+                        # Only reach here if no next candidate was found
+                        self.breakthrough_state = BreakthroughState.NORMAL
                         return
                 else:
                     # Current best agent clears the hurdle
@@ -3501,13 +3620,6 @@ class ERLTrainer:
                     print(f"  Confirmed Baseline: {self.confirmed_baseline:.2f}")
                     print(f"  Agent failed stress test - applying soft penalty")
                     print(f"  Population keeps evolutionary progress (no snapback)")
-                    if self.use_candidate_queue and self.candidate_queue:
-                        print(f"  Trying next candidate from queue ({len(self.candidate_queue)} remaining)")
-                    else:
-                        if self.use_candidate_queue:
-                            print(f"  No more candidates in queue - returning to normal evolution")
-                        else:
-                            print(f"  Returning to normal evolution")
                     print(f"{'='*60}")
 
                     # Log to wandb
@@ -3520,15 +3632,45 @@ class ERLTrainer:
                     # The rest of the population keeps their evolutionary progress
                     # This allows the model to continue forward instead of being trapped in the past
 
-                    # Return to NORMAL state
-                    self.breakthrough_state = BreakthroughState.NORMAL
+                    # Clear the current candidate
                     self.breakthrough_candidate = None
                     self.stabilization_generations_elapsed = 0
 
-                    # Queue-based recovery: Try next candidate instead of re-selecting the same agent
-                    # This prevents the "Ghost Loop" where the same lucky agent keeps getting selected
-                    # Note: check_for_breakthrough will be called on the next generation and will
-                    # automatically select the next candidate from the queue if available
+                    # CRITICAL FIX: Immediately select next candidate from queue BEFORE evolution runs
+                    # If we wait until the next generation, evolve_population() will scramble the indices
+                    # and the queue entries will point to wrong agents (Ghost Index Problem)
+                    if self.use_candidate_queue and self.candidate_queue:
+                        print(f"\n  ⏩ Immediately switching to next candidate ({len(self.candidate_queue)} remaining)...")
+                        next_candidate_found = self._select_next_candidate_from_queue()
+
+                        if next_candidate_found:
+                            # Successfully transitioned to DETECTION state
+                            # The next call to process_gauntlet_state_machine will move to STABILIZATION
+                            print(f"  ✓ Next candidate loaded - will enter STABILIZATION on next state machine cycle")
+                            return  # Exit early - don't reset to NORMAL
+                        else:
+                            print(f"  ✗ Queue exhausted - returning to normal evolution")
+                    else:
+                        if self.use_candidate_queue:
+                            print(f"  No more candidates in queue - returning to normal evolution")
+                        else:
+                            print(f"  Returning to normal evolution")
+
+                    # FIX: If we have a pending update from a previous candidate in this batch, apply it now!
+                    # This fixes the "Last Candidate Trap" where the batch credit is lost if the last candidate fails
+                    if self.pending_baseline_update is not None:
+                        old_baseline = self.confirmed_baseline
+                        self.confirmed_baseline = self.pending_baseline_update
+                        self.confirmed_breakthroughs += 1
+                        print(f"\n  ⚠️ Last candidate failed, but recovering pending breakthrough...")
+                        print(f"     Old Baseline: {old_baseline:.2f}")
+                        print(f"     New Baseline: {self.confirmed_baseline:.2f}")
+                        print(f"  ✓ Breakthrough recovered! Count: {self.confirmed_breakthroughs}")
+                        self.pending_baseline_update = None
+                        self.tested_candidate_indices.clear()
+
+                    # Only reach here if no next candidate was found
+                    self.breakthrough_state = BreakthroughState.NORMAL
 
     def check_hof_turnover(self):
         """
@@ -3714,8 +3856,13 @@ class ERLTrainer:
                         mutated_g50.is_elite = False  # Mark as exploratory
                         self.population[worst_idx] = mutated_g50
 
+                        # FIX 3: Update fitness score so evolve_population doesn't immediately cull the injected agent
+                        # Give it max fitness so it survives as an elite or parent
+                        max_fitness = np.max(fitness_scores) if len(fitness_scores) > 0 else 1.0
+                        fitness_scores[worst_idx] = max_fitness
+
                         print(f"  ✓ Injected mutated Global 50 agent")
-                        print(f"  ✓ Replaced worst agent (ID: {worst_idx}, Fitness: {worst_fitness:.2f})")
+                        print(f"  ✓ Replaced worst agent (ID: {worst_idx}, Fitness: {worst_fitness:.2f} → {max_fitness:.2f})")
                         print(f"  ✓ Mutation applied: {mutation_rate:.2f} rate")
 
                         # Clean up the original g50_agent to free memory
@@ -4923,6 +5070,10 @@ class ERLTrainer:
                 hof_champions = self.hall_of_fame.sample_random(k=num_to_inject)
 
                 if len(hof_champions) > 0:
+                    # FIX 2: Calculate max fitness BEFORE injection to give champions a "safe" high score
+                    # This ensures evolve_population keeps them instead of immediately culling
+                    max_fitness = np.max(fitness_scores) if len(fitness_scores) > 0 else 1.0
+
                     print(f"\n🏆 Hall of Fame Injection: Replacing {len(hof_champions)} worst agents with champions")
                     for i, (worst_idx, champion) in enumerate(zip(worst_indices, hof_champions)):
                         # Clone the champion and assign it a new agent ID
@@ -4936,9 +5087,26 @@ class ERLTrainer:
                         self.population[worst_idx] = champion_copy
                         del old_agent  # Free memory
 
-                        print(f"   Agent {worst_idx}: Fitness {old_fitness:.2f} → HoF Champion")
+                        # FIX 2: Update fitness_scores so evolve_population recognizes this as a high-value agent
+                        # Without this, the evolution step sees the old low score and culls the champion
+                        fitness_scores[worst_idx] = max_fitness
 
-            # 3. Evolve population using validation fitness for elite selection
+                        # Also update validation_scores if available (for elite selection)
+                        if validation_scores is not None and len(validation_scores) > worst_idx:
+                            max_val_fitness = np.max(validation_scores) if len(validation_scores) > 0 else max_fitness
+                            validation_scores[worst_idx] = max_val_fitness
+
+                        print(f"   Agent {worst_idx}: Fitness {old_fitness:.2f} → HoF Champion (Score: {max_fitness:.2f})")
+
+            # 3. Check for plateau and adjust mutation adaptively (FIX 3: MOVED BEFORE evolve_population)
+            # This must happen BEFORE evolution because:
+            # - check_and_adjust_mutation identifies the worst agent by index and replaces it
+            # - If we run it AFTER evolve_population, the indices are scrambled (crossover/mutation)
+            # - Running it before ensures we replace the actual worst agent from THIS generation
+            # Pass validation_scores to enable Global 50 injection (replaces worst agent)
+            self.check_and_adjust_mutation(self.best_validation_fitness, fitness_scores=validation_scores)
+
+            # 4. Evolve population using validation fitness for elite selection
             # Note: We pass both training fitness and validation scores
             # - training fitness: used for tournament selection and DDPG gradient updates
             # - validation scores: used for elite selection (ensures robust generalization)
@@ -4949,11 +5117,6 @@ class ERLTrainer:
 
             # 🔍 Memory tracking after evolution
             # log_memory(f"Gen {gen+1}: After evolve_population", show_objects=True)
-
-            # 4. Check for plateau and adjust mutation adaptively
-            # Run this every generation to detect plateaus quickly
-            # Pass validation_scores to enable Global 50 injection (replaces worst agent)
-            self.check_and_adjust_mutation(self.best_validation_fitness, fitness_scores=validation_scores)
 
             # Tensorboard logging (less frequent to reduce I/O)
             if (gen + 1) % Config.LOG_FREQUENCY == 0:

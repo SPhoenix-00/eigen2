@@ -780,6 +780,183 @@ class AgentEvaluator:
         print(f"\n✓ Local now matches cloud")
         print(f"   Local: {self.global_hof.local_dir}")
 
+    def cleanup_orphan_agents(self, dry_run: bool = True) -> dict:
+        """
+        Find and archive orphan agents (files in agents/ not listed in global50.json).
+
+        These orphans occur when agents are evicted from the top 50 but their .pth
+        files weren't properly deleted from cloud storage.
+
+        Args:
+            dry_run: If True, only report orphans without archiving them
+
+        Returns:
+            Dictionary with cleanup statistics
+        """
+        print(f"\n{'='*70}")
+        print("Orphan Agent Cleanup")
+        print(f"{'='*70}")
+        print(f"Mode: {'DRY RUN (report only)' if dry_run else 'CLEANUP (will archive orphans)'}")
+
+        if not self.global_hof.enabled:
+            print("⚠ Global 50 not enabled (local mode or disabled)")
+            return {'success': False, 'error': 'not_enabled'}
+
+        # Step 1: Get list of valid agents from global50.json
+        print("\n1. Loading global50.json...")
+        self.global_hof._download_global_ledger()
+        self.global_hof._load_local_ledger()
+
+        valid_filenames = set()
+        for entry in self.global_hof.entries:
+            valid_filenames.add(entry.get_filename())
+
+        print(f"   Found {len(valid_filenames)} valid agents in global50.json")
+
+        # Step 2: List all .pth files in cloud agents/ directory
+        print("\n2. Listing agent files in cloud storage...")
+        cloud_agents_prefix = f"{self.global_hof.cloud_base}/agents/"
+
+        cloud_agent_files = set()
+        try:
+            if self.cloud_sync.provider == "gcs":
+                blobs = self.cloud_sync.bucket.list_blobs(prefix=cloud_agents_prefix)
+                for blob in blobs:
+                    if blob.name.endswith('.pth'):
+                        filename = blob.name.split('/')[-1]
+                        cloud_agent_files.add(filename)
+            elif self.cloud_sync.provider == "s3":
+                paginator = self.cloud_sync.client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=self.cloud_sync.bucket_name, Prefix=cloud_agents_prefix)
+                for page in pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            if obj['Key'].endswith('.pth'):
+                                filename = obj['Key'].split('/')[-1]
+                                cloud_agent_files.add(filename)
+            elif self.cloud_sync.provider == "azure":
+                blob_list = self.cloud_sync.container_client.list_blobs(name_starts_with=cloud_agents_prefix)
+                for blob in blob_list:
+                    if blob.name.endswith('.pth'):
+                        filename = blob.name.split('/')[-1]
+                        cloud_agent_files.add(filename)
+            else:
+                print("   ⚠ Local provider - checking local files only")
+                if self.global_hof.local_agents_dir.exists():
+                    for f in self.global_hof.local_agents_dir.glob("*.pth"):
+                        cloud_agent_files.add(f.name)
+        except Exception as e:
+            print(f"   ✗ Error listing cloud files: {e}")
+            return {'success': False, 'error': str(e)}
+
+        print(f"   Found {len(cloud_agent_files)} .pth files in agents/")
+
+        # Step 3: Identify orphans
+        orphan_files = cloud_agent_files - valid_filenames
+        print(f"\n3. Identifying orphans...")
+        print(f"   Valid agents (in JSON):     {len(valid_filenames)}")
+        print(f"   Agent files (in storage):   {len(cloud_agent_files)}")
+        print(f"   Orphan files:               {len(orphan_files)}")
+
+        if not orphan_files:
+            print("\n✓ No orphan agents found. Storage is clean!")
+            return {
+                'success': True,
+                'valid_count': len(valid_filenames),
+                'storage_count': len(cloud_agent_files),
+                'orphan_count': 0,
+                'archived_count': 0
+            }
+
+        # List orphans
+        print(f"\n   Orphan files:")
+        for filename in sorted(orphan_files):
+            print(f"     - {filename}")
+
+        if dry_run:
+            print(f"\n{'='*70}")
+            print("DRY RUN COMPLETE")
+            print(f"{'='*70}")
+            print(f"Found {len(orphan_files)} orphan agent(s) that would be archived.")
+            print(f"\nTo actually archive these orphans, run:")
+            print(f"  python evaluate_for_global50.py --cleanup")
+            return {
+                'success': True,
+                'valid_count': len(valid_filenames),
+                'storage_count': len(cloud_agent_files),
+                'orphan_count': len(orphan_files),
+                'archived_count': 0,
+                'dry_run': True
+            }
+
+        # Step 4: Archive orphans (move from agents/ to archive/)
+        print(f"\n4. Archiving orphan agents...")
+        archived_count = 0
+        failed_count = 0
+
+        for filename in sorted(orphan_files):
+            cloud_src = f"{self.global_hof.cloud_base}/agents/{filename}"
+            cloud_dst = f"{self.global_hof.cloud_base}/archive/{filename}"
+            local_src = self.global_hof.local_agents_dir / filename
+            local_dst = self.global_hof.local_archive_dir / filename
+
+            try:
+                # Download to local archive if not already there
+                if not local_dst.exists():
+                    if local_src.exists():
+                        # Move locally
+                        import shutil
+                        shutil.move(str(local_src), str(local_dst))
+                    else:
+                        # Download from cloud to archive
+                        self.cloud_sync.download_file(cloud_src, str(local_dst))
+
+                # Upload to cloud archive
+                if local_dst.exists():
+                    self.cloud_sync.upload_file(str(local_dst), cloud_dst, background=False)
+
+                    # Verify archive exists before deleting from agents/
+                    if self.cloud_sync.file_exists(cloud_dst):
+                        if self.cloud_sync.delete_file(cloud_src):
+                            print(f"   ✓ Archived: {filename}")
+                            archived_count += 1
+
+                            # Also delete local source if it still exists
+                            if local_src.exists():
+                                local_src.unlink()
+                        else:
+                            print(f"   ⚠ Archived but failed to delete from agents/: {filename}")
+                            failed_count += 1
+                    else:
+                        print(f"   ⚠ Archive upload failed, keeping in agents/: {filename}")
+                        failed_count += 1
+                else:
+                    print(f"   ✗ Could not download {filename}")
+                    failed_count += 1
+
+            except Exception as e:
+                print(f"   ✗ Error archiving {filename}: {e}")
+                failed_count += 1
+
+        print(f"\n{'='*70}")
+        print("Cleanup Summary")
+        print(f"{'='*70}")
+        print(f"Orphan agents found:    {len(orphan_files)}")
+        print(f"Successfully archived:  {archived_count}")
+        if failed_count > 0:
+            print(f"Failed to archive:      {failed_count}")
+        print(f"{'='*70}")
+
+        return {
+            'success': True,
+            'valid_count': len(valid_filenames),
+            'storage_count': len(cloud_agent_files),
+            'orphan_count': len(orphan_files),
+            'archived_count': archived_count,
+            'failed_count': failed_count,
+            'dry_run': False
+        }
+
     def reevaluate_global50(self):
         """
         Re-evaluate all agents in Global 50 with current evaluation logic.
@@ -1196,6 +1373,12 @@ Examples:
 
   # Evaluate specific run's champions
   python evaluate_for_global50.py --agent-dir checkpoints/crimson-wave-456/hall_of_fame
+
+  # Find orphan agents (dry run - report only)
+  python evaluate_for_global50.py --cleanup-dry-run
+
+  # Archive orphan agents (move from agents/ to archive/)
+  python evaluate_for_global50.py --cleanup
         """
     )
 
@@ -1236,6 +1419,18 @@ Examples:
         '--eval',
         action='store_true',
         help='Re-evaluate all agents in Global 50 with current evaluation logic. Updates all metrics.'
+    )
+
+    parser.add_argument(
+        '--cleanup',
+        action='store_true',
+        help='Find and archive orphan agents (files in agents/ not in global50.json). Moves orphans to archive/.'
+    )
+
+    parser.add_argument(
+        '--cleanup-dry-run',
+        action='store_true',
+        help='Like --cleanup but only reports orphans without archiving them.'
     )
 
     args = parser.parse_args()
@@ -1320,6 +1515,18 @@ Examples:
         print("="*70)
 
         evaluator.reevaluate_global50()
+
+        print("\n" + "="*70)
+        return
+
+    # Handle --cleanup and --cleanup-dry-run modes
+    if args.cleanup or args.cleanup_dry_run:
+        print("\n" + "="*70)
+        print("CLEANUP MODE")
+        print("="*70)
+
+        dry_run = args.cleanup_dry_run  # --cleanup-dry-run = dry run, --cleanup = actually archive
+        evaluator.cleanup_orphan_agents(dry_run=dry_run)
 
         print("\n" + "="*70)
         return
