@@ -2035,8 +2035,11 @@ class ERLTrainer:
             futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
             # Collect results as they complete
+            # Track at agent level (not slice level) for cleaner progress display
             completed_tasks = 0
-            for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating (parallel)"):
+            completed_agents = set()
+            pbar = tqdm(total=len(self.population), desc="Evaluating agents")
+            for future in as_completed(futures):
                 task_idx = futures[future]
                 agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
 
@@ -2075,6 +2078,13 @@ class ERLTrainer:
                         'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
                     }))
                     completed_tasks += 1
+
+                # Update progress bar when an agent completes all its slices
+                if len(fitness_by_agent[agent_idx]) == num_episodes and agent_idx not in completed_agents:
+                    completed_agents.add(agent_idx)
+                    pbar.update(1)
+
+            pbar.close()
 
             # Aggregate results (same logic as sequential version)
             fitness_scores = []
@@ -3788,6 +3798,12 @@ class ERLTrainer:
         """
         # Add current fitness to history
         self.validation_fitness_history.append(current_val_fitness)
+
+        # GUARD: Disable plateau detection and Global 50 injection during Stabilization/Gauntlet phases
+        # During these phases, the population is locked to "1 elite + mutants of candidate" to force
+        # convergence on a specific strategy. Injecting foreign agents would pollute this process.
+        if self.breakthrough_state != BreakthroughState.NORMAL:
+            return
 
         # Need at least plateau_window generations to detect plateau
         if len(self.validation_fitness_history) < self.plateau_window:
