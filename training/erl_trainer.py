@@ -42,6 +42,18 @@ from torch.utils.data import DataLoader
 # from utils.memory_profiler import get_profiler, log_memory  # Memory profiling disabled
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """Custom encoder for NumPy data types."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
+
 # Global variables for worker processes
 _worker_env_config = None  # Shared environment configuration
 _worker_env = None  # Reusable environment instance (created once per worker)
@@ -4001,7 +4013,7 @@ class ERLTrainer:
         temp_path = checkpoint_dir / "trainer_state.tmp"
         try:
             with open(temp_path, 'w') as f:
-                json.dump(trainer_state, f, indent=4)
+                json.dump(trainer_state, f, indent=4, cls=NumpyEncoder)
             # Atomic replace
             temp_path.replace(state_path)
         except Exception as e:
@@ -4315,68 +4327,73 @@ class ERLTrainer:
 
         Note: Replay buffer is NOT saved in snapshot to save time/space.
         """
-        snapshot_dir = self.checkpoint_dir / "gauntlet_snapshot"
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            snapshot_dir = self.checkpoint_dir / "gauntlet_snapshot"
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n📸 Saving Gauntlet Snapshot (Gen {self.generation})...")
+            print(f"\n📸 Saving Gauntlet Snapshot (Gen {self.generation})...")
 
-        # 1. Save population
-        pop_dir = snapshot_dir / "population"
-        pop_dir.mkdir(exist_ok=True)
-        for agent in self.population:
-            agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
-            agent.save(str(agent_path))
+            # 1. Save population
+            pop_dir = snapshot_dir / "population"
+            pop_dir.mkdir(exist_ok=True)
+            for agent in self.population:
+                agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
+                agent.save(str(agent_path))
 
-        # 2. Save trainer state
-        trainer_state = {
-            'generation': self.generation,
-            'best_fitness': self.best_fitness,
-            'best_validation_fitness': self.best_validation_fitness,
-            'validation_fitness_history': self.validation_fitness_history,
-            'current_mutation_rate': self.current_mutation_rate,
-            'current_mutation_std': self.current_mutation_std,
-            'plateau_detected': self.plateau_detected,
-            'leverage_mode_active': self.leverage_mode_active,
-            'leverage_generations_remaining': self.leverage_generations_remaining,
-            'roi_hurdle_ema': self.roi_hurdle_ema,
-            # Gauntlet Mode state (save pre-detection state)
-            'gauntlet_mode_enabled': self.gauntlet_mode_enabled,
-            'breakthrough_state': BreakthroughState.NORMAL.value,  # Always restore to NORMAL
-            'confirmed_baseline': self.confirmed_baseline,
-            'confirmed_breakthroughs': self.confirmed_breakthroughs,
-            'breakthrough_history': self.breakthrough_history,
-            'stabilization_generations_elapsed': 0,  # Reset stabilization counter
-            # Queue-based candidate tracking (save for debugging)
-            'candidate_queue': self.candidate_queue.copy(),  # Preserve queue state
-            'tested_candidate_indices': list(self.tested_candidate_indices),  # Convert set to list for JSON
-            'pending_baseline_update': self.pending_baseline_update,
-            # Hall of Fame turnover tracking (for consistency mode)
-            'hof_turnover_count': self.hof_turnover_count,
-            'hof_current_median': self.hof_current_median,
-        }
-        state_path = snapshot_dir / "trainer_state.json"
-        with open(state_path, 'w') as f:
-            json.dump(trainer_state, f, indent=4)
+            # 2. Save trainer state
+            trainer_state = {
+                'generation': self.generation,
+                'best_fitness': self.best_fitness,
+                'best_validation_fitness': self.best_validation_fitness,
+                'validation_fitness_history': self.validation_fitness_history,
+                'current_mutation_rate': self.current_mutation_rate,
+                'current_mutation_std': self.current_mutation_std,
+                'plateau_detected': self.plateau_detected,
+                'leverage_mode_active': self.leverage_mode_active,
+                'leverage_generations_remaining': self.leverage_generations_remaining,
+                'roi_hurdle_ema': self.roi_hurdle_ema,
+                # Gauntlet Mode state (save pre-detection state)
+                'gauntlet_mode_enabled': self.gauntlet_mode_enabled,
+                'breakthrough_state': BreakthroughState.NORMAL.value,  # Always restore to NORMAL
+                'confirmed_baseline': self.confirmed_baseline,
+                'confirmed_breakthroughs': self.confirmed_breakthroughs,
+                'breakthrough_history': self.breakthrough_history,
+                'stabilization_generations_elapsed': 0,  # Reset stabilization counter
+                # Queue-based candidate tracking (save for debugging)
+                'candidate_queue': self.candidate_queue.copy(),  # Preserve queue state
+                'tested_candidate_indices': list(self.tested_candidate_indices),  # Convert set to list for JSON
+                'pending_baseline_update': self.pending_baseline_update,
+                # Hall of Fame turnover tracking (for consistency mode)
+                'hof_turnover_count': self.hof_turnover_count,
+                'hof_current_median': self.hof_current_median,
+            }
+            state_path = snapshot_dir / "trainer_state.json"
+            with open(state_path, 'w') as f:
+                json.dump(trainer_state, f, indent=4, cls=NumpyEncoder)
 
-        # 3. Save Hall of Fame (copy the current HoF directory)
-        if self.hall_of_fame is not None and len(self.hall_of_fame) > 0:
-            # Save HoF metadata
-            hof_snapshot_path = snapshot_dir / "hall_of_fame.json"
-            import shutil
-            hof_source = self.hall_of_fame.hof_dir / "hall_of_fame.json"
-            if hof_source.exists():
-                shutil.copy(hof_source, hof_snapshot_path)
+            # 3. Save Hall of Fame (copy the current HoF directory)
+            if self.hall_of_fame is not None and len(self.hall_of_fame) > 0:
+                # Save HoF metadata
+                hof_snapshot_path = snapshot_dir / "hall_of_fame.json"
+                import shutil
+                hof_source = self.hall_of_fame.hof_dir / "hall_of_fame.json"
+                if hof_source.exists():
+                    shutil.copy(hof_source, hof_snapshot_path)
 
-            # Copy HoF agent files
-            hof_agents_dir = snapshot_dir / "hof_agents"
-            hof_agents_dir.mkdir(exist_ok=True)
-            for entry in self.hall_of_fame.entries:
-                agent_path = self.hall_of_fame.hof_dir / f"hof_agent_{entry.agent_id}.pth"
-                if agent_path.exists():
-                    dest_path = hof_agents_dir / f"hof_agent_{entry.agent_id}.pth"
-                    shutil.copy(agent_path, dest_path)
+                # Copy HoF agent files
+                hof_agents_dir = snapshot_dir / "hof_agents"
+                hof_agents_dir.mkdir(exist_ok=True)
+                for entry in self.hall_of_fame.entries:
+                    agent_path = self.hall_of_fame.hof_dir / f"hof_agent_{entry.agent_id}.pth"
+                    if agent_path.exists():
+                        dest_path = hof_agents_dir / f"hof_agent_{entry.agent_id}.pth"
+                        shutil.copy(agent_path, dest_path)
 
-        print(f"✓ Snapshot saved to {snapshot_dir}")
+            print(f"✓ Snapshot saved to {snapshot_dir}")
+
+        except Exception as e:
+            print(f"⚠ FAILED TO SAVE GAUNTLET SNAPSHOT: {e}")
+            print(f"  Continuing training anyway...")
 
     def restore_gauntlet_snapshot(self):
         """
