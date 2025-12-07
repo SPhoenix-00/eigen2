@@ -3998,8 +3998,14 @@ class ERLTrainer:
             }
         }
         state_path = checkpoint_dir / "trainer_state.json"
-        with open(state_path, 'w') as f:
-            json.dump(trainer_state, f, indent=4)
+        temp_path = checkpoint_dir / "trainer_state.tmp"
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(trainer_state, f, indent=4)
+            # Atomic replace
+            temp_path.replace(state_path)
+        except Exception as e:
+            print(f"⚠ Failed to save trainer state: {e}")
 
         # 5. Save Hall of Fame
         if self.hall_of_fame is not None and len(self.hall_of_fame) > 0:
