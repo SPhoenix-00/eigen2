@@ -52,6 +52,7 @@ class Config:
     FORCED_EXIT_PENALTY_PCT = 0.01  # 3% penalty on position size (entry_price * coefficient)
     ZERO_TRADES_PENALTY_NORMAL = 2000.0  # Heavy penalty for making NO trades in normal mode
     ZERO_TRADES_PENALTY_CONSISTENCY = 500.0  # Penalty for making NO trades in consistency mode
+    ZERO_TRADES_PENALTY_GAUNTLET = 10.0  # Soft penalty during stabilization/gauntlet (tactical no-trade is acceptable)
     HURDLE_RATE = 0.006  # 0.6% transaction cost per trade (mimics real trading costs, disincentivizes high-volume strategies)
     CONVICTION_SCALING_POWER = 1.25  # Power law exponent for conviction scaling (convex reward surface encourages high-confidence bets)
 

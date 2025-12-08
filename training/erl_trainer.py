@@ -1793,7 +1793,14 @@ class ERLTrainer:
         # 1. Handle Inactivity
         # Keep your existing gradient logic for zero trades
         if total_trades == 0:
-            penalty = Config.ZERO_TRADES_PENALTY_CONSISTENCY if self.consistency_mode else Config.ZERO_TRADES_PENALTY_NORMAL
+            # In consistency mode during stabilization/gauntlet, use soft penalty
+            # (tactical no-trade in a slice is acceptable, not a ghost indicator)
+            if self.consistency_mode and self.breakthrough_state in (BreakthroughState.STABILIZATION, BreakthroughState.GAUNTLET):
+                penalty = Config.ZERO_TRADES_PENALTY_GAUNTLET
+            elif self.consistency_mode:
+                penalty = Config.ZERO_TRADES_PENALTY_CONSISTENCY
+            else:
+                penalty = Config.ZERO_TRADES_PENALTY_NORMAL
             return -penalty + stats.get('max_coefficient_during_episode', 0)
 
         # 2. Calculate Core Metrics
