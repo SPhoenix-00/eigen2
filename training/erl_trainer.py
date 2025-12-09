@@ -5045,6 +5045,7 @@ class ERLTrainer:
             # --- Hall of Fame Admission Logic ---
             # In consistency mode, only gauntlet-passing agents are admitted to HoF
             # In normal mode, all validated agents are eligible for HoF admission
+            admission_results = []  # Default to empty if consistency_mode skips normal admission
             if not self.consistency_mode:
                 # Re-evaluate all existing HoF entries with current median (EMA-based erosion)
                 # This ensures historical agents don't have unfair ROI advantages as median rises

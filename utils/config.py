@@ -128,7 +128,7 @@ class Config:
     
     # ============ ERL Parameters ============
     POPULATION_SIZE = 96 # Used to be 32 when context was 504 days 
-    NUM_GENERATIONS = 150
+    NUM_GENERATIONS = 200
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
     # Selection
