@@ -3845,7 +3845,7 @@ class ERLTrainer:
 
         # Inject up to 10 unique Global 50 agents (or as many as available)
         max_injections = 10
-        g50_agents_available = self.global_hof.get_size() if hasattr(self.global_hof, 'get_size') else len(self.global_hof.agents) if hasattr(self.global_hof, 'agents') else 0
+        g50_agents_available = len(self.global_hof.entries) if hasattr(self.global_hof, 'entries') else 0
         num_to_request = min(max_injections, g50_agents_available, len(fitness_scores))
 
         if num_to_request > 0:
