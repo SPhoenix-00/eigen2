@@ -125,6 +125,18 @@ class GlobalHallOfFame:
         self.checkpoint_dir = checkpoint_dir
         self.enabled = not disable_global50 and (cloud_sync.provider != "local")
 
+        # Critical warning if cloud credentials are missing
+        if cloud_sync.provider == "local" and not disable_global50:
+            print("\n" + "!"*70)
+            print("! CRITICAL: Cloud credentials not configured!")
+            print("! Global 50 injection is DISABLED - diversity recovery won't work.")
+            print("!")
+            print("! To enable, set environment variables:")
+            print("!   export CLOUD_PROVIDER=gcs")
+            print("!   export CLOUD_BUCKET=<your-bucket>")
+            print("!   export GOOGLE_APPLICATION_CREDENTIALS=<path-to-credentials.json>")
+            print("!"*70 + "\n")
+
         # Local cache
         self.entries: List[GlobalHoFEntry] = []
         self.entry_threshold: float = float('-inf')
@@ -768,22 +780,38 @@ class GlobalHallOfFame:
         Call this before injection to get the latest view of available agents.
         """
         if not self.enabled:
+            print(f"  Global 50 refresh skipped (disabled)")
             return
 
-        print(f"  Refreshing Global 50 entries from cloud...")
+        print(f"\n{'='*60}")
+        print(f"Global 50 Refresh")
+        print(f"{'='*60}")
 
         # Re-download global50.json for current league
+        print(f"Downloading global50.json for cw{self.league_rules.context_window_days}...")
         success = self._download_global_ledger()
         if success:
             self._load_local_ledger()
             self._update_entry_threshold()
-            print(f"  ✓ Current league ({self.league_rules.context_window_days} days): {len(self.entries)} agents")
+            print(f"✓ Current league (cw{self.league_rules.context_window_days}): {len(self.entries)} agents")
+            if len(self.entries) > 0:
+                scores = [e.gauntlet_score for e in self.entries]
+                print(f"  Entry threshold: {self.entry_threshold:.2f}")
+                print(f"  Score range: {min(scores):.2f} - {max(scores):.2f}")
         else:
-            print(f"  ⚠ Could not refresh current league")
+            print(f"⚠ Could not download global50.json for cw{self.league_rules.context_window_days}")
 
         # Re-discover fallback leagues to get updated entry counts
+        print(f"\nDiscovering fallback leagues...")
         self.fallback_leagues = []  # Clear existing
         self._discover_fallback_leagues()
+
+        # Summary
+        total_agents = len(self.entries)
+        for fallback in self.fallback_leagues:
+            total_agents += fallback.get('entry_count', 0)
+        print(f"\n✓ Total agents available for injection: {total_agents}")
+        print(f"{'='*60}\n")
 
     def _load_agents_from_fallback(self, fallback: Dict, n: int) -> List[DDPGAgent]:
         """
