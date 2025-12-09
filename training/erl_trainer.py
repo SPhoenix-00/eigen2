@@ -3458,6 +3458,12 @@ class ERLTrainer:
                             self.pending_baseline_update = None
                             self.tested_candidate_indices.clear()
 
+                        # Inject Global 50 agents to recover diversity after failed stabilization
+                        if validation_results:
+                            print(f"\n💉 INJECTING GLOBAL 50 AGENTS TO RECOVER DIVERSITY")
+                            training_fitness_scores = [r['training_fitness'] for r in validation_results]
+                            self._inject_global50_agents(training_fitness_scores)
+
                         # Only reach here if no next candidate was found
                         self.breakthrough_state = BreakthroughState.NORMAL
                         return
@@ -3700,6 +3706,15 @@ class ERLTrainer:
                         self.pending_baseline_update = None
                         self.tested_candidate_indices.clear()
 
+                    # Inject Global 50 agents to recover diversity after failed Gauntlet
+                    if validation_results:
+                        print(f"\n💉 INJECTING GLOBAL 50 AGENTS TO RECOVER DIVERSITY")
+                        # validation_results is sorted by combined_fitness, so we must resort by idx
+                        # to match population order before extracting fitness
+                        sorted_results = sorted(validation_results, key=lambda x: x['idx'])
+                        training_fitness_scores = [r['training_fitness'] for r in sorted_results]
+                        self._inject_global50_agents(training_fitness_scores)
+
                     # Only reach here if no next candidate was found
                     self.breakthrough_state = BreakthroughState.NORMAL
 
@@ -3805,6 +3820,73 @@ class ERLTrainer:
         val_results = self.validate_agent(self.best_agent)
         return val_results
 
+    def _inject_global50_agents(self, fitness_scores: List[float]):
+        """
+        Inject mutated Global 50 agents to replace the worst performers in the population.
+        Used during plateau detection AND after gauntlet failures to restore genetic diversity.
+
+        Args:
+            fitness_scores: List of fitness scores for the current population (used to find worst agents)
+        """
+        # Only trigger if buffer is at least half full
+        buffer_half_full = len(self.replay_buffer) >= (self.replay_buffer.capacity // 2)
+
+        if not buffer_half_full:
+            print(f"\n  ⚠ Global 50 injection skipped (buffer < 50% full: {len(self.replay_buffer)}/{self.replay_buffer.capacity})")
+            return
+
+        if fitness_scores is None or len(fitness_scores) == 0:
+            return
+
+        print(f"\n🧬 Global 50 Injection Protocol Activated")
+        print(f"  Buffer status: {len(self.replay_buffer)}/{self.replay_buffer.capacity} (>50% full)")
+
+        # Inject up to 10 unique Global 50 agents (or as many as available)
+        max_injections = 10
+        g50_agents_available = self.global_hof.get_size() if hasattr(self.global_hof, 'get_size') else len(self.global_hof.agents) if hasattr(self.global_hof, 'agents') else 0
+        num_to_request = min(max_injections, g50_agents_available, len(fitness_scores))
+
+        if num_to_request > 0:
+            # Get unique random agents (no duplicates)
+            g50_agents = self.global_hof.get_random_agents(num_to_request)
+
+            if len(g50_agents) > 0:
+                print(f"  Injecting {len(g50_agents)} unique agents (requested: {num_to_request}, available: {g50_agents_available})")
+
+                # Get indices of worst agents (sorted ascending by fitness)
+                worst_indices = np.argsort(fitness_scores)[:len(g50_agents)]
+                mutation_rate = Config.MUTATION_RATE_CONSISTENCY
+                max_fitness_val = np.max(fitness_scores) if len(fitness_scores) > 0 else 1.0
+
+                injected_count = 0
+                for worst_idx, g50_agent in zip(worst_indices, g50_agents):
+                    # Apply mutation to the Global 50 agent
+                    mutated_g50 = mutate(g50_agent, mutation_rate=mutation_rate, mutation_std=self.base_mutation_std)
+
+                    worst_fitness = fitness_scores[worst_idx]
+
+                    # Replace worst agent
+                    mutated_g50.agent_id = worst_idx
+                    mutated_g50.is_elite = False
+                    self.population[worst_idx] = mutated_g50
+
+                    # Update fitness score to protect it from immediate culling
+                    fitness_scores[worst_idx] = max_fitness_val
+
+                    injected_count += 1
+                    print(f"  ✓ Injected agent #{injected_count} → slot {worst_idx} (was: {worst_fitness:.2f})")
+                    del g50_agent
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                print(f"  ✓ Total injected: {injected_count} unique agents (mutation rate: {mutation_rate:.2f})")
+            else:
+                print(f"  ⚠ Global 50 injection skipped (failed to load agents)")
+        else:
+            print(f"  ⚠ Global 50 injection skipped (no agents available)")
+
     def check_and_adjust_mutation(self, current_val_fitness: float, fitness_scores: List[float] = None):
         """
         Check for fitness plateau and adaptively increase mutation parameters.
@@ -3872,64 +3954,9 @@ class ERLTrainer:
                 print(f"  Mutation Rate: {self.base_mutation_rate:.3f} → {self.current_mutation_rate:.3f}")
                 print(f"  Mutation STD:  {self.base_mutation_std:.4f} → {self.current_mutation_std:.4f}")
 
-                # Global 50 Injection: Replace worst agent with mutated Global 50 agent
-                # Only trigger if buffer is at least half full
-                buffer_half_full = len(self.replay_buffer) >= (self.replay_buffer.capacity // 2)
-
-                if buffer_half_full and fitness_scores is not None and len(fitness_scores) > 0:
-                    print(f"\n🧬 Global 50 Injection Protocol Activated")
-                    print(f"  Buffer status: {len(self.replay_buffer)}/{self.replay_buffer.capacity} (>50% full)")
-
-                    # Inject up to 10 Global 50 agents (or as many as available)
-                    max_injections = 10
-                    g50_agents_available = self.global_hof.get_size() if hasattr(self.global_hof, 'get_size') else len(self.global_hof.agents) if hasattr(self.global_hof, 'agents') else 0
-                    num_injections = min(max_injections, g50_agents_available, len(fitness_scores))
-
-                    if num_injections > 0:
-                        print(f"  Injecting {num_injections} agents (max: {max_injections}, available: {g50_agents_available})")
-
-                        # Get indices of worst agents (sorted ascending by fitness)
-                        worst_indices = np.argsort(fitness_scores)[:num_injections]
-                        mutation_rate = Config.MUTATION_RATE_CONSISTENCY  # Use 0.2 as specified
-                        max_fitness_val = np.max(fitness_scores) if len(fitness_scores) > 0 else 1.0
-
-                        injected_count = 0
-                        for worst_idx in worst_indices:
-                            # Try to get a random Global 50 agent
-                            g50_agent = self.global_hof.get_random_agent()
-
-                            if g50_agent is None:
-                                break  # No more agents available
-
-                            # Apply mutation to the Global 50 agent (safety valve)
-                            mutated_g50 = mutate(g50_agent, mutation_rate=mutation_rate, mutation_std=self.base_mutation_std)
-
-                            worst_fitness = fitness_scores[worst_idx]
-
-                            # Replace worst agent with mutated Global 50 agent
-                            mutated_g50.agent_id = worst_idx
-                            mutated_g50.is_elite = False  # Mark as exploratory
-                            self.population[worst_idx] = mutated_g50
-
-                            # Update fitness score so evolve_population doesn't immediately cull the injected agent
-                            fitness_scores[worst_idx] = max_fitness_val
-
-                            injected_count += 1
-                            print(f"  ✓ Injected agent #{injected_count} → slot {worst_idx} (was: {worst_fitness:.2f})")
-
-                            # Clean up the original g50_agent to free memory
-                            del g50_agent
-
-                        # Single cleanup after all injections
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
-                        print(f"  ✓ Total injected: {injected_count} agents (mutation rate: {mutation_rate:.2f})")
-                    else:
-                        print(f"  ⚠ Global 50 injection skipped (no agents available)")
-                elif not buffer_half_full:
-                    print(f"\n  ⚠ Global 50 injection skipped (buffer < 50% full: {len(self.replay_buffer)}/{self.replay_buffer.capacity})")
+                # Global 50 Injection: Replace worst agents with mutated Global 50 agents
+                if fitness_scores is not None and len(fitness_scores) > 0:
+                    self._inject_global50_agents(fitness_scores)
 
                 print(f"{'='*60}\n")
 

@@ -666,6 +666,59 @@ class GlobalHallOfFame:
         # No agents available anywhere
         return None
 
+    def get_random_agents(self, n: int) -> List[DDPGAgent]:
+        """
+        Load N unique random agents from the Global 50.
+
+        This is used for diversity injection during plateau detection and gauntlet failures.
+        Ensures no duplicate agents are returned.
+
+        Args:
+            n: Number of unique agents to retrieve
+
+        Returns:
+            List of unique DDPGAgent instances from Global 50 (may be fewer than n if not enough available)
+        """
+        if not self.enabled or n <= 0:
+            return []
+
+        import random
+
+        agents = []
+        available_entries = list(self.entries)  # Copy to avoid modifying original
+
+        # Limit to available agents
+        n = min(n, len(available_entries))
+
+        if n == 0:
+            return []
+
+        # Sample n unique entries
+        selected_entries = random.sample(available_entries, n)
+
+        for entry in selected_entries:
+            filename = entry.get_filename()
+            local_agent_path = self.local_agents_dir / filename
+            cloud_agent_path = f"{self.cloud_base}/agents/{filename}"
+
+            # Download from cloud if not in cache
+            if not local_agent_path.exists():
+                success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
+                if not success:
+                    print(f"  ⚠ Failed to download Global 50 agent: {filename}")
+                    continue
+
+            # Load agent
+            try:
+                agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
+                agent.load(str(local_agent_path))
+                agents.append(agent)
+            except Exception as e:
+                print(f"  ⚠ Failed to load Global 50 agent: {e}")
+                continue
+
+        return agents
+
     def get_stats(self) -> Dict:
         """
         Get Global Hall of Fame statistics.
