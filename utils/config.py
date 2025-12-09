@@ -212,6 +212,7 @@ class Config:
 
     # Stabilization phase - lock training on candidate for N generations
     STABILIZATION_GENERATIONS = 3  # Allow networks to converge on new behavior
+    STABILIZATION_GHOST_DETECTION = False  # If True, abort stabilization if fitness drops below baseline (disabled to give candidates a fair chance)
 
     # Gauntlet validation - rigorous stress test with many diverse slices
     GAUNTLET_NUM_SLICES = 20  # Number of validation slices for Gauntlet (vs 7 for normal validation)
@@ -221,7 +222,7 @@ class Config:
     TARGET_BREAKTHROUGHS_CONSISTENCY = 8  # Deprecated - not used in consistency mode (uses turnovers instead)
 
     # Hall of Fame turnover goals (consistency mode only)
-    TARGET_HOF_TURNOVERS = 4  # Number of complete HoF turnovers required (minimum 2)
+    TARGET_HOF_TURNOVERS = 3  # Number of complete HoF turnovers required (minimum 2)
     # Unified turnover logic: All 10 HoF agents must have ROI >= previous median
     # Initial median is 0 (first breakthrough establishes baseline from gauntlet score)
     # Each turnover raises the bar: median₀=0 → median₁ → median₂ → median₃...

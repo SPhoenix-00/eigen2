@@ -893,6 +893,7 @@ class ERLTrainer:
         self.hof_turnover_count = 0  # Number of complete HoF turnovers
         self.hof_current_median = None  # Current median ROI baseline (updated each turnover)
         self.target_hof_turnovers = Config.TARGET_HOF_TURNOVERS  # Target number of turnovers
+        self.generation_at_last_turnover = 0  # Reset fallback counter on each turnover (consistency mode)
 
         if self.gauntlet_mode_enabled:
             print(f"\n🎯 Gauntlet Mode ENABLED")
@@ -3224,7 +3225,8 @@ class ERLTrainer:
             print(f"\n🔄 Stabilization: {self.stabilization_generations_elapsed}/{Config.STABILIZATION_GENERATIONS} generations")
 
             # PROGRESSIVE STABILIZATION CHECK: Abort if performance drops below baseline
-            if validation_results is not None and len(validation_results) > 0:
+            # (Disabled by default - ghost detection is too aggressive and doesn't give candidates a fair chance)
+            if Config.STABILIZATION_GHOST_DETECTION and validation_results is not None and len(validation_results) > 0:
                 best_result = validation_results[0]
                 best_val_fitness = best_result['validation_fitness']
 
@@ -3732,6 +3734,7 @@ class ERLTrainer:
             self.hof_turnover_count += 1
             previous_median = current_baseline
             self.hof_current_median = self.hall_of_fame.get_median_roi()
+            self.generation_at_last_turnover = self.generation  # Reset fallback counter
 
             print(f"\n{'='*60}")
             print(f"🏆 HALL OF FAME TURNOVER {self.hof_turnover_count} COMPLETE!")
@@ -3815,14 +3818,17 @@ class ERLTrainer:
             current_val_fitness: Current validation fitness
             fitness_scores: Optional fitness scores of current population (for finding worst agent)
         """
-        # Add current fitness to history
-        self.validation_fitness_history.append(current_val_fitness)
-
-        # GUARD: Disable plateau detection and Global 50 injection during Stabilization/Gauntlet phases
+        # GUARD: Disable plateau detection AND history recording during Stabilization/Gauntlet phases
         # During these phases, the population is locked to "1 elite + mutants of candidate" to force
-        # convergence on a specific strategy. Injecting foreign agents would pollute this process.
+        # convergence on a specific strategy. Recording these scores would pollute the history with
+        # "frozen" population data, blinding the detector to long-term stagnation.
+        # By skipping recording, Gen 50 compares to Gen 30 if Gens 31-49 were stabilization.
         if self.breakthrough_state != BreakthroughState.NORMAL:
             return
+
+        # Add current fitness to history ONLY in NORMAL state
+        # This ensures validation_fitness_history is a contiguous record of evolutionary progress
+        self.validation_fitness_history.append(current_val_fitness)
 
         # Need at least plateau_window generations to detect plateau
         if len(self.validation_fitness_history) < self.plateau_window:
@@ -3874,37 +3880,52 @@ class ERLTrainer:
                     print(f"\n🧬 Global 50 Injection Protocol Activated")
                     print(f"  Buffer status: {len(self.replay_buffer)}/{self.replay_buffer.capacity} (>50% full)")
 
-                    # Try to get a random Global 50 agent
-                    g50_agent = self.global_hof.get_random_agent()
+                    # Inject up to 10 Global 50 agents (or as many as available)
+                    max_injections = 10
+                    g50_agents_available = self.global_hof.get_size() if hasattr(self.global_hof, 'get_size') else len(self.global_hof.agents) if hasattr(self.global_hof, 'agents') else 0
+                    num_injections = min(max_injections, g50_agents_available, len(fitness_scores))
 
-                    if g50_agent is not None:
-                        # Apply mutation to the Global 50 agent (safety valve)
+                    if num_injections > 0:
+                        print(f"  Injecting {num_injections} agents (max: {max_injections}, available: {g50_agents_available})")
+
+                        # Get indices of worst agents (sorted ascending by fitness)
+                        worst_indices = np.argsort(fitness_scores)[:num_injections]
                         mutation_rate = Config.MUTATION_RATE_CONSISTENCY  # Use 0.2 as specified
-                        mutated_g50 = mutate(g50_agent, mutation_rate=mutation_rate, mutation_std=self.base_mutation_std)
+                        max_fitness_val = np.max(fitness_scores) if len(fitness_scores) > 0 else 1.0
 
-                        # Find worst agent in population
-                        worst_idx = np.argmin(fitness_scores)
-                        worst_fitness = fitness_scores[worst_idx]
+                        injected_count = 0
+                        for worst_idx in worst_indices:
+                            # Try to get a random Global 50 agent
+                            g50_agent = self.global_hof.get_random_agent()
 
-                        # Replace worst agent with mutated Global 50 agent
-                        mutated_g50.agent_id = worst_idx
-                        mutated_g50.is_elite = False  # Mark as exploratory
-                        self.population[worst_idx] = mutated_g50
+                            if g50_agent is None:
+                                break  # No more agents available
 
-                        # FIX 3: Update fitness score so evolve_population doesn't immediately cull the injected agent
-                        # Give it max fitness so it survives as an elite or parent
-                        max_fitness = np.max(fitness_scores) if len(fitness_scores) > 0 else 1.0
-                        fitness_scores[worst_idx] = max_fitness
+                            # Apply mutation to the Global 50 agent (safety valve)
+                            mutated_g50 = mutate(g50_agent, mutation_rate=mutation_rate, mutation_std=self.base_mutation_std)
 
-                        print(f"  ✓ Injected mutated Global 50 agent")
-                        print(f"  ✓ Replaced worst agent (ID: {worst_idx}, Fitness: {worst_fitness:.2f} → {max_fitness:.2f})")
-                        print(f"  ✓ Mutation applied: {mutation_rate:.2f} rate")
+                            worst_fitness = fitness_scores[worst_idx]
 
-                        # Clean up the original g50_agent to free memory
-                        del g50_agent
+                            # Replace worst agent with mutated Global 50 agent
+                            mutated_g50.agent_id = worst_idx
+                            mutated_g50.is_elite = False  # Mark as exploratory
+                            self.population[worst_idx] = mutated_g50
+
+                            # Update fitness score so evolve_population doesn't immediately cull the injected agent
+                            fitness_scores[worst_idx] = max_fitness_val
+
+                            injected_count += 1
+                            print(f"  ✓ Injected agent #{injected_count} → slot {worst_idx} (was: {worst_fitness:.2f})")
+
+                            # Clean up the original g50_agent to free memory
+                            del g50_agent
+
+                        # Single cleanup after all injections
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
+
+                        print(f"  ✓ Total injected: {injected_count} agents (mutation rate: {mutation_rate:.2f})")
                     else:
                         print(f"  ⚠ Global 50 injection skipped (no agents available)")
                 elif not buffer_half_full:
@@ -4001,6 +4022,7 @@ class ERLTrainer:
             # Hall of Fame turnover tracking (for consistency mode)
             'hof_turnover_count': self.hof_turnover_count,
             'hof_current_median': self.hof_current_median,
+            'generation_at_last_turnover': self.generation_at_last_turnover,
 
             # Configuration mode flags (for proper restoration context)
             'consistency_mode': self.consistency_mode,
@@ -4220,11 +4242,13 @@ class ERLTrainer:
                 # Load Hall of Fame turnover tracking (for consistency mode, backwards compatible)
                 self.hof_turnover_count = trainer_state.get('hof_turnover_count', 0)
                 self.hof_current_median = trainer_state.get('hof_current_median', None)
+                self.generation_at_last_turnover = trainer_state.get('generation_at_last_turnover', 0)
                 if self.consistency_mode and (self.hof_turnover_count > 0 or self.hof_current_median is not None):
                     print(f"✓ HoF Turnover tracking restored:")
                     print(f"  Turnovers: {self.hof_turnover_count}/{self.target_hof_turnovers}")
                     if self.hof_current_median is not None:
                         print(f"  Current Median ROI: {self.hof_current_median:.2f}%")
+                    print(f"  Generation at last turnover: {self.generation_at_last_turnover}")
 
                 print(f"✓ Resuming from Gen {self.start_generation} → Gen {self.start_generation + 1}")
                 print(f"✓ Best validation fitness: {self.best_validation_fitness:.2f}")
@@ -4373,6 +4397,7 @@ class ERLTrainer:
                 # Hall of Fame turnover tracking (for consistency mode)
                 'hof_turnover_count': self.hof_turnover_count,
                 'hof_current_median': self.hof_current_median,
+                'generation_at_last_turnover': self.generation_at_last_turnover,
             }
             state_path = snapshot_dir / "trainer_state.json"
             with open(state_path, 'w') as f:
@@ -4471,6 +4496,7 @@ class ERLTrainer:
                 # Restore Hall of Fame turnover tracking (for consistency mode)
                 self.hof_turnover_count = trainer_state.get('hof_turnover_count', 0)
                 self.hof_current_median = trainer_state.get('hof_current_median', None)
+                self.generation_at_last_turnover = trainer_state.get('generation_at_last_turnover', 0)
 
                 print(f"✓ Restored trainer state")
                 if self.candidate_queue:
@@ -4669,7 +4695,12 @@ class ERLTrainer:
 
         # Use start_generation for the loop
         # Stopping condition: Gauntlet Mode uses breakthroughs, fallback to generation limit
-        max_generations = Config.MAX_GENERATIONS_GAUNTLET if self.gauntlet_mode_enabled else Config.NUM_GENERATIONS
+        # In consistency mode, fallback resets with each turnover (checked inside loop)
+        if self.consistency_mode and self.gauntlet_mode_enabled:
+            # Use a high ceiling - actual stopping is controlled by turnover-based fallback inside loop
+            max_generations = 10000
+        else:
+            max_generations = Config.MAX_GENERATIONS_GAUNTLET if self.gauntlet_mode_enabled else Config.NUM_GENERATIONS
 
         for gen in range(self.start_generation, max_generations):
             self.generation = gen  # Keep this to track the *current* gen
@@ -4688,6 +4719,21 @@ class ERLTrainer:
                 print(f"  Generation: {gen + 1}")
                 print(f"{'='*60}")
                 break
+
+            # Consistency mode fallback: reset counter with each turnover
+            # This gives more runway after each successful turnover instead of a hard global limit
+            if self.consistency_mode and self.gauntlet_mode_enabled:
+                generations_since_turnover = gen - self.generation_at_last_turnover
+                if generations_since_turnover >= Config.MAX_GENERATIONS_GAUNTLET:
+                    print(f"\n{'='*60}")
+                    print(f"⏱️ CONSISTENCY MODE FALLBACK - NO TURNOVER IN {Config.MAX_GENERATIONS_GAUNTLET} GENERATIONS")
+                    print(f"{'='*60}")
+                    print(f"  Turnovers achieved: {self.hof_turnover_count}/{self.target_hof_turnovers}")
+                    print(f"  Generations since last turnover: {generations_since_turnover}")
+                    print(f"  Current median ROI: {self.hof_current_median:.2f}%" if self.hof_current_median else "  No median established yet")
+                    print(f"  Generation: {gen + 1}")
+                    print(f"{'='*60}")
+                    break
             elif self.gauntlet_mode_enabled and not self.consistency_mode and self.confirmed_breakthroughs >= self.target_breakthroughs:
                 print(f"\n{'='*60}")
                 print(f"🎯 TARGET BREAKTHROUGHS ACHIEVED!")
@@ -4706,10 +4752,13 @@ class ERLTrainer:
             print(f"\n{'='*60}")
             if self.gauntlet_mode_enabled:
                 if self.consistency_mode:
+                    generations_since_turnover = gen - self.generation_at_last_turnover
+                    runway_remaining = Config.MAX_GENERATIONS_GAUNTLET - generations_since_turnover
                     turnover_status = f"Turnover: {self.hof_turnover_count}/{self.target_hof_turnovers}"
                     if self.hof_current_median is not None:
                         turnover_status += f" | Median: {self.hof_current_median:.2f}%"
-                    print(f"Generation {gen + 1} / {max_generations} | {turnover_status} | State: {self.breakthrough_state.value}")
+                    turnover_status += f" | Runway: {runway_remaining}"
+                    print(f"Generation {gen + 1} | {turnover_status} | State: {self.breakthrough_state.value}")
                 else:
                     print(f"Generation {gen + 1} / {max_generations} | Breakthroughs: {self.confirmed_breakthroughs}/{self.target_breakthroughs} | State: {self.breakthrough_state.value}")
             else:
