@@ -3874,11 +3874,10 @@ class ERLTrainer:
                 max_fitness_val = np.max(fitness_scores) if len(fitness_scores) > 0 else 1.0
 
                 injected_count = 0
+                replaced_slots = []
                 for worst_idx, g50_agent in zip(worst_indices, g50_agents):
                     # Apply mutation to the Global 50 agent
                     mutated_g50 = mutate(g50_agent, mutation_rate=mutation_rate, mutation_std=self.base_mutation_std)
-
-                    worst_fitness = fitness_scores[worst_idx]
 
                     # Replace worst agent
                     mutated_g50.agent_id = worst_idx
@@ -3889,14 +3888,14 @@ class ERLTrainer:
                     fitness_scores[worst_idx] = max_fitness_val
 
                     injected_count += 1
-                    print(f"  ✓ Injected agent #{injected_count} → slot {worst_idx} (was: {worst_fitness:.2f})")
+                    replaced_slots.append(worst_idx)
                     del g50_agent
 
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                print(f"  ✓ Total injected: {injected_count} unique agents (mutation rate: {mutation_rate:.2f})")
+                print(f"  ✓ Injected {injected_count} agents into slots {replaced_slots} (mutation rate: {mutation_rate:.2f})")
             else:
                 print(f"  ⚠ Global 50 injection skipped (failed to load agents)")
         else:

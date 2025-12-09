@@ -361,9 +361,19 @@ class GlobalHallOfFame:
             print(f"  Note: Fallback league discovery only supported for GCS provider")
             available_windows = []
 
+        # Track which context windows we've already added (to avoid duplicates)
+        added_context_windows = set()
+        for fb in self.fallback_leagues:
+            added_context_windows.add(fb['context_window_days'])
+
         # Try to download JSON for each discovered context window
         import tempfile
         for window_days in available_windows:
+            # Skip if we already have this context window (e.g., legacy 504)
+            if window_days in added_context_windows:
+                print(f"  Skipping cw{window_days} (already have legacy fallback)")
+                continue
+
             fallback_id = f"cw{window_days}"
             cloud_json_path = f"{self.cloud_sync.project_name}/global50/{fallback_id}/global50.json"
 
@@ -383,6 +393,7 @@ class GlobalHallOfFame:
                             'cloud_base': f"{self.cloud_sync.project_name}/global50/{fallback_id}",
                             'is_legacy': False
                         })
+                        added_context_windows.add(window_days)
                         print(f"  ✓ Found fallback: {window_days} days ({entry_count} agents)")
                 except Exception:
                     pass  # Doesn't exist, skip
@@ -841,7 +852,7 @@ class GlobalHallOfFame:
 
         try:
             cloud_json_path = f"{fallback_cloud_base}/global50.json"
-            success = self.cloud_sync.download_file(cloud_json_path, temp_json_path)
+            success = self.cloud_sync.download_file(cloud_json_path, temp_json_path, silent=True)
             if not success:
                 print(f"  ✗ Failed to download fallback league JSON: {fallback_id}")
                 return agents
@@ -866,7 +877,7 @@ class GlobalHallOfFame:
                 fallback_local_dir = self.LOCAL_BASE_DIR / fallback_id / "agents"
             fallback_local_dir.mkdir(parents=True, exist_ok=True)
 
-            # Load each selected agent
+            # Load each selected agent (silently - only report failures)
             for entry in selected_entries:
                 filename = entry.get_filename()
                 local_agent_path = fallback_local_dir / filename
@@ -874,7 +885,7 @@ class GlobalHallOfFame:
 
                 # Download from cloud if not in cache
                 if not local_agent_path.exists():
-                    success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
+                    success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path), silent=True)
                     if not success:
                         print(f"  ⚠ Failed to download fallback agent: {filename}")
                         continue
@@ -884,10 +895,13 @@ class GlobalHallOfFame:
                     agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
                     agent.load(str(local_agent_path))
                     agents.append(agent)
-                    print(f"  ✓ Loaded fallback agent from {fallback['context_window_days']} days league: {filename}")
                 except Exception as e:
                     print(f"  ⚠ Failed to load fallback agent {filename}: {e}")
                     continue
+
+            # Summary for this fallback league
+            if len(agents) > 0:
+                print(f"  ✓ Loaded {len(agents)} agents from {fallback['context_window_days']} days fallback league")
 
         finally:
             # Clean up temp file

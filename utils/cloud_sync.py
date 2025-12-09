@@ -192,13 +192,14 @@ class CloudSync:
 
         return False
 
-    def download_file(self, cloud_path: str, local_path: str):
+    def download_file(self, cloud_path: str, local_path: str, silent: bool = False):
         """
         Download a file from cloud storage.
 
         Args:
             cloud_path: Path in cloud storage
             local_path: Path to save locally
+            silent: If True, suppress success messages (errors still printed)
         """
         if self.provider == "local":
             return False
@@ -220,11 +221,13 @@ class CloudSync:
                     download_stream = blob_client.download_blob()
                     f.write(download_stream.readall())
 
-            print(f"✓ Downloaded: {cloud_path} → {local_path}")
+            if not silent:
+                print(f"✓ Downloaded: {cloud_path} → {local_path}")
             return True
 
         except Exception as e:
-            print(f"Warning: Failed to download {cloud_path}: {e}")
+            if not silent:
+                print(f"Warning: Failed to download {cloud_path}: {e}")
             return False
 
     def delete_file(self, cloud_path: str) -> bool:
