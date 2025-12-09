@@ -671,7 +671,8 @@ class GlobalHallOfFame:
         Load N unique random agents from the Global 50.
 
         This is used for diversity injection during plateau detection and gauntlet failures.
-        Ensures no duplicate agents are returned.
+        Ensures no duplicate agents are returned. If current league has fewer than n agents,
+        supplements with agents from fallback leagues (other context windows).
 
         Args:
             n: Number of unique agents to retrieve
@@ -685,37 +686,50 @@ class GlobalHallOfFame:
         import random
 
         agents = []
+
+        # === STEP 1: Try current league ===
         available_entries = list(self.entries)  # Copy to avoid modifying original
+        current_league_count = min(n, len(available_entries))
 
-        # Limit to available agents
-        n = min(n, len(available_entries))
+        if current_league_count > 0:
+            selected_entries = random.sample(available_entries, current_league_count)
 
-        if n == 0:
-            return []
+            for entry in selected_entries:
+                filename = entry.get_filename()
+                local_agent_path = self.local_agents_dir / filename
+                cloud_agent_path = f"{self.cloud_base}/agents/{filename}"
 
-        # Sample n unique entries
-        selected_entries = random.sample(available_entries, n)
+                # Download from cloud if not in cache
+                if not local_agent_path.exists():
+                    success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
+                    if not success:
+                        print(f"  ⚠ Failed to download Global 50 agent: {filename}")
+                        continue
 
-        for entry in selected_entries:
-            filename = entry.get_filename()
-            local_agent_path = self.local_agents_dir / filename
-            cloud_agent_path = f"{self.cloud_base}/agents/{filename}"
-
-            # Download from cloud if not in cache
-            if not local_agent_path.exists():
-                success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
-                if not success:
-                    print(f"  ⚠ Failed to download Global 50 agent: {filename}")
+                # Load agent
+                try:
+                    agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
+                    agent.load(str(local_agent_path))
+                    agents.append(agent)
+                except Exception as e:
+                    print(f"  ⚠ Failed to load Global 50 agent: {e}")
                     continue
 
-            # Load agent
-            try:
-                agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
-                agent.load(str(local_agent_path))
-                agents.append(agent)
-            except Exception as e:
-                print(f"  ⚠ Failed to load Global 50 agent: {e}")
-                continue
+        # === STEP 2: Try fallback leagues if we need more agents ===
+        remaining_needed = n - len(agents)
+        if remaining_needed > 0 and len(self.fallback_leagues) > 0:
+            if len(self.entries) == 0:
+                print(f"  ⚠ Current league ({self.league_rules.context_window_days} days) is empty.")
+            print(f"  Attempting diversity injection from fallback leagues ({remaining_needed} more needed)...")
+
+            # Try each fallback league until we have enough agents
+            for fallback in self.fallback_leagues:
+                if remaining_needed <= 0:
+                    break
+
+                fallback_agents = self._load_agents_from_fallback(fallback, remaining_needed)
+                agents.extend(fallback_agents)
+                remaining_needed = n - len(agents)
 
         return agents
 
@@ -747,3 +761,109 @@ class GlobalHallOfFame:
             'mean_score': sum(scores) / len(scores),
             'league_compatible': self.league_compatible,
         }
+
+    def refresh(self):
+        """
+        Refresh the global50 entries from cloud storage.
+        Call this before injection to get the latest view of available agents.
+        """
+        if not self.enabled:
+            return
+
+        print(f"  Refreshing Global 50 entries from cloud...")
+
+        # Re-download global50.json for current league
+        success = self._download_global_ledger()
+        if success:
+            self._load_local_ledger()
+            self._update_entry_threshold()
+            print(f"  ✓ Current league ({self.league_rules.context_window_days} days): {len(self.entries)} agents")
+        else:
+            print(f"  ⚠ Could not refresh current league")
+
+        # Re-discover fallback leagues to get updated entry counts
+        self.fallback_leagues = []  # Clear existing
+        self._discover_fallback_leagues()
+
+    def _load_agents_from_fallback(self, fallback: Dict, n: int) -> List[DDPGAgent]:
+        """
+        Load up to n agents from a fallback league.
+
+        Args:
+            fallback: Fallback league info dict with keys:
+                - context_window_id: e.g., "cw504"
+                - cloud_base: cloud path prefix
+                - is_legacy: whether this is the old structure (no subdirectory)
+            n: Maximum number of agents to load
+
+        Returns:
+            List of successfully loaded DDPGAgent instances
+        """
+        import random
+        import tempfile
+        import os
+
+        agents = []
+        fallback_id = fallback['context_window_id']
+        fallback_cloud_base = fallback['cloud_base']
+
+        # Download the fallback league's JSON to get available agents
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+            temp_json_path = tmp.name
+
+        try:
+            cloud_json_path = f"{fallback_cloud_base}/global50.json"
+            success = self.cloud_sync.download_file(cloud_json_path, temp_json_path)
+            if not success:
+                print(f"  ✗ Failed to download fallback league JSON: {fallback_id}")
+                return agents
+
+            # Load entries
+            with open(temp_json_path, 'r') as f:
+                data = json.load(f)
+            fallback_entries = [GlobalHoFEntry.from_dict(e) for e in data.get('entries', [])]
+
+            if len(fallback_entries) == 0:
+                print(f"  ✗ Fallback league {fallback_id} is empty")
+                return agents
+
+            # Sample up to n agents from fallback league
+            num_to_sample = min(n, len(fallback_entries))
+            selected_entries = random.sample(fallback_entries, num_to_sample)
+
+            # Create local directory for fallback agents
+            if fallback.get('is_legacy', False):
+                fallback_local_dir = self.LOCAL_BASE_DIR / "agents"
+            else:
+                fallback_local_dir = self.LOCAL_BASE_DIR / fallback_id / "agents"
+            fallback_local_dir.mkdir(parents=True, exist_ok=True)
+
+            # Load each selected agent
+            for entry in selected_entries:
+                filename = entry.get_filename()
+                local_agent_path = fallback_local_dir / filename
+                cloud_agent_path = f"{fallback_cloud_base}/agents/{filename}"
+
+                # Download from cloud if not in cache
+                if not local_agent_path.exists():
+                    success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
+                    if not success:
+                        print(f"  ⚠ Failed to download fallback agent: {filename}")
+                        continue
+
+                # Load agent
+                try:
+                    agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
+                    agent.load(str(local_agent_path))
+                    agents.append(agent)
+                    print(f"  ✓ Loaded fallback agent from {fallback['context_window_days']} days league: {filename}")
+                except Exception as e:
+                    print(f"  ⚠ Failed to load fallback agent {filename}: {e}")
+                    continue
+
+        finally:
+            # Clean up temp file
+            if os.path.exists(temp_json_path):
+                os.unlink(temp_json_path)
+
+        return agents

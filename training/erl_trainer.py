@@ -945,6 +945,10 @@ class ERLTrainer:
             print("="*60)
             self.load_checkpoint()
 
+            # Refresh global50 entries after resume to get latest view from cloud
+            print("\nRefreshing Global 50 entries...")
+            self.global_hof.refresh()
+
         # Memory profiling: Take baseline snapshot
         # print("\n🔍 Taking baseline memory snapshot...")
         # log_memory("Trainer initialized (baseline)", show_objects=True)
@@ -3843,9 +3847,18 @@ class ERLTrainer:
         print(f"\n🧬 Global 50 Injection Protocol Activated")
         print(f"  Buffer status: {len(self.replay_buffer)}/{self.replay_buffer.capacity} (>50% full)")
 
+        # Refresh global50 entries from cloud before injection to get latest view
+        self.global_hof.refresh()
+
         # Inject up to 10 unique Global 50 agents (or as many as available)
         max_injections = 10
+
+        # Count agents from current league + fallback leagues
         g50_agents_available = len(self.global_hof.entries) if hasattr(self.global_hof, 'entries') else 0
+        if hasattr(self.global_hof, 'fallback_leagues'):
+            for fallback in self.global_hof.fallback_leagues:
+                g50_agents_available += fallback.get('entry_count', 0)
+
         num_to_request = min(max_injections, g50_agents_available, len(fitness_scores))
 
         if num_to_request > 0:
