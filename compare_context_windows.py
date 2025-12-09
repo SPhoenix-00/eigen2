@@ -109,7 +109,8 @@ class ContextWindowComparator:
             start_idx=context_window_days,  # Minimum index with enough history
             end_idx=len(self.data_array),
             data_array_full=self.data_array,
-            is_training=False  # Evaluation mode - no observation noise
+            is_training=False,  # Evaluation mode - no observation noise
+            gauntlet_mode=self.use_gauntlet  # Use soft penalty when in gauntlet mode
         )
 
         return env

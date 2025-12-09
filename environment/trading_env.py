@@ -48,7 +48,8 @@ class TradingEnvironment(gym.Env):
                  trading_end_idx: int = None,
                  data_array_full: np.ndarray = None,
                  is_training: bool = True,
-                 consistency_mode: bool = False):
+                 consistency_mode: bool = False,
+                 gauntlet_mode: bool = False):
         """
         Initialize trading environment.
 
@@ -63,6 +64,7 @@ class TradingEnvironment(gym.Env):
                             If None, uses data_array (for backward compatibility)
             is_training: If True, applies observation noise for regularization
             consistency_mode: If True, applies loss magnification for consistency training (see Config.CONSISTENCY_LOSS_MULTIPLIER)
+            gauntlet_mode: If True, uses soft penalty for zero trades (tactical no-trade is acceptable)
         """
         super().__init__()
 
@@ -74,6 +76,7 @@ class TradingEnvironment(gym.Env):
         self.end_idx = end_idx
         self.is_training = is_training  # Flag to control observation noise
         self.consistency_mode = consistency_mode  # Flag to enable loss magnification
+        self.gauntlet_mode = gauntlet_mode  # Flag for soft zero-trades penalty during gauntlet/stabilization
 
         # Trading end is when model stops opening new positions
         # Settlement period allows existing positions to close
@@ -136,6 +139,15 @@ class TradingEnvironment(gym.Env):
             is_training: If True, applies observation noise for regularization
         """
         self.is_training = is_training
+
+    def set_gauntlet_mode(self, gauntlet_mode: bool):
+        """
+        Set whether environment is in gauntlet/stabilization mode.
+
+        Args:
+            gauntlet_mode: If True, uses soft penalty for zero trades (tactical no-trade is acceptable)
+        """
+        self.gauntlet_mode = gauntlet_mode
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None,
              start_idx: Optional[int] = None, end_idx: Optional[int] = None,
@@ -554,9 +566,15 @@ class TradingEnvironment(gym.Env):
         inaction_penalty_total = self.days_without_positions * Config.INACTION_PENALTY
 
         # Calculate zero trades penalty (will be applied by caller)
-        # Use mode-specific penalty: harsher in normal mode, lighter in consistency mode
+        # Use mode-specific penalty: soft in gauntlet, lighter in consistency, harsher in normal
         if self.num_trades == 0:
-            zero_trades_penalty = Config.ZERO_TRADES_PENALTY_CONSISTENCY if self.consistency_mode else Config.ZERO_TRADES_PENALTY_NORMAL
+            if self.gauntlet_mode:
+                # Soft penalty during stabilization/gauntlet (tactical no-trade is acceptable)
+                zero_trades_penalty = Config.ZERO_TRADES_PENALTY_GAUNTLET
+            elif self.consistency_mode:
+                zero_trades_penalty = Config.ZERO_TRADES_PENALTY_CONSISTENCY
+            else:
+                zero_trades_penalty = Config.ZERO_TRADES_PENALTY_NORMAL
         else:
             zero_trades_penalty = 0.0
 

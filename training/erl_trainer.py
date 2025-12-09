@@ -109,7 +109,8 @@ def _init_worker(env_config):
             'end_idx': env_config['end_idx'],
             'trading_end_idx': env_config['trading_end_idx'],
             'is_training': env_config.get('is_training', True),
-            'consistency_mode': env_config.get('consistency_mode', False)
+            'consistency_mode': env_config.get('consistency_mode', False),
+            'gauntlet_mode': env_config.get('gauntlet_mode', False)
         }
         _worker_env_config = actual_env_config
     else:
@@ -500,7 +501,7 @@ class ERLTrainer:
 
     def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
                  consistency_mode: bool = False, heroes_hof_dir: str = None, buffer_storage_path: str = None,
-                 original_stdout=None, original_stderr=None):
+                 reset_limit: bool = False, original_stdout=None, original_stderr=None):
         """
         Initialize ERL trainer.
 
@@ -511,6 +512,7 @@ class ERLTrainer:
             consistency_mode: If True, evaluate with 5 episodes (sum) and loss magnification (see Config.CONSISTENCY_LOSS_MULTIPLIER)
             heroes_hof_dir: Path to Hall of Fame directory to load pre-trained agents from
             buffer_storage_path: Optional path to existing buffer_storage folder to reuse (e.g., "checkpoints/run-123/buffer_storage")
+            reset_limit: If True, reset the fallback generation counter to current generation on resume
             original_stdout: Original stdout before any redirection (for wandb console capture)
             original_stderr: Original stderr before any redirection (for wandb console capture)
         """
@@ -520,6 +522,7 @@ class ERLTrainer:
         self.consistency_mode = consistency_mode
         self.heroes_hof_dir = heroes_hof_dir
         self.external_buffer_storage_path = buffer_storage_path  # Optional path to reuse existing buffer
+        self.reset_limit = reset_limit  # Reset fallback counter on resume
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -1054,7 +1057,7 @@ class ERLTrainer:
             pass  # Ignore errors during destruction
 
     def _get_shared_env_config(self, start_idx: int, end_idx: int, trading_end_idx: int,
-                               is_training: bool = True) -> dict:
+                               is_training: bool = True, gauntlet_mode: bool = False) -> dict:
         """
         Build environment config dict using shared memory references.
 
@@ -1066,6 +1069,7 @@ class ERLTrainer:
             end_idx: Episode end index
             trading_end_idx: Last day to open new positions
             is_training: Whether environment is in training mode
+            gauntlet_mode: Whether to use soft zero-trades penalty (for stabilization/gauntlet)
 
         Returns:
             Dict with shared memory references and other config
@@ -1080,7 +1084,8 @@ class ERLTrainer:
             'end_idx': end_idx,
             'trading_end_idx': trading_end_idx,
             'is_training': is_training,
-            'consistency_mode': self.consistency_mode
+            'consistency_mode': self.consistency_mode,
+            'gauntlet_mode': gauntlet_mode
         }
 
     def _create_dataloader(self):
@@ -1317,87 +1322,69 @@ class ERLTrainer:
         print(f"\nPopulation replaced with {len(self.population)} heroes")
 
         # --- Validate heroes and populate Hall of Fame with ROI ---
-        # In normal mode: Add heroes directly to HoF (ensures median ROI is set from start)
-        # In consistency mode: Heroes must gauntlet their way into HoF (no direct admission)
+        # Heroes are added directly to HoF (ensures median ROI is set from start)
+        # HoF tracks top 10 agents ever seen; Global 50 is the "repository of excellence"
 
-        if not self.consistency_mode:
-            print("\n--- Validating heroes for Hall of Fame (with ROI) ---")
+        print("\n--- Validating heroes for Hall of Fame (with ROI) ---")
 
-            # Generate validation slices for hero evaluation
-            self.current_generation_val_slices = self.generate_validation_slices()
+        # Generate validation slices for hero evaluation
+        self.current_generation_val_slices = self.generate_validation_slices()
 
-            # Validate top heroes and add to HoF
-            num_to_validate = min(10, len(self.population))  # Validate top 10 for HoF
-            hero_validation_results = []
+        # Validate top heroes and add to HoF
+        num_to_validate = min(10, len(self.population))  # Validate top 10 for HoF
+        hero_validation_results = []
 
-            for idx in tqdm(range(num_to_validate), desc="Validating heroes for HoF"):
-                val_results = self.validate_agent_cached(self.population[idx])
-                val_fitness = val_results['fitness']
-                agent_roi = val_results.get('roi', 0.0)
+        for idx in tqdm(range(num_to_validate), desc="Validating heroes for HoF"):
+            val_results = self.validate_agent_cached(self.population[idx])
+            val_fitness = val_results['fitness']
+            agent_roi = val_results.get('roi', 0.0)
 
-                # Use validation fitness as combined score (no training penalty for initial heroes)
-                combined_fitness = val_fitness
+            # Use validation fitness as combined score (no training penalty for initial heroes)
+            combined_fitness = val_fitness
 
-                hero_validation_results.append({
-                    'idx': idx,
-                    'combined_fitness': combined_fitness,
-                    'roi': agent_roi,
-                    'raw_pnl': val_results.get('raw_pnl', 0.0),
-                    'expectancy': val_results.get('expectancy', 0.0),
-                    'quality_count': val_results.get('quality_count', 0),
-                    'total_trades': val_results.get('total_trades', 0)
-                })
+            hero_validation_results.append({
+                'idx': idx,
+                'combined_fitness': combined_fitness,
+                'roi': agent_roi,
+                'raw_pnl': val_results.get('raw_pnl', 0.0),
+                'expectancy': val_results.get('expectancy', 0.0),
+                'quality_count': val_results.get('quality_count', 0),
+                'total_trades': val_results.get('total_trades', 0)
+            })
 
-            # Sort by combined fitness and add to HoF
-            hero_validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
+        # Sort by combined fitness and add to HoF
+        hero_validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
 
-            # Build candidates for HoF
-            hof_candidates = []
-            for result in hero_validation_results:
-                agent_idx = result['idx']
-                combined_score = result['combined_fitness']
-                agent_roi = result['roi']
-                agent_expectancy = result['expectancy']
-                train_fitness = 0.0  # Heroes don't have training fitness
-                quality_count = result.get('quality_count', 0)
-                total_trades = result.get('total_trades', 0)
-                val_fitness = combined_score  # Use combined fitness as validation fitness
-                base_combined_fitness = combined_score
-                hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
-                                     train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
+        # Build candidates for HoF
+        hof_candidates = []
+        for result in hero_validation_results:
+            agent_idx = result['idx']
+            combined_score = result['combined_fitness']
+            agent_roi = result['roi']
+            agent_expectancy = result['expectancy']
+            train_fitness = 0.0  # Heroes don't have training fitness
+            quality_count = result.get('quality_count', 0)
+            total_trades = result.get('total_trades', 0)
+            val_fitness = combined_score  # Use combined fitness as validation fitness
+            base_combined_fitness = combined_score
+            hof_candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
+                                 train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
 
-            # Add heroes to Hall of Fame (normal mode only)
-            admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
+        # Add heroes to Hall of Fame
+        admission_results = self.hall_of_fame.update_from_generation(hof_candidates, generation=0)
 
-            # Print HoF initialization summary
-            admitted = [(idx, score, action) for idx, score, action in admission_results
-                       if action == 'admitted' or action.startswith('replaced_')]
-            if admitted:
-                hof_stats = self.hall_of_fame.get_stats()
-                print(f"\n⭐ Hall of Fame initialized with {len(admitted)} heroes:")
-                for agent_idx, score, _ in admitted[:5]:  # Show top 5
-                    roi = next((r['roi'] for r in hero_validation_results if r['idx'] == agent_idx), 0.0)
-                    print(f"   + Agent {agent_idx}: Combined={score:.2f}, ROI={roi:.2f}%")
-                if len(admitted) > 5:
-                    print(f"   ... and {len(admitted) - 5} more")
-                print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
-        else:
-            # Consistency mode: DO NOT seed HoF with heroes (prevents HoF poisoning)
-            # Instead, store heroes for population injection until first breakthrough
-            print("\n--- Consistency Mode: HoF starts EMPTY (gauntlet-only admission) ---")
-            print("  Heroes will NOT be added to HoF directly.")
-            print("  Only agents that pass the Gauntlet can enter the HoF.")
-            print("  This prevents HoF poisoning from lucky validation scores.")
-
-            # Store all loaded heroes in the injection pool for use during evolution
-            # These will be used to inject mutated Global50 agents until first breakthrough
-            self.global50_injection_pool = [agent.clone() for agent in self.population]
-            print(f"\n  Stored {len(self.global50_injection_pool)} heroes in injection pool")
-            print(f"  Will inject {self.global50_injection_count} mutated heroes per generation until first breakthrough")
-
-            print(f"\n   Goal: {self.target_hof_turnovers} complete turnovers")
-            print(f"   Each turnover raises the quality bar (all HoF agents must exceed previous median)")
-            print(f"   HoF will fill organically through gauntlet-confirmed breakthroughs")
+        # Print HoF initialization summary
+        admitted = [(idx, score, action) for idx, score, action in admission_results
+                   if action == 'admitted' or action.startswith('replaced_')]
+        if admitted:
+            hof_stats = self.hall_of_fame.get_stats()
+            print(f"\n⭐ Hall of Fame initialized with {len(admitted)} heroes:")
+            for agent_idx, score, _ in admitted[:5]:  # Show top 5
+                roi = next((r['roi'] for r in hero_validation_results if r['idx'] == agent_idx), 0.0)
+                print(f"   + Agent {agent_idx}: Combined={score:.2f}, ROI={roi:.2f}%")
+            if len(admitted) > 5:
+                print(f"   ... and {len(admitted) - 5} more")
+            print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
 
         print(f"\nUsing heroes mode elite/offspring fractions:")
         print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_ELITE_FRAC)} agents)")
@@ -2606,11 +2593,14 @@ class ERLTrainer:
 
         # Prepare environment config using shared memory (eliminates serialization overhead)
         # Note: start_idx/end_idx are dummy values here, overridden per slice in worker reset()
+        # Use gauntlet_mode during stabilization/gauntlet for soft zero-trades penalty
+        use_gauntlet_mode = self.breakthrough_state in (BreakthroughState.STABILIZATION, BreakthroughState.GAUNTLET)
         env_config = self._get_shared_env_config(
             start_idx=self.val_start_idx,
             end_idx=self.val_end_idx,
             trading_end_idx=self.val_start_idx + Config.TRADING_PERIOD_DAYS,
-            is_training=False  # Validation mode: no noise
+            is_training=False,  # Validation mode: no noise
+            gauntlet_mode=use_gauntlet_mode
         )
 
         # Execute validation in parallel
@@ -2701,6 +2691,9 @@ class ERLTrainer:
         gauntlet_slices = self.generate_gauntlet_slices()
         print(f"Testing on {len(gauntlet_slices)} slices (10 training + 10 validation)")
 
+        # Enable gauntlet mode for soft zero-trades penalty (tactical no-trade is acceptable)
+        self.eval_env.set_gauntlet_mode(True)
+
         # Run agent on all Gauntlet slices
         slice_results = []
         all_closed_trades = []  # Collect for expectancy calculation only
@@ -2784,6 +2777,9 @@ class ERLTrainer:
         print(f"  Quality Trades:    {quality_count:>12}")
         print(f"  Expectancy:        {expectancy:>11.2f}%")
         print(f"{'='*70}")
+
+        # Reset gauntlet mode after validation
+        self.eval_env.set_gauntlet_mode(False)
 
         return {
             'gauntlet_score': gauntlet_score,
@@ -3614,31 +3610,6 @@ class ERLTrainer:
                         if self.global_hof.enabled:
                             print(f"   Global 50 threshold: {self.global_hof.entry_threshold:.2f}")
 
-                    # CONSISTENCY MODE: Add agent to Hall of Fame (gauntlet is the gate to HoF)
-                    # This happens regardless of whether baseline is deferred
-                    if self.consistency_mode:
-                        # For gauntlet agents, we use the gauntlet_score as combined fitness
-                        # and store necessary fields for re-evaluation
-                        train_fitness = 0.0  # Gauntlet doesn't use training fitness
-                        val_fitness = gauntlet_score  # Gauntlet score is the validation fitness
-                        base_combined_fitness = gauntlet_score
-
-                        # Admit to Hall of Fame
-                        candidates = [(agent_to_admit, gauntlet_score, self.breakthrough_candidate.agent_idx, agent_roi, agent_expectancy,
-                                     train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness)]
-                        admission_results = self.hall_of_fame.update_from_generation(candidates, self.generation)
-
-                        # Print admission
-                        if admission_results:
-                            for agent_idx, score, action in admission_results:
-                                if action == 'admitted' or action.startswith('replaced_'):
-                                    print(f"\n🏆 Agent {agent_idx} admitted to Hall of Fame!")
-                                    print(f"   Gauntlet Score: {score:.2f}, ROI: {agent_roi:.2f}%")
-
-                        # Check for HoF turnover (only if baseline was applied)
-                        if not self.candidate_queue:
-                            self.check_hof_turnover()
-
                     # Log to wandb
                     wandb.log({
                         'gauntlet/confirmed_breakthroughs': self.confirmed_breakthroughs,
@@ -4284,6 +4255,14 @@ class ERLTrainer:
                 self.hof_turnover_count = trainer_state.get('hof_turnover_count', 0)
                 self.hof_current_median = trainer_state.get('hof_current_median', None)
                 self.generation_at_last_turnover = trainer_state.get('generation_at_last_turnover', 0)
+
+                # Reset fallback counter if --reset-limit flag was used
+                if self.reset_limit and self.consistency_mode:
+                    old_value = self.generation_at_last_turnover
+                    self.generation_at_last_turnover = self.start_generation
+                    print(f"✓ Reset fallback counter: {old_value} → {self.start_generation}")
+                    print(f"  Fresh runway of {Config.MAX_GENERATIONS_GAUNTLET} generations")
+
                 if self.consistency_mode and (self.hof_turnover_count > 0 or self.hof_current_median is not None):
                     print(f"✓ HoF Turnover tracking restored:")
                     print(f"  Turnovers: {self.hof_turnover_count}/{self.target_hof_turnovers}")
@@ -5099,9 +5078,6 @@ class ERLTrainer:
 
                 # Use batch update with aggressive admission and cascading swaps
                 admission_results = self.hall_of_fame.update_from_generation(candidates, gen)
-            else:
-                # Consistency mode: HoF admission happens only via gauntlet
-                admission_results = []
 
             # Print admission results
             admitted = [(idx, score, action) for idx, score, action in admission_results

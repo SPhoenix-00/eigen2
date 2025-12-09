@@ -225,6 +225,9 @@ class AgentEvaluator:
         agent.actor.eval()
         agent.critic.eval()
 
+        # Enable gauntlet mode for soft zero-trades penalty (tactical no-trade is acceptable)
+        self.gauntlet_helper.eval_env.set_gauntlet_mode(True)
+
         # Evaluate each slice using ERLTrainer's run_episode_batched
         for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
             # Use ERLTrainer's optimized batched inference
@@ -291,6 +294,9 @@ class AgentEvaluator:
         # Calculate ratios
         quality_ratio = float(quality_count / total_trades) if total_trades > 0 else 0.0
         win_ratio = float(total_wins / total_trades) if total_trades > 0 else 0.0
+
+        # Reset gauntlet mode after validation
+        self.gauntlet_helper.eval_env.set_gauntlet_mode(False)
 
         detailed_metrics = {
             'gauntlet_score': gauntlet_score,

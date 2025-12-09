@@ -147,6 +147,13 @@ def main():
             help='Path to an existing buffer_storage folder to reuse (e.g., "checkpoints/run-123/buffer_storage"). '
                  'Allows starting a new run with pre-filled replay buffer instead of starting from zero.'
         )
+        parser.add_argument(
+            '--reset-limit',
+            action='store_true',
+            help='Use with --resume to reset the fallback generation counter to max. '
+                 'In consistency mode, this resets the "generations since last turnover" counter, '
+                 'giving the run a fresh runway of MAX_GENERATIONS_GAUNTLET generations.'
+        )
         args = parser.parse_args()
         # --------------------------------
 
@@ -274,6 +281,7 @@ def main():
             consistency_mode=args.consistency,
             heroes_hof_dir=args.heroes,
             buffer_storage_path=args.buffer,
+            reset_limit=args.reset_limit,
             original_stdout=tee_logger.terminal,
             original_stderr=tee_logger.terminal
         )
