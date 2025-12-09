@@ -3461,7 +3461,9 @@ class ERLTrainer:
                         # Inject Global 50 agents to recover diversity after failed stabilization
                         if validation_results:
                             print(f"\n💉 INJECTING GLOBAL 50 AGENTS TO RECOVER DIVERSITY")
-                            training_fitness_scores = [r['training_fitness'] for r in validation_results]
+                            # Sort by agent index to ensure fitness matches population order
+                            sorted_results = sorted(validation_results, key=lambda x: x['idx'])
+                            training_fitness_scores = [r['training_fitness'] for r in sorted_results]
                             self._inject_global50_agents(training_fitness_scores)
 
                         # Only reach here if no next candidate was found
