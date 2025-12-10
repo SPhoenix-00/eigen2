@@ -5043,42 +5043,38 @@ class ERLTrainer:
             wandb.log(validation_log, step=gen)
 
             # --- Hall of Fame Admission Logic ---
-            # In consistency mode, only gauntlet-passing agents are admitted to HoF
-            # In normal mode, all validated agents are eligible for HoF admission
-            admission_results = []  # Default to empty if consistency_mode skips normal admission
-            if not self.consistency_mode:
-                # Re-evaluate all existing HoF entries with current median (EMA-based erosion)
-                # This ensures historical agents don't have unfair ROI advantages as median rises
-                # Erosion uses EMA smoothing: α=0.33 means gradual adjustment over ~3 generations
-                if len(self.hall_of_fame.entries) > 0:
-                    erosion_alpha = getattr(Config, 'HOF_EROSION_ALPHA', 0.33)  # Default: α=0.33 ≈ 3 gen convergence
-                    updated_count = self.hall_of_fame.recompute_all_scores(
-                        current_median_roi=median_hof_roi,
-                        roi_adjustment_multiplier=Config.ROI_ADJUSTMENT_MULTIPLIER,
-                        min_trades_threshold=Config.ROI_CONFIDENCE_MIN_TRADES,
-                        erosion_alpha=erosion_alpha,
-                        consistency_mode=self.consistency_mode
-                    )
-                    if updated_count > 0:
-                        print(f"\n🔄 Re-evaluated {updated_count}/{len(self.hall_of_fame.entries)} HoF agents with current median ({median_hof_roi:.2f}%) [EMA α={erosion_alpha:.2f}]")
+            # Re-evaluate all existing HoF entries with current median (EMA-based erosion)
+            # This ensures historical agents don't have unfair ROI advantages as median rises
+            # Erosion uses EMA smoothing: α=0.33 means gradual adjustment over ~3 generations
+            if len(self.hall_of_fame.entries) > 0:
+                erosion_alpha = getattr(Config, 'HOF_EROSION_ALPHA', 0.33)  # Default: α=0.33 ≈ 3 gen convergence
+                updated_count = self.hall_of_fame.recompute_all_scores(
+                    current_median_roi=median_hof_roi,
+                    roi_adjustment_multiplier=Config.ROI_ADJUSTMENT_MULTIPLIER,
+                    min_trades_threshold=Config.ROI_CONFIDENCE_MIN_TRADES,
+                    erosion_alpha=erosion_alpha,
+                    consistency_mode=self.consistency_mode
+                )
+                if updated_count > 0:
+                    print(f"\n🔄 Re-evaluated {updated_count}/{len(self.hall_of_fame.entries)} HoF agents with current median ({median_hof_roi:.2f}%) [EMA α={erosion_alpha:.2f}]")
 
-                # Build candidate list from all agents in this generation
-                candidates = []
-                for result in validation_results:
-                    agent_idx = result['idx']
-                    combined_score = result['combined_fitness']
-                    agent_roi = result['roi']
-                    agent_expectancy = result['expectancy']
-                    train_fitness = result['training_fitness']
-                    quality_count = result['quality_count']
-                    total_trades = result['total_trades']
-                    val_fitness = result['validation_fitness']
-                    base_combined_fitness = result['base_combined_fitness']
-                    candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
-                                     train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
+            # Build candidate list from all agents in this generation
+            candidates = []
+            for result in validation_results:
+                agent_idx = result['idx']
+                combined_score = result['combined_fitness']
+                agent_roi = result['roi']
+                agent_expectancy = result['expectancy']
+                train_fitness = result['training_fitness']
+                quality_count = result['quality_count']
+                total_trades = result['total_trades']
+                val_fitness = result['validation_fitness']
+                base_combined_fitness = result['base_combined_fitness']
+                candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
+                                 train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
 
-                # Use batch update with aggressive admission and cascading swaps
-                admission_results = self.hall_of_fame.update_from_generation(candidates, gen)
+            # Use batch update with aggressive admission and cascading swaps
+            admission_results = self.hall_of_fame.update_from_generation(candidates, gen)
 
             # Print admission results
             admitted = [(idx, score, action) for idx, score, action in admission_results
