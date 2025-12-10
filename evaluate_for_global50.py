@@ -1428,6 +1428,9 @@ Examples:
   # Re-evaluate all agents with current logic (updates metrics)
   python evaluate_for_global50.py --eval
 
+  # Re-evaluate agents in a specific context window (e.g., cw504)
+  python evaluate_for_global50.py --eval --cw 504
+
   # Remove agents with scores below 0
   python evaluate_for_global50.py --trim 0
 
@@ -1502,7 +1505,20 @@ Examples:
         help='Like --cleanup but only reports orphans without archiving them.'
     )
 
+    parser.add_argument(
+        '--cw',
+        type=int,
+        metavar='DAYS',
+        help='Context window size in days (e.g., --cw 504 for cw504). Overrides Config.CONTEXT_WINDOW_DAYS for this script only.'
+    )
+
     args = parser.parse_args()
+
+    # Override context window if specified
+    if args.cw:
+        from utils.config import Config
+        Config.CONTEXT_WINDOW_DAYS = args.cw
+        print(f"Using context window: cw{args.cw}")
 
     # Initialize evaluator
     evaluator = AgentEvaluator(run_name=args.run_name)
