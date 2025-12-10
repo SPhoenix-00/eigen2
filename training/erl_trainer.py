@@ -3667,15 +3667,42 @@ class ERLTrainer:
                         self.breakthrough_history.append(breakthrough_event)
 
                     # GLOBAL 50: Attempt to promote agent to Global Hall of Fame
-                    # CRITICAL: Only allow promotion when running with --consistency mode
-                    # This ensures Global 50 contains only agents evaluated with rigorous consistency standards
+                    # All promotions use consistency-aligned gauntlet scores for fair comparison
                     if self.consistency_mode:
+                        # Already in consistency mode - use existing gauntlet results
+                        g50_gauntlet_score = gauntlet_score
+                        g50_gauntlet_results = gauntlet_results
+                    else:
+                        # Normal mode: Check if agent might qualify, then run consistency-aligned re-gauntlet
+                        g50_gauntlet_score = None
+                        g50_gauntlet_results = None
+
+                        if self.global_hof.enabled and self.global_hof.should_promote(gauntlet_score):
+                            print(f"\n   ⓘ Agent may qualify for Global 50 (score {gauntlet_score:.2f} > threshold {self.global_hof.entry_threshold:.2f})")
+                            print(f"   Running consistency-aligned re-gauntlet for fair Global 50 comparison...")
+
+                            # Temporarily enable consistency mode on eval_env
+                            self.eval_env.set_consistency_mode(True)
+                            try:
+                                g50_gauntlet_results = self.run_gauntlet_validation(self.breakthrough_candidate.agent)
+                                g50_gauntlet_score = g50_gauntlet_results['gauntlet_score']
+                                print(f"   Consistency-aligned gauntlet score: {g50_gauntlet_score:.2f}")
+                            finally:
+                                # Always reset consistency mode back to False
+                                self.eval_env.set_consistency_mode(False)
+                        else:
+                            print(f"   ⓘ Agent gauntlet score: {gauntlet_score:.2f}")
+                            if self.global_hof.enabled:
+                                print(f"   Global 50 threshold: {self.global_hof.entry_threshold:.2f}")
+
+                    # Attempt promotion if we have a consistency-aligned score
+                    if g50_gauntlet_score is not None and self.global_hof.should_promote(g50_gauntlet_score):
                         agent_to_admit = self.breakthrough_candidate.agent
-                        agent_roi = gauntlet_results['roi']
-                        agent_expectancy = gauntlet_results['expectancy']
-                        quality_count = gauntlet_results.get('quality_count', 0)
-                        total_trades = gauntlet_results.get('total_trades', 0)
-                        win_rate = gauntlet_results.get('win_rate', 0.0)
+                        agent_roi = g50_gauntlet_results['roi']
+                        agent_expectancy = g50_gauntlet_results['expectancy']
+                        quality_count = g50_gauntlet_results.get('quality_count', 0)
+                        total_trades = g50_gauntlet_results.get('total_trades', 0)
+                        win_rate = g50_gauntlet_results.get('win_rate', 0.0)
 
                         # Calculate quality_ratio from quality_count and total_trades
                         quality_ratio = quality_count / total_trades if total_trades > 0 else 0.0
@@ -3683,7 +3710,7 @@ class ERLTrainer:
                         # Try to promote to Global 50
                         promoted = self.global_hof.check_and_promote(
                             agent=agent_to_admit,
-                            gauntlet_score=gauntlet_score,
+                            gauntlet_score=g50_gauntlet_score,
                             generation=self.generation,
                             roi=agent_roi,
                             expectancy=agent_expectancy,
@@ -3694,12 +3721,6 @@ class ERLTrainer:
 
                         if promoted:
                             pass  # Global 50 promotion succeeded
-                    else:
-                        # Normal mode: Can compare scores but cannot promote to Global 50
-                        print(f"   ⓘ Global 50 promotion skipped (requires --consistency mode)")
-                        print(f"   Agent gauntlet score: {gauntlet_score:.2f}")
-                        if self.global_hof.enabled:
-                            print(f"   Global 50 threshold: {self.global_hof.entry_threshold:.2f}")
 
                     # Log to wandb
                     wandb.log({

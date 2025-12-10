@@ -154,6 +154,15 @@ class TradingEnvironment(gym.Env):
         """
         self.gauntlet_mode = gauntlet_mode
 
+    def set_consistency_mode(self, consistency_mode: bool):
+        """
+        Set whether environment uses consistency mode evaluation rules.
+
+        Args:
+            consistency_mode: If True, applies loss magnification (see Config.CONSISTENCY_LOSS_MULTIPLIER)
+        """
+        self.consistency_mode = consistency_mode
+
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None,
              start_idx: Optional[int] = None, end_idx: Optional[int] = None,
              trading_end_idx: Optional[int] = None) -> Tuple[np.ndarray, dict]:
