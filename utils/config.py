@@ -68,8 +68,8 @@ class Config:
     ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY = 50  # Consistency mode: higher bar for stricter requirements
     # Confidence factor = min(1.0, quality_count / threshold)
     # This prevents "lucky snipers" who make few high-ROI trades from getting inflated fitness
-    ROI_QUALITY_THRESHOLD = 7.5  # Default minimum gain_pct for a trade to count as "quality"
-    ROI_USE_HOF_MEDIAN_AS_THRESHOLD = True  # If True, use HoF median ROI as threshold (supersedes default)
+    ROI_QUALITY_THRESHOLD = 10.0  # Default minimum gain_pct for a trade to count as "quality"
+    ROI_USE_HOF_MEDIAN_AS_THRESHOLD = False  # If True, use HoF median ROI as threshold (supersedes default)
 
     # Hall of Fame erosion mechanism
     HOF_EROSION_ALPHA = 0.33  # EMA smoothing factor for gradual score erosion (0-1)
