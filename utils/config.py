@@ -16,7 +16,7 @@ class Config:
     TOTAL_COLUMNS = 117  # Skinny dataset: only loading first 117 columns (columns 0-116) from the pkl
     FEATURES_PER_CELL = 5  # [close, RSI, MACD_signal, TRIX, diff20DMA] - selected from original 9
     
-    CONTEXT_WINDOW_DAYS = 151  # Used to be 504 (2 years of trading days)
+    CONTEXT_WINDOW_DAYS = 151  # ~6 months of trading days
     TRAIN_TEST_SPLIT = 0.95  # DEPRECATED - Use VALIDATION_DAYS and COMMITTEE_HOLDOUT_DAYS instead
 
     # ============ Data Split Configuration ============
@@ -127,17 +127,14 @@ class Config:
     MIN_NOISE = 0.01
     
     # ============ ERL Parameters ============
-    POPULATION_SIZE = 96 # Used to be 32 when context was 504 days 
-    NUM_GENERATIONS = 200
+    POPULATION_SIZE = 96
+    NUM_GENERATIONS = 100
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
-    # Selection
-    """     NUM_PARENTS = 8  # Top performers to keep
-    NUM_OFFSPRING = 6  # Generated via crossover
-    NUM_MUTANTS = 2  # Random mutations """
-    ELITE_FRAC = 0.4       # 25% of population
-    OFFSPRING_FRAC = 0.4   # 25% of population
-    # MUTANT_FRAC will be the remainder (50%, massively increased for exploration)
+    # Selection (fraction-based)
+    ELITE_FRAC = 0.4       # 40% of population
+    OFFSPRING_FRAC = 0.4   # 40% of population
+    # MUTANT_FRAC is the remainder (20%)
 
     # Heroes mode - when loading pre-trained agents from Hall of Fame
     # Uses higher elite fraction since these agents are already well-trained
@@ -150,11 +147,11 @@ class Config:
     CONSISTENCY_LOSS_MULTIPLIER = 1.5  # Magnify losses by 1.5x to focus training on reducing drawdowns
 
     # Genetic operators
-    CROSSOVER_ALPHA_MIN = 0.2  # Widened range for more diverse offspring (was 0.3)
-    CROSSOVER_ALPHA_MAX = 0.8  # Widened range for more diverse offspring (was 0.7)
-    MUTATION_RATE = 0.20  # Base mutation rate for normal mode (doubled from 0.20 for aggressive exploration)
+    CROSSOVER_ALPHA_MIN = 0.2
+    CROSSOVER_ALPHA_MAX = 0.8
+    MUTATION_RATE = 0.20  # Base mutation rate for normal mode
     MUTATION_RATE_CONSISTENCY = 0.15  # Mutation rate for consistency mode (lower to preserve stable traits)
-    MUTATION_STD = 0.025  # Base mutation magnitude (doubled from 0.025 for aggressive exploration)
+    MUTATION_STD = 0.025  # Base mutation magnitude
     # NOTE: Adaptive mutation automatically boosts these values by 1.5x when validation fitness
     # plateaus for 3 consecutive generations (< 2% improvement), helping escape local optima
     # Max caps are set in ERLTrainer (0.8 for rate, 0.1 for std) to allow further increases

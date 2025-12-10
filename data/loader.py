@@ -351,12 +351,12 @@ class StockDataLoader:
     def get_window(self, end_idx: int) -> Optional[np.ndarray]:
         """
         Get a context window ending at end_idx.
-        
+
         Args:
             end_idx: Index of the current day (window ends here)
-            
+
         Returns:
-            Window of shape [context_window_days, num_columns, 9_features]
+            Window of shape [context_window_days, num_columns, num_features]
             or None if not enough history
         """
         if self.data_array is None:
@@ -416,11 +416,11 @@ class StockDataLoader:
         """
         Normalize a window using provided statistics.
         NaN values remain as NaN after normalization.
-        
+
         Args:
-            window: Array of shape [context_window_days, num_columns, 9_features]
+            window: Array of shape [context_window_days, num_columns, num_features]
             stats: Dictionary with 'mean' and 'std'
-            
+
         Returns:
             Normalized window (same shape)
         """

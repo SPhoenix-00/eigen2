@@ -8,13 +8,12 @@ import os
 import shutil
 import threading
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass, asdict
+from typing import Optional, Dict, List, Tuple, Any
+from pydantic import BaseModel, field_validator, model_validator
 from models.ddpg_agent import DDPGAgent
 
 
-@dataclass
-class LeagueRules:
+class LeagueRules(BaseModel):
     """
     Configuration rules that define the competitive league.
     All runs must match these rules to participate in the Global 50.
@@ -23,29 +22,31 @@ class LeagueRules:
     # Add other league-defining parameters here as needed
     # e.g., episode_length, min_holding_period, etc.
 
+    model_config = {"extra": "ignore"}
+
+    @field_validator('context_window_days', mode='before')
+    @classmethod
+    def convert_numpy_int(cls, v: Any) -> int:
+        """Convert numpy types to Python native types."""
+        if hasattr(v, 'item'):
+            return v.item()
+        return v
+
     def matches(self, other: 'LeagueRules') -> bool:
         """Check if this league config matches another."""
         return self.context_window_days == other.context_window_days
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        data = asdict(self)
-        # Convert numpy types to Python native types for JSON serialization
-        for key, value in data.items():
-            if hasattr(value, 'item'):  # numpy scalar
-                data[key] = value.item()
-            elif isinstance(value, (list, tuple)):
-                data[key] = [v.item() if hasattr(v, 'item') else v for v in value]
-        return data
+        return self.model_dump()
 
     @staticmethod
     def from_dict(data: dict) -> 'LeagueRules':
         """Create from dictionary."""
-        return LeagueRules(**data)
+        return LeagueRules.model_validate(data)
 
 
-@dataclass
-class GlobalHoFEntry:
+class GlobalHoFEntry(BaseModel):
     """
     A single entry in the Global Hall of Fame.
     """
@@ -59,33 +60,44 @@ class GlobalHoFEntry:
     win_ratio: float = 0.0
     total_trades: int = 0
 
+    model_config = {"extra": "ignore"}
+
+    @field_validator('agent_id', 'generation', 'total_trades', mode='before')
+    @classmethod
+    def convert_numpy_int(cls, v: Any) -> int:
+        """Convert numpy int types to Python native int."""
+        if hasattr(v, 'item'):
+            return v.item()
+        return v
+
+    @field_validator('gauntlet_score', 'roi', 'expectancy', 'quality_ratio', 'win_ratio', mode='before')
+    @classmethod
+    def convert_numpy_float(cls, v: Any) -> float:
+        """Convert numpy float types to Python native float."""
+        if hasattr(v, 'item'):
+            return v.item()
+        return v
+
+    @model_validator(mode='before')
+    @classmethod
+    def migrate_old_format(cls, data: Any) -> Any:
+        """Handle migration from old format (quality_count) to new format (quality_ratio, win_ratio)."""
+        if isinstance(data, dict):
+            if 'quality_count' in data and 'quality_ratio' not in data:
+                quality_count = data.pop('quality_count')
+                total_trades = data.get('total_trades', 0)
+                data['quality_ratio'] = float(quality_count / total_trades) if total_trades > 0 else 0.0
+                data['win_ratio'] = 0.0
+        return data
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        data = asdict(self)
-        # Convert numpy types to Python native types for JSON serialization
-        for key, value in data.items():
-            if hasattr(value, 'item'):  # numpy scalar
-                data[key] = value.item()
-            elif isinstance(value, (list, tuple)):
-                data[key] = [v.item() if hasattr(v, 'item') else v for v in value]
-        return data
+        return self.model_dump()
 
     @staticmethod
     def from_dict(data: dict) -> 'GlobalHoFEntry':
         """Create from dictionary with backward compatibility."""
-        # Handle migration from old format (quality_count) to new format (quality_ratio, win_ratio)
-        if 'quality_count' in data and 'quality_ratio' not in data:
-            # Old format detected - convert to new format
-            quality_count = data.pop('quality_count')
-            total_trades = data.get('total_trades', 0)
-
-            # Calculate quality_ratio from quality_count
-            data['quality_ratio'] = float(quality_count / total_trades) if total_trades > 0 else 0.0
-
-            # win_ratio wasn't stored before, default to 0.0
-            data['win_ratio'] = 0.0
-
-        return GlobalHoFEntry(**data)
+        return GlobalHoFEntry.model_validate(data)
 
     def get_filename(self) -> str:
         """Generate unique filename for this agent's weights."""

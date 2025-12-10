@@ -63,42 +63,6 @@ export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
 
 python main.py              # New training
 python main.py --resume     # Resume from last run
-
-# Reuse replay buffer from a previous run (start with pre-filled buffer)
-python main.py --buffer checkpoints/azure-thunder-123/buffer_storage
-```
-
----
-
-## Training Options
-
-### Reusing Replay Buffers (`--buffer`)
-
-When starting a new training run, you can leverage an existing replay buffer from a previous run instead of starting from zero. This can significantly speed up initial training by providing pre-collected experiences.
-
-**Usage:**
-```bash
-python main.py --buffer checkpoints/RUN_NAME/buffer_storage
-```
-
-**How it works:**
-1. Loads existing transitions from the specified buffer storage folder
-2. Creates a new run with its own checkpoint directory
-3. New transitions are added to the current run's buffer storage
-4. The buffer acts as a "warm start" for training
-
-**When to use:**
-- Starting a new run with different hyperparameters but want to reuse experiences
-- Testing new agent architectures with existing data
-- Continuing experimentation without waiting for buffer to fill
-
-**Example:**
-```bash
-# Run 1: Train normally (builds buffer from scratch)
-python main.py
-
-# Later: Start new run reusing the buffer from azure-thunder-123
-python main.py --buffer checkpoints/azure-thunder-123/buffer_storage --heroes auto
 ```
 
 ---

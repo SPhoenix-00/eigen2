@@ -373,7 +373,7 @@ class Actor(nn.Module):
         Forward pass with gradient checkpointing.
 
         Args:
-            state: [batch, context_days, num_columns, 9]
+            state: [batch, context_days, num_columns, num_features]
             return_attention_weights: Whether to return attention weights for logging
 
         Returns:
@@ -442,20 +442,24 @@ class Actor(nn.Module):
     def _apply_coefficient_activation(self, raw: torch.Tensor) -> torch.Tensor:
         """
         Apply activation to output continuous position size multiplier.
-        Uses ReLU for unbounded positive output [0, inf).
+        Uses ReLU clamped to [0, 100] for bounded positive output.
 
         During training: outputs continuous values for gradient flow
         During inference: will be compared against threshold in trading logic
+
+        CRITICAL: Hard cap at 100 ensures Critic sees the same max limit as inference.
+        Without this, the Actor might output 500 during training (Critic learns high Q-value)
+        but inference clips to 100, causing action space mismatch and underperformance.
 
         Args:
             raw: Raw output from network
 
         Returns:
-            Activated coefficients as position size multipliers [0, inf)
+            Activated coefficients as position size multipliers [0, 100]
         """
         # ReLU: maps raw values to [0, inf) for position size multiplier
         # Values below COEFFICIENT_THRESHOLD (1.0) will not trigger trades
-        # Values >= COEFFICIENT_THRESHOLD will scale position size (discrete sizing with cap at 100)
+        # Values >= COEFFICIENT_THRESHOLD will scale position size
         coefficients = F.relu(raw)
 
         # Apply leverage multiplier if enabled (when coefficient > 1)
@@ -464,6 +468,11 @@ class Actor(nn.Module):
             mask = coefficients > 1.0
             # Apply multiplier only to coefficients > 1
             coefficients = torch.where(mask, coefficients * self.leverage_multiplier, coefficients)
+
+        # HARD CAP AT 100: Align training with inference constraints
+        # Gradients zero out above 100, preventing the network from
+        # "dreaming" of infinite leverage the Critic can never deliver
+        coefficients = torch.clamp(coefficients, max=100.0)
 
         return coefficients
 
@@ -528,7 +537,7 @@ class Critic(nn.Module):
         Forward pass with gradient checkpointing.
 
         Args:
-            state: [batch, context_days, num_columns, 9]
+            state: [batch, context_days, num_columns, num_features]
             action: [batch, 108, 2]
 
         Returns:

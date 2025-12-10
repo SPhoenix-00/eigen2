@@ -19,7 +19,7 @@ python main.py --heroes /path/to/checkpoint_folder --consistency
 ### Command-line Arguments
 
 - `--heroes HOF_DIR`: Path to a checkpoint directory containing agent files
-- `--consistency`: (Optional) Enable consistency mode with loss magnification (3.0x by default, see Config.CONSISTENCY_LOSS_MULTIPLIER)
+- `--consistency`: (Optional) Enable consistency mode with loss magnification (1.5x by default, see Config.CONSISTENCY_LOSS_MULTIPLIER)
 
 ## Hall of Fame Folder Structure
 
@@ -88,8 +88,8 @@ python main.py --heroes my_heroes --consistency
 2. **Evaluate**: Each agent is evaluated using the current reward function:
    - Standard mode: 3 episodes, fitness = avg(lowest 2)
    - Consistency mode: 5 episodes, fitness = sum(all 5)
-3. **Select**: Top 32 agents by fitness are selected for the initial population
-4. **Fill**: If fewer than 32 agents, top performers are cloned to fill remaining slots
+3. **Select**: Top agents by fitness are selected for the initial population (up to POPULATION_SIZE)
+4. **Fill**: If fewer agents than POPULATION_SIZE, top performers are cloned to fill remaining slots
 
 ## Evolution Fractions in Heroes Mode
 
@@ -97,9 +97,9 @@ Heroes mode uses different elite/mutant ratios optimized for fine-tuning pre-tra
 
 | Parameter | Standard Mode | Heroes Mode |
 |-----------|---------------|-------------|
-| Elite %   | 25% (8)       | 50% (16)    |
-| Offspring %| 25% (8)      | 37.5% (12)  |
-| Mutant %  | 50% (16)      | 12.5% (4)   |
+| Elite %   | 40%           | 50%         |
+| Offspring %| 40%          | 37.5%       |
+| Mutant %  | 20%           | 12.5%       |
 
 This preserves more of the proven performers while still allowing some genetic exploration.
 
@@ -126,7 +126,7 @@ This preserves more of the proven performers while still allowing some genetic e
 
 - The evaluation during loading uses the current environment settings (including consistency mode)
 - Agents are evaluated on training data slices, not validation data
-- The original agent IDs are discarded; new IDs 0-31 are assigned by fitness rank
+- The original agent IDs are discarded; new IDs are assigned by fitness rank
 - If no valid agents can be loaded, training continues with random initialization
 
 ## Troubleshooting

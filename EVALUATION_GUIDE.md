@@ -71,7 +71,7 @@ The script will:
 
 ### 3. Validation Slice Evaluation
 Generates 3 random slices from the interim validation set, each consisting of:
-- **504 days of context** (2 years) - for the agent to observe market conditions
+- **151 days of context** (~6 months) - for the agent to observe market conditions
 - **125 days of trading** - where the agent can open new positions
 - **30 days of settlement** - to close remaining positions (min 20-day hold + 10-day liquidation window)
 
@@ -223,8 +223,8 @@ fitness = total_reward - inaction_penalty - zero_trades_penalty
 
 Where:
 - `total_reward`: Sum of rewards from all closed positions
-- `inaction_penalty`: 5 points per day without an open position
-- `zero_trades_penalty`: 10,000 points if no trades were made
+- `inaction_penalty`: Points per day without an open position (see Config.INACTION_PENALTY)
+- `zero_trades_penalty`: Heavy penalty if no trades were made (see Config.ZERO_TRADES_PENALTY_NORMAL)
 
 ### Trade Exit Types
 

@@ -383,18 +383,15 @@ if __name__ == "__main__":
     # Test full generation creation
     print("\n--- Testing Full Generation Creation ---")
     # Temporarily override config for testing
-    original_config = (Config.NUM_PARENTS, Config.NUM_OFFSPRING, Config.NUM_MUTANTS)
-    Config.NUM_PARENTS = 3
-    Config.NUM_OFFSPRING = 2
-    Config.NUM_MUTANTS = 1
+    original_pop_size = Config.POPULATION_SIZE
     Config.POPULATION_SIZE = 6
-    
+
     next_gen = create_next_generation(population, fitness_scores)
-    
+
     print(f"\nNext generation size: {len(next_gen)}")
     print(f"Agent IDs: {[a.agent_id for a in next_gen]}")
-    
+
     # Restore config
-    Config.NUM_PARENTS, Config.NUM_OFFSPRING, Config.NUM_MUTANTS = original_config
-    
+    Config.POPULATION_SIZE = original_pop_size
+
     print("\n✓ Genetic algorithm operations test complete!")

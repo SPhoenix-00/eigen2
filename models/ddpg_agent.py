@@ -70,11 +70,11 @@ class DDPGAgent:
     def select_action(self, state: np.ndarray, add_noise: bool = True) -> np.ndarray:
         """
         Select action using current policy.
-        
+
         Args:
-            state: State observation [context_days, num_columns, 9]
+            state: State observation [context_days, num_columns, num_features]
             add_noise: Whether to add exploration noise
-            
+
         Returns:
             Action [108, 2]
         """
@@ -102,8 +102,10 @@ class DDPGAgent:
             # It causes the agent to overfit to the training noise.
             # action[:, 0] = np.round(action[:, 0]) # <-- DELETED
 
-            # Cap coefficients at 100 to prevent reward explosion
-            # (reward = coefficient × gain_pct, so uncapped coefficients could destabilize training)
+            # Safety clip for coefficients after noise addition
+            # NOTE: The Actor network now clamps coefficients to [0, 100] internally via torch.clamp,
+            # ensuring the Critic sees the same range during training as inference.
+            # This numpy clip is a safety net for noise that might push values outside bounds.
             action[:, 0] = np.clip(action[:, 0], 0, 100)
 
         self.actor.train()
@@ -144,7 +146,8 @@ class DDPGAgent:
                 actions[:, :, 0] = np.maximum(actions[:, :, 0], 0)  # Coefficient >= 0
                 actions[:, :, 1] = np.clip(actions[:, :, 1], Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
 
-            # Cap coefficients
+            # Safety clip for coefficients after noise addition
+            # NOTE: Actor network clamps to [0, 100] internally; this handles noise overflow
             actions[:, :, 0] = np.clip(actions[:, :, 0], 0, 100)
 
         self.actor.train()

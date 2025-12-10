@@ -19,9 +19,14 @@ import math
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-from multiprocessing import shared_memory
+from multiprocessing import shared_memory, resource_tracker
 from enum import Enum
 from dataclasses import dataclass
+from collections import OrderedDict
+
+# Maximum number of agents to cache per worker to prevent memory leaks
+# During evolution, agents mutate every generation, so old cache entries become stale
+_WORKER_CACHE_MAX_SIZE = 50
 
 # Suppress common library warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='gymnasium')
@@ -124,7 +129,48 @@ def _init_worker(env_config):
 
     # Cache for reconstructed agents to avoid rebuilding same agent multiple times
     # Key: hash of agent_state, Value: DDPGAgent instance
-    _worker_agent_cache = {}
+    # Uses OrderedDict for LRU eviction - most recently used items are moved to end
+    _worker_agent_cache = OrderedDict()
+
+
+def _cache_agent(state_hash, agent):
+    """
+    Add an agent to the LRU cache with size limit enforcement.
+
+    Uses OrderedDict for LRU semantics - entries are ordered by insertion/access time.
+    When cache exceeds _WORKER_CACHE_MAX_SIZE, the oldest entries are evicted.
+
+    Args:
+        state_hash: Hash key for the agent state
+        agent: DDPGAgent instance to cache
+    """
+    global _worker_agent_cache
+
+    # Evict oldest entries if cache is at capacity
+    while len(_worker_agent_cache) >= _WORKER_CACHE_MAX_SIZE:
+        # popitem(last=False) removes the oldest (first) entry
+        _worker_agent_cache.popitem(last=False)
+
+    _worker_agent_cache[state_hash] = agent
+
+
+def _get_cached_agent(state_hash):
+    """
+    Retrieve an agent from cache, updating LRU order if found.
+
+    Args:
+        state_hash: Hash key to look up
+
+    Returns:
+        DDPGAgent if found, None otherwise
+    """
+    global _worker_agent_cache
+
+    if state_hash in _worker_agent_cache:
+        # Move to end to mark as recently used (LRU semantics)
+        _worker_agent_cache.move_to_end(state_hash)
+        return _worker_agent_cache[state_hash]
+    return None
 
 
 def _run_episode_worker(args):
@@ -159,7 +205,9 @@ def _run_episode_worker(args):
     actor_bytes = str(agent_state['actor']).encode()
     state_hash = hashlib.md5(actor_bytes).hexdigest()
 
-    if state_hash not in _worker_agent_cache:
+    # Use LRU cache with size limit to prevent memory leaks during evolution
+    agent = _get_cached_agent(state_hash)
+    if agent is None:
         # Reconstruct agent from state dict (agents with CUDA tensors are not picklable)
         from models.ddpg_agent import DDPGAgent
         agent = DDPGAgent(agent_id=0)
@@ -167,9 +215,7 @@ def _run_episode_worker(args):
         agent.critic.load_state_dict(agent_state['critic'])
         agent.actor.eval()
         agent.critic.eval()
-        _worker_agent_cache[state_hash] = agent
-    else:
-        agent = _worker_agent_cache[state_hash]
+        _cache_agent(state_hash, agent)
 
     # OPTIMIZATION: Reuse worker's environment instead of creating new one
     env = _worker_env
@@ -184,8 +230,8 @@ def _run_episode_worker(args):
     transition_file_paths = []
 
     # Write transitions directly to disk during episode (parallel I/O)
-    # Note: We save to buffer regardless of training flag (noise) - this enables "Teacher Forcing"
-    # where Elites contribute high-quality positive-reward examples to help the Critic learn
+    # Note: We save to buffer regardless of training flag (noise) - this enables "Elite Demonstration"
+    # where Elites contribute high-quality off-policy examples to help the Critic learn
     if buffer_storage_path:
         from pathlib import Path
         import pickle
@@ -297,7 +343,9 @@ def _run_validation_worker(args):
     actor_bytes = str(agent_state['actor']).encode()
     state_hash = hashlib.md5(actor_bytes).hexdigest()
 
-    if state_hash not in _worker_agent_cache:
+    # Use LRU cache with size limit to prevent memory leaks during evolution
+    agent = _get_cached_agent(state_hash)
+    if agent is None:
         # Reconstruct agent from state dict
         from models.ddpg_agent import DDPGAgent
         agent = DDPGAgent(agent_id=0)
@@ -305,9 +353,7 @@ def _run_validation_worker(args):
         agent.critic.load_state_dict(agent_state['critic'])
         agent.actor.eval()
         agent.critic.eval()
-        _worker_agent_cache[state_hash] = agent
-    else:
-        agent = _worker_agent_cache[state_hash]
+        _cache_agent(state_hash, agent)
 
     # OPTIMIZATION: Reuse worker's environment instead of creating new one
     env = _worker_env
@@ -797,7 +843,10 @@ class ERLTrainer:
         self._create_dataloader()
 
         # Set unique random seed based on wandb run id
-        run_id_hash = hash(wandb.run.id) % (2**32)
+        # Use hashlib instead of hash() for deterministic cross-process reproducibility
+        # (Python's hash() is randomized per process due to PYTHONHASHSEED)
+        import hashlib
+        run_id_hash = int(hashlib.sha256(wandb.run.id.encode()).hexdigest(), 16) % (2**32)
         self.seed = run_id_hash
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
@@ -1006,6 +1055,8 @@ class ERLTrainer:
         )
         shm_data_view[:] = data_array[:]
         self._shm_blocks.append(self._shm_data_array)
+        # Register with resource tracker for crash-safe cleanup (prevents zombie segments)
+        resource_tracker.register(self._shm_data_array.name, "shared_memory")
 
         # Create shared memory for data_array_full (full features for environment)
         data_array_full = self.data_loader.data_array_full
@@ -1021,6 +1072,8 @@ class ERLTrainer:
         )
         shm_full_view[:] = data_array_full[:]
         self._shm_blocks.append(self._shm_data_array_full)
+        # Register with resource tracker for crash-safe cleanup (prevents zombie segments)
+        resource_tracker.register(self._shm_data_array_full.name, "shared_memory")
 
         # Store metadata for workers
         self._shm_metadata = {
@@ -1437,7 +1490,7 @@ class ERLTrainer:
             # Take step
             next_state, reward, terminated, truncated, info = env.step(action)
             
-            # Store transition in replay buffer (Teacher Forcing: all agents contribute)
+            # Store transition in replay buffer (Off-Policy Buffer: all agents contribute)
             # Note: training flag controls noise (line 776), not buffer saving
             self.replay_buffer.add(
                 state=state.astype(np.float32),
@@ -1845,6 +1898,74 @@ class ERLTrainer:
 
         return float(fitness)
 
+    def _calculate_pessimistic_fitness(self, slice_fitness_scores: List[float]) -> float:
+        """
+        Calculate fitness using pessimistic aggregator (0.4*mean + 0.6*min).
+
+        This aligns training incentives with validation requirements by giving
+        60% weight to worst slice performance and 40% to average performance.
+
+        Args:
+            slice_fitness_scores: List of fitness scores from multiple evaluation slices
+
+        Returns:
+            Pessimistically aggregated fitness score
+        """
+        mean_score = np.mean(slice_fitness_scores)
+        min_score = np.min(slice_fitness_scores)
+        return (0.4 * mean_score) + (0.6 * min_score)
+
+    def _aggregate_agent_stats(self, slice_episode_stats: List[Dict]) -> Dict:
+        """
+        Aggregate episode statistics across all training slices for a single agent.
+
+        Calculates global win rate (total wins / total trades) rather than
+        averaging per-slice win rates for more accurate representation.
+
+        Args:
+            slice_episode_stats: List of episode info dicts from multiple slices
+
+        Returns:
+            Aggregated stats dict with num_trades, num_wins, num_losses, win_rate
+        """
+        agent_total_wins = sum(s['num_wins'] for s in slice_episode_stats)
+        agent_total_losses = sum(s['num_losses'] for s in slice_episode_stats)
+        agent_total_trades = agent_total_wins + agent_total_losses
+        agent_win_rate = agent_total_wins / agent_total_trades if agent_total_trades > 0 else 0.0
+
+        return {
+            'num_trades': int(np.mean([s['num_trades'] for s in slice_episode_stats])),
+            'num_wins': int(np.mean([s['num_wins'] for s in slice_episode_stats])),
+            'num_losses': int(np.mean([s['num_losses'] for s in slice_episode_stats])),
+            'win_rate': agent_win_rate,
+        }
+
+    def _aggregate_population_stats(self, all_episode_stats: List[Dict], fitness_scores: List[float]) -> Dict:
+        """
+        Aggregate statistics across all agents in the population.
+
+        Args:
+            all_episode_stats: List of per-agent aggregated stats dicts
+            fitness_scores: List of fitness scores for all agents
+
+        Returns:
+            Population-level aggregate stats dict
+        """
+        agents_with_trades = [s for s in all_episode_stats if s['num_trades'] > 0]
+        avg_win_rate = (
+            float(sum(s['win_rate'] for s in agents_with_trades) / len(agents_with_trades))
+            if agents_with_trades else 0.0
+        )
+
+        return {
+            'total_trades': int(sum(s['num_trades'] for s in all_episode_stats)),
+            'avg_trades_per_agent': float(sum(s['num_trades'] for s in all_episode_stats) / len(all_episode_stats)),
+            'total_wins': int(sum(s['num_wins'] for s in all_episode_stats)),
+            'total_losses': int(sum(s['num_losses'] for s in all_episode_stats)),
+            'avg_win_rate': avg_win_rate,
+            'agents_with_positive_fitness': int(sum(1 for f in fitness_scores if f > 0)),
+        }
+
     def evaluate_population(self) -> Tuple[List[float], Dict]:
         """
         Evaluate all agents in population (fitness scores).
@@ -1871,7 +1992,7 @@ class ERLTrainer:
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
         num_exploratory = len(self.population) - num_elites
-        print(f"Teacher Forcing enabled: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
+        print(f"Elite Demonstration: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
 
         for agent_idx, agent in enumerate(tqdm(self.population, desc="Evaluating agents")):
             # Evaluate agent on multiple random training slices
@@ -1909,44 +2030,19 @@ class ERLTrainer:
                 slice_episode_stats.append(episode_info)
 
             # Calculate fitness using pessimistic aggregator (same as validation gatekeeper)
-            # This aligns training incentives with validation requirements
-            # 60% weight on worst slice, 40% weight on average
-            mean_score = np.mean(slice_fitness_scores)
-            min_score = np.min(slice_fitness_scores)
-            final_fitness = (0.4 * mean_score) + (0.6 * min_score)
-
+            final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
             fitness_scores.append(final_fitness)
 
             # Aggregate episode stats across all training slices for this agent
-            # Calculate global win rate (total wins / total trades) not average of per-slice win rates
-            agent_total_wins = sum([s['num_wins'] for s in slice_episode_stats])
-            agent_total_losses = sum([s['num_losses'] for s in slice_episode_stats])
-            agent_total_trades = agent_total_wins + agent_total_losses
-            agent_win_rate = agent_total_wins / agent_total_trades if agent_total_trades > 0 else 0.0
-
-            agent_aggregate_stats = {
-                'num_trades': int(np.mean([s['num_trades'] for s in slice_episode_stats])),
-                'num_wins': int(np.mean([s['num_wins'] for s in slice_episode_stats])),
-                'num_losses': int(np.mean([s['num_losses'] for s in slice_episode_stats])),
-                'win_rate': agent_win_rate,
-            }
-            all_episode_stats.append(agent_aggregate_stats)
+            all_episode_stats.append(self._aggregate_agent_stats(slice_episode_stats))
 
         # Ensure fitness_scores are all plain floats
         fitness_scores = [float(f) for f in fitness_scores]
 
         # Aggregate statistics across all agents
-        aggregate_stats = {
-            'total_trades': int(sum(s['num_trades'] for s in all_episode_stats)),
-            'avg_trades_per_agent': float(sum(s['num_trades'] for s in all_episode_stats) / len(all_episode_stats)),
-            'total_wins': int(sum(s['num_wins'] for s in all_episode_stats)),
-            'total_losses': int(sum(s['num_losses'] for s in all_episode_stats)),
-            'avg_win_rate': float(sum(s['win_rate'] for s in all_episode_stats if s['num_trades'] > 0) / len([s for s in all_episode_stats if s['num_trades'] > 0])) if any(s['num_trades'] > 0 for s in all_episode_stats) else 0.0,
-            'agents_with_positive_fitness': int(sum(1 for f in fitness_scores if f > 0)),
-        }
+        aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
 
         # CRITICAL FIX: Delete large all_episode_stats list and force aggressive GC
-        # The all_episode_stats list is no longer needed after aggregation
         del all_episode_stats
         gc.collect()
         if torch.cuda.is_available():
@@ -1976,7 +2072,7 @@ class ERLTrainer:
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
         num_exploratory = len(self.population) - num_elites
-        print(f"Teacher Forcing enabled: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
+        print(f"Elite Demonstration: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
 
         # Prepare environment config using shared memory (eliminates serialization overhead)
         # Workers reconstruct arrays from shared memory names (zero-copy access)
@@ -2110,25 +2206,11 @@ class ERLTrainer:
                 slice_stats = [info for _, info in agent_slices]
 
                 # Calculate fitness using pessimistic aggregator (same as validation gatekeeper)
-                # This aligns training incentives with validation requirements
-                mean_score = np.mean(slice_fitness)
-                min_score = np.min(slice_fitness)
-                final_fitness = (0.4 * mean_score) + (0.6 * min_score)
+                final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
                 fitness_scores.append(final_fitness)
 
-                # Aggregate stats - calculate global win rate (not average of per-slice win rates)
-                agent_total_wins = sum([s['num_wins'] for s in slice_stats])
-                agent_total_losses = sum([s['num_losses'] for s in slice_stats])
-                agent_total_trades = agent_total_wins + agent_total_losses
-                agent_win_rate = agent_total_wins / agent_total_trades if agent_total_trades > 0 else 0.0
-
-                agent_stats = {
-                    'num_trades': int(np.mean([s['num_trades'] for s in slice_stats])),
-                    'num_wins': int(np.mean([s['num_wins'] for s in slice_stats])),
-                    'num_losses': int(np.mean([s['num_losses'] for s in slice_stats])),
-                    'win_rate': agent_win_rate,
-                }
-                all_episode_stats.append(agent_stats)
+                # Aggregate stats for this agent
+                all_episode_stats.append(self._aggregate_agent_stats(slice_stats))
 
             # Ensure fitness_scores are all plain floats
             fitness_scores = [float(f) for f in fitness_scores]
@@ -2173,14 +2255,7 @@ class ERLTrainer:
                 print("  No transitions collected this generation")
 
             # Aggregate statistics across all agents
-            aggregate_stats = {
-                'total_trades': int(sum(s['num_trades'] for s in all_episode_stats)),
-                'avg_trades_per_agent': float(sum(s['num_trades'] for s in all_episode_stats) / len(all_episode_stats)),
-                'total_wins': int(sum(s['num_wins'] for s in all_episode_stats)),
-                'total_losses': int(sum(s['num_losses'] for s in all_episode_stats)),
-                'avg_win_rate': float(sum(s['win_rate'] for s in all_episode_stats if s['num_trades'] > 0) / len([s for s in all_episode_stats if s['num_trades'] > 0])) if any(s['num_trades'] > 0 for s in all_episode_stats) else 0.0,
-                'agents_with_positive_fitness': int(sum(1 for f in fitness_scores if f > 0)),
-            }
+            aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
 
         # Clean up
         del all_episode_stats
@@ -3863,6 +3938,11 @@ class ERLTrainer:
                 injected_count = 0
                 replaced_slots = []
                 for worst_idx, g50_agent in zip(worst_indices, g50_agents):
+                    # Reset noise_scale to encourage exploration
+                    # Injected agents from HoF may have decayed noise (converged to ~0.01)
+                    # but need fresh exploration in the new population context
+                    g50_agent.noise_scale = Config.NOISE_SCALE
+
                     # Apply mutation to the Global 50 agent
                     mutated_g50 = mutate(g50_agent, mutation_rate=mutation_rate, mutation_std=self.base_mutation_std)
 

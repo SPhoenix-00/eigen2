@@ -71,7 +71,12 @@ class TradingEnvironment(gym.Env):
         self.data_array = data_array  # For observations (5 features)
         self.data_array_full = data_array_full if data_array_full is not None else data_array  # For rewards (9 features)
         self.dates = dates
-        self.norm_stats = normalization_stats
+        # Pre-cast normalization stats to float32 to avoid implicit double-precision
+        # conversion overhead during vectorized math operations every step
+        self.norm_stats = {
+            'mean': normalization_stats['mean'].astype(np.float32, copy=False),
+            'std': normalization_stats['std'].astype(np.float32, copy=False)
+        }
         self.start_idx = start_idx
         self.end_idx = end_idx
         self.is_training = is_training  # Flag to control observation noise

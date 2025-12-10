@@ -130,7 +130,7 @@ def main():
             default=None,
             metavar='HOF_DIR',
             help='Path to a Hall of Fame directory. Loads all agents, evaluates them with current '
-                 'reward function, and selects best 32 as initial population. Uses reduced mutant ratio. '
+                 'reward function, and selects best as initial population. Uses reduced mutant ratio. '
                  'If flag is used without a path, automatically uses global50 directory for current context window.'
         )
         parser.add_argument(
