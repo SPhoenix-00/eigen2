@@ -16,8 +16,13 @@ from utils.config import Config
 class FeatureExtractor(nn.Module):
     """
     Extracts features from multi-column time-series data.
-    Uses 1D CNN across features, then LSTM across time.
+    Uses Instance Normalization for scale-invariance, then 1D CNN across features, then LSTM across time.
     Gradient checkpointing enabled to reduce memory usage.
+
+    Instance Normalization makes the model mathematically scale-invariant:
+    - Whether the Dow is at 10,000 or 100,000, the agent sees a standardized curve
+    - Raw nominal data (actual prices, raw MACD, etc.) can be fed directly
+    - Enables daily fine-tuning without invalidating learned weights
     """
 
     def __init__(self, num_columns: int = Config.TOTAL_COLUMNS, num_features: int = Config.FEATURES_PER_CELL):
@@ -25,6 +30,18 @@ class FeatureExtractor(nn.Module):
 
         self.num_columns = num_columns
         self.num_features = num_features
+
+        # Instance Normalization: normalizes each stock's context window independently
+        # Applied FIRST, before any other processing
+        # Input shape: [batch * num_columns, num_features, context_days]
+        # Normalizes across context_days dimension for each (batch, column, feature) independently
+        # affine=False: purely statistical normalization (no learnable scale/shift)
+        # track_running_stats=False: always compute stats from current batch (not global)
+        self.instance_norm = nn.InstanceNorm1d(
+            num_features=num_features,
+            affine=False,
+            track_running_stats=False
+        )
 
         # 1D CNN to extract features from the selected feature elements per cell
         # Input: [batch, num_columns, context_days, num_features]
@@ -67,12 +84,17 @@ class FeatureExtractor(nn.Module):
         lstm_out, _ = self.lstm(x)
         return lstm_out
 
+    def _instance_norm_block(self, x: torch.Tensor) -> torch.Tensor:
+        """Instance normalization block for gradient checkpointing."""
+        return self.instance_norm(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through feature extractor with gradient checkpointing.
 
         Args:
             x: Input tensor [batch, context_days, num_columns, num_features]
+               Contains RAW nominal data (actual prices, raw MACD, etc.)
 
         Returns:
             Features tensor [batch, num_columns, lstm_output_size]
@@ -81,9 +103,17 @@ class FeatureExtractor(nn.Module):
         context_days = x.shape[1]
         num_columns = x.shape[2]
 
-        # Reshape for CNN: [batch * num_columns, num_features, context_days]
+        # Reshape for Instance Norm and CNN: [batch * num_columns, num_features, context_days]
         x = x.permute(0, 2, 3, 1)  # [batch, num_columns, num_features, context_days]
         x = x.reshape(batch_size * num_columns, self.num_features, context_days)
+
+        # INSTANCE NORMALIZATION: Normalize each stock's context window independently
+        # This makes the model scale-invariant (Dow at 10k vs 100k looks the same)
+        # Applied FIRST, before CNN/LSTM processing
+        if self.training and self.use_gradient_checkpointing:
+            x = checkpoint(self._instance_norm_block, x, use_reentrant=False)
+        else:
+            x = self._instance_norm_block(x)
 
         # CNN across features (with gradient checkpointing during training)
         if self.training and self.use_gradient_checkpointing:

@@ -378,44 +378,38 @@ class StockDataLoader:
     
     def compute_normalization_stats(self) -> dict:
         """
-        Compute mean and std for normalization from training data only.
-        Handles nan values by computing stats only on valid data.
-        
+        DEPRECATED: Global normalization removed in favor of Instance Normalization.
+
+        Instance Normalization is now applied in the neural network (FeatureExtractor)
+        which normalizes each context window independently. This makes the model
+        mathematically scale-invariant and allows for:
+        - Training on raw nominal data (actual prices, raw MACD, etc.)
+        - Daily fine-tuning without invalidating learned weights
+        - Robust handling of market regime changes (price doubling, volatility shifts)
+
         Returns:
-            Dictionary with 'mean' and 'std' arrays of shape [num_columns, 9_features]
+            Dictionary with dummy 'mean' (0) and 'std' (1) arrays for backward compatibility
         """
         if self.data_array is None or self.train_indices is None:
             raise ValueError("Must call extract_features() and create_train_val_split() first")
-        
-        print("\nComputing normalization statistics from training data...")
 
-        # Get training data
-        train_data = self.data_array[self.train_indices, :, :]
+        print("\n[INSTANCE NORM] Skipping global normalization stats computation...")
+        print("  Raw data will be passed to network; Instance Normalization applied in FeatureExtractor")
 
-        # Compute mean and std per feature, ignoring nans
-        # Suppress expected warnings for columns with all NaN values
-        import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', category=RuntimeWarning, message='Mean of empty slice')
-            warnings.filterwarnings('ignore', category=RuntimeWarning, message='Degrees of freedom <= 0')
-            mean = np.nanmean(train_data, axis=0)  # Shape: [num_columns, 5]
-            std = np.nanstd(train_data, axis=0)    # Shape: [num_columns, 5]
+        # Return identity transform (mean=0, std=1) for backward compatibility
+        # This ensures any legacy code that calls normalize_window() gets raw data back
+        num_columns = self.data_array.shape[1]
+        num_features = self.data_array.shape[2]
 
-        # Handle edge case: if std is 0 (constant feature), set to 1 to avoid division by zero
-        std = np.where(std == 0, 1.0, std)
-        std = np.where(np.isnan(std), 1.0, std)  # If all values were nan, set std to 1
+        mean = np.zeros((num_columns, num_features), dtype=np.float32)
+        std = np.ones((num_columns, num_features), dtype=np.float32)
 
-        # Replace nan means with 0
-        mean = np.where(np.isnan(mean), 0.0, mean)
-        
-        print(f"  Mean shape: {mean.shape}")
-        print(f"  Std shape: {std.shape}")
-        print(f"  Sample mean (column 0, feature 0): {mean[0, 0]:.4f}")
-        print(f"  Sample std (column 0, feature 0): {std[0, 0]:.4f}")
-        
+        print(f"  Returning identity transform (mean=0, std=1)")
+        print(f"  Shape: [{num_columns}, {num_features}]")
+
         return {
-            'mean': mean.astype(np.float32),
-            'std': std.astype(np.float32)
+            'mean': mean,
+            'std': std
         }
     
     def normalize_window(self, window: np.ndarray, stats: dict) -> np.ndarray:

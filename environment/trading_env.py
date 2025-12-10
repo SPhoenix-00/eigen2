@@ -265,7 +265,15 @@ class TradingEnvironment(gym.Env):
     
     def _get_observation(self) -> np.ndarray:
         """
-        Get current observation (normalized context window).
+        Get current observation (raw context window).
+
+        Returns RAW nominal data (actual prices, raw MACD, etc.) to the network.
+        Instance Normalization is applied inside the FeatureExtractor, making
+        the model mathematically scale-invariant.
+
+        Note: norm_stats now contains identity transform (mean=0, std=1) for
+        backward compatibility, so the "normalization" step below is effectively
+        a pass-through.
 
         Applies Gaussian noise during training as a regularization technique
         to prevent overfitting. This encourages the agent to learn robust,
@@ -273,6 +281,7 @@ class TradingEnvironment(gym.Env):
 
         Returns:
             Array of shape [context_window_days, num_columns, 5_features]
+            Contains raw nominal data (actual prices, raw indicators)
         """
         start_idx = self.current_idx - Config.CONTEXT_WINDOW_DAYS + 1
         end_idx = self.current_idx + 1
@@ -280,17 +289,18 @@ class TradingEnvironment(gym.Env):
         # Extract window
         window = self.data_array[start_idx:end_idx, :, :]
 
-        # Normalize
-        normalized = (window - self.norm_stats['mean']) / self.norm_stats['std']
+        # Legacy normalization step (now identity transform: mean=0, std=1)
+        # Instance Normalization is applied in FeatureExtractor instead
+        observation = (window - self.norm_stats['mean']) / self.norm_stats['std']
 
         # Add observation noise for regularization during training
         # This prevents the agent from overfitting to exact values and forces
         # it to learn more robust, "fuzzy" decision rules that generalize better
         if self.is_training:
-            noise = np.random.normal(0.0, Config.OBSERVATION_NOISE_STD, normalized.shape)
-            normalized = normalized + noise
+            noise = np.random.normal(0.0, Config.OBSERVATION_NOISE_STD, observation.shape)
+            observation = observation + noise
 
-        return normalized.astype(np.float32)
+        return observation.astype(np.float32)
     
     def _process_action(self, action: np.ndarray) -> float:
         """
