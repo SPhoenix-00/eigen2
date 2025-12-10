@@ -181,7 +181,7 @@ class Config:
     
     # ============ Validation Parameters ============
     EVAL_EPISODES = 5  # Number of episodes for evaluation
-    EVAL_NUM_WORKERS = 96  # Maximum parallel workers for evaluation (actual: min(cpu_count-1, this value))
+    EVAL_NUM_WORKERS = 48  # Maximum parallel workers for evaluation (actual: min(cpu_count-1, this value))
     SKIP_REEVALUATION_ON_RESUME = True  # Skip re-evaluating agents on resume (only needed if reward function changed)
 
     # ============ Gauntlet Mode Parameters ============
