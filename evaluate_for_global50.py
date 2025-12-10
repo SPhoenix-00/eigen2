@@ -5,8 +5,8 @@ This script loads agents from a specified folder, runs them through gauntlet
 validation, and promotes qualifying agents to the Global Hall of Fame.
 
 The script maintains a mirrored directory structure between local (global50/)
-and GCP cloud storage. Use --mirror to check sync status and download any missing
-agent files. If JSON mismatch is detected, conflicts can be resolved interactively.
+and GCP cloud storage. Use --mirror to check sync status across ALL context
+windows (cw151, cw504, etc.) and automatically download any missing agent files.
 
 Usage:
     python evaluate_for_global50.py --init                              # Initialize Global 50
@@ -485,27 +485,80 @@ class AgentEvaluator:
         print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
         print(f"   Status: UP TO DATE")
 
-    def check_mirror_status(self) -> bool:
+    def discover_cloud_context_windows(self) -> List[str]:
         """
-        Check synchronization status between local and GCP.
-        Verifies JSON metadata and downloads any missing agent files.
-        Returns True if in sync, False if mismatch detected.
+        Discover all context window directories in cloud storage.
+
+        Returns:
+            List of context window IDs (e.g., ['cw151', 'cw504', ...])
         """
-        print(f"\n{'='*70}")
-        print("Checking Mirror Status")
-        print(f"{'='*70}")
+        context_windows = set()
+        cloud_global50_prefix = f"{self.cloud_sync.project_name}/global50/"
 
-        if not self.global_hof.enabled:
-            print("⚠ Global 50 not enabled (local mode or disabled)")
-            return True
+        try:
+            if self.cloud_sync.provider == "gcs":
+                # List all blobs under global50/
+                blobs = self.cloud_sync.bucket.list_blobs(prefix=cloud_global50_prefix, delimiter='/')
+                # Get prefixes (subdirectories)
+                for prefix in blobs.prefixes:
+                    # prefix looks like "eigen2/global50/cw151/"
+                    cw_id = prefix.rstrip('/').split('/')[-1]
+                    if cw_id.startswith('cw'):
+                        context_windows.add(cw_id)
+            elif self.cloud_sync.provider == "s3":
+                paginator = self.cloud_sync.client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(
+                    Bucket=self.cloud_sync.bucket_name,
+                    Prefix=cloud_global50_prefix,
+                    Delimiter='/'
+                )
+                for page in pages:
+                    if 'CommonPrefixes' in page:
+                        for prefix in page['CommonPrefixes']:
+                            cw_id = prefix['Prefix'].rstrip('/').split('/')[-1]
+                            if cw_id.startswith('cw'):
+                                context_windows.add(cw_id)
+            elif self.cloud_sync.provider == "azure":
+                blob_list = self.cloud_sync.container_client.walk_blobs(
+                    name_starts_with=cloud_global50_prefix,
+                    delimiter='/'
+                )
+                for blob in blob_list:
+                    if hasattr(blob, 'prefix'):
+                        cw_id = blob.prefix.rstrip('/').split('/')[-1]
+                        if cw_id.startswith('cw'):
+                            context_windows.add(cw_id)
+        except Exception as e:
+            print(f"   ⚠ Error listing cloud context windows: {e}")
 
-        # Check if local file exists
-        local_exists = self.global_hof.local_json_path.exists()
+        return sorted(context_windows)
 
-        # Check if cloud file exists by trying to download it to a temp location
+    def check_mirror_status_for_context_window(self, context_window_id: str) -> bool:
+        """
+        Check synchronization status for a specific context window.
+
+        Args:
+            context_window_id: Context window ID (e.g., 'cw151')
+
+        Returns:
+            True if in sync, False if mismatch detected.
+        """
         import tempfile
         import os
 
+        # Build paths for this context window
+        local_dir = Path("global50") / context_window_id
+        local_json_path = local_dir / "global50.json"
+        local_agents_dir = local_dir / "agents"
+        cloud_base = f"{self.cloud_sync.project_name}/global50/{context_window_id}"
+        cloud_json_path = f"{cloud_base}/global50.json"
+
+        print(f"\n  [{context_window_id}]")
+
+        # Check if local file exists
+        local_exists = local_json_path.exists()
+
+        # Check if cloud file exists
         cloud_exists = False
         temp_cloud_path = None
 
@@ -513,165 +566,175 @@ class AgentEvaluator:
             temp_cloud_path = tmp.name
 
         try:
-            cloud_exists = self.cloud_sync.download_file(
-                self.global_hof.cloud_json_path,
-                temp_cloud_path
-            )
+            cloud_exists = self.cloud_sync.download_file(cloud_json_path, temp_cloud_path)
         except Exception:
             cloud_exists = False
 
-        # Case 1: Neither exists
+        # Case 1: Neither exists (skip)
         if not local_exists and not cloud_exists:
-            print("✓ No global50.json found locally or in cloud")
-            print("  This appears to be a fresh setup")
+            print(f"    ✓ Empty (no data)")
             if temp_cloud_path and os.path.exists(temp_cloud_path):
                 os.unlink(temp_cloud_path)
             return True
 
         # Case 2: Only local exists
         if local_exists and not cloud_exists:
-            print("⚠ Mismatch detected:")
-            print(f"  Local:  EXISTS at {self.global_hof.local_json_path}")
-            print(f"  Cloud:  NOT FOUND")
+            print(f"    ⚠ Local exists but cloud is missing")
             if temp_cloud_path and os.path.exists(temp_cloud_path):
                 os.unlink(temp_cloud_path)
             return False
 
-        # Case 3: Only cloud exists
+        # Case 3: Only cloud exists - need to download
         if not local_exists and cloud_exists:
-            print("⚠ Mismatch detected:")
-            print(f"  Local:  NOT FOUND")
-            print(f"  Cloud:  EXISTS at gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_json_path}")
-            if temp_cloud_path and os.path.exists(temp_cloud_path):
-                os.unlink(temp_cloud_path)
-            return False
+            print(f"    ⚠ Cloud exists but local is missing - downloading...")
 
-        # Case 4: Both exist - compare content and timestamps
-        try:
-            # Load local file
-            with open(self.global_hof.local_json_path, 'r') as f:
-                local_data = json.load(f)
+            # Create local directory structure
+            local_dir.mkdir(parents=True, exist_ok=True)
+            local_agents_dir.mkdir(parents=True, exist_ok=True)
 
-            # Load cloud file (from temp download)
-            with open(temp_cloud_path, 'r') as f:
-                cloud_data = json.load(f)
+            # Move temp file to local json path
+            import shutil
+            shutil.move(temp_cloud_path, str(local_json_path))
+            print(f"    ✓ Downloaded global50.json")
 
-            # Get modification times
-            local_mtime = os.path.getmtime(self.global_hof.local_json_path)
-            cloud_mtime = os.path.getmtime(temp_cloud_path)
+            # Load and download agents
+            try:
+                with open(local_json_path, 'r') as f:
+                    data = json.load(f)
 
-            local_time_str = datetime.fromtimestamp(local_mtime).strftime('%Y-%m-%d %H:%M:%S')
-            cloud_time_str = datetime.fromtimestamp(cloud_mtime).strftime('%Y-%m-%d %H:%M:%S')
-
-            # Compare content
-            if local_data == cloud_data:
-                print("✓ Local and cloud JSON are synchronized")
-                print(f"  Local:  {len(local_data.get('entries', []))} entries, modified {local_time_str}")
-                print(f"  Cloud:  {len(cloud_data.get('entries', []))} entries, modified {cloud_time_str}")
-
-                # Check if agent files exist locally and verify cloud
-                print("\nChecking agent files...")
-                missing_local_agents = []
-                present_local_agents = []
-                entries = local_data.get('entries', [])
-
+                entries = data.get('entries', [])
+                downloaded = 0
                 for entry in entries:
-                    # Construct filename from entry
                     run_name = entry.get('run_name', 'unknown')
                     agent_id = entry.get('agent_id', 0)
                     filename = f"{run_name}_{agent_id}.pth"
-
-                    local_agent_path = self.global_hof.local_agents_dir / filename
-                    cloud_path = f"{self.global_hof.cloud_base}/agents/{filename}"
+                    local_agent_path = local_agents_dir / filename
+                    cloud_agent_path = f"{cloud_base}/agents/{filename}"
 
                     if not local_agent_path.exists():
-                        missing_local_agents.append((filename, cloud_path, str(local_agent_path)))
-                    else:
-                        present_local_agents.append((filename, str(local_agent_path), cloud_path))
-
-                # Download missing local agents
-                if missing_local_agents:
-                    print(f"⚠ Found {len(missing_local_agents)} missing local agent files")
-                    print(f"  Downloading from cloud...")
-
-                    downloaded = 0
-                    for filename, cloud_path, local_path in missing_local_agents:
                         try:
-                            success = self.cloud_sync.download_file(cloud_path, local_path)
+                            success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
                             if success:
-                                print(f"  ✓ Downloaded: {filename}")
                                 downloaded += 1
-                            else:
-                                print(f"  ✗ Failed to download: {filename}")
-                        except Exception as e:
-                            print(f"  ✗ Error downloading {filename}: {e}")
-
-                    print(f"  Downloaded {downloaded}/{len(missing_local_agents)} agent files")
-
-                if not missing_local_agents:
-                    print("✓ All agent files present locally")
-
-                # Verify cloud has all agents (by checking if local→cloud download would fail)
-                # This checks bidirectional sync without unnecessary uploads
-                print(f"\n  Verifying cloud has all {len(present_local_agents)} agent files...")
-                missing_in_cloud = []
-
-                for filename, local_path, cloud_path in present_local_agents:
-                    # Test if cloud has the file by attempting to download to a temp location
-                    with tempfile.NamedTemporaryFile(delete=True) as tmp:
-                        try:
-                            exists = self.cloud_sync.download_file(cloud_path, tmp.name)
-                            if not exists:
-                                missing_in_cloud.append((filename, local_path, cloud_path))
                         except Exception:
-                            missing_in_cloud.append((filename, local_path, cloud_path))
+                            pass
 
-                # Upload missing agents to cloud
-                if missing_in_cloud:
-                    print(f"⚠ Found {len(missing_in_cloud)} agent files missing in cloud")
-                    print(f"  Uploading to cloud...")
+                print(f"    ✓ Downloaded {downloaded}/{len(entries)} agents")
+            except Exception as e:
+                print(f"    ⚠ Error downloading agents: {e}")
 
-                    uploaded = 0
-                    for filename, local_path, cloud_path in missing_in_cloud:
+            return True
+
+        # Case 4: Both exist - compare and sync
+        try:
+            with open(local_json_path, 'r') as f:
+                local_data = json.load(f)
+            with open(temp_cloud_path, 'r') as f:
+                cloud_data = json.load(f)
+
+            local_entries = len(local_data.get('entries', []))
+            cloud_entries = len(cloud_data.get('entries', []))
+
+            if local_data == cloud_data:
+                print(f"    ✓ Synced ({local_entries} entries)")
+
+                # Check for missing agent files
+                entries = local_data.get('entries', [])
+                missing_count = 0
+                downloaded = 0
+
+                for entry in entries:
+                    run_name = entry.get('run_name', 'unknown')
+                    agent_id = entry.get('agent_id', 0)
+                    filename = f"{run_name}_{agent_id}.pth"
+                    local_agent_path = local_agents_dir / filename
+
+                    if not local_agent_path.exists():
+                        missing_count += 1
+                        cloud_agent_path = f"{cloud_base}/agents/{filename}"
                         try:
-                            self.cloud_sync.upload_file(
-                                local_path,
-                                cloud_path,
-                                background=False
-                            )
-                            print(f"  ✓ Uploaded: {filename}")
-                            uploaded += 1
-                        except Exception as e:
-                            print(f"  ✗ Error uploading {filename}: {e}")
+                            local_agents_dir.mkdir(parents=True, exist_ok=True)
+                            success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
+                            if success:
+                                downloaded += 1
+                        except Exception:
+                            pass
 
-                    print(f"  Uploaded {uploaded}/{len(missing_in_cloud)} agent files to cloud")
-                else:
-                    print("✓ All agent files present in cloud")
-
-                print("\n✓ Local and cloud are fully synchronized")
+                if missing_count > 0:
+                    print(f"    ✓ Downloaded {downloaded}/{missing_count} missing agents")
 
                 if temp_cloud_path and os.path.exists(temp_cloud_path):
                     os.unlink(temp_cloud_path)
                 return True
             else:
-                print("⚠ Mismatch detected:")
-                print(f"\n  Local:  {self.global_hof.local_json_path}")
-                print(f"          {len(local_data.get('entries', []))} entries")
-                print(f"          Modified: {local_time_str}")
-
-                print(f"\n  Cloud:  gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_json_path}")
-                print(f"          {len(cloud_data.get('entries', []))} entries")
-                print(f"          Modified: {cloud_time_str}")
-
-                # Store temp file path for potential sync
-                self._temp_cloud_file = temp_cloud_path
+                print(f"    ⚠ Mismatch (local: {local_entries}, cloud: {cloud_entries})")
+                if temp_cloud_path and os.path.exists(temp_cloud_path):
+                    os.unlink(temp_cloud_path)
                 return False
 
         except Exception as e:
-            print(f"⚠ Error comparing files: {e}")
+            print(f"    ⚠ Error: {e}")
             if temp_cloud_path and os.path.exists(temp_cloud_path):
                 os.unlink(temp_cloud_path)
             return False
+
+    def check_mirror_status(self) -> bool:
+        """
+        Check synchronization status between local and GCP for ALL context windows.
+        Verifies JSON metadata and downloads any missing agent files.
+        Returns True if all in sync, False if any mismatch detected.
+        """
+        print(f"\n{'='*70}")
+        print("Checking Mirror Status (All Context Windows)")
+        print(f"{'='*70}")
+
+        if not self.global_hof.enabled:
+            print("⚠ Global 50 not enabled (local mode or disabled)")
+            return True
+
+        # Discover all context windows in cloud
+        print("\nDiscovering context windows in cloud...")
+        cloud_context_windows = self.discover_cloud_context_windows()
+
+        # Also check local directories
+        local_base = Path("global50")
+        local_context_windows = set()
+        if local_base.exists():
+            for subdir in local_base.iterdir():
+                if subdir.is_dir() and subdir.name.startswith('cw'):
+                    local_context_windows.add(subdir.name)
+
+        # Combine all context windows
+        all_context_windows = sorted(set(cloud_context_windows) | local_context_windows)
+
+        if not all_context_windows:
+            print("✓ No context windows found (fresh setup)")
+            return True
+
+        print(f"Found {len(all_context_windows)} context window(s): {', '.join(all_context_windows)}")
+
+        # Check each context window
+        all_synced = True
+        mismatched = []
+
+        print("\nChecking synchronization status:")
+        for cw_id in all_context_windows:
+            synced = self.check_mirror_status_for_context_window(cw_id)
+            if not synced:
+                all_synced = False
+                mismatched.append(cw_id)
+
+        # Summary
+        print(f"\n{'='*70}")
+        if all_synced:
+            print("✓ All context windows are fully synchronized!")
+        else:
+            print(f"⚠ {len(mismatched)} context window(s) have mismatches: {', '.join(mismatched)}")
+            print("\nTo resolve mismatches, you may need to manually sync:")
+            print("  - Option 1: Delete local global50/<cw_id>/ and re-run --mirror")
+            print("  - Option 2: Use --eval to re-evaluate and sync")
+
+        return all_synced
 
     def resolve_mirror_conflict(self):
         """
@@ -1486,19 +1549,10 @@ Examples:
     # Handle --mirror mode (check sync status)
     if args.mirror:
         print("\n" + "="*70)
-        print("MIRROR CHECK MODE")
+        print("MIRROR CHECK MODE (All Context Windows)")
         print("="*70)
 
         in_sync = evaluator.check_mirror_status()
-
-        if not in_sync:
-            evaluator.resolve_mirror_conflict()
-
-            # Verify sync after resolution
-            print("\n" + "="*70)
-            print("Verifying Sync Status")
-            print("="*70)
-            evaluator.check_mirror_status()
 
         print("\n" + "="*70)
         return
