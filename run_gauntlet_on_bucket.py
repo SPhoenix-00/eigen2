@@ -15,7 +15,7 @@ Parameters used match main.py exactly:
     - ZERO_TRADES_PENALTY_GAUNTLET = 10.0 (not 500, for soft penalty during gauntlet)
     - Consistency mode enabled (same as Global 50 evaluation)
     - 20 slices (10 training + 10 validation)
-    - Pessimistic aggregator: 0.5*mean + 0.5*min
+    - Aggregator: 0.67*mean + 0.33*min (excluding top slice)
 """
 
 import argparse
@@ -202,7 +202,7 @@ class GauntletRunner:
         Uses the exact same parameters as main.py:
         - ZERO_TRADES_PENALTY_GAUNTLET = 10.0 (soft penalty)
         - 20 slices (10 training + 10 validation)
-        - Pessimistic aggregator: 0.5*mean + 0.5*min
+        - Aggregator: 0.67*mean + 0.33*min (excluding top slice)
 
         Args:
             agent: Agent to evaluate
@@ -270,11 +270,15 @@ class GauntletRunner:
         # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Use same aggregator as ERLTrainer: 0.5*mean + 0.5*min
-        mean_score = float(np.mean(fitness_scores))
-        min_score = float(np.min(fitness_scores))
+        # Exclude top slice from gauntlet score calculation (prevents lucky outliers from inflating score)
+        # But keep max_score for display purposes
         max_score = float(np.max(fitness_scores))
-        gauntlet_score = float((0.5 * mean_score) + (0.5 * min_score))
+        scores_without_top = sorted(fitness_scores)[:-1]  # Remove the highest score
+
+        # Use same aggregator as ERLTrainer: 0.67*mean + 0.33*min (excluding top slice)
+        mean_score = float(np.mean(scores_without_top))
+        min_score = float(np.min(scores_without_top))
+        gauntlet_score = float((0.67 * mean_score) + (0.33 * min_score))
 
         # Aggregate metrics
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])

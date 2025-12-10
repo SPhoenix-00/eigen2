@@ -293,12 +293,16 @@ class TradingEnvironment(gym.Env):
         # Instance Normalization is applied in FeatureExtractor instead
         observation = (window - self.norm_stats['mean']) / self.norm_stats['std']
 
-        # Add observation noise for regularization during training
-        # This prevents the agent from overfitting to exact values and forces
-        # it to learn more robust, "fuzzy" decision rules that generalize better
+        # Add MULTIPLICATIVE observation noise for regularization during training
+        # CRITICAL: With raw data, features have vastly different scales:
+        #   - Price: ~150.00
+        #   - RSI: ~50.00
+        #   - TRIX: ~0.05
+        # Additive noise would destroy small-scale signals (TRIX, MACD).
+        # Multiplicative noise applies relative perturbation (e.g., ±1%) to all features equally.
         if self.is_training:
-            noise = np.random.normal(0.0, Config.OBSERVATION_NOISE_STD, observation.shape)
-            observation = observation + noise
+            noise_pct = np.random.normal(0.0, Config.OBSERVATION_NOISE_STD, observation.shape)
+            observation = observation * (1.0 + noise_pct)
 
         return observation.astype(np.float32)
     

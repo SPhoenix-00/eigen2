@@ -2736,12 +2736,16 @@ class ERLTrainer:
         # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Slightly forgiving aggregator: 0.5*mean + 0.5*min
-        # Balances robustness with average performance
-        mean_score = np.mean(fitness_scores)
-        min_score = np.min(fitness_scores)
+        # Exclude top slice from gauntlet score calculation (prevents lucky outliers from inflating score)
+        # But keep max_score for display purposes
         max_score = np.max(fitness_scores)
-        gauntlet_score = (0.5 * mean_score) + (0.5 * min_score)
+        scores_without_top = sorted(fitness_scores)[:-1]  # Remove the highest score
+
+        # Aggregator: 0.67*mean + 0.33*min (excluding top slice)
+        # Weights average performance more heavily while still penalizing worst case
+        mean_score = np.mean(scores_without_top)
+        min_score = np.min(scores_without_top)
+        gauntlet_score = (0.67 * mean_score) + (0.33 * min_score)
 
         # Calculate aggregate metrics
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
