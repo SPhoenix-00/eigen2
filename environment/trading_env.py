@@ -199,7 +199,12 @@ class TradingEnvironment(gym.Env):
         # Reset raw P&L and investment tracking (for ROI calculation)
         # Uses floored coefficient (integer shares)
         self.raw_pnl = 0.0
-        self.total_investment = 0.0
+        self.total_investment = 0.0  # Legacy: cumulative transaction volume
+
+        # Peak Capital Employed tracking (for accurate ROI)
+        # Tracks the maximum capital tied up at any point, not cumulative transaction volume
+        self.current_capital_employed = 0.0  # Current value of all open positions
+        self.peak_capital_employed = 0.0     # High water mark of capital usage
 
         # Get initial observation
         obs = self._get_observation()
@@ -412,6 +417,14 @@ class TradingEnvironment(gym.Env):
             self.total_positions_opened += 1
             positions_opened_this_step += 1
 
+            # Track capital employed for accurate ROI calculation
+            shares = int(coefficient)
+            cost = entry_price * shares
+            self.current_capital_employed += cost
+            # Update peak capital (high water mark)
+            if self.current_capital_employed > self.peak_capital_employed:
+                self.peak_capital_employed = self.current_capital_employed
+
             self.episode_actions.append({
                 'day': self.dates[self.current_idx],
                 'action': 'open',
@@ -497,7 +510,11 @@ class TradingEnvironment(gym.Env):
                 # 2. Update Raw Stats (for reporting)
                 shares = int(position.coefficient)
                 self.raw_pnl += (exit_price - position.entry_price) * shares
-                self.total_investment += position.entry_price * shares
+                self.total_investment += position.entry_price * shares  # Legacy cumulative
+
+                # Release capital when closing position (for peak capital tracking)
+                cost = position.entry_price * shares
+                self.current_capital_employed -= cost
 
                 # 3. SNIPER LOGIC: Apply Hurdle FIRST
                 # A trade making 0.5% when hurdle is 0.6% is a LOSS of -0.1%
@@ -614,8 +631,11 @@ class TradingEnvironment(gym.Env):
             'closed_trades': closed_trades,  # Include all closed trades for analysis
             'max_coefficient_during_episode': self.max_coefficient_during_episode,  # For validation gradient
             'raw_pnl': self.raw_pnl,  # Sum of (exit_price - entry_price) * int(coef)
-            'total_investment': self.total_investment,  # Sum of entry_price * int(coef)
-            'roi': (self.raw_pnl / self.total_investment * 100) if self.total_investment > 0 else 0.0,  # ROI percentage
+            'total_investment': self.total_investment,  # Legacy: cumulative transaction volume
+            'peak_capital_employed': self.peak_capital_employed,  # Max capital tied up at any point
+            # ROI now uses peak capital employed (true capital efficiency)
+            # This rewards high-turnover strategies that recycle the same capital multiple times
+            'roi': (self.raw_pnl / self.peak_capital_employed * 100) if self.peak_capital_employed > 0 else 0.0,
         }
 
         # CRITICAL FIX: Clear episode history to prevent memory leak (~15-20GB per generation)

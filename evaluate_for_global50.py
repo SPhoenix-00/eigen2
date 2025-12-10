@@ -254,7 +254,8 @@ class AgentEvaluator:
                 'num_losses': episode_info['num_losses'],
                 'avg_reward_per_trade': episode_info['avg_reward_per_trade'],
                 'raw_pnl': episode_info.get('raw_pnl', 0.0),
-                'total_investment': episode_info.get('total_investment', 0.0)
+                'total_investment': episode_info.get('total_investment', 0.0),
+                'peak_capital_employed': episode_info.get('peak_capital_employed', 0.0)
             })
 
             # Collect closed trades for expectancy calculation
@@ -276,8 +277,11 @@ class AgentEvaluator:
 
         # Aggregate metrics (same calculations as ERLTrainer)
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
-        total_investment = sum([r['total_investment'] for r in slice_results])
-        roi = float((total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0)
+        total_investment = sum([r['total_investment'] for r in slice_results])  # Legacy cumulative
+        # Pooled ROI: sum of peak capitals (slices are parallel/independent scenarios)
+        # This answers: "For every dollar of max drawdown capacity across all scenarios, how much profit?"
+        total_peak_capital = sum([r['peak_capital_employed'] for r in slice_results])
+        roi = float((total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0)
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])

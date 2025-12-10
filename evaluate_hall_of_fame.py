@@ -334,8 +334,10 @@ class HallOfFameEvaluator:
                 total_wins = sum(r['num_wins'] for r in results)
                 overall_win_rate = total_wins / total_trades if total_trades > 0 else 0
                 total_raw_pnl = sum(r.get('raw_pnl', 0.0) for r in results)
-                total_investment = sum(r.get('total_investment', 0.0) for r in results)
-                overall_roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
+                total_investment = sum(r.get('total_investment', 0.0) for r in results)  # Legacy cumulative
+                # Pooled ROI: sum of peak capitals (slices are parallel/independent scenarios)
+                total_peak_capital = sum(r.get('peak_capital_employed', 0.0) for r in results)
+                overall_roi = (total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0
 
                 agent_averages.append({
                     'name': agent_name,

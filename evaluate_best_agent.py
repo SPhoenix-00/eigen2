@@ -403,8 +403,10 @@ class AgentEvaluator:
             total_losses = sum(s['num_losses'] for s in self.slice_summaries)
             avg_fitness = np.mean([s['fitness'] for s in self.slice_summaries])
             total_raw_pnl = sum(s.get('raw_pnl', 0.0) for s in self.slice_summaries)
-            total_investment = sum(s.get('total_investment', 0.0) for s in self.slice_summaries)
-            overall_roi = (total_raw_pnl / total_investment * 100) if total_investment > 0 else 0.0
+            total_investment = sum(s.get('total_investment', 0.0) for s in self.slice_summaries)  # Legacy cumulative
+            # Pooled ROI: sum of peak capitals (slices are parallel/independent scenarios)
+            total_peak_capital = sum(s.get('peak_capital_employed', 0.0) for s in self.slice_summaries)
+            overall_roi = (total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0
             overall_win_rate = total_wins / total_trades if total_trades > 0 else 0
 
             f.write(f"Total Trades: {total_trades}\n")
