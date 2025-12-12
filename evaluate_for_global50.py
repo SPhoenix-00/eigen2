@@ -12,12 +12,12 @@ Usage:
     python evaluate_for_global50.py --init                              # Initialize Global 50
     python evaluate_for_global50.py --mirror                            # Check sync status
     python evaluate_for_global50.py --eval                              # Re-evaluate all agents
-    python evaluate_for_global50.py --trim <threshold>                  # Remove agents below threshold
+    python evaluate_for_global50.py --trim                              # Interactive trim (prompts for thresholds)
     python evaluate_for_global50.py --agent-dir <path> [--run-name <name>]
 
 Example:
     python evaluate_for_global50.py --eval                              # Update all metrics
-    python evaluate_for_global50.py --trim 0                            # Remove negative scores
+    python evaluate_for_global50.py --trim                              # Interactive trim with gauntlet/ROI/expectancy
     python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
     python evaluate_for_global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
 """
@@ -374,9 +374,11 @@ class AgentEvaluator:
             result['success'] = True
 
             # Check if qualifies for Global 50
-            if self.global_hof.should_promote(gauntlet_score):
+            if self.global_hof.should_promote(gauntlet_score, metrics['roi'], metrics['expectancy']):
                 print(f"\n   Agent QUALIFIES for Global 50!")
-                print(f"   Threshold: {self.global_hof.entry_threshold:.2f}")
+                print(f"   Gauntlet Threshold: {self.global_hof.entry_threshold:.2f}")
+                print(f"   ROI Threshold: {self.global_hof.roi_threshold:.2f}%")
+                print(f"   Expectancy Threshold: {self.global_hof.expectancy_threshold:.4f}")
                 print(f"   Attempting promotion...")
 
                 # Attempt promotion
@@ -399,7 +401,10 @@ class AgentEvaluator:
                     print(f"   WARNING: Promotion failed (concurrent update?)")
             else:
                 print(f"\n   Agent does not qualify for Global 50")
-                print(f"   Score: {gauntlet_score:.2f} < Threshold: {self.global_hof.entry_threshold:.2f}")
+                print(f"   Gauntlet: {gauntlet_score:.2f} (threshold: {self.global_hof.entry_threshold:.2f})")
+                print(f"   ROI: {metrics['roi']:.2f}% (threshold: {self.global_hof.roi_threshold:.2f}%)")
+                print(f"   Expectancy: {metrics['expectancy']:.4f} (threshold: {self.global_hof.expectancy_threshold:.4f})")
+                print(f"   Criteria: gauntlet > threshold AND (ROI > threshold OR expectancy > threshold)")
 
         except Exception as e:
             print(f"\n   ERROR: {e}")
@@ -1144,7 +1149,8 @@ class AgentEvaluator:
                     'old_score': entry.gauntlet_score,
                     'new_score': new_score,
                     'change': score_change,
-                    'success': True
+                    'success': True,
+                    'fingerprint': tuple(metrics['fitness_all_slices'])  # Behavioral fingerprint
                 })
                 updated_entries.append(updated_entry)
 
@@ -1158,17 +1164,59 @@ class AgentEvaluator:
                     'error': str(e)
                 })
 
-        # Show summary
+        # Detect behavioral duplicates (agents with identical trading behavior)
         print(f"\n{'='*70}")
-        print("Re-evaluation Summary")
+        print("Detecting Behavioral Duplicates")
         print(f"{'='*70}")
 
         successful = [r for r in results if r['success']]
         failed = [r for r in results if not r['success']]
 
-        print(f"\nTotal Agents:   {len(results)}")
-        print(f"Successful:     {len(successful)}")
-        print(f"Failed:         {len(failed)}")
+        # Group agents by their behavioral fingerprint
+        fingerprint_groups = {}
+        for r in successful:
+            fp = r['fingerprint']
+            if fp not in fingerprint_groups:
+                fingerprint_groups[fp] = []
+            fingerprint_groups[fp].append(r)
+
+        # Find duplicate groups (more than one agent with same fingerprint)
+        duplicate_groups = {fp: group for fp, group in fingerprint_groups.items() if len(group) > 1}
+
+        behavioral_duplicates = []
+        if duplicate_groups:
+            print(f"\n⚠ Found {len(duplicate_groups)} group(s) of behaviorally identical agents:")
+
+            for i, (fp, group) in enumerate(duplicate_groups.items(), 1):
+                # Sort by score descending, keep the best one
+                group_sorted = sorted(group, key=lambda x: x['new_score'], reverse=True)
+                keeper = group_sorted[0]
+                duplicates_in_group = group_sorted[1:]
+
+                print(f"\n  Group {i}: {len(group)} identical agents")
+                print(f"    KEEPING: {keeper['entry'].run_name} (Agent {keeper['entry'].agent_id}) - Score: {keeper['new_score']:.2f}")
+                for dup in duplicates_in_group:
+                    print(f"    REMOVING: {dup['entry'].run_name} (Agent {dup['entry'].agent_id}) - Score: {dup['new_score']:.2f}")
+                    behavioral_duplicates.append(dup)
+
+            print(f"\n→ {len(behavioral_duplicates)} behavioral duplicate(s) will be removed")
+
+            # Remove duplicates from successful list and updated_entries
+            duplicate_keys = {(d['entry'].run_name, d['entry'].agent_id) for d in behavioral_duplicates}
+            successful = [r for r in successful if (r['entry'].run_name, r['entry'].agent_id) not in duplicate_keys]
+            updated_entries = [e for e in updated_entries if (e.run_name, e.agent_id) not in duplicate_keys]
+        else:
+            print("\n✓ No behavioral duplicates found - all agents have unique trading patterns")
+
+        # Show summary
+        print(f"\n{'='*70}")
+        print("Re-evaluation Summary")
+        print(f"{'='*70}")
+
+        print(f"\nTotal Agents:      {len(results)}")
+        print(f"Successful:        {len(successful)}")
+        print(f"Duplicates:        {len(behavioral_duplicates)}")
+        print(f"Failed:            {len(failed)}")
 
         if len(successful) > 0:
             print(f"\nScore Changes:")
@@ -1243,15 +1291,16 @@ class AgentEvaluator:
         print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
         print(f"{'='*70}")
 
-    def trim_agents(self, threshold: float):
+    def trim_agents(self):
         """
-        Remove agents below a specified score threshold from Global 50.
+        Interactive trim mode: shows current thresholds and prompts for
+        gauntlet, ROI, and expectancy thresholds to trim agents.
 
-        Args:
-            threshold: Minimum gauntlet score to keep (agents below this will be removed)
+        Trim criteria matches promotion criteria:
+        Agent is KEPT if: gauntlet >= threshold AND (ROI >= threshold OR expectancy >= threshold)
         """
         print(f"\n{'='*70}")
-        print(f"Trimming Global 50 - Threshold: {threshold:.2f}")
+        print(f"Interactive Trim Mode")
         print(f"{'='*70}")
 
         if not self.global_hof.enabled:
@@ -1265,39 +1314,136 @@ class AgentEvaluator:
         # Re-download to ensure we have the latest
         self.global_hof._download_global_ledger()
         self.global_hof._load_local_ledger()
+        self.global_hof._update_entry_threshold()
 
         if len(self.global_hof.entries) == 0:
             print("✓ Global 50 is empty. Nothing to trim.")
             return
 
-        # Identify agents to remove
-        agents_to_remove = [
-            entry for entry in self.global_hof.entries
-            if entry.gauntlet_score < threshold
-        ]
-        agents_to_keep = [
-            entry for entry in self.global_hof.entries
-            if entry.gauntlet_score >= threshold
-        ]
+        # Show current state
+        print(f"\n{'='*70}")
+        print(f"Current Global 50 State")
+        print(f"{'='*70}")
+        print(f"  Population size: {len(self.global_hof.entries)}/{self.global_hof.CAPACITY}")
+
+        if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
+            print(f"\n  Current Thresholds (population full):")
+            print(f"    Gauntlet:    {self.global_hof.entry_threshold:.2f} (50th rank)")
+            print(f"    ROI:         {self.global_hof.roi_threshold:.2f}% (minimum)")
+            print(f"    Expectancy:  {self.global_hof.expectancy_threshold:.4f} (minimum)")
+        else:
+            # Show current minimums for reference
+            min_gauntlet = min(e.gauntlet_score for e in self.global_hof.entries)
+            min_roi = min(e.roi for e in self.global_hof.entries)
+            min_expectancy = min(e.expectancy for e in self.global_hof.entries)
+            print(f"\n  Current Minimums (population not full, thresholds are -inf):")
+            print(f"    Gauntlet:    {min_gauntlet:.2f} (current min)")
+            print(f"    ROI:         {min_roi:.2f}% (current min)")
+            print(f"    Expectancy:  {min_expectancy:.4f} (current min)")
+
+        # Show distribution
+        print(f"\n  Score Ranges:")
+        print(f"    Gauntlet:    {min(e.gauntlet_score for e in self.global_hof.entries):.2f} to {max(e.gauntlet_score for e in self.global_hof.entries):.2f}")
+        print(f"    ROI:         {min(e.roi for e in self.global_hof.entries):.2f}% to {max(e.roi for e in self.global_hof.entries):.2f}%")
+        print(f"    Expectancy:  {min(e.expectancy for e in self.global_hof.entries):.4f} to {max(e.expectancy for e in self.global_hof.entries):.4f}")
+
+        # Prompt for thresholds
+        print(f"\n{'='*70}")
+        print(f"Enter Trim Thresholds")
+        print(f"{'='*70}")
+        print(f"Agents will be KEPT if: gauntlet >= threshold AND (ROI >= threshold OR expectancy >= threshold)")
+        print(f"Press Enter to skip a threshold (use -inf)")
+
+        # Get gauntlet threshold
+        while True:
+            gauntlet_input = input("\n  Gauntlet threshold (or Enter to skip): ").strip()
+            if gauntlet_input == "":
+                gauntlet_threshold = float('-inf')
+                break
+            try:
+                gauntlet_threshold = float(gauntlet_input)
+                break
+            except ValueError:
+                print("  Invalid number. Please enter a numeric value.")
+
+        # Get ROI threshold
+        while True:
+            roi_input = input("  ROI threshold % (or Enter to skip): ").strip()
+            if roi_input == "":
+                roi_threshold = float('-inf')
+                break
+            try:
+                roi_threshold = float(roi_input)
+                break
+            except ValueError:
+                print("  Invalid number. Please enter a numeric value.")
+
+        # Get expectancy threshold
+        while True:
+            expectancy_input = input("  Expectancy threshold (or Enter to skip): ").strip()
+            if expectancy_input == "":
+                expectancy_threshold = float('-inf')
+                break
+            try:
+                expectancy_threshold = float(expectancy_input)
+                break
+            except ValueError:
+                print("  Invalid number. Please enter a numeric value.")
+
+        print(f"\n  Selected thresholds:")
+        print(f"    Gauntlet:    {gauntlet_threshold if gauntlet_threshold != float('-inf') else 'skipped (-inf)'}")
+        print(f"    ROI:         {roi_threshold if roi_threshold != float('-inf') else 'skipped (-inf)'}%")
+        print(f"    Expectancy:  {expectancy_threshold if expectancy_threshold != float('-inf') else 'skipped (-inf)'}")
+
+        # Identify agents to remove using same logic as promotion
+        # Keep if: gauntlet >= threshold AND (ROI >= threshold OR expectancy >= threshold)
+        agents_to_keep = []
+        agents_to_remove = []
+
+        for entry in self.global_hof.entries:
+            passes_gauntlet = entry.gauntlet_score >= gauntlet_threshold
+            passes_roi = entry.roi >= roi_threshold
+            passes_expectancy = entry.expectancy >= expectancy_threshold
+
+            if passes_gauntlet and (passes_roi or passes_expectancy):
+                agents_to_keep.append(entry)
+            else:
+                agents_to_remove.append(entry)
 
         if len(agents_to_remove) == 0:
-            print(f"\n✓ No agents below threshold {threshold:.2f}")
-            print(f"  All {len(self.global_hof.entries)} agents meet the minimum score requirement.")
+            print(f"\n✓ No agents would be removed with these thresholds.")
+            print(f"  All {len(self.global_hof.entries)} agents meet the criteria.")
             return
 
         # Show what will be removed
-        print(f"\n⚠ WARNING: {len(agents_to_remove)} agents will be REMOVED from Global 50:")
+        print(f"\n{'='*70}")
+        print(f"⚠ WARNING: {len(agents_to_remove)} agents will be REMOVED from Global 50:")
         print(f"{'='*70}")
-        print(f"{'Score':<10} {'Run Name':<30} {'Agent ID':<10}")
-        print(f"{'-'*70}")
+        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'Run Name':<25} {'Agent':<8} {'Reason'}")
+        print(f"{'-'*90}")
 
         for entry in sorted(agents_to_remove, key=lambda e: e.gauntlet_score):
-            print(f"{entry.gauntlet_score:<10.2f} {entry.run_name:<30} {entry.agent_id:<10}")
+            # Determine why agent fails
+            passes_gauntlet = entry.gauntlet_score >= gauntlet_threshold
+            passes_roi = entry.roi >= roi_threshold
+            passes_expectancy = entry.expectancy >= expectancy_threshold
+
+            reasons = []
+            if not passes_gauntlet:
+                reasons.append("gauntlet")
+            if not passes_roi and not passes_expectancy:
+                reasons.append("ROI+expect")
+            reason_str = ", ".join(reasons)
+
+            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.run_name:<25} {entry.agent_id:<8} {reason_str}")
 
         print(f"\n{len(agents_to_keep)} agents will remain in Global 50.")
 
         if len(agents_to_keep) > 0:
-            print(f"Score range after trim: {min(e.gauntlet_score for e in agents_to_keep):.2f} to {max(e.gauntlet_score for e in agents_to_keep):.2f}")
+            print(f"\nRemaining score ranges:")
+            print(f"  Gauntlet:    {min(e.gauntlet_score for e in agents_to_keep):.2f} to {max(e.gauntlet_score for e in agents_to_keep):.2f}")
+            print(f"  ROI:         {min(e.roi for e in agents_to_keep):.2f}% to {max(e.roi for e in agents_to_keep):.2f}%")
+            print(f"  Expectancy:  {min(e.expectancy for e in agents_to_keep):.4f} to {max(e.expectancy for e in agents_to_keep):.4f}")
 
         # Ask for confirmation
         print(f"\n{'='*70}")
@@ -1377,7 +1523,10 @@ class AgentEvaluator:
         print(f"{'='*70}")
         print(f"  Removed:        {len(agents_to_remove)} agents")
         print(f"  Remaining:      {len(agents_to_keep)} agents")
-        print(f"  New threshold:  {self.global_hof.entry_threshold:.2f}")
+        print(f"  New thresholds:")
+        print(f"    Gauntlet:     {self.global_hof.entry_threshold:.2f}")
+        print(f"    ROI:          {self.global_hof.roi_threshold:.2f}%")
+        print(f"    Expectancy:   {self.global_hof.expectancy_threshold:.4f}")
         print(f"  Archived to:    {self.global_hof.local_archive_dir}")
         print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
         print(f"{'='*70}")
@@ -1439,11 +1588,8 @@ Examples:
   # Re-evaluate agents in a specific context window (e.g., cw504)
   python evaluate_for_global50.py --eval --cw 504
 
-  # Remove agents with scores below 0
-  python evaluate_for_global50.py --trim 0
-
-  # Remove agents with scores below 5.0
-  python evaluate_for_global50.py --trim 5.0
+  # Interactive trim - prompts for gauntlet, ROI, and expectancy thresholds
+  python evaluate_for_global50.py --trim
 
   # Evaluate agents from Hall of Fame directory
   python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
@@ -1490,9 +1636,8 @@ Examples:
 
     parser.add_argument(
         '--trim',
-        type=float,
-        metavar='THRESHOLD',
-        help='Remove agents below specified score threshold (e.g., --trim 0 removes all agents with negative scores)'
+        action='store_true',
+        help='Interactive trim mode: shows current thresholds and prompts for gauntlet, ROI, and expectancy thresholds'
     )
 
     parser.add_argument(
@@ -1581,13 +1726,13 @@ Examples:
         print("\n" + "="*70)
         return
 
-    # Handle --trim mode (remove agents below threshold)
-    if args.trim is not None:
+    # Handle --trim mode (interactive multi-threshold trim)
+    if args.trim:
         print("\n" + "="*70)
         print("TRIM MODE")
         print("="*70)
 
-        evaluator.trim_agents(threshold=args.trim)
+        evaluator.trim_agents()
 
         print("\n" + "="*70)
         return

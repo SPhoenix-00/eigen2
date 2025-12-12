@@ -3677,7 +3677,11 @@ class ERLTrainer:
                         g50_gauntlet_score = None
                         g50_gauntlet_results = None
 
-                        if self.global_hof.enabled and self.global_hof.should_promote(gauntlet_score):
+                        if self.global_hof.enabled and self.global_hof.should_promote(
+                            gauntlet_score,
+                            gauntlet_results.get('roi', 0.0),
+                            gauntlet_results.get('expectancy', 0.0)
+                        ):
                             print(f"\n   ⓘ Agent may qualify for Global 50 (score {gauntlet_score:.2f} > threshold {self.global_hof.entry_threshold:.2f})")
                             print(f"   Running consistency-aligned re-gauntlet for fair Global 50 comparison...")
 
@@ -3696,7 +3700,11 @@ class ERLTrainer:
                                 print(f"   Global 50 threshold: {self.global_hof.entry_threshold:.2f}")
 
                     # Attempt promotion if we have a consistency-aligned score
-                    if g50_gauntlet_score is not None and self.global_hof.should_promote(g50_gauntlet_score):
+                    if g50_gauntlet_score is not None and self.global_hof.should_promote(
+                        g50_gauntlet_score,
+                        g50_gauntlet_results.get('roi', 0.0),
+                        g50_gauntlet_results.get('expectancy', 0.0)
+                    ):
                         agent_to_admit = self.breakthrough_candidate.agent
                         agent_roi = g50_gauntlet_results['roi']
                         agent_expectancy = g50_gauntlet_results['expectancy']

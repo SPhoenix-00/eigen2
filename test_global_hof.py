@@ -83,7 +83,7 @@ def test_basic_functionality():
     # Test should_promote logic
     print("\n5. Testing promotion threshold logic...")
     # When disabled (local mode), should always return False
-    assert global_hof.should_promote(9999.0) == False, "Should not promote when disabled"
+    assert global_hof.should_promote(9999.0, roi=10.0, expectancy=1.0) == False, "Should not promote when disabled"
     print("   [PASS] Correctly rejects promotion when disabled")
 
     # Test get_stats

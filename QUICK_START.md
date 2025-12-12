@@ -55,7 +55,7 @@ wandb login
 ### 6. Start Training in tmux
 ```bash
 cd /workspace
-tmux new -s training
+tmux -u new -s training
 
 export CLOUD_PROVIDER=gcs
 export CLOUD_BUCKET=eigen2-checkpoints-ase0

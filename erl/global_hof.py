@@ -152,6 +152,8 @@ class GlobalHallOfFame:
         # Local cache
         self.entries: List[GlobalHoFEntry] = []
         self.entry_threshold: float = float('-inf')
+        self.roi_threshold: float = float('-inf')
+        self.expectancy_threshold: float = float('-inf')
         self.league_compatible: bool = False
 
         # Thread safety for atomic updates
@@ -215,7 +217,9 @@ class GlobalHallOfFame:
 
         if self.league_compatible:
             print(f"✓ League Validation: PASSED")
-            print(f"✓ Entry Threshold: {self.entry_threshold:.2f} (Rank #50)")
+            print(f"✓ Gauntlet Threshold: {self.entry_threshold:.2f} (Rank #50)")
+            print(f"✓ ROI Threshold: {self.roi_threshold:.2f}% (Min in G50)")
+            print(f"✓ Expectancy Threshold: {self.expectancy_threshold:.4f} (Min in G50)")
             print(f"✓ Current Global 50 Size: {len(self.entries)}")
         else:
             print(f"✗ League Validation: FAILED")
@@ -301,13 +305,18 @@ class GlobalHallOfFame:
             print(f"  Global:  {self._stored_league_rules.to_dict()}")
 
     def _update_entry_threshold(self):
-        """Update the local entry threshold (score of rank #50)."""
+        """Update the local entry thresholds (gauntlet score, ROI, expectancy)."""
         if len(self.entries) < self.CAPACITY:
             self.entry_threshold = float('-inf')
+            self.roi_threshold = float('-inf')
+            self.expectancy_threshold = float('-inf')
         else:
             # Get the 50th ranked agent's score (worst in top 50)
             sorted_entries = sorted(self.entries, key=lambda e: e.gauntlet_score, reverse=True)
             self.entry_threshold = sorted_entries[self.CAPACITY - 1].gauntlet_score
+            # ROI and expectancy thresholds = minimum in the population
+            self.roi_threshold = min(e.roi for e in self.entries)
+            self.expectancy_threshold = min(e.expectancy for e in self.entries)
 
     def _discover_fallback_leagues(self):
         """
@@ -415,12 +424,16 @@ class GlobalHallOfFame:
         else:
             print(f"  Total fallback leagues: {len(self.fallback_leagues)}")
 
-    def should_promote(self, gauntlet_score: float) -> bool:
+    def should_promote(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0) -> bool:
         """
-        Check if an agent with given gauntlet score qualifies for Global 50.
+        Check if an agent qualifies for Global 50.
+
+        Criteria: gauntlet_score > threshold AND (ROI > roi_threshold OR expectancy > expectancy_threshold)
 
         Args:
             gauntlet_score: Agent's certified Gauntlet score
+            roi: Agent's ROI percentage
+            expectancy: Agent's expectancy metric
 
         Returns:
             True if agent should be promoted, False otherwise
@@ -428,7 +441,12 @@ class GlobalHallOfFame:
         if not self.enabled or not self.league_compatible:
             return False
 
-        return gauntlet_score > self.entry_threshold
+        # Must beat gauntlet threshold
+        if gauntlet_score <= self.entry_threshold:
+            return False
+
+        # Must beat EITHER ROI or expectancy threshold
+        return roi > self.roi_threshold or expectancy > self.expectancy_threshold
 
     def check_and_promote(self, agent: DDPGAgent, gauntlet_score: float, generation: int,
                           roi: float = 0.0, expectancy: float = 0.0,
@@ -453,14 +471,14 @@ class GlobalHallOfFame:
         Returns:
             True if agent was promoted, False otherwise
         """
-        if not self.should_promote(gauntlet_score):
+        if not self.should_promote(gauntlet_score, roi, expectancy):
             return False
 
         with self._lock:
             print(f"\n{'='*60}")
             print("Global Hall of Fame - Promotion Routine")
             print(f"{'='*60}")
-            print(f"🏆 Agent qualified with Gauntlet Score: {gauntlet_score:.2f}")
+            print(f"🏆 Agent qualified with Gauntlet Score: {gauntlet_score:.2f}, ROI: {roi:.2f}%, Expectancy: {expectancy:.4f}")
 
             # ATOMIC UPDATE: Re-download to get latest state
             print("⏳ Re-downloading global50.json for atomic update...")

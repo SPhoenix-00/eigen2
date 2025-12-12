@@ -43,7 +43,9 @@
       "Bash(else echo \"Global 50 directory does not exist\")",
       "Bash(ls:*)",
       "Bash(git log:*)",
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(git merge-base:*)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []
