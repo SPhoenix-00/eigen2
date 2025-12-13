@@ -1311,6 +1311,13 @@ class AgentEvaluator:
         print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
         print(f"{'='*70}")
 
+        # Automatically clean up orphan agents in cloud storage
+        # This archives any .pth files in agents/ that are no longer in global50.json
+        print(f"\n{'='*70}")
+        print("Cleaning up orphan agents in cloud storage...")
+        print(f"{'='*70}")
+        self.cleanup_orphan_agents(dry_run=False)
+
     def trim_agents(self):
         """
         Interactive trim mode: shows current thresholds and prompts for
@@ -1522,6 +1529,7 @@ class AgentEvaluator:
             # Cloud: Upload to archive/ with verification
             cloud_archive_pth = f"{self.global_hof.cloud_base}/archive/{filename}"
             cloud_archive_json = f"{self.global_hof.cloud_base}/archive/{scoresheet_filename}"
+            cloud_agents_pth = f"{self.global_hof.cloud_base}/agents/{filename}"
 
             if local_dst.exists():
                 if self.global_hof.enabled:
@@ -1532,6 +1540,13 @@ class AgentEvaluator:
                 self.cloud_sync.upload_file_verified(str(scoresheet_path), cloud_archive_json)
             else:
                 self.cloud_sync.upload_file(str(scoresheet_path), cloud_archive_json, background=False)
+
+            # Delete from cloud agents/ ONLY after confirming archive exists
+            if self.cloud_sync.file_exists(cloud_archive_pth):
+                if self.cloud_sync.delete_file(cloud_agents_pth):
+                    print(f"   ✓ Deleted from cloud agents/: {filename}")
+                else:
+                    print(f"   ⚠ Failed to delete from cloud agents/: {filename}")
 
         # Update entries list
         self.global_hof.entries = agents_to_keep

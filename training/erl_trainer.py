@@ -550,8 +550,8 @@ class ERLTrainer:
     """
 
     def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
-                 consistency_mode: bool = False, heroes_hof_dir: str = None, buffer_storage_path: str = None,
-                 reset_limit: bool = False, original_stdout=None, original_stderr=None):
+                 consistency_mode: bool = False, heroes_hof_dir: str = None, single_agent_path: str = None,
+                 buffer_storage_path: str = None, reset_limit: bool = False, original_stdout=None, original_stderr=None):
         """
         Initialize ERL trainer.
 
@@ -561,6 +561,7 @@ class ERLTrainer:
             enable_leverage: If True, enable leverage mode (replaces bottom 5 with top 5 HoF agents with 1.5x coefficients)
             consistency_mode: If True, evaluate with 5 episodes (sum) and loss magnification (see Config.CONSISTENCY_LOSS_MULTIPLIER)
             heroes_hof_dir: Path to Hall of Fame directory to load pre-trained agents from
+            single_agent_path: Path to a specific Global50 agent for single-agent focused refinement
             buffer_storage_path: Optional path to existing buffer_storage folder to reuse (e.g., "checkpoints/run-123/buffer_storage")
             reset_limit: If True, reset the fallback generation counter to current generation on resume
             original_stdout: Original stdout before any redirection (for wandb console capture)
@@ -571,6 +572,8 @@ class ERLTrainer:
         self.enable_leverage = enable_leverage
         self.consistency_mode = consistency_mode
         self.heroes_hof_dir = heroes_hof_dir
+        self.single_agent_path = single_agent_path
+        self.single_agent_mode = single_agent_path is not None
         self.external_buffer_storage_path = buffer_storage_path  # Optional path to reuse existing buffer
         self.reset_limit = reset_limit  # Reset fallback counter on resume
 
@@ -916,6 +919,7 @@ class ERLTrainer:
         self.confirmed_breakthroughs = 0  # Count of confirmed breakthroughs
         self.breakthrough_history = []  # Track breakthrough events with timestamps
         self.stabilization_generations_elapsed = 0  # Counter for stabilization phase
+        self.initial_single_baseline = 0.0  # Original baseline for single-agent mode (for final summary)
 
         # Candidate queue and tracking (fixes Ghost Loop and Winner-Takes-All)
         # Only used in consistency mode with heroes, where pre-trained agents are deterministic
@@ -993,6 +997,10 @@ class ERLTrainer:
         # Load heroes from Hall of Fame if specified (must happen after env creation, before checkpoint load)
         if self.heroes_hof_dir:
             self.load_heroes_from_hof()
+
+        # Load single agent for focused refinement (mutually exclusive with heroes mode)
+        if self.single_agent_mode:
+            self.load_single_agent(self.single_agent_path)
 
         # Automatically load checkpoint if resuming
         if self.resume_run_name:
@@ -1449,6 +1457,182 @@ class ERLTrainer:
         mutant_frac = 1.0 - Config.HEROES_ELITE_FRAC - Config.HEROES_OFFSPRING_FRAC
         print(f"  Mutants: {mutant_frac * 100:.1f}% ({int(Config.POPULATION_SIZE * mutant_frac)} agents)")
         print("="*60 + "\n")
+
+    def load_single_agent(self, agent_path: str, stored_gauntlet_score: float = None):
+        """
+        Load a single Global50 agent and initialize population for focused refinement.
+
+        Population composition (from Config):
+        - SINGLE_CLONE_FRAC: Pure clones of the agent (50%)
+        - SINGLE_NORMAL_MUTATION_FRAC: Clones with normal mutation applied (25%)
+        - SINGLE_PLATEAU_MUTATION_FRAC: Clones with plateau (1.5x) mutation applied (25%)
+
+        Baseline is min(stored_score, evaluated_score) for safety.
+
+        Args:
+            agent_path: Path to the agent .pth file
+            stored_gauntlet_score: Optional stored gauntlet score from global50.json
+        """
+        print(f"\n{'='*60}")
+        print(f"🎯 SINGLE AGENT MODE - Loading and Evaluating")
+        print(f"{'='*60}")
+
+        # 1. Load the agent
+        source_agent = DDPGAgent(agent_id=0)
+        source_agent.load(agent_path)
+        print(f"  Loaded: {Path(agent_path).name}")
+
+        # 2. Evaluate to establish baseline using consistency-mode evaluation
+        evaluated_score = self._evaluate_single_agent_for_baseline(source_agent)
+        print(f"  Evaluated score: {evaluated_score:.2f}")
+
+        if stored_gauntlet_score is not None:
+            print(f"  Stored score: {stored_gauntlet_score:.2f}")
+            baseline = min(stored_gauntlet_score, evaluated_score)
+            print(f"  Baseline (min): {baseline:.2f}")
+        else:
+            baseline = evaluated_score
+            print(f"  Baseline: {baseline:.2f}")
+
+        # 3. Set confirmed baseline for breakthrough detection
+        self.confirmed_baseline = baseline
+        self.initial_single_baseline = baseline  # Store original for final summary
+
+        # 4. Initialize population with clones + mutations
+        pop_size = Config.POPULATION_SIZE
+        num_clones = int(pop_size * Config.SINGLE_CLONE_FRAC)
+        num_normal_mutants = int(pop_size * Config.SINGLE_NORMAL_MUTATION_FRAC)
+        num_plateau_mutants = pop_size - num_clones - num_normal_mutants
+
+        print(f"\n  Population initialization:")
+        print(f"    Pure clones: {num_clones} ({Config.SINGLE_CLONE_FRAC*100:.0f}%)")
+        print(f"    Normal mutation: {num_normal_mutants} ({Config.SINGLE_NORMAL_MUTATION_FRAC*100:.0f}%)")
+        print(f"    Plateau mutation: {num_plateau_mutants} ({Config.SINGLE_PLATEAU_MUTATION_FRAC*100:.0f}%)")
+
+        new_population = []
+
+        # Pure clones
+        for i in range(num_clones):
+            clone = source_agent.clone()
+            clone.agent_id = i
+            clone.is_elite = True  # Mark as elite initially
+            new_population.append(clone)
+
+        # Normal mutation clones
+        base_mutation_rate = Config.MUTATION_RATE_CONSISTENCY
+        base_mutation_std = Config.MUTATION_STD
+        for i in range(num_normal_mutants):
+            clone = source_agent.clone()
+            clone.agent_id = num_clones + i
+            clone.mutate(mutation_rate=base_mutation_rate, mutation_std=base_mutation_std)
+            clone.is_elite = False
+            new_population.append(clone)
+
+        # Plateau mutation clones (1.5x mutation)
+        plateau_mutation_rate = min(base_mutation_rate * 1.5, self.max_mutation_rate)
+        plateau_mutation_std = min(base_mutation_std * 1.5, self.max_mutation_std)
+        for i in range(num_plateau_mutants):
+            clone = source_agent.clone()
+            clone.agent_id = num_clones + num_normal_mutants + i
+            clone.mutate(mutation_rate=plateau_mutation_rate, mutation_std=plateau_mutation_std)
+            clone.is_elite = False
+            new_population.append(clone)
+
+        self.population = new_population
+        print(f"  Population initialized: {len(self.population)} agents")
+
+        # 5. Override target breakthroughs for single mode
+        self.target_breakthroughs = Config.SINGLE_TARGET_BREAKTHROUGHS
+
+        print(f"\n  Training configuration:")
+        print(f"    Stabilization: {Config.SINGLE_STABILIZATION_GENERATIONS} generations")
+        print(f"    Target breakthroughs: {Config.SINGLE_TARGET_BREAKTHROUGHS}")
+        print(f"    Breakthrough threshold: 5%")
+        print(f"    Fallback timeout: {Config.MAX_GENERATIONS_GAUNTLET} generations")
+        print("="*60 + "\n")
+
+        return baseline
+
+    def _evaluate_single_agent_for_baseline(self, agent: DDPGAgent) -> float:
+        """
+        Evaluate a single agent using consistency-mode evaluation.
+        Uses 5 episodes with pessimistic (0.4*mean + 0.6*min) aggregation.
+
+        Args:
+            agent: The agent to evaluate
+
+        Returns:
+            Pessimistically aggregated fitness score
+        """
+        print(f"\n  Evaluating agent for baseline (5 episodes, pessimistic aggregation)...")
+
+        num_episodes = 5
+
+        # Prepare environment config using shared memory
+        env_config = self._get_shared_env_config(
+            start_idx=self.train_start_idx,
+            end_idx=self.train_end_idx,
+            trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+            is_training=True
+        )
+
+        # Extract agent state (CPU tensors only)
+        agent_state = {
+            'actor': {k: v.cpu() for k, v in agent.actor.state_dict().items()},
+            'critic': {k: v.cpu() for k, v in agent.critic.state_dict().items()}
+        }
+
+        # Prepare tasks for parallel evaluation
+        tasks = []
+        for slice_idx in range(num_episodes):
+            # Calculate episode indices
+            total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+            max_start = self.train_end_idx - total_days_needed
+            start_idx = np.random.randint(self.train_start_idx, max_start)
+            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+
+            # Create unique seed for this task
+            task_seed = self.seed + slice_idx * 1000
+
+            tasks.append((
+                agent_state,
+                start_idx,
+                end_idx,
+                False,  # training=False, don't add to buffer
+                task_seed,
+                None,  # No buffer storage
+                0  # file_id_start (unused)
+            ))
+
+        # Execute in parallel
+        num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
+
+        slice_fitness_scores = []
+
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=mp.get_context('spawn'),
+            initializer=_init_worker,
+            initargs=(env_config,)
+        ) as executor:
+            futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
+
+            for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating baseline"):
+                try:
+                    raw_fitness, episode_info, _ = future.result()
+                    triad_fitness = self.calculate_triad_fitness(episode_info)
+                    slice_fitness_scores.append(triad_fitness)
+                except Exception as e:
+                    print(f"\n  ! Worker failed: {e}")
+                    slice_fitness_scores.append(-10000.0)
+
+        # Calculate pessimistic fitness (0.4*mean + 0.6*min)
+        final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+
+        print(f"  Slice scores: {[f'{s:.2f}' for s in slice_fitness_scores]}")
+        print(f"  Pessimistic aggregation: {final_fitness:.2f}")
+
+        return final_fitness
 
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
@@ -2238,8 +2422,36 @@ class ERLTrainer:
                 # Reset if we are about to drop files (overflow) OR if we are already at capacity
                 should_reset_workers = (current_size + num_new > capacity) or (current_size >= capacity)
 
+                # CRITICAL: Collect old paths that will be evicted so we can delete them from disk
+                # When appending to a bounded deque, oldest entries are automatically removed,
+                # but the FILES remain on disk unless we explicitly delete them
+                num_to_evict = max(0, current_size + num_new - capacity)
+                old_paths_to_delete = []
+                if num_to_evict > 0:
+                    old_paths_to_delete = [self.replay_buffer.buffer[i] for i in range(num_to_evict)]
+
                 for file_path in all_transition_file_paths:
                     self.replay_buffer.buffer.append(file_path)
+
+                # Delete evicted files from disk to prevent unbounded disk growth
+                if old_paths_to_delete:
+                    deleted_count = 0
+                    external_deleted = 0
+                    for old_path in old_paths_to_delete:
+                        try:
+                            # Check if from external source (migration cleanup)
+                            if self.replay_buffer._is_from_external_source(old_path):
+                                os.remove(old_path)
+                                self.replay_buffer.migrated_count += 1
+                                external_deleted += 1
+                            else:
+                                os.remove(old_path)
+                            deleted_count += 1
+                        except OSError:
+                            pass  # File might already be gone
+                    if external_deleted > 0:
+                        print(f"  Migration cleanup: {external_deleted} external files deleted")
+                    print(f"  Disk cleanup: deleted {deleted_count} evicted transition files")
 
                 # Update total_added counter
                 self.replay_buffer.total_added = file_id_counter
@@ -2999,7 +3211,11 @@ class ERLTrainer:
 
         # WARMUP PERIOD: Prevent breakthrough detection until Generation > threshold
         # Let the population churn before declaring winners
-        if self.generation <= Config.BREAKTHROUGH_WARMUP_GENERATIONS:
+        # Single-agent mode uses longer stabilization to let clones settle
+        warmup_generations = (Config.SINGLE_STABILIZATION_GENERATIONS
+                              if self.single_agent_mode
+                              else Config.BREAKTHROUGH_WARMUP_GENERATIONS)
+        if self.generation <= warmup_generations:
             return False
 
         if self.breakthrough_state != BreakthroughState.NORMAL:
@@ -4852,8 +5068,39 @@ class ERLTrainer:
             gen_start_time = time.time()
 
             # Check stopping conditions
+            # Single-agent mode: Stop after 4 breakthroughs or fallback timeout
             # Consistency mode: Stop after target HoF turnovers achieved
             # Normal mode: Stop after target breakthroughs achieved
+
+            # Single-agent mode success: 4 breakthroughs achieved
+            if self.single_agent_mode and self.confirmed_breakthroughs >= Config.SINGLE_TARGET_BREAKTHROUGHS:
+                print(f"\n{'='*60}")
+                print(f"🎯 SINGLE AGENT MODE SUCCESS - {Config.SINGLE_TARGET_BREAKTHROUGHS} BREAKTHROUGHS ACHIEVED!")
+                print(f"{'='*60}")
+                print(f"  Original baseline: {self.initial_single_baseline:.2f}")
+                print(f"  Final baseline: {self.confirmed_baseline:.2f}")
+                if self.initial_single_baseline != 0:
+                    total_improvement = (self.confirmed_baseline - self.initial_single_baseline) / abs(self.initial_single_baseline)
+                    print(f"  Total improvement: {total_improvement:.1%}")
+                print(f"  Generation: {gen + 1}")
+                print(f"{'='*60}")
+                break
+
+            # Single-agent mode fallback timeout
+            if self.single_agent_mode and gen >= Config.MAX_GENERATIONS_GAUNTLET:
+                print(f"\n{'='*60}")
+                print(f"⏱️ SINGLE AGENT MODE TIMEOUT - {Config.MAX_GENERATIONS_GAUNTLET} GENERATIONS")
+                print(f"{'='*60}")
+                print(f"  Breakthroughs achieved: {self.confirmed_breakthroughs}/{Config.SINGLE_TARGET_BREAKTHROUGHS}")
+                print(f"  Original baseline: {self.initial_single_baseline:.2f}")
+                print(f"  Current baseline: {self.confirmed_baseline:.2f}")
+                if self.initial_single_baseline != 0:
+                    total_improvement = (self.confirmed_baseline - self.initial_single_baseline) / abs(self.initial_single_baseline)
+                    print(f"  Total improvement: {total_improvement:.1%}")
+                print(f"  Generation: {gen + 1}")
+                print(f"{'='*60}")
+                break
+
             if self.consistency_mode and self.hof_turnover_count >= self.target_hof_turnovers:
                 print(f"\n{'='*60}")
                 print(f"🎯 CONSISTENCY MODE SUCCESS - {self.target_hof_turnovers} HoF TURNOVERS COMPLETE!")

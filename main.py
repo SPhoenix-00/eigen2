@@ -134,6 +134,15 @@ def main():
                  'If flag is used without a path, automatically uses global50 directory for current context window.'
         )
         parser.add_argument(
+            '--single',
+            type=str,
+            default=None,
+            metavar='AGENT_FILENAME',
+            help='Load a specific Global50 agent by filename (e.g., "azure-thunder-123_42") '
+                 'and run focused refinement training. Auto-enables consistency mode. '
+                 'Training seeks 4 breakthroughs of 5%% improvement each.'
+        )
+        parser.add_argument(
             '--cleanup',
             action='store_true',
             help='Clean up orphaned replay buffer files before resuming. Use with --resume or --resume-run. '
@@ -204,6 +213,40 @@ def main():
                 print(f"  You may need to run: python download_global50.py")
                 print("  Continuing with random initialization.")
                 args.heroes = None
+
+        # Validate --single agent exists BEFORE loading data (fail fast)
+        if args.single:
+            # Construct expected filename
+            agent_filename = args.single if args.single.endswith('.pth') else f"{args.single}.pth"
+
+            # Context window identifier
+            context_window_id = f"cw{Config.CONTEXT_WINDOW_DAYS}"
+
+            # Check possible paths for the agent
+            possible_paths = [
+                Path(f"global50/{context_window_id}/agents/{agent_filename}"),
+                Path(f"workspace/global50/{context_window_id}/agents/{agent_filename}"),
+            ]
+
+            agent_found = False
+            for path in possible_paths:
+                if path.exists():
+                    agent_found = True
+                    args.single_agent_path = str(path)
+                    break
+
+            if not agent_found:
+                print(f"\n❌ ERROR: Agent '{args.single}' not found in Global50")
+                print(f"  Searched: {[str(p) for p in possible_paths]}")
+                print(f"  Available agents can be listed with: ls global50/{context_window_id}/agents/")
+                sys.exit(1)
+
+            # Auto-enable consistency mode for single-agent training
+            args.consistency = True
+            print(f"\n🎯 SINGLE AGENT MODE: {agent_filename}")
+            print(f"  Agent path: {args.single_agent_path}")
+            print(f"  Consistency mode auto-enabled")
+            print(f"  Target: {Config.SINGLE_TARGET_BREAKTHROUGHS} breakthroughs of 5% each")
 
         # NOTE: Seed will be set AFTER wandb init in ERLTrainer to ensure unique seeds per run
         # This prevents parallel runs from having identical behavior
@@ -280,6 +323,7 @@ def main():
             enable_leverage=args.leverage,
             consistency_mode=args.consistency,
             heroes_hof_dir=args.heroes,
+            single_agent_path=getattr(args, 'single_agent_path', None),
             buffer_storage_path=args.buffer,
             reset_limit=args.reset_limit,
             original_stdout=tee_logger.terminal,

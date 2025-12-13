@@ -142,6 +142,16 @@ class Config:
     HEROES_OFFSPRING_FRAC = 0.375  # 37.5% offspring (12 agents) - blend elite genetics
     # HEROES_MUTANT_FRAC = 0.125 (remainder: 4 agents) - minimal random exploration
 
+    # Single-agent mode - focused refinement of one Global50 agent
+    # Population is initialized from clones of the single agent with varying mutation levels
+    SINGLE_CLONE_FRAC = 0.50            # 50% pure clones (no mutation)
+    SINGLE_NORMAL_MUTATION_FRAC = 0.25  # 25% with normal mutation rate
+    SINGLE_PLATEAU_MUTATION_FRAC = 0.25 # 25% with plateau (1.5x) mutation rate
+    # Note: These must sum to 1.0
+
+    SINGLE_STABILIZATION_GENERATIONS = 5  # Generations before breakthrough detection starts
+    SINGLE_TARGET_BREAKTHROUGHS = 4       # Training ends after 4 confirmed breakthroughs
+
     # Consistency mode - loss magnification for training on consistency
     # Applied ONLY when --consistency flag is used. Normal mode uses 1.0 (no magnification)
     CONSISTENCY_LOSS_MULTIPLIER = 1.5  # Magnify losses by 1.5x to focus training on reducing drawdowns
@@ -226,7 +236,7 @@ class Config:
     # This creates a ratcheting quality mechanism where HoF progressively improves
 
     # Fallback to generation limit if breakthroughs not achieved
-    MAX_GENERATIONS_GAUNTLET = 200  # Maximum generations before stopping regardless of breakthroughs
+    MAX_GENERATIONS_GAUNTLET = 100  # Maximum generations before stopping regardless of breakthroughs
     
     @classmethod
     def display(cls):
