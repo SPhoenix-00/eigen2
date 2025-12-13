@@ -455,48 +455,55 @@ class AgentEvaluator:
     def _sync_to_cloud(self):
         """
         Sync the context-window-specific global50 directory to GCP.
-        Ensures local and cloud are mirrored.
+        Ensures local and cloud are mirrored with verification.
         """
         if not self.global_hof.enabled:
             return
 
-        # Sync global50.json
+        failed_uploads = []
+
+        # Sync global50.json with verification
         if self.global_hof.local_json_path.exists():
             print(f"   Uploading global50.json...")
-            self.cloud_sync.upload_file(
+            if not self.cloud_sync.upload_file_verified(
                 str(self.global_hof.local_json_path),
-                self.global_hof.cloud_json_path,
-                background=False
-            )
+                self.global_hof.cloud_json_path
+            ):
+                failed_uploads.append("global50.json")
 
-        # Sync agents directory
+        # Sync agents directory with verification
         agents_synced = 0
         if self.global_hof.local_agents_dir.exists():
             for agent_file in self.global_hof.local_agents_dir.glob("*.pth"):
                 cloud_path = f"{self.global_hof.cloud_base}/agents/{agent_file.name}"
-                self.cloud_sync.upload_file(
-                    str(agent_file),
-                    cloud_path,
-                    background=False
-                )
-                agents_synced += 1
+                if self.cloud_sync.upload_file_verified(str(agent_file), cloud_path):
+                    agents_synced += 1
+                else:
+                    failed_uploads.append(agent_file.name)
 
-        # Sync archive directory
+        # Sync archive directory with verification
         archive_synced = 0
         if self.global_hof.local_archive_dir.exists():
             for archive_file in self.global_hof.local_archive_dir.glob("*"):
                 cloud_path = f"{self.global_hof.cloud_base}/archive/{archive_file.name}"
-                self.cloud_sync.upload_file(
-                    str(archive_file),
-                    cloud_path,
-                    background=False
-                )
-                archive_synced += 1
+                if self.cloud_sync.upload_file_verified(str(archive_file), cloud_path):
+                    archive_synced += 1
+                else:
+                    failed_uploads.append(f"archive/{archive_file.name}")
 
         print(f"   Synced {agents_synced} agent files")
         print(f"   Synced {archive_synced} archive files")
         print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
-        print(f"   Status: UP TO DATE")
+
+        if failed_uploads:
+            print(f"   ⚠ WARNING: {len(failed_uploads)} file(s) failed to sync:")
+            for f in failed_uploads[:5]:  # Show first 5
+                print(f"      - {f}")
+            if len(failed_uploads) > 5:
+                print(f"      ... and {len(failed_uploads) - 5} more")
+            print(f"   Status: INCOMPLETE - Run --mirror to verify")
+        else:
+            print(f"   Status: UP TO DATE")
 
     def discover_cloud_context_windows(self) -> List[str]:
         """
@@ -781,46 +788,54 @@ class AgentEvaluator:
 
     def _sync_local_to_cloud(self):
         """
-        Sync local directory to cloud (local supersedes cloud).
+        Sync local directory to cloud (local supersedes cloud) with verification.
         """
         print("   Uploading local files to cloud...")
 
-        # Upload global50.json
-        if self.global_hof.local_json_path.exists():
-            self.cloud_sync.upload_file(
-                str(self.global_hof.local_json_path),
-                self.global_hof.cloud_json_path,
-                background=False
-            )
-            print(f"   ✓ Uploaded global50.json")
+        failed_uploads = []
 
-        # Upload all agents
+        # Upload global50.json with verification
+        if self.global_hof.local_json_path.exists():
+            if self.cloud_sync.upload_file_verified(
+                str(self.global_hof.local_json_path),
+                self.global_hof.cloud_json_path
+            ):
+                print(f"   ✓ Uploaded and verified global50.json")
+            else:
+                failed_uploads.append("global50.json")
+
+        # Upload all agents with verification
         agents_uploaded = 0
         if self.global_hof.local_agents_dir.exists():
             for agent_file in self.global_hof.local_agents_dir.glob("*.pth"):
                 cloud_path = f"{self.global_hof.cloud_base}/agents/{agent_file.name}"
-                self.cloud_sync.upload_file(
-                    str(agent_file),
-                    cloud_path,
-                    background=False
-                )
-                agents_uploaded += 1
+                if self.cloud_sync.upload_file_verified(str(agent_file), cloud_path):
+                    agents_uploaded += 1
+                else:
+                    failed_uploads.append(agent_file.name)
 
-        # Upload all archive files
+        # Upload all archive files with verification
         archive_uploaded = 0
         if self.global_hof.local_archive_dir.exists():
             for archive_file in self.global_hof.local_archive_dir.glob("*"):
                 cloud_path = f"{self.global_hof.cloud_base}/archive/{archive_file.name}"
-                self.cloud_sync.upload_file(
-                    str(archive_file),
-                    cloud_path,
-                    background=False
-                )
-                archive_uploaded += 1
+                if self.cloud_sync.upload_file_verified(str(archive_file), cloud_path):
+                    archive_uploaded += 1
+                else:
+                    failed_uploads.append(f"archive/{archive_file.name}")
 
         print(f"   ✓ Uploaded {agents_uploaded} agent files")
         print(f"   ✓ Uploaded {archive_uploaded} archive files")
-        print(f"\n✓ Cloud now matches local")
+
+        if failed_uploads:
+            print(f"\n⚠ WARNING: {len(failed_uploads)} file(s) failed to upload:")
+            for f in failed_uploads[:5]:
+                print(f"      - {f}")
+            if len(failed_uploads) > 5:
+                print(f"      ... and {len(failed_uploads) - 5} more")
+            print(f"\n⚠ Cloud may not match local - run --mirror to verify")
+        else:
+            print(f"\n✓ Cloud now matches local")
         print(f"   Mirror: gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
 
     def _sync_cloud_to_local(self):
@@ -993,12 +1008,11 @@ class AgentEvaluator:
                         # Download from cloud to archive
                         self.cloud_sync.download_file(cloud_src, str(local_dst))
 
-                # Upload to cloud archive
+                # Upload to cloud archive with verification
                 if local_dst.exists():
-                    self.cloud_sync.upload_file(str(local_dst), cloud_dst, background=False)
+                    upload_success = self.cloud_sync.upload_file_verified(str(local_dst), cloud_dst)
 
-                    # Verify archive exists before deleting from agents/
-                    if self.cloud_sync.file_exists(cloud_dst):
+                    if upload_success:
                         if self.cloud_sync.delete_file(cloud_src):
                             print(f"   ✓ Archived: {filename}")
                             archived_count += 1
@@ -1277,10 +1291,16 @@ class AgentEvaluator:
         self.global_hof.entries = final_entries
         self.global_hof._update_entry_threshold()
 
-        # Save and upload
+        # Save and upload with verification
         print("\nSaving updated global50.json...")
         self.global_hof._save_local_ledger()
-        self.global_hof._upload_global_ledger()
+
+        if self.global_hof.enabled:
+            ledger_success = self.global_hof._upload_global_ledger_verified()
+            if not ledger_success:
+                print(f"⚠ WARNING: Ledger sync failed! Run --mirror to check consistency.")
+        else:
+            self.global_hof._upload_global_ledger()
 
         print(f"\n{'='*70}")
         print("✓ Re-evaluation Complete!")
@@ -1499,13 +1519,19 @@ class AgentEvaluator:
             with open(scoresheet_path, 'w') as f:
                 json.dump(entry.to_dict(), f, indent=2)
 
-            # Cloud: Upload to archive/
+            # Cloud: Upload to archive/ with verification
             cloud_archive_pth = f"{self.global_hof.cloud_base}/archive/{filename}"
             cloud_archive_json = f"{self.global_hof.cloud_base}/archive/{scoresheet_filename}"
 
             if local_dst.exists():
-                self.cloud_sync.upload_file(str(local_dst), cloud_archive_pth, background=False)
-            self.cloud_sync.upload_file(str(scoresheet_path), cloud_archive_json, background=False)
+                if self.global_hof.enabled:
+                    self.cloud_sync.upload_file_verified(str(local_dst), cloud_archive_pth)
+                else:
+                    self.cloud_sync.upload_file(str(local_dst), cloud_archive_pth, background=False)
+            if self.global_hof.enabled:
+                self.cloud_sync.upload_file_verified(str(scoresheet_path), cloud_archive_json)
+            else:
+                self.cloud_sync.upload_file(str(scoresheet_path), cloud_archive_json, background=False)
 
         # Update entries list
         self.global_hof.entries = agents_to_keep
@@ -1513,10 +1539,16 @@ class AgentEvaluator:
         # Update threshold
         self.global_hof._update_entry_threshold()
 
-        # Save and upload updated ledger
+        # Save and upload updated ledger with verification
         print("\nUpdating global50.json...")
         self.global_hof._save_local_ledger()
-        self.global_hof._upload_global_ledger()
+
+        if self.global_hof.enabled:
+            ledger_success = self.global_hof._upload_global_ledger_verified()
+            if not ledger_success:
+                print(f"⚠ WARNING: Ledger sync failed! Run --mirror to check consistency.")
+        else:
+            self.global_hof._upload_global_ledger()
 
         print(f"\n{'='*70}")
         print("✓ Trim Complete!")

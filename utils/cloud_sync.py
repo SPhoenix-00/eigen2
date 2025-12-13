@@ -155,6 +155,45 @@ class CloudSync:
             # Synchronous upload
             self._upload_file_sync(local_path, cloud_path)
 
+    def upload_file_verified(self, local_path: str, cloud_path: str, max_retries: int = 3) -> bool:
+        """
+        Upload a file to cloud storage with verification.
+
+        Uploads the file and then confirms it exists in cloud storage.
+        Retries on failure up to max_retries times.
+
+        Args:
+            local_path: Path to local file
+            cloud_path: Full path in cloud storage
+            max_retries: Maximum number of upload attempts
+
+        Returns:
+            True if upload succeeded and verified, False otherwise
+        """
+        if self.provider == "local":
+            return True
+
+        if not os.path.exists(local_path):
+            print(f"⚠ Upload verification failed: Local file not found: {local_path}")
+            return False
+
+        for attempt in range(max_retries):
+            try:
+                # Upload
+                self._upload_file_sync(local_path, cloud_path)
+
+                # Verify
+                if self.file_exists(cloud_path):
+                    return True
+                else:
+                    print(f"⚠ Upload verification failed (attempt {attempt + 1}/{max_retries}): File not found after upload: {cloud_path}")
+
+            except Exception as e:
+                print(f"⚠ Upload failed (attempt {attempt + 1}/{max_retries}): {cloud_path}: {e}")
+
+        print(f"✗ Upload verification failed after {max_retries} attempts: {cloud_path}")
+        return False
+
     def file_exists_on_cloud(self, filename: str) -> bool:
         """
         Check if a file exists in cloud storage.

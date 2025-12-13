@@ -256,6 +256,20 @@ class GlobalHallOfFame:
             print(f"⚠ Failed to upload global50.json: {e}")
             return False
 
+    def _upload_global_ledger_verified(self) -> bool:
+        """Upload global50.json to cloud storage with verification."""
+        try:
+            success = self.cloud_sync.upload_file_verified(
+                str(self.local_json_path),
+                self.cloud_json_path
+            )
+            if success:
+                print(f"  ✓ Ledger uploaded and verified: global50.json")
+            return success
+        except Exception as e:
+            print(f"⚠ Failed to upload global50.json: {e}")
+            return False
+
     def _load_local_ledger(self):
         """Load global50.json from local cache."""
         if not self.local_json_path.exists():
@@ -516,12 +530,29 @@ class GlobalHallOfFame:
                 dropouts = self.entries[self.CAPACITY:]
                 self.entries = self.entries[:self.CAPACITY]
 
-            # Sync Files
-            self._sync_agent_files(new_entry, agent, dropouts)
+            # Sync Files - MUST succeed before updating ledger
+            if not self._sync_agent_files(new_entry, agent, dropouts):
+                # Rollback: Remove the new entry from the list
+                self.entries = [e for e in self.entries if e != new_entry]
+                # Re-add dropouts if any were removed
+                self.entries.extend(dropouts)
+                self.entries.sort(key=lambda e: e.gauntlet_score, reverse=True)
+                print(f"✗ Promotion aborted: Agent file upload failed")
+                print(f"{'='*60}\n")
+                return False
 
             # Update Ledger
             self._save_local_ledger()
-            self._upload_global_ledger()
+
+            # Upload ledger with verification (if cloud enabled)
+            if self.enabled:
+                ledger_success = self._upload_global_ledger_verified()
+                if not ledger_success:
+                    print(f"⚠ WARNING: Agent uploaded but ledger sync failed!")
+                    print(f"  The agent file exists in cloud but global50.json may be out of sync.")
+                    print(f"  Run --mirror to check and resolve any inconsistencies.")
+            else:
+                self._upload_global_ledger()
 
             # Update Local Threshold
             self._update_entry_threshold()
@@ -543,21 +574,37 @@ class GlobalHallOfFame:
             return True
 
     def _sync_agent_files(self, new_entry: GlobalHoFEntry, agent: DDPGAgent,
-                          dropouts: List[GlobalHoFEntry]):
+                          dropouts: List[GlobalHoFEntry]) -> bool:
         """
         Sync agent weight files between local and cloud.
 
         - Upload new agent's .pth to global50/agents/
         - Move dropout agents from agents/ to archive/ (both locally and on cloud)
         - Save dropout metadata as JSON scoresheets in archive/
+
+        Returns:
+            True if agent upload succeeded and verified, False otherwise
         """
         # Upload new agent
         local_agent_path = self.local_agents_dir / new_entry.get_filename()
         agent.save(str(local_agent_path))
 
         cloud_agent_path = f"{self.cloud_base}/agents/{new_entry.get_filename()}"
-        self.cloud_sync.upload_file(str(local_agent_path), cloud_agent_path, background=False)
-        print(f"  ✓ Uploaded: {new_entry.get_filename()}")
+
+        # Use verified upload for the new agent - this is critical
+        if self.enabled:
+            upload_success = self.cloud_sync.upload_file_verified(
+                str(local_agent_path), cloud_agent_path
+            )
+            if not upload_success:
+                print(f"  ✗ CRITICAL: Failed to upload and verify agent: {new_entry.get_filename()}")
+                # Clean up local file since promotion will be aborted
+                if local_agent_path.exists():
+                    local_agent_path.unlink()
+                return False
+            print(f"  ✓ Uploaded and verified: {new_entry.get_filename()}")
+        else:
+            print(f"  ✓ Saved locally: {new_entry.get_filename()}")
 
         # Handle dropouts
         for dropout in dropouts:
@@ -597,6 +644,8 @@ class GlobalHallOfFame:
                     print(f"  ⚠ Archived but failed to delete from agents/: {filename}")
             else:
                 print(f"  ⚠ Archive upload failed, keeping in agents/: {filename}")
+
+        return True
 
     def get_random_agent(self) -> Optional[DDPGAgent]:
         """
