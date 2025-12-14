@@ -604,9 +604,48 @@ class AgentEvaluator:
                 os.unlink(temp_cloud_path)
             return False
 
-        # Case 3: Only cloud exists - need to download
+        # Case 3: Only cloud exists - need user confirmation before downloading
         if not local_exists and cloud_exists:
-            print(f"    ⚠ Cloud exists but local is missing - downloading...")
+            # Load cloud data to show entry count
+            try:
+                with open(temp_cloud_path, 'r') as f:
+                    cloud_data = json.load(f)
+                cloud_entries = len(cloud_data.get('entries', []))
+            except Exception:
+                cloud_entries = "unknown"
+
+            print(f"    ⚠ Cloud exists ({cloud_entries} entries) but local is missing")
+            print(f"")
+            print(f"    This could mean:")
+            print(f"      1. You're on a new machine and need to sync from cloud")
+            print(f"      2. Local data was accidentally deleted")
+            print(f"      3. You haven't run --init yet on this machine")
+            print(f"")
+            print(f"    Options:")
+            print(f"      [d] Download from cloud (sync cloud → local)")
+            print(f"      [i] Run --init first (recommended for new setups)")
+            print(f"      [s] Skip this context window")
+            print(f"")
+
+            while True:
+                choice = input("    Enter choice (d/i/s): ").strip().lower()
+                if choice == 'd':
+                    break
+                elif choice == 'i':
+                    print(f"    → Please run: python evaluate_for_global50.py --init")
+                    if temp_cloud_path and os.path.exists(temp_cloud_path):
+                        os.unlink(temp_cloud_path)
+                    return False
+                elif choice == 's':
+                    print(f"    → Skipping {context_window_id}")
+                    if temp_cloud_path and os.path.exists(temp_cloud_path):
+                        os.unlink(temp_cloud_path)
+                    return True  # Not a failure, just skipped
+                else:
+                    print("    Invalid choice. Please enter d, i, or s.")
+
+            # User chose to download
+            print(f"    Downloading from cloud...")
 
             # Create local directory structure
             local_dir.mkdir(parents=True, exist_ok=True)
@@ -624,6 +663,8 @@ class AgentEvaluator:
 
                 entries = data.get('entries', [])
                 downloaded = 0
+                failed_downloads = []
+
                 for entry in entries:
                     run_name = entry.get('run_name', 'unknown')
                     agent_id = entry.get('agent_id', 0)
@@ -636,12 +677,27 @@ class AgentEvaluator:
                             success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
                             if success:
                                 downloaded += 1
+                            else:
+                                failed_downloads.append(filename)
                         except Exception:
-                            pass
+                            failed_downloads.append(filename)
 
-                print(f"    ✓ Downloaded {downloaded}/{len(entries)} agents")
+                if failed_downloads:
+                    print(f"    ⚠ Downloaded {downloaded}/{len(entries)} agents")
+                    print(f"    ⚠ {len(failed_downloads)} agents MISSING from cloud:")
+                    for f in failed_downloads[:5]:
+                        print(f"        - {f}")
+                    if len(failed_downloads) > 5:
+                        print(f"        ... and {len(failed_downloads) - 5} more")
+                    print(f"")
+                    print(f"    ⚠ Cloud data integrity issue: global50.json references agents")
+                    print(f"      that don't exist in cloud storage.")
+                    return False
+                else:
+                    print(f"    ✓ Downloaded {downloaded}/{len(entries)} agents")
             except Exception as e:
                 print(f"    ⚠ Error downloading agents: {e}")
+                return False
 
             return True
 
@@ -654,6 +710,8 @@ class AgentEvaluator:
 
             local_entries = len(local_data.get('entries', []))
             cloud_entries = len(cloud_data.get('entries', []))
+            local_timestamp = local_data.get('last_updated', '')
+            cloud_timestamp = cloud_data.get('last_updated', '')
 
             if local_data == cloud_data:
                 print(f"    ✓ Synced ({local_entries} entries)")
@@ -662,6 +720,7 @@ class AgentEvaluator:
                 entries = local_data.get('entries', [])
                 missing_count = 0
                 downloaded = 0
+                failed_downloads = []
 
                 for entry in entries:
                     run_name = entry.get('run_name', 'unknown')
@@ -677,20 +736,88 @@ class AgentEvaluator:
                             success = self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path))
                             if success:
                                 downloaded += 1
+                            else:
+                                failed_downloads.append(filename)
                         except Exception:
-                            pass
+                            failed_downloads.append(filename)
 
                 if missing_count > 0:
-                    print(f"    ✓ Downloaded {downloaded}/{missing_count} missing agents")
+                    if failed_downloads:
+                        print(f"    ⚠ Downloaded {downloaded}/{missing_count} missing agents")
+                        print(f"    ⚠ {len(failed_downloads)} agents MISSING from cloud storage:")
+                        for f in failed_downloads[:5]:
+                            print(f"        - {f}")
+                        if len(failed_downloads) > 5:
+                            print(f"        ... and {len(failed_downloads) - 5} more")
+                        if temp_cloud_path and os.path.exists(temp_cloud_path):
+                            os.unlink(temp_cloud_path)
+                        return False  # Data integrity issue
+                    else:
+                        print(f"    ✓ Downloaded {downloaded}/{missing_count} missing agents")
 
                 if temp_cloud_path and os.path.exists(temp_cloud_path):
                     os.unlink(temp_cloud_path)
                 return True
             else:
-                print(f"    ⚠ Mismatch (local: {local_entries}, cloud: {cloud_entries})")
-                if temp_cloud_path and os.path.exists(temp_cloud_path):
-                    os.unlink(temp_cloud_path)
-                return False
+                # Mismatch - compare timestamps to determine which is newer
+                print(f"    ⚠ Mismatch detected:")
+                print(f"        Local:  {local_entries} entries (updated: {local_timestamp or 'unknown'})")
+                print(f"        Cloud:  {cloud_entries} entries (updated: {cloud_timestamp or 'unknown'})")
+                print(f"")
+
+                # Determine which is newer
+                local_newer = False
+                cloud_newer = False
+                if local_timestamp and cloud_timestamp:
+                    local_newer = local_timestamp > cloud_timestamp
+                    cloud_newer = cloud_timestamp > local_timestamp
+                    if local_newer:
+                        print(f"    → Local is NEWER (recommended: upload local to cloud)")
+                    elif cloud_newer:
+                        print(f"    → Cloud is NEWER (recommended: download cloud to local)")
+                    else:
+                        print(f"    → Timestamps are identical (manual resolution needed)")
+                else:
+                    print(f"    → Cannot determine which is newer (timestamps missing)")
+
+                print(f"")
+                print(f"    Options:")
+                print(f"      [l] Use LOCAL version (upload to cloud)")
+                print(f"      [c] Use CLOUD version (download to local)")
+                print(f"      [s] Skip (leave as-is, report mismatch)")
+                print(f"")
+
+                while True:
+                    choice = input("    Enter choice (l/c/s): ").strip().lower()
+                    if choice == 'l':
+                        # Upload local to cloud
+                        print(f"    → Uploading local to cloud...")
+                        if self.cloud_sync.upload_file_verified(str(local_json_path), cloud_json_path):
+                            print(f"    ✓ Cloud updated to match local")
+                            if temp_cloud_path and os.path.exists(temp_cloud_path):
+                                os.unlink(temp_cloud_path)
+                            return True
+                        else:
+                            print(f"    ✗ Failed to upload to cloud")
+                            if temp_cloud_path and os.path.exists(temp_cloud_path):
+                                os.unlink(temp_cloud_path)
+                            return False
+                    elif choice == 'c':
+                        # Download cloud to local
+                        print(f"    → Downloading cloud to local...")
+                        import shutil
+                        shutil.copy(temp_cloud_path, str(local_json_path))
+                        print(f"    ✓ Local updated to match cloud")
+                        if temp_cloud_path and os.path.exists(temp_cloud_path):
+                            os.unlink(temp_cloud_path)
+                        return True
+                    elif choice == 's':
+                        print(f"    → Skipping (mismatch remains)")
+                        if temp_cloud_path and os.path.exists(temp_cloud_path):
+                            os.unlink(temp_cloud_path)
+                        return False
+                    else:
+                        print("    Invalid choice. Please enter l, c, or s.")
 
         except Exception as e:
             print(f"    ⚠ Error: {e}")

@@ -224,6 +224,14 @@ class Config:
     # Gauntlet validation - rigorous stress test with many diverse slices
     GAUNTLET_NUM_SLICES = 20  # Number of validation slices for Gauntlet (vs 7 for normal validation)
 
+    # ============ Committee Selection Parameters ============
+    # Committee drafts top agents from Global50 to form an ensemble
+    COMMITTEE_SIZE = 9  # Target committee size
+    COMMITTEE_TOP_K_INITIAL = 20  # Start optimization with top K agents by gauntlet score
+    COMMITTEE_EARLY_STOP = 5  # Stop expanding pool after N consecutive non-improvements
+    COMMITTEE_CORRELATION_EXPONENT = 2  # Exponent for correlation penalty: (1 - avg_corr^exp)
+    COMMITTEE_VALIDATION_SLICES = 3  # Number of holdout slices for validation
+
     # Breakthrough goals - stopping condition based on confirmed breakthroughs
     TARGET_BREAKTHROUGHS_NORMAL = 4  # Number of confirmed breakthroughs in normal mode
     TARGET_BREAKTHROUGHS_CONSISTENCY = 8  # Deprecated - not used in consistency mode (uses turnovers instead)

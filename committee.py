@@ -1,37 +1,33 @@
 """
-Committee Production Engine for Project Eigen 2
-- Phase 1: Draft Day (Pairwise Decorrelation & Sharpe Selection)
-- Phase 2: Calibration (Horizon-Matched Tuning & Bootstrapping)
-- Phase 3: Inference (Placeholder for Production)
+Committee Production Engine for Project Eigen 2 (Global50 Edition)
+- Phase 1: Draft Day (Global50 Selection with Coefficient Correlation Optimization)
+- Phase 2: Validation (3-Slice Holdout Testing)
+- Cloud Sync: Committee roster is mirrored to cloud in global50/cw{N}/committee/
 
 HOLDOUT CONFIGURATION:
 The committee uses Config.COMMITTEE_HOLDOUT_DAYS to define a holdout period at the
 END of your dataset. This data is reserved EXCLUSIVELY for committee validation and
 must NEVER be used during agent training.
 
-Example:
-  - Full dataset: 5000 days
-  - Config.COMMITTEE_HOLDOUT_DAYS = 252 (1 year)
-  - Training data: Days 0-4747 (available for training)
-  - Holdout data: Days 4748-4999 (NEVER seen by agents)
+AGENT SOURCE:
+Agents are sourced from Global50 (global50/cw{N}/global50.json) instead of Hall of Fame.
+Selection optimizes for aggregate gauntlet score while minimizing coefficient correlation.
 
-REQUIREMENTS FOR DATA LOADER:
-  loader.data_array : np.ndarray
-      Normalized feature data [Days, Stocks, Features] (5-feature set)
+OBJECTIVE FUNCTION:
+    objective = Σ(gauntlet_scores) * (1 - avg_correlation^EXPONENT)
 
-  loader.data_array_full : np.ndarray
-      Full raw data [Days, Stocks, Features] (9-feature OHLCV set)
+This balances committee strength with diversity of decision-making.
 
-  loader.train_end_idx : int (OPTIONAL)
-      Last index used for training. If not provided, computed as:
-      (total_days - Config.COMMITTEE_HOLDOUT_DAYS - Config.MIN_HOLDING_PERIOD)
-
-The script will automatically compute holdout indices and verify no overlap.
+CLOUD STORAGE:
+Committee roster is stored in: global50/cw{N}/committee/
+  - committee_roster.json: Full committee metadata
+  - committee_correlation.png: Correlation heatmap visualization
 
 USAGE:
   python committee.py --verify-only   # Check data split only
-  python committee.py --draft         # Phase 1: Select committee
-  python committee.py --calibrate     # Phase 2: Tune thresholds
+  python committee.py --draft         # Phase 1: Select committee from Global50
+  python committee.py --validate      # Phase 2: Validate on holdout slices
+  python committee.py --mirror        # Check cloud sync status, download if needed
 """
 
 import os
@@ -45,106 +41,305 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
-import gc
 from itertools import combinations
+import gc
+import tempfile
 
 # Project Imports
 from utils.config import Config
 from data.loader import StockDataLoader
 from models.ddpg_agent import DDPGAgent
+from utils.cloud_sync import get_cloud_sync_from_env
 
 # --- Configuration ---
-HOF_DIR = Path("/workspace/hall_of_fame")
-COMMITTEE_DIR = Path("committee_results")
-ROSTER_FILE = COMMITTEE_DIR / "committee_roster.json"
-CALIBRATION_FILE = COMMITTEE_DIR / "calibration_results.csv"
+GLOBAL50_BASE_DIR = Path("global50")
+COMMITTEE_DIR = Path("committee_results")  # Legacy local-only path
+ROSTER_FILENAME = "committee_roster.json"
+CORRELATION_FILENAME = "committee_correlation.png"
 
-# --- metrics ---
-MIN_TRADES_FOR_SIGNIFICANCE = 50
-MAX_PAIRWISE_CORRELATION = 0.70
-BOOTSTRAP_ROUNDS = 1000
-TRANSACTION_COST_BPS = 20  # Basis points per round trip (slippage + commissions)
+
+class CommitteeManager:
+    """
+    Manages committee selection, storage, and cloud synchronization.
+    Committee files live in global50/cw{N}/committee/ alongside agents/.
+    """
+
+    def __init__(self, context_window_days: int):
+        """
+        Initialize CommitteeManager.
+
+        Args:
+            context_window_days: Context window for this league (e.g., 151)
+        """
+        self.context_window_days = context_window_days
+        self.context_window_id = f"cw{context_window_days}"
+
+        # Cloud sync
+        self.cloud_sync = get_cloud_sync_from_env()
+
+        # Local paths
+        self.local_base = GLOBAL50_BASE_DIR / self.context_window_id
+        self.local_committee_dir = self.local_base / "committee"
+        self.local_roster_path = self.local_committee_dir / ROSTER_FILENAME
+        self.local_correlation_path = self.local_committee_dir / CORRELATION_FILENAME
+
+        # Cloud paths
+        self.cloud_base = f"{self.cloud_sync.project_name}/global50/{self.context_window_id}"
+        self.cloud_committee_base = f"{self.cloud_base}/committee"
+        self.cloud_roster_path = f"{self.cloud_committee_base}/{ROSTER_FILENAME}"
+        self.cloud_correlation_path = f"{self.cloud_committee_base}/{CORRELATION_FILENAME}"
+
+        # Ensure local directories exist
+        self.local_committee_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_roster(self, roster_data: dict, correlation_matrix: np.ndarray = None) -> bool:
+        """
+        Save committee roster locally and sync to cloud.
+
+        Args:
+            roster_data: Committee roster dictionary
+            correlation_matrix: Optional correlation matrix for heatmap
+
+        Returns:
+            True if save and sync succeeded
+        """
+        # Save roster JSON locally
+        with open(self.local_roster_path, 'w') as f:
+            json.dump(roster_data, f, indent=2)
+        print(f"✓ Roster saved locally: {self.local_roster_path}")
+
+        # Save correlation heatmap if provided
+        if correlation_matrix is not None:
+            self._save_correlation_heatmap(roster_data, correlation_matrix)
+
+        # Sync to cloud
+        return self._sync_to_cloud()
+
+    def _save_correlation_heatmap(self, roster_data: dict, correlation_matrix: np.ndarray):
+        """Save correlation heatmap visualization."""
+        plt.figure(figsize=(10, 8))
+        labels = [f"{m['run_name']}_{m['agent_id']}"[:15] for m in roster_data['members']]
+
+        avg_corr = roster_data.get('correlation', {}).get('average', 0)
+        max_corr = roster_data.get('correlation', {}).get('max_pair', 0)
+
+        sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt=".2f",
+                    vmin=-1, vmax=1, xticklabels=labels, yticklabels=labels)
+        plt.title(f"Committee Coefficient Correlation\n"
+                  f"(Avg: {avg_corr:.3f}, Max: {max_corr:.3f})")
+        plt.tight_layout()
+        plt.savefig(self.local_correlation_path, dpi=150)
+        plt.close()
+        print(f"✓ Correlation heatmap saved: {self.local_correlation_path}")
+
+    def _sync_to_cloud(self) -> bool:
+        """Sync local committee files to cloud storage."""
+        if self.cloud_sync.provider == "local":
+            print("  ⚠ Cloud sync disabled (local mode)")
+            return True
+
+        print(f"\nSyncing committee to cloud...")
+        success = True
+
+        # Upload roster JSON
+        if self.local_roster_path.exists():
+            if self.cloud_sync.upload_file_verified(
+                str(self.local_roster_path), self.cloud_roster_path
+            ):
+                print(f"  ✓ Uploaded: {ROSTER_FILENAME}")
+            else:
+                print(f"  ✗ Failed to upload: {ROSTER_FILENAME}")
+                success = False
+
+        # Upload correlation heatmap
+        if self.local_correlation_path.exists():
+            if self.cloud_sync.upload_file_verified(
+                str(self.local_correlation_path), self.cloud_correlation_path
+            ):
+                print(f"  ✓ Uploaded: {CORRELATION_FILENAME}")
+            else:
+                print(f"  ✗ Failed to upload: {CORRELATION_FILENAME}")
+                success = False
+
+        if success:
+            print(f"  ✓ Cloud mirror: gs://{self.cloud_sync.bucket_name}/{self.cloud_committee_base}/")
+
+        return success
+
+    def load_roster(self) -> dict:
+        """Load committee roster from local storage."""
+        if not self.local_roster_path.exists():
+            return None
+
+        with open(self.local_roster_path, 'r') as f:
+            return json.load(f)
+
+    def check_mirror_status(self) -> bool:
+        """
+        Check synchronization status between local and cloud.
+        Downloads missing files from cloud if needed.
+
+        Returns:
+            True if in sync, False if mismatch or error
+        """
+        print("\n" + "="*60)
+        print(f"COMMITTEE MIRROR CHECK ({self.context_window_id})")
+        print("="*60)
+
+        if self.cloud_sync.provider == "local":
+            print("  ⚠ Cloud sync disabled (local mode)")
+            print("  Checking local files only...")
+            return self._check_local_status()
+
+        print(f"  Cloud base: gs://{self.cloud_sync.bucket_name}/{self.cloud_committee_base}/")
+        print(f"  Local base: {self.local_committee_dir}/")
+
+        # Check cloud roster exists
+        cloud_roster_exists = self._cloud_file_exists(self.cloud_roster_path)
+        local_roster_exists = self.local_roster_path.exists()
+
+        print(f"\n  Roster JSON:")
+        print(f"    Cloud: {'EXISTS' if cloud_roster_exists else 'MISSING'}")
+        print(f"    Local: {'EXISTS' if local_roster_exists else 'MISSING'}")
+
+        # Download from cloud if local missing
+        if cloud_roster_exists and not local_roster_exists:
+            print(f"  → Downloading roster from cloud...")
+            if self.cloud_sync.download_file(self.cloud_roster_path, str(self.local_roster_path)):
+                print(f"    ✓ Downloaded {ROSTER_FILENAME}")
+                local_roster_exists = True
+            else:
+                print(f"    ✗ Failed to download {ROSTER_FILENAME}")
+
+        # Check correlation heatmap
+        cloud_corr_exists = self._cloud_file_exists(self.cloud_correlation_path)
+        local_corr_exists = self.local_correlation_path.exists()
+
+        print(f"\n  Correlation Heatmap:")
+        print(f"    Cloud: {'EXISTS' if cloud_corr_exists else 'MISSING'}")
+        print(f"    Local: {'EXISTS' if local_corr_exists else 'MISSING'}")
+
+        if cloud_corr_exists and not local_corr_exists:
+            print(f"  → Downloading correlation heatmap from cloud...")
+            if self.cloud_sync.download_file(self.cloud_correlation_path, str(self.local_correlation_path)):
+                print(f"    ✓ Downloaded {CORRELATION_FILENAME}")
+                local_corr_exists = True
+            else:
+                print(f"    ✗ Failed to download {CORRELATION_FILENAME}")
+
+        # Compare local vs cloud if both exist
+        if cloud_roster_exists and local_roster_exists:
+            match = self._compare_rosters()
+            if match:
+                print(f"\n  ✓ Local and cloud rosters MATCH")
+            else:
+                print(f"\n  ⚠ Local and cloud rosters DIFFER")
+                print(f"    Use --draft to regenerate committee")
+                return False
+
+        # Summary
+        if local_roster_exists:
+            roster = self.load_roster()
+            print(f"\n  Committee Status:")
+            print(f"    Size: {roster.get('committee_size', 'N/A')}")
+            print(f"    Objective: {roster.get('objective_value', 'N/A'):.2f}")
+            print(f"    Avg Correlation: {roster.get('correlation', {}).get('average', 'N/A'):.3f}")
+            print(f"    Generated: {roster.get('generated_at', 'N/A')}")
+            return True
+        else:
+            print(f"\n  ⚠ No committee roster found")
+            print(f"    Run --draft to create committee")
+            return False
+
+    def _check_local_status(self) -> bool:
+        """Check local committee status when cloud is disabled."""
+        if self.local_roster_path.exists():
+            roster = self.load_roster()
+            print(f"\n  Committee Status:")
+            print(f"    Size: {roster.get('committee_size', 'N/A')}")
+            print(f"    Objective: {roster.get('objective_value', 'N/A'):.2f}")
+            print(f"    Avg Correlation: {roster.get('correlation', {}).get('average', 'N/A'):.3f}")
+            print(f"    Generated: {roster.get('generated_at', 'N/A')}")
+            return True
+        else:
+            print(f"\n  ⚠ No committee roster found locally")
+            print(f"    Run --draft to create committee")
+            return False
+
+    def _cloud_file_exists(self, cloud_path: str) -> bool:
+        """Check if a file exists in cloud storage."""
+        try:
+            return self.cloud_sync.file_exists(cloud_path)
+        except Exception:
+            return False
+
+    def _compare_rosters(self) -> bool:
+        """Compare local and cloud rosters for equality."""
+        try:
+            # Download cloud roster to temp file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                temp_path = tmp.name
+
+            if not self.cloud_sync.download_file(self.cloud_roster_path, temp_path, silent=True):
+                return False
+
+            with open(temp_path, 'r') as f:
+                cloud_roster = json.load(f)
+
+            local_roster = self.load_roster()
+
+            # Compare key fields
+            if local_roster.get('committee_size') != cloud_roster.get('committee_size'):
+                return False
+
+            local_members = set(m['filename'] for m in local_roster.get('members', []))
+            cloud_members = set(m['filename'] for m in cloud_roster.get('members', []))
+
+            return local_members == cloud_members
+
+        except Exception as e:
+            print(f"  ⚠ Error comparing rosters: {e}")
+            return False
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
 
 # --- Helper Functions ---
 
 def calculate_max_drawdown(cumulative_returns):
     """Calculates Maximum Drawdown from a cumulative return series."""
-    if len(cumulative_returns) == 0: return 0.0
+    if len(cumulative_returns) == 0:
+        return 0.0
     peak = np.maximum.accumulate(cumulative_returns)
-    # Avoid division by zero if peak starts at 0
     peak = np.where(peak == 0, 1e-9, peak)
     drawdown = (cumulative_returns - peak) / peak
-    return np.min(drawdown)
+    return float(np.min(drawdown))
 
-def bootstrap_expectancy(gains, rounds=BOOTSTRAP_ROUNDS):
-    """
-    Resample trades to estimate 95% Confidence Interval of Expectancy.
-    Returns: (lower_bound, mean, upper_bound)
-    """
-    if len(gains) < 10: return -1.0, 0.0, 1.0
-    
-    means = []
-    # Separate wins and losses to preserve win-rate structure in resampling? 
-    # No, simplistic resampling of the outcome vector is standard for expectancy.
-    
-    for _ in range(rounds):
-        sample = np.random.choice(gains, size=len(gains), replace=True)
-        
-        wins = sample[sample > 0]
-        losses = abs(sample[sample <= 0])
-        
-        win_rate = len(wins) / len(sample)
-        loss_rate = 1.0 - win_rate
-        avg_win = np.mean(wins) if len(wins) > 0 else 0
-        avg_loss = np.mean(losses) if len(losses) > 0 else 0
-        
-        expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
-        means.append(expectancy)
-        
-    return np.percentile(means, 2.5), np.mean(means), np.percentile(means, 97.5)
 
 def verify_data_split(loader):
     """
     Verifies THREE-TIER split: Training → Validation → Holdout
 
-    Checks that:
-    1. Loader properly excludes holdout from training/validation
-    2. Holdout period matches Config.COMMITTEE_HOLDOUT_DAYS
-    3. No overlap between training, validation, and holdout
-
     Returns: (is_valid, error_message, holdout_info_dict)
     """
     total_days = len(loader.data_array_full)
 
-    # Check minimum dataset size
-    min_required = Config.CONTEXT_WINDOW_DAYS + Config.VALIDATION_DAYS + Config.COMMITTEE_HOLDOUT_DAYS + Config.MIN_HOLDING_PERIOD
+    min_required = (Config.CONTEXT_WINDOW_DAYS + Config.VALIDATION_DAYS +
+                    Config.COMMITTEE_HOLDOUT_DAYS + Config.MIN_HOLDING_PERIOD)
     if total_days < min_required:
-        return False, (
-            f"Dataset too small: {total_days} days\n"
-            f"  Need at least {min_required} days:\n"
-            f"    - Context: {Config.CONTEXT_WINDOW_DAYS}\n"
-            f"    - Validation: {Config.VALIDATION_DAYS}\n"
-            f"    - Holdout: {Config.COMMITTEE_HOLDOUT_DAYS}\n"
-            f"    - Min holding: {Config.MIN_HOLDING_PERIOD}"
-        ), None
+        return False, f"Dataset too small: {total_days} days (need {min_required})", None
 
-    # Compute expected holdout indices (last N days)
     expected_holdout_start = total_days - Config.COMMITTEE_HOLDOUT_DAYS
     holdout_end = total_days - 1
 
-    # Verify loader has proper train_end_idx set
     if not hasattr(loader, 'train_end_idx') or loader.train_end_idx is None:
-        return False, (
-            "Loader missing train_end_idx!\n"
-            "  The data loader must call create_train_val_split() which sets this attribute.\n"
-            "  This ensures training data excludes the committee holdout."
-        ), None
+        return False, "Loader missing train_end_idx! Must call create_train_val_split() first.", None
 
     train_end = loader.train_end_idx
     train_start = 0
     train_size = train_end - train_start + 1
 
-    # Verify loader has validation indices
     if not hasattr(loader, 'val_end_idx') or loader.val_end_idx is None:
         return False, "Loader missing val_end_idx! Must call create_train_val_split() first.", None
 
@@ -152,58 +347,9 @@ def verify_data_split(loader):
     val_end = loader.val_end_idx
     val_size = val_end - val_start + 1
 
-    # CRITICAL: Verify validation doesn't overlap with holdout
     if val_end >= expected_holdout_start:
-        return False, (
-            f"❌ VALIDATION OVERLAPS WITH HOLDOUT!\n"
-            f"  Validation ends at: {val_end}\n"
-            f"  Holdout starts at: {expected_holdout_start}\n"
-            f"  This means agents saw holdout data during training!\n"
-            f"\n"
-            f"  Fix: Update data/loader.py to exclude holdout:\n"
-            f"    holdout_start = num_days - Config.COMMITTEE_HOLDOUT_DAYS\n"
-            f"    val_end_idx = holdout_start - 1"
-        ), None
+        return False, f"VALIDATION OVERLAPS WITH HOLDOUT! val_end={val_end}, holdout_start={expected_holdout_start}", None
 
-    # Verify no gap between validation and holdout (strict adjacency)
-    gap_val_holdout = expected_holdout_start - val_end - 1
-    if gap_val_holdout != 0:
-        return False, (
-            f"Gap detected between validation and holdout: {gap_val_holdout} days\n"
-            f"  Validation ends: {val_end}\n"
-            f"  Holdout starts: {expected_holdout_start}\n"
-            f"  These should be adjacent (val_end + 1 = holdout_start)"
-        ), None
-
-    # Verify no gap between training and validation (strict adjacency)
-    gap_train_val = val_start - train_end - 1
-    if gap_train_val != 0:
-        return False, (
-            f"Gap detected between training and validation: {gap_train_val} days\n"
-            f"  Training ends: {train_end}\n"
-            f"  Validation starts: {val_start}\n"
-            f"  These should be adjacent (train_end + 1 = val_start)"
-        ), None
-
-    # Verify sizes match Config
-    if val_size != Config.VALIDATION_DAYS:
-        return False, (
-            f"Validation size mismatch!\n"
-            f"  Expected: {Config.VALIDATION_DAYS} days\n"
-            f"  Actual: {val_size} days\n"
-            f"  Check data/loader.py split logic."
-        ), None
-
-    holdout_size = Config.COMMITTEE_HOLDOUT_DAYS
-
-    # Verify minimum sizes
-    if train_size < Config.CONTEXT_WINDOW_DAYS:
-        return False, f"Training set too small: {train_size} days (need at least {Config.CONTEXT_WINDOW_DAYS})", None
-
-    if holdout_size < 100:
-        return False, f"Holdout too small: {holdout_size} days (recommend at least 100 for statistical power)", None
-
-    # Package holdout info for later use
     holdout_info = {
         'holdout_start': expected_holdout_start,
         'holdout_end': holdout_end,
@@ -211,19 +357,16 @@ def verify_data_split(loader):
         'train_end': train_end,
         'val_start': val_start,
         'val_end': val_end,
-        'gap': 0  # No gaps in strict three-tier split
     }
 
     print("✅ THREE-TIER DATA SPLIT VERIFICATION PASSED")
     print(f"\n  Total Days:     {total_days:,}")
     print(f"  Training:       {train_size:,} days (indices {train_start:,} to {train_end:,})")
     print(f"  Validation:     {val_size:,} days (indices {val_start:,} to {val_end:,})")
-    print(f"  Holdout:        {holdout_size:,} days (indices {expected_holdout_start:,} to {holdout_end:,})")
-    print(f"\n  ✓ No overlap detected")
-    print(f"  ✓ Strict adjacency verified (no gaps)")
-    print(f"  ✓ Holdout is completely separate from training/validation")
+    print(f"  Holdout:        {Config.COMMITTEE_HOLDOUT_DAYS:,} days (indices {expected_holdout_start:,} to {holdout_end:,})")
 
     return True, None, holdout_info
+
 
 def load_normalization_stats():
     """Calculates normalization stats deterministically."""
@@ -232,404 +375,724 @@ def load_normalization_stats():
     _, stats = loader.load_and_prepare()
     return loader, stats
 
+
 def load_agent_actor_only(filepath, agent_id):
     """Loads only the Actor network to save VRAM."""
     try:
         agent = DDPGAgent(agent_id=agent_id)
-        checkpoint = torch.load(filepath, map_location=Config.DEVICE)
+        checkpoint = torch.load(filepath, map_location=Config.DEVICE, weights_only=False)
         agent.actor.load_state_dict(checkpoint['actor_state_dict'])
         agent.actor.eval()
-        # Delete critic/targets to save memory
         del agent.critic
         del agent.critic_target
         del agent.actor_target
         return agent
     except Exception as e:
-        print(f"⚠ Corrupt checkpoint {filepath.name}: {e}")
+        print(f"⚠ Error loading {filepath}: {e}")
         return None
 
-def get_out_of_sample_data(loader, stats, holdout_info):
-    """
-    Get strictly Out-Of-Sample (Holdout) data based on Config.COMMITTEE_HOLDOUT_DAYS.
-    Uses the holdout_info dict computed by verify_data_split().
 
-    Args:
-        loader: StockDataLoader instance
-        stats: Normalization statistics
-        holdout_info: Dict with holdout_start, holdout_end, train_end
+def get_holdout_data(loader, stats, holdout_info):
+    """
+    Get holdout data tensor for inference.
 
     Returns:
         (inputs_tensor, valid_indices)
     """
-    # Extract holdout boundaries
     holdout_start = holdout_info['holdout_start']
     holdout_end = holdout_info['holdout_end']
-    train_end = holdout_info['train_end']
 
-    # Data for Context (Features) - Uses 5-feature set
     input_data = loader.data_array  # [Days, Stocks, 5_feats]
 
-    # Valid inference points in holdout period
-    # Need to leave room for MIN_HOLDING_PERIOD forward returns
-    valid_indices = range(holdout_start, holdout_end - Config.MIN_HOLDING_PERIOD + 1)
+    # Valid inference points (need room for MIN_HOLDING_PERIOD forward)
+    valid_indices = list(range(holdout_start, holdout_end - Config.MIN_HOLDING_PERIOD + 1))
 
     inputs = []
-
-    print(f"\nPreparing {len(valid_indices)} days of Holdout data...")
-    print(f"  Holdout period: Indices {holdout_start} to {holdout_end}")
-    print(f"  Training ended at: Index {train_end}")
-    print(f"  Gap: {holdout_start - train_end - 1} days\n")
-
     for i in valid_indices:
-        # Normalize context window deterministically
         window = input_data[i - Config.CONTEXT_WINDOW_DAYS : i]
         normalized = (window - stats['mean']) / stats['std']
         inputs.append(normalized)
 
     inputs = np.array(inputs)
-    # Tensor: [Batch, Context, Stocks, Feats]
     inputs_tensor = torch.FloatTensor(inputs).to(Config.DEVICE)
 
     return inputs_tensor, valid_indices
 
-# --- Phase 1: Draft Day ---
 
-def run_draft(loader, stats, holdout_info):
-    COMMITTEE_DIR.mkdir(exist_ok=True)
-    print("\n" + "="*60)
-    print("PHASE 1: DRAFT DAY (Robust Selection)")
-    print("="*60)
+# --- Global50 Loading ---
 
-    # 1. Scan Hall of Fame
-    agent_files = sorted(list(HOF_DIR.glob("*.pth")))
-    if not agent_files:
-        print(f"❌ No agents found in {HOF_DIR}")
-        return
+def load_global50_candidates(context_window_days: int) -> list:
+    """
+    Load agents from Global50, sorted by gauntlet_score descending.
 
-    # 2. Prepare Data
-    market_tensor, valid_indices = get_out_of_sample_data(loader, stats, holdout_info)
-    
-    # 3. Generate Horizon-Matched PnL Curves
-    print(f"Auditing {len(agent_files)} agents on {Config.MIN_HOLDING_PERIOD}-day hold returns...")
-    
-    # Pre-calculate market returns for the hold period
-    # We need (Close_t+20 - Close_t) / Close_t
-    # Index 1 is Close price in standard OHLCV arrays
-    close_idx = 1 
-    full_closes = loader.data_array_full[:, :, close_idx]
-    
-    # Calculate N-day forward return for every day in valid_indices
-    # shape: [Num_Test_Days, Num_Stocks]
-    period_returns = []
-    for t in valid_indices:
-        entry_price = full_closes[t]
-        # Enforce Holding Period Mismatch Fix (Point 2)
-        exit_price = full_closes[t + Config.MIN_HOLDING_PERIOD]
-        
-        # Safety for NaNs
-        ret = np.where(entry_price > 0, (exit_price - entry_price) / entry_price, 0.0)
-        period_returns.append(ret)
-    
-    period_returns = np.array(period_returns) # [Days, Stocks]
+    Args:
+        context_window_days: Context window to load (e.g., 151)
 
-    agent_curves = {} # {filename: daily_portfolio_pnl}
-    agent_sharpes = {}
+    Returns:
+        List of entry dicts with agent metadata
+    """
+    json_path = GLOBAL50_BASE_DIR / f"cw{context_window_days}" / "global50.json"
 
-    for fpath in tqdm(agent_files, desc="Simulating"):
-        agent = load_agent_actor_only(fpath, 0)
-        if agent is None: continue
-        
+    if not json_path.exists():
+        print(f"❌ Global50 ledger not found: {json_path}")
+        return []
+
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    entries = data.get('entries', [])
+
+    # Sort by gauntlet_score descending
+    entries.sort(key=lambda e: e.get('gauntlet_score', 0), reverse=True)
+
+    print(f"✓ Loaded {len(entries)} agents from Global50 (cw{context_window_days})")
+
+    return entries
+
+
+def get_agent_filepath(entry: dict, context_window_days: int) -> Path:
+    """Get the filepath for an agent's weights."""
+    filename = f"{entry['run_name']}_{entry['agent_id']}.pth"
+    return GLOBAL50_BASE_DIR / f"cw{context_window_days}" / "agents" / filename
+
+
+# --- Correlation Calculation ---
+
+def calculate_coefficient_correlations(entries: list, holdout_tensor: torch.Tensor,
+                                        context_window_days: int) -> tuple:
+    """
+    Calculate pairwise coefficient correlations between agents.
+
+    Args:
+        entries: List of Global50 entry dicts
+        holdout_tensor: Prepared holdout data tensor [Days, Context, Stocks, Features]
+        context_window_days: Context window for filepath lookup
+
+    Returns:
+        (correlation_matrix, coefficients_dict, loaded_agents_list)
+    """
+    n = len(entries)
+    coefficients = {}  # entry_index -> coefficient array
+    loaded_agents = []
+
+    print(f"\nCalculating coefficient correlations for {n} agents...")
+
+    for idx, entry in enumerate(tqdm(entries, desc="Loading agents")):
+        filepath = get_agent_filepath(entry, context_window_days)
+
+        if not filepath.exists():
+            print(f"  ⚠ Agent file not found: {filepath}")
+            coefficients[idx] = None
+            loaded_agents.append(None)
+            continue
+
+        agent = load_agent_actor_only(filepath, entry['agent_id'])
+        if agent is None:
+            coefficients[idx] = None
+            loaded_agents.append(None)
+            continue
+
         with torch.no_grad():
-            # Action: [Days, Stocks, 2]
-            actions = agent.actor(market_tensor).cpu().numpy()
-            
-        # Calculate PnL
-        coeffs = actions[:, :, 0]
-        
-        # Filter: Only trades that would actually trigger (Threshold > 1.0)
-        # We use 1.0 here as the baseline definition of "Active" for correlation purposes
-        active_pos = np.maximum(0, coeffs - 1.0) 
-        
-        # Cap leverage for simulation safety
-        active_pos = np.minimum(active_pos, 2.0) 
-        
-        # Agent Daily PnL = Sum(Position * Period_Return) across stocks
-        # This represents the PnL "realized" for trades initiated on day t
-        daily_pnl = np.sum(active_pos * period_returns, axis=1)
-        
-        agent_curves[fpath.name] = daily_pnl
-        
-        # Calculate Sharpe (Annualized)
-        if np.std(daily_pnl) > 1e-6:
-            sharpe = np.mean(daily_pnl) / np.std(daily_pnl) * np.sqrt(252)
-        else:
-            sharpe = -999.0
-            
-        agent_sharpes[fpath.name] = sharpe
-        
+            # Get coefficient predictions [Days, Stocks, 2]
+            actions = agent.actor(holdout_tensor).cpu().numpy()
+
+        # Extract coefficients (first output dimension)
+        # Flatten to 1D for correlation: [Days * Stocks]
+        coefs = actions[:, :, 0].flatten()
+        coefficients[idx] = coefs
+        loaded_agents.append(agent)
+
         del agent
         torch.cuda.empty_cache()
 
-    # 4. Draft Logic: Greedy Pairwise Decorrelation
-    print("\nDrafting Committee (Optimizing for Uncorrelated Sharpe)...")
-    
-    # Sort candidates by Sharpe Ratio (Risk-Adjusted Quality)
-    sorted_candidates = sorted(agent_sharpes.keys(), key=lambda x: agent_sharpes[x], reverse=True)
-    
-    # Convert curves to DataFrame for easy correlation
-    df_pnl = pd.DataFrame(agent_curves)
-    
-    # Pick Captain (Best Sharpe)
-    captain = sorted_candidates[0]
-    drafted = [captain]
-    print(f"  1. {captain} (Sharpe: {agent_sharpes[captain]:.2f})")
-    
-    target_size = 9
-    
-    for candidate in sorted_candidates[1:]:
-        if len(drafted) >= target_size: break
-        
-        # Pairwise Correlation Check (Point 5)
-        is_uncorrelated = True
-        max_pairwise = -1.0
-        conflict_agent = None
-        
-        cand_curve = df_pnl[candidate]
-        
-        for member in drafted:
-            member_curve = df_pnl[member]
-            corr = np.corrcoef(cand_curve, member_curve)[0, 1]
-            
-            if corr > MAX_PAIRWISE_CORRELATION:
-                is_uncorrelated = False
-                conflict_agent = member
-                max_pairwise = corr
-                break # Fail fast
-        
-        if is_uncorrelated:
-            drafted.append(candidate)
-            print(f"  {len(drafted)}. {candidate} (Sharpe: {agent_sharpes[candidate]:.2f})")
+    # Build correlation matrix
+    corr_matrix = np.zeros((n, n))
+
+    valid_indices = [i for i in range(n) if coefficients[i] is not None]
+
+    for i in valid_indices:
+        for j in valid_indices:
+            if i == j:
+                corr_matrix[i, j] = 1.0
+            else:
+                corr = np.corrcoef(coefficients[i], coefficients[j])[0, 1]
+                corr_matrix[i, j] = corr if not np.isnan(corr) else 0.0
+
+    return corr_matrix, coefficients, loaded_agents
+
+
+# --- Objective Function ---
+
+def committee_objective(indices: tuple, entries: list, corr_matrix: np.ndarray) -> tuple:
+    """
+    Calculate committee objective value.
+
+    Objective = Σ(gauntlet_scores) * (1 - avg_correlation^EXPONENT)
+
+    Args:
+        indices: Tuple of agent indices in the committee
+        entries: Full list of Global50 entries
+        corr_matrix: Full NxN correlation matrix
+
+    Returns:
+        (objective_value, score_sum, avg_correlation, max_correlation)
+    """
+    # Sum of gauntlet scores
+    score_sum = sum(entries[i]['gauntlet_score'] for i in indices)
+
+    # Extract submatrix for committee members
+    n = len(indices)
+    pairs = []
+    max_corr = 0.0
+
+    for i_idx in range(n):
+        for j_idx in range(i_idx + 1, n):
+            i = indices[i_idx]
+            j = indices[j_idx]
+            corr = corr_matrix[i, j]
+            pairs.append(corr)
+            if corr > max_corr:
+                max_corr = corr
+
+    avg_corr = np.mean(pairs) if pairs else 0.0
+
+    # Objective with correlation penalty
+    penalty = 1.0 - (avg_corr ** Config.COMMITTEE_CORRELATION_EXPONENT)
+    objective = score_sum * penalty
+
+    return objective, score_sum, avg_corr, max_corr
+
+
+# --- Optimization ---
+
+def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
+    """
+    Find optimal committee using incremental exhaustive search.
+
+    Algorithm:
+    1. Start with top K agents (COMMITTEE_TOP_K_INITIAL)
+    2. Exhaustive search for best COMMITTEE_SIZE combination
+    3. Expand pool by 1 agent, re-optimize
+    4. Stop after COMMITTEE_EARLY_STOP consecutive non-improvements
+
+    Returns:
+        Dict with best committee info
+    """
+    committee_size = Config.COMMITTEE_SIZE
+    initial_pool = Config.COMMITTEE_TOP_K_INITIAL
+    early_stop = Config.COMMITTEE_EARLY_STOP
+
+    # Filter to entries with valid correlation data
+    valid_entries = [i for i in range(len(entries))
+                     if corr_matrix[i, i] == 1.0]  # Valid entries have self-correlation = 1
+
+    if len(valid_entries) < committee_size:
+        print(f"❌ Not enough valid agents ({len(valid_entries)}) for committee of {committee_size}")
+        return None
+
+    print(f"\n{'='*60}")
+    print(f"COMMITTEE OPTIMIZATION")
+    print(f"{'='*60}")
+    print(f"  Committee Size: {committee_size}")
+    print(f"  Initial Pool: top {initial_pool} agents")
+    print(f"  Early Stop: {early_stop} consecutive non-improvements")
+    print(f"  Valid Agents: {len(valid_entries)}")
+
+    best_committee = None
+    best_objective = float('-inf')
+    best_score_sum = 0
+    best_avg_corr = 0
+    best_max_corr = 0
+    consecutive_failures = 0
+    current_pool_size = min(initial_pool, len(valid_entries))
+
+    iteration = 0
+
+    while consecutive_failures < early_stop and current_pool_size <= len(valid_entries):
+        iteration += 1
+        pool = valid_entries[:current_pool_size]
+
+        # Count combinations
+        from math import comb
+        num_combos = comb(len(pool), committee_size)
+
+        print(f"\n  Iteration {iteration}: Pool size {current_pool_size}, "
+              f"searching {num_combos:,} combinations...")
+
+        improved = False
+
+        for combo in combinations(pool, committee_size):
+            obj, score_sum, avg_corr, max_corr = committee_objective(
+                combo, entries, corr_matrix
+            )
+
+            if obj > best_objective:
+                best_objective = obj
+                best_committee = combo
+                best_score_sum = score_sum
+                best_avg_corr = avg_corr
+                best_max_corr = max_corr
+                improved = True
+
+        if improved:
+            consecutive_failures = 0
+            print(f"    ✓ New best: objective={best_objective:.2f}, "
+                  f"score_sum={best_score_sum:.2f}, "
+                  f"avg_corr={best_avg_corr:.3f}, max_corr={best_max_corr:.3f}")
         else:
-            # Verbose reject (optional)
-            pass 
-            
-    # 5. Save Roster
-    roster_data = {
-        'committee_size': len(drafted),
-        'members': drafted,
-        'test_period_start': int(valid_indices[0]),
-        'test_period_end': int(valid_indices[-1]),
-        'generated_at': str(datetime.now())
+            consecutive_failures += 1
+            print(f"    No improvement ({consecutive_failures}/{early_stop})")
+
+        # Expand pool
+        current_pool_size += 1
+
+    print(f"\n{'='*60}")
+    print(f"OPTIMIZATION COMPLETE")
+    print(f"{'='*60}")
+    print(f"  Final Objective: {best_objective:.2f}")
+    print(f"  Aggregate Score: {best_score_sum:.2f}")
+    print(f"  Avg Correlation: {best_avg_corr:.3f}")
+    print(f"  Max Pair Correlation: {best_max_corr:.3f}")
+
+    return {
+        'committee_indices': best_committee,
+        'objective': best_objective,
+        'score_sum': best_score_sum,
+        'avg_correlation': best_avg_corr,
+        'max_correlation': best_max_corr,
     }
-    
-    with open(ROSTER_FILE, 'w') as f:
-        json.dump(roster_data, f, indent=4)
-        
-    print(f"\n✓ Roster saved to {ROSTER_FILE}")
-    
-    # Save Correlation Heatmap
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(df_pnl[drafted].corr(), annot=True, cmap='coolwarm', fmt=".2f", vmin=-1, vmax=1)
-    plt.title(f"Committee Correlation (Max Allowed: {MAX_PAIRWISE_CORRELATION})")
-    plt.tight_layout()
-    plt.savefig(COMMITTEE_DIR / "committee_correlation.png")
 
 
-# --- Phase 2: Calibration ---
+# --- Validation ---
 
-def run_calibration(loader, stats, holdout_info):
-    if not ROSTER_FILE.exists():
-        print(f"❌ No roster file found. Run --draft first.")
-        return
+def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
+                            slice_returns: np.ndarray) -> dict:
+    """
+    Evaluate a single agent on a holdout slice.
 
+    Returns dict with fitness metrics.
+    """
+    agent = load_agent_actor_only(agent_path, 0)
+    if agent is None:
+        return {'error': 'Failed to load agent'}
+
+    with torch.no_grad():
+        actions = agent.actor(slice_tensor).cpu().numpy()
+
+    coeffs = actions[:, :, 0]  # [Days, Stocks]
+
+    # Active positions (coefficient > threshold)
+    active = np.maximum(0, coeffs - Config.COEFFICIENT_THRESHOLD)
+    active = np.minimum(active, 2.0)  # Cap leverage
+
+    # Calculate trades and PnL
+    trades_mask = active > 0
+    num_trades = np.sum(trades_mask)
+
+    if num_trades == 0:
+        del agent
+        return {
+            'num_trades': 0,
+            'win_rate': 0.0,
+            'roi': 0.0,
+            'fitness': -Config.ZERO_TRADES_PENALTY_GAUNTLET,
+        }
+
+    # Get returns for active positions
+    trade_returns = slice_returns[trades_mask]
+    trade_weights = active[trades_mask]
+
+    # Weighted PnL
+    weighted_returns = trade_returns * trade_weights
+    total_pnl = np.sum(weighted_returns)
+    total_investment = np.sum(trade_weights)
+
+    roi = (total_pnl / total_investment * 100) if total_investment > 0 else 0.0
+    win_rate = np.mean(trade_returns > 0) if len(trade_returns) > 0 else 0.0
+
+    # Simple fitness approximation
+    fitness = roi * np.log10(abs(total_pnl) + 10)
+    if roi > 0:
+        fitness *= (1 + win_rate ** 2)
+
+    del agent
+    torch.cuda.empty_cache()
+
+    return {
+        'num_trades': int(num_trades),
+        'win_rate': float(win_rate),
+        'roi': float(roi),
+        'fitness': float(fitness),
+    }
+
+
+def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
+                                 slice_returns: np.ndarray,
+                                 context_window_days: int) -> dict:
+    """
+    Evaluate committee consensus on a holdout slice.
+
+    Uses voting mechanism: trade triggers when majority of committee agrees.
+    """
+    all_coeffs = []
+
+    for entry in members:
+        filepath = get_agent_filepath(entry, context_window_days)
+        agent = load_agent_actor_only(filepath, entry['agent_id'])
+        if agent is None:
+            continue
+
+        with torch.no_grad():
+            actions = agent.actor(slice_tensor).cpu().numpy()
+
+        coeffs = actions[:, :, 0]
+        all_coeffs.append(coeffs)
+
+        del agent
+        torch.cuda.empty_cache()
+
+    if not all_coeffs:
+        return {'error': 'No agents loaded'}
+
+    # Stack coefficients: [Agents, Days, Stocks]
+    all_coeffs = np.array(all_coeffs)
+
+    # Voting: each agent votes if coefficient > threshold
+    votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD  # [Agents, Days, Stocks]
+    vote_counts = np.sum(votes, axis=0)  # [Days, Stocks]
+
+    # Quorum: majority (> half) must agree
+    quorum = len(members) // 2 + 1
+    triggers = vote_counts >= quorum  # [Days, Stocks]
+
+    num_trades = np.sum(triggers)
+
+    if num_trades == 0:
+        return {
+            'num_trades': 0,
+            'win_rate': 0.0,
+            'roi': 0.0,
+            'fitness': -Config.ZERO_TRADES_PENALTY_GAUNTLET,
+        }
+
+    # Average coefficient for triggered trades (consensus strength)
+    avg_coef = np.mean(all_coeffs, axis=0)  # [Days, Stocks]
+    active = np.where(triggers, np.maximum(0, avg_coef - Config.COEFFICIENT_THRESHOLD), 0)
+    active = np.minimum(active, 2.0)
+
+    trade_returns = slice_returns[triggers]
+    trade_weights = active[triggers]
+
+    weighted_returns = trade_returns * trade_weights
+    total_pnl = np.sum(weighted_returns)
+    total_investment = np.sum(trade_weights)
+
+    roi = (total_pnl / total_investment * 100) if total_investment > 0 else 0.0
+    win_rate = np.mean(trade_returns > 0) if len(trade_returns) > 0 else 0.0
+
+    fitness = roi * np.log10(abs(total_pnl) + 10)
+    if roi > 0:
+        fitness *= (1 + win_rate ** 2)
+
+    return {
+        'num_trades': int(num_trades),
+        'win_rate': float(win_rate),
+        'roi': float(roi),
+        'fitness': float(fitness),
+    }
+
+
+def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
+                   context_window_days: int) -> dict:
+    """
+    Run 3-slice holdout validation on the committee.
+
+    Returns validation results dict.
+    """
     print("\n" + "="*60)
-    print("PHASE 2: CALIBRATION (Bootstrap & Risk Metrics)")
+    print("PHASE 2: VALIDATION (3-Slice Holdout Test)")
     print("="*60)
 
-    with open(ROSTER_FILE, 'r') as f:
-        roster = json.load(f)
-    members = roster['members']
+    roster = manager.load_roster()
+    if roster is None:
+        print(f"❌ No roster found. Run --draft first.")
+        return None
 
-    # 1. Prepare Data
-    market_tensor, valid_indices = get_out_of_sample_data(loader, stats, holdout_info)
-    
-    # 2. Pre-Calculate Votes
-    print(f"Calculating votes for {len(members)} agents...")
-    all_votes = [] # [Days, Agents, Stocks, 2]
-    
-    for fname in tqdm(members):
-        fpath = HOF_DIR / fname
-        agent = load_agent_actor_only(fpath, 0)
-        with torch.no_grad():
-            actions = agent.actor(market_tensor).cpu().numpy()
-            all_votes.append(actions)
-        del agent
-        
-    all_votes = np.array(all_votes).transpose(1, 0, 2, 3)
-    
-    # 3. Prepare Returns Data (20-Day Hold)
-    print("Preparing return data...")
+    members = roster['members']
+    num_slices = Config.COMMITTEE_VALIDATION_SLICES
+
+    # Get full holdout data
+    holdout_tensor, valid_indices = get_holdout_data(loader, stats, holdout_info)
+
+    # Calculate returns
     close_idx = 1
     full_closes = loader.data_array_full[:, :, close_idx]
-    
-    # Matrix of trade outcomes: [Days, Stocks]
-    # Entry at T, Exit at T+20
-    trade_outcomes = np.zeros((len(valid_indices), Config.NUM_INVESTABLE_STOCKS))
-    
-    for i, day_idx in enumerate(valid_indices):
-        entry = full_closes[day_idx]
-        exit_p = full_closes[day_idx + Config.MIN_HOLDING_PERIOD]
-        # % Return
-        trade_outcomes[i] = np.where(entry > 0, (exit_p - entry)/entry * 100, 0.0)
 
-    # 4. Grid Search
-    thresholds = [0.8, 1.0, 1.2, 1.4, 1.6]
-    quorums = range(2, len(members) + 1)
-    
-    results = []
-    print(f"Testing configurations with Bootstrap Resampling...")
-    
-    for thresh in thresholds:
-        for quorum in quorums:
-            # Vectorized Trigger Logic
-            coefs = all_votes[:, :, :, 0]
-            # Vote: Coef > Threshold
-            votes = coefs >= thresh
-            # Quorum: Sum(Votes) >= Quorum
-            triggers = np.sum(votes, axis=1) >= quorum
-            
-            num_trades = np.sum(triggers)
-            
-            # Statistical Significance Check (Point 4)
-            if num_trades < MIN_TRADES_FOR_SIGNIFICANCE:
-                continue
-                
-            # Get Outcomes
-            actual_gains = trade_outcomes[triggers]
+    holdout_returns = []
+    for t in valid_indices:
+        entry_price = full_closes[t]
+        exit_price = full_closes[t + Config.MIN_HOLDING_PERIOD]
+        ret = np.where(entry_price > 0, (exit_price - entry_price) / entry_price, 0.0)
+        holdout_returns.append(ret)
+    holdout_returns = np.array(holdout_returns)
 
-            # Deduct Transaction Costs (realistic expectancy)
-            cost_per_trade = TRANSACTION_COST_BPS / 100.0  # Convert bps to %
-            actual_gains = actual_gains - cost_per_trade
+    # Split into slices
+    slice_size = len(valid_indices) // num_slices
 
-            # Metrics
-            wins = actual_gains[actual_gains > 0]
-            losses = abs(actual_gains[actual_gains <= 0])
-            
-            win_rate = len(wins) / len(actual_gains)
-            loss_rate = 1.0 - win_rate
-            avg_win = np.mean(wins) if len(wins) else 0
-            avg_loss = np.mean(losses) if len(losses) else 0
-            
-            # Expectancy
-            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
-            
-            # Risk Metrics (Point 6)
-            # Convert % to decimal for Sharpe/Sortino
-            decimal_returns = actual_gains / 100.0
-            
-            # Annualize (assuming these are 20-day returns, approx 12 periods/year)
-            # Stdev of a series of trades != Time series Stdev, but good proxy for trade consistency
-            sharpe = np.mean(decimal_returns) / (np.std(decimal_returns) + 1e-9) * np.sqrt(12)
-            
-            downside = decimal_returns[decimal_returns < 0]
-            if len(downside) > 0:
-                sortino = np.mean(decimal_returns) / (np.std(downside) + 1e-9) * np.sqrt(12)
-            else:
-                sortino = 999.0  # All wins, infinite Sortino
-            
-            # Drawdown (Simulated equity curve)
-            max_dd = calculate_max_drawdown(np.cumsum(decimal_returns))
-            
-            # Bootstrap Confidence (Point 4)
-            ci_low, ci_mean, ci_high = bootstrap_expectancy(actual_gains)
-            
-            results.append({
-                'threshold': thresh,
-                'quorum': quorum,
-                'trades': num_trades,
-                'win_rate': win_rate,
-                'expectancy': expectancy,
-                'ci_lower': ci_low,
-                'ci_upper': ci_high,
-                'sharpe': sharpe,
-                'sortino': sortino,
-                'max_dd': max_dd
-            })
-            
-    # 5. Report
-    if not results:
-        print("❌ No configurations met the minimum trade count.")
-        return
+    print(f"\n  Holdout days: {len(valid_indices)}")
+    print(f"  Slices: {num_slices}")
+    print(f"  Days per slice: {slice_size}")
 
-    df = pd.DataFrame(results)
-    df.to_csv(CALIBRATION_FILE, index=False)
-    
-    # Filter: Lower Bound of CI > 0 (95% confident it makes money)
-    robust = df[df['ci_lower'] > 0].sort_values('expectancy', ascending=False)
-    
-    print(f"\nTOP ROBUST CONFIGURATIONS (CI Lower Bound > 0):")
-    print(robust[['threshold', 'quorum', 'trades', 'expectancy', 'ci_lower', 'sharpe', 'max_dd']].head(10).to_string(index=False))
-    print(f"\n✓ Results saved to {CALIBRATION_FILE}")
+    results = {
+        'individual_agents': [],
+        'committee_aggregate': {
+            'slice_scores': [],
+            'mean': 0.0,
+        }
+    }
+
+    # Validate individual agents
+    print(f"\nValidating {len(members)} individual agents...")
+
+    for member in tqdm(members, desc="Agents"):
+        entry = member  # member is already the entry dict
+        filepath = get_agent_filepath(entry, context_window_days)
+
+        agent_results = {
+            'agent_id': entry['agent_id'],
+            'run_name': entry['run_name'],
+            'stored_gauntlet': entry['gauntlet_score'],
+            'slice_scores': [],
+        }
+
+        for s in range(num_slices):
+            start_idx = s * slice_size
+            end_idx = (s + 1) * slice_size if s < num_slices - 1 else len(valid_indices)
+
+            slice_tensor = holdout_tensor[start_idx:end_idx]
+            slice_returns = holdout_returns[start_idx:end_idx]
+
+            metrics = evaluate_agent_on_slice(filepath, slice_tensor, slice_returns)
+            agent_results['slice_scores'].append(metrics.get('fitness', 0.0))
+
+        agent_results['fresh_mean'] = float(np.mean(agent_results['slice_scores']))
+        results['individual_agents'].append(agent_results)
+
+    # Validate committee consensus
+    print(f"\nValidating committee consensus...")
+
+    for s in range(num_slices):
+        start_idx = s * slice_size
+        end_idx = (s + 1) * slice_size if s < num_slices - 1 else len(valid_indices)
+
+        slice_tensor = holdout_tensor[start_idx:end_idx]
+        slice_returns = holdout_returns[start_idx:end_idx]
+
+        metrics = evaluate_committee_on_slice(
+            members, slice_tensor, slice_returns, context_window_days
+        )
+        results['committee_aggregate']['slice_scores'].append(metrics.get('fitness', 0.0))
+
+    results['committee_aggregate']['mean'] = float(
+        np.mean(results['committee_aggregate']['slice_scores'])
+    )
+
+    # Print results
+    print(f"\n{'='*60}")
+    print("VALIDATION RESULTS")
+    print(f"{'='*60}")
+
+    print("\nIndividual Agents:")
+    for agent in results['individual_agents']:
+        print(f"  {agent['run_name']}_{agent['agent_id']}: "
+              f"stored={agent['stored_gauntlet']:.2f}, "
+              f"fresh_mean={agent['fresh_mean']:.2f}")
+
+    print(f"\nCommittee Consensus:")
+    print(f"  Slice scores: {results['committee_aggregate']['slice_scores']}")
+    print(f"  Mean: {results['committee_aggregate']['mean']:.2f}")
+
+    return results
+
+
+# --- Phase 1: Draft Day ---
+
+def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
+    """
+    Phase 1: Select committee from Global50 using coefficient correlation optimization.
+    """
+    print("\n" + "="*60)
+    print("PHASE 1: DRAFT DAY (Global50 Selection)")
+    print("="*60)
+
+    context_window_days = manager.context_window_days
+
+    # 1. Load Global50 candidates
+    entries = load_global50_candidates(context_window_days)
+    if not entries:
+        print("❌ No agents in Global50")
+        return None
+
+    print(f"\n  Top 5 agents by gauntlet score:")
+    for i, e in enumerate(entries[:5]):
+        print(f"    {i+1}. {e['run_name']}_{e['agent_id']}: "
+              f"score={e['gauntlet_score']:.2f}, roi={e.get('roi', 0):.2f}%")
+
+    # 2. Prepare holdout data
+    holdout_tensor, valid_indices = get_holdout_data(loader, stats, holdout_info)
+    print(f"\n  Holdout tensor shape: {holdout_tensor.shape}")
+
+    # 3. Calculate coefficient correlations
+    corr_matrix, coefficients, _ = calculate_coefficient_correlations(
+        entries, holdout_tensor, context_window_days
+    )
+
+    # 4. Optimize committee selection
+    result = optimize_committee(entries, corr_matrix)
+
+    if result is None:
+        print("❌ Optimization failed")
+        return None
+
+    # 5. Build roster
+    committee_indices = result['committee_indices']
+    committee_members = [entries[i] for i in committee_indices]
+
+    # Build correlation matrix for committee
+    n = len(committee_indices)
+    committee_corr = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            committee_corr[i, j] = corr_matrix[committee_indices[i], committee_indices[j]]
+
+    roster_data = {
+        'committee_size': len(committee_members),
+        'members': [
+            {
+                'filename': f"{e['run_name']}_{e['agent_id']}.pth",
+                'agent_id': e['agent_id'],
+                'run_name': e['run_name'],
+                'gauntlet_score': e['gauntlet_score'],
+                'roi': e.get('roi', 0.0),
+                'expectancy': e.get('expectancy', 0.0),
+                'quality_ratio': e.get('quality_ratio', 0.0),
+                'win_ratio': e.get('win_ratio', 0.0),
+            }
+            for e in committee_members
+        ],
+        'aggregate_score': result['score_sum'],
+        'objective_value': result['objective'],
+        'correlation': {
+            'average': result['avg_correlation'],
+            'max_pair': result['max_correlation'],
+            'matrix': committee_corr.tolist(),
+        },
+        'context_window_days': context_window_days,
+        'holdout_period': {
+            'start_idx': int(valid_indices[0]),
+            'end_idx': int(valid_indices[-1]),
+            'num_days': len(valid_indices),
+        },
+        'generated_at': str(datetime.now()),
+    }
+
+    # Save roster and sync to cloud
+    manager.save_roster(roster_data, committee_corr)
+
+    # Print committee
+    print(f"\n{'='*60}")
+    print("SELECTED COMMITTEE")
+    print(f"{'='*60}")
+
+    for i, m in enumerate(roster_data['members']):
+        print(f"  {i+1}. {m['run_name']}_{m['agent_id']}: "
+              f"score={m['gauntlet_score']:.2f}, roi={m['roi']:.2f}%")
+
+    print(f"\n  Aggregate Score: {result['score_sum']:.2f}")
+    print(f"  Objective Value: {result['objective']:.2f}")
+    print(f"  Avg Correlation: {result['avg_correlation']:.3f}")
+    print(f"  Max Pair Correlation: {result['max_correlation']:.3f}")
+
+    return roster_data
+
+
+# --- Main ---
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--draft', action='store_true', help='Run Draft Day to select committee members')
-    parser.add_argument('--calibrate', action='store_true', help='Run Calibration to tune thresholds')
-    parser.add_argument('--verify-only', action='store_true', help='Only verify data split, do not run')
+    parser = argparse.ArgumentParser(description="Committee Selection from Global50")
+    parser.add_argument('--draft', action='store_true',
+                        help='Run Phase 1: Draft committee from Global50')
+    parser.add_argument('--validate', action='store_true',
+                        help='Run Phase 2: Validate on holdout slices')
+    parser.add_argument('--verify-only', action='store_true',
+                        help='Only verify data split')
+    parser.add_argument('--mirror', action='store_true',
+                        help='Check cloud sync status, download missing files')
     args = parser.parse_args()
 
-    if not args.draft and not args.calibrate and not args.verify_only:
-        print("Usage: python committee.py [--draft] [--calibrate] [--verify-only]")
+    if not args.draft and not args.validate and not args.verify_only and not args.mirror:
+        print("Usage: python committee.py [--draft] [--validate] [--verify-only] [--mirror]")
         print("\nOptions:")
-        print("  --draft        Run Phase 1: Draft committee from Hall of Fame")
-        print("  --calibrate    Run Phase 2: Calibrate thresholds and quorum")
-        print("  --verify-only  Verify data split without running analysis")
+        print("  --draft        Run Phase 1: Draft committee from Global50")
+        print("  --validate     Run Phase 2: Validate committee on holdout slices")
+        print("  --verify-only  Verify data split without running")
+        print("  --mirror       Check cloud sync status, download missing files")
         exit(0)
 
-    print("Initializing Engine...")
+    print("Initializing Committee Engine...")
     Config.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Device: {Config.DEVICE}")
 
-    # Config.MIN_HOLDING_PERIOD must be defined, default to 20 if not
-    if not hasattr(Config, 'MIN_HOLDING_PERIOD'):
-        Config.MIN_HOLDING_PERIOD = 20
-        print(f"⚠ MIN_HOLDING_PERIOD not in Config, defaulting to {Config.MIN_HOLDING_PERIOD}")
+    context_window_days = Config.CONTEXT_WINDOW_DAYS
+    manager = CommitteeManager(context_window_days)
 
-    # Config.COMMITTEE_HOLDOUT_DAYS must be defined
-    if not hasattr(Config, 'COMMITTEE_HOLDOUT_DAYS'):
-        print(f"\n❌ ERROR: Config.COMMITTEE_HOLDOUT_DAYS is not defined!")
-        print(f"   Add the following to utils/config.py:")
-        print(f"")
-        print(f"   # Committee Holdout")
-        print(f"   COMMITTEE_HOLDOUT_DAYS = 252  # 1 year of holdout data")
-        print(f"")
-        exit(1)
+    print(f"  Context Window: {context_window_days} days")
+    print(f"  Cloud Provider: {manager.cloud_sync.provider}")
+    if manager.cloud_sync.provider != "local":
+        print(f"  Bucket: {manager.cloud_sync.bucket_name}")
+        print(f"  Cloud Path: {manager.cloud_committee_base}/")
 
+    # Handle --mirror mode
+    if args.mirror:
+        manager.check_mirror_status()
+        exit(0)
+
+    # Load data for other operations
     loader, stats = load_normalization_stats()
 
-    # CRITICAL: Verify data split before proceeding
+    # Verify data split
     print("\n" + "="*60)
     print("DATA INTEGRITY CHECK")
     print("="*60)
+
     is_valid, error_msg, holdout_info = verify_data_split(loader)
 
     if not is_valid:
         print(f"\n❌ Data split verification FAILED!")
         print(f"   Error: {error_msg}")
-        print(f"\n   Holdout Configuration:")
-        print(f"     Config.COMMITTEE_HOLDOUT_DAYS = {Config.COMMITTEE_HOLDOUT_DAYS}")
-        print(f"\n   The script will automatically use the LAST {Config.COMMITTEE_HOLDOUT_DAYS} days")
-        print(f"   of your dataset as the holdout period.")
-        print(f"\n   IMPORTANT: Ensure your agents were NOT trained on this data!")
         exit(1)
 
     if args.verify_only:
-        print("\n✓ Verification complete. Holdout period is properly configured.")
+        print("\n✓ Verification complete.")
         exit(0)
 
     if args.draft:
-        run_draft(loader, stats, holdout_info)
+        roster = run_draft(manager, loader, stats, holdout_info)
 
-    if args.calibrate:
-        gc.collect()
-        torch.cuda.empty_cache()
-        run_calibration(loader, stats, holdout_info)
+        # Auto-run validation after draft if requested
+        if roster and args.validate:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    if args.validate:
+        validation_results = run_validation(
+            manager, loader, stats, holdout_info, context_window_days
+        )
+
+        if validation_results:
+            # Update roster with validation results
+            roster = manager.load_roster()
+            if roster:
+                roster['validation'] = validation_results
+                manager.save_roster(roster)
+                print(f"\n✓ Validation results added and synced to cloud")

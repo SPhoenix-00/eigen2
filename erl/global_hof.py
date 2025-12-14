@@ -182,7 +182,7 @@ class GlobalHallOfFame:
         """
         Phase A: Startup
         - Create local directories
-        - Download global50.json from cloud for our context window
+        - Sync global50.json between local and cloud (prefer newer version)
         - If no match, create new league for this context window
         - Discover other context windows for fallback diversity injection
         """
@@ -196,17 +196,93 @@ class GlobalHallOfFame:
         print(f"{'='*60}")
         print(f"Context Window: {self.league_rules.context_window_days} days")
 
-        # Download global50.json for our context window
-        success = self._download_global_ledger()
+        # Check if local file exists BEFORE downloading
+        local_exists = self.local_json_path.exists()
 
-        if success:
+        # Download cloud version to temp file for comparison
+        import tempfile
+        temp_cloud_path = None
+        cloud_exists = False
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+            temp_cloud_path = tmp.name
+
+        try:
+            cloud_exists = self.cloud_sync.download_file(
+                self.cloud_json_path,
+                temp_cloud_path
+            )
+        except Exception:
+            cloud_exists = False
+
+        # Determine which version to use
+        if local_exists and cloud_exists:
+            # Both exist - compare timestamps and use newer
+            try:
+                with open(self.local_json_path, 'r') as f:
+                    local_data = json.load(f)
+                with open(temp_cloud_path, 'r') as f:
+                    cloud_data = json.load(f)
+
+                local_timestamp = local_data.get('last_updated', '')
+                cloud_timestamp = cloud_data.get('last_updated', '')
+                local_entries = len(local_data.get('entries', []))
+                cloud_entries = len(cloud_data.get('entries', []))
+
+                if local_data == cloud_data:
+                    print(f"✓ Local and cloud are in sync ({local_entries} entries)")
+                elif local_timestamp and cloud_timestamp:
+                    if local_timestamp > cloud_timestamp:
+                        print(f"✓ Using LOCAL version (newer)")
+                        print(f"  Local:  {local_entries} entries (updated: {local_timestamp})")
+                        print(f"  Cloud:  {cloud_entries} entries (updated: {cloud_timestamp})")
+                        # Keep local, upload to cloud
+                        self._upload_global_ledger_verified()
+                    else:
+                        print(f"✓ Using CLOUD version (newer)")
+                        print(f"  Local:  {local_entries} entries (updated: {local_timestamp})")
+                        print(f"  Cloud:  {cloud_entries} entries (updated: {cloud_timestamp})")
+                        # Use cloud version
+                        import shutil
+                        shutil.copy(temp_cloud_path, str(self.local_json_path))
+                else:
+                    # No timestamps - prefer cloud (legacy behavior for backward compat)
+                    print(f"⚠ Cannot determine which is newer (timestamps missing)")
+                    print(f"  Using cloud version for safety")
+                    import shutil
+                    shutil.copy(temp_cloud_path, str(self.local_json_path))
+            except Exception as e:
+                print(f"⚠ Error comparing versions: {e}")
+                # Fall back to cloud
+                import shutil
+                shutil.copy(temp_cloud_path, str(self.local_json_path))
+
             # Load and validate
             self._load_local_ledger()
             self._validate_league_rules()
             self._update_entry_threshold()
             print(f"✓ Connected to existing Global 50 (context window: {self.league_rules.context_window_days} days)")
+
+        elif cloud_exists:
+            # Only cloud exists - download it
+            import shutil
+            shutil.copy(temp_cloud_path, str(self.local_json_path))
+            self._load_local_ledger()
+            self._validate_league_rules()
+            self._update_entry_threshold()
+            print(f"✓ Connected to existing Global 50 (context window: {self.league_rules.context_window_days} days)")
+
+        elif local_exists:
+            # Only local exists - upload it to cloud
+            print(f"⚠ Local exists but cloud is missing - uploading...")
+            self._load_local_ledger()
+            self._validate_league_rules()
+            self._update_entry_threshold()
+            self._upload_global_ledger_verified()
+            print(f"✓ Connected to existing Global 50 (context window: {self.league_rules.context_window_days} days)")
+
         else:
-            # No existing global50.json for this context window - create new league
+            # Neither exists - create new league
             print(f"⚠ No existing Global 50 for {self.league_rules.context_window_days} days context window.")
             print(f"  This will be the founding run for this context window.")
             self.league_compatible = True
@@ -214,6 +290,10 @@ class GlobalHallOfFame:
             # Initialize empty ledger
             self._save_local_ledger()
             self._upload_global_ledger()
+
+        # Clean up temp file
+        if temp_cloud_path and os.path.exists(temp_cloud_path):
+            os.unlink(temp_cloud_path)
 
         if self.league_compatible:
             print(f"✓ League Validation: PASSED")
@@ -293,11 +373,13 @@ class GlobalHallOfFame:
 
     def _save_local_ledger(self):
         """Save global50.json to local cache."""
+        from datetime import datetime
         data = {
             'league_rules': self.league_rules.to_dict(),
             'entries': [e.to_dict() for e in self.entries],
             'capacity': self.CAPACITY,
-            'version': '1.0'
+            'version': '1.0',
+            'last_updated': datetime.utcnow().isoformat() + 'Z'
         }
 
         with open(self.local_json_path, 'w') as f:
