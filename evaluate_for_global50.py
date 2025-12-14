@@ -2237,10 +2237,28 @@ class AgentEvaluator:
 
             pass_promoted = 0
 
+            # First, find all qualifying candidates at this tier
+            qualifying_candidates = []
             for ec in evaluated_candidates:
                 if ec['promoted']:
                     continue  # Already promoted in earlier tier
 
+                candidate = ec['candidate']
+                new_score = ec['new_score']
+                metrics = ec['metrics']
+
+                # Check if qualifies at this tier
+                qualifies = should_promote_with_tier(new_score, metrics['roi'], metrics['expectancy'], tier)
+                if qualifies:
+                    qualifying_candidates.append(ec)
+
+            # Sort qualifying candidates by new gauntlet score (highest first)
+            qualifying_candidates.sort(key=lambda ec: ec['new_score'], reverse=True)
+
+            print(f"  Qualifying candidates at Tier {tier}: {len(qualifying_candidates)}")
+
+            # Promote qualifying candidates in order of score until slots are full
+            for ec in qualifying_candidates:
                 # Check if we still have slots
                 if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
                     break
@@ -2250,55 +2268,54 @@ class AgentEvaluator:
                 metrics = ec['metrics']
                 agent = ec['agent']
 
-                # Check if qualifies at this tier
-                qualifies = should_promote_with_tier(new_score, metrics['roi'], metrics['expectancy'], tier)
+                print(f"\n  → {candidate['run_name']} (Agent {candidate['agent_id']})")
+                print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
 
-                if qualifies:
-                    print(f"\n  → {candidate['run_name']} (Agent {candidate['agent_id']})")
-                    print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
+                # Attempt promotion - we bypass should_promote check since we did our own
+                # Temporarily set all thresholds (minimums, medians, P75) to -inf to allow promotion
+                self.global_hof.entry_threshold = float('-inf')
+                self.global_hof.roi_threshold = float('-inf')
+                self.global_hof.expectancy_threshold = float('-inf')
+                self.global_hof.gauntlet_median = float('-inf')
+                self.global_hof.roi_median = float('-inf')
+                self.global_hof.expectancy_median = float('-inf')
+                self.global_hof.gauntlet_p75 = float('-inf')
+                self.global_hof.roi_p75 = float('-inf')
+                self.global_hof.expectancy_p75 = float('-inf')
 
-                    # Attempt promotion - we bypass should_promote check since we did our own
-                    # Temporarily set thresholds to allow promotion
-                    old_entry_threshold = self.global_hof.entry_threshold
-                    old_roi_threshold = self.global_hof.roi_threshold
-                    old_expectancy_threshold = self.global_hof.expectancy_threshold
-                    self.global_hof.entry_threshold = float('-inf')
-                    self.global_hof.roi_threshold = float('-inf')
-                    self.global_hof.expectancy_threshold = float('-inf')
+                promoted = self.global_hof.check_and_promote(
+                    agent=agent,
+                    gauntlet_score=new_score,
+                    generation=candidate.get('generation', 0),
+                    roi=metrics['roi'],
+                    expectancy=metrics['expectancy'],
+                    quality_ratio=metrics['quality_ratio'],
+                    win_ratio=metrics['win_ratio'],
+                    total_trades=metrics['total_trades'],
+                    run_name=candidate['run_name']
+                )
 
-                    promoted = self.global_hof.check_and_promote(
-                        agent=agent,
-                        gauntlet_score=new_score,
-                        generation=candidate.get('generation', 0),
-                        roi=metrics['roi'],
-                        expectancy=metrics['expectancy'],
-                        quality_ratio=metrics['quality_ratio'],
-                        win_ratio=metrics['win_ratio'],
-                        total_trades=metrics['total_trades'],
-                        run_name=candidate['run_name']
-                    )
+                # Restore and recompute thresholds
+                recompute_thresholds_from_population()
 
-                    # Restore and recompute thresholds
-                    recompute_thresholds_from_population()
+                if promoted:
+                    ec['promoted'] = True
+                    pass_promoted += 1
+                    total_promoted += 1
+                    promotions_by_tier[tier] += 1
+                    print(f"    ✓ Promoted to Global 50 (Tier {tier})")
 
-                    if promoted:
-                        ec['promoted'] = True
-                        pass_promoted += 1
-                        total_promoted += 1
-                        promotions_by_tier[tier] += 1
-                        print(f"    ✓ Promoted to Global 50 (Tier {tier})")
-
-                        # Delete from archive
-                        if ec['local_agent_path'].exists():
-                            ec['local_agent_path'].unlink()
-                        scoresheet_path = self.global_hof.local_archive_dir / ec['filename'].replace('.pth', '.json')
-                        if scoresheet_path.exists():
-                            scoresheet_path.unlink()
-                        self.cloud_sync.delete_file(ec['cloud_archive_path'])
-                        cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{ec['filename'].replace('.pth', '.json')}"
-                        self.cloud_sync.delete_file(cloud_scoresheet_path)
-                    else:
-                        print(f"    ⚠ Promotion failed (concurrent update?)")
+                    # Delete from archive
+                    if ec['local_agent_path'].exists():
+                        ec['local_agent_path'].unlink()
+                    scoresheet_path = self.global_hof.local_archive_dir / ec['filename'].replace('.pth', '.json')
+                    if scoresheet_path.exists():
+                        scoresheet_path.unlink()
+                    self.cloud_sync.delete_file(ec['cloud_archive_path'])
+                    cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{ec['filename'].replace('.pth', '.json')}"
+                    self.cloud_sync.delete_file(cloud_scoresheet_path)
+                else:
+                    print(f"    ⚠ Promotion failed (concurrent update?)")
 
             print(f"\n  Tier {tier} promoted: {pass_promoted} agents")
 
