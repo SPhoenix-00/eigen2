@@ -547,7 +547,7 @@ class GlobalHallOfFame:
     def check_and_promote(self, agent: DDPGAgent, gauntlet_score: float, generation: int,
                           roi: float = 0.0, expectancy: float = 0.0,
                           quality_ratio: float = 0.0, win_ratio: float = 0.0,
-                          total_trades: int = 0) -> bool:
+                          total_trades: int = 0, run_name: Optional[str] = None) -> bool:
         """
         Phase C: The Promotion Routine (Atomic Update)
 
@@ -588,9 +588,11 @@ class GlobalHallOfFame:
             self._load_local_ledger()
 
             # Create new entry
+            # Use provided run_name if given (e.g., for archive fill), otherwise use self.run_name
+            entry_run_name = run_name if run_name is not None else self.run_name
             new_entry = GlobalHoFEntry(
                 agent_id=agent.agent_id,
-                run_name=self.run_name,
+                run_name=entry_run_name,
                 gauntlet_score=gauntlet_score,
                 generation=generation,
                 roi=roi,

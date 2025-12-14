@@ -133,9 +133,10 @@ class Global50Fixer:
             self.gauntlet_helper, GauntletHelper
         )
 
-    def list_cloud_agents(self) -> List[str]:
-        """List all .pth files in cloud agents/ directory."""
+    def list_cloud_agents(self, include_archive: bool = True) -> List[str]:
+        """List all .pth files in cloud agents/ directory and optionally archive/."""
         agent_files = []
+        archive_files = []
 
         print(f"\nListing agents in: gs://{self.cloud_sync.bucket_name}/{self.cloud_agents_prefix}")
 
@@ -153,12 +154,35 @@ class Global50Fixer:
             print(f"   ✗ Error listing agents: {e}")
             return []
 
-        print(f"   Found {len(agent_files)} agent files")
-        return sorted(agent_files)
+        print(f"   Found {len(agent_files)} agent files in agents/")
 
-    def download_agent(self, filename: str) -> Path:
-        """Download a single agent from cloud."""
-        cloud_path = f"{self.cloud_agents_prefix}{filename}"
+        # Also check archive
+        if include_archive:
+            print(f"\nListing archive in: gs://{self.cloud_sync.bucket_name}/{self.cloud_archive_prefix}")
+            try:
+                if self.cloud_sync.provider == "gcs":
+                    blobs = self.cloud_sync.bucket.list_blobs(prefix=self.cloud_archive_prefix)
+                    for blob in blobs:
+                        if blob.name.endswith('.pth'):
+                            filename = blob.name.split('/')[-1]
+                            # Only add if not already in agents
+                            if filename not in agent_files:
+                                archive_files.append(filename)
+            except Exception as e:
+                print(f"   ✗ Error listing archive: {e}")
+
+            print(f"   Found {len(archive_files)} additional agent files in archive/")
+
+        all_files = agent_files + archive_files
+        print(f"\n   Total: {len(all_files)} unique agent files")
+        return sorted(all_files), agent_files, archive_files
+
+    def download_agent(self, filename: str, from_archive: bool = False) -> Path:
+        """Download a single agent from cloud (agents/ or archive/)."""
+        if from_archive:
+            cloud_path = f"{self.cloud_archive_prefix}{filename}"
+        else:
+            cloud_path = f"{self.cloud_agents_prefix}{filename}"
         local_path = self.temp_agents_dir / filename
 
         success = self.cloud_sync.download_file(cloud_path, str(local_path))
@@ -341,27 +365,33 @@ class Global50Fixer:
         7. Run final eval for pure scores
         """
         print("\n" + "="*70)
-        print("PHASE 1: Download all agents from cloud")
+        print("PHASE 1: Download all agents from cloud (agents/ + archive/)")
         print("="*70)
 
-        # List all agents in cloud
-        agent_files = self.list_cloud_agents()
-        if not agent_files:
+        # List all agents in cloud (both agents/ and archive/)
+        all_files, agents_files, archive_files = self.list_cloud_agents(include_archive=True)
+        if not all_files:
             print("✗ No agents found in cloud. Nothing to fix.")
             return
 
-        print(f"\nDownloading {len(agent_files)} agents...")
+        # Create sets for quick lookup
+        agents_set = set(agents_files)
+        archive_set = set(archive_files)
+
+        print(f"\nDownloading {len(all_files)} agents...")
         downloaded_paths = []
-        for i, filename in enumerate(agent_files, 1):
-            print(f"  [{i}/{len(agent_files)}] {filename}...", end=" ")
-            path = self.download_agent(filename)
+        for i, filename in enumerate(all_files, 1):
+            from_archive = filename in archive_set
+            location = "archive" if from_archive else "agents"
+            print(f"  [{i}/{len(all_files)}] {filename} ({location})...", end=" ")
+            path = self.download_agent(filename, from_archive=from_archive)
             if path:
                 downloaded_paths.append(path)
                 print("✓")
             else:
                 print("✗ FAILED")
 
-        print(f"\n✓ Downloaded {len(downloaded_paths)}/{len(agent_files)} agents")
+        print(f"\n✓ Downloaded {len(downloaded_paths)}/{len(all_files)} agents")
 
         if len(downloaded_paths) == 0:
             print("✗ No agents downloaded. Cannot proceed.")

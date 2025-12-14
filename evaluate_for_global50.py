@@ -1935,7 +1935,8 @@ class AgentEvaluator:
                         expectancy=metrics['expectancy'],
                         quality_ratio=metrics['quality_ratio'],
                         win_ratio=metrics['win_ratio'],
-                        total_trades=metrics['total_trades']
+                        total_trades=metrics['total_trades'],
+                        run_name=candidate['run_name']  # Preserve original run name from archive
                     )
 
                     # Restore original thresholds
