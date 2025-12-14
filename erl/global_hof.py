@@ -428,7 +428,7 @@ class GlobalHallOfFame:
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=True) as tmp:
                 try:
-                    success = self.cloud_sync.download_file(old_cloud_json_path, tmp.name)
+                    success = self.cloud_sync.download_file(old_cloud_json_path, tmp.name, silent=True)
                     if success:
                         # Load to get entry count
                         with open(tmp.name, 'r') as f:
