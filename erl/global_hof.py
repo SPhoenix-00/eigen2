@@ -527,7 +527,7 @@ class GlobalHallOfFame:
         """
         Check if an agent qualifies for Global 50.
 
-        Criteria: gauntlet_score > threshold AND (ROI > roi_threshold OR expectancy > expectancy_threshold)
+        Criteria: gauntlet_score > threshold AND ROI > roi_threshold AND expectancy > expectancy_threshold
 
         Args:
             gauntlet_score: Agent's certified Gauntlet score
@@ -544,8 +544,8 @@ class GlobalHallOfFame:
         if gauntlet_score <= self.entry_threshold:
             return False
 
-        # Must beat EITHER ROI or expectancy threshold
-        return roi > self.roi_threshold or expectancy > self.expectancy_threshold
+        # Must beat BOTH ROI and expectancy thresholds
+        return roi > self.roi_threshold and expectancy > self.expectancy_threshold
 
     def check_and_promote(self, agent: DDPGAgent, gauntlet_score: float, generation: int,
                           roi: float = 0.0, expectancy: float = 0.0,

@@ -413,7 +413,7 @@ class AgentEvaluator:
                 print(f"   Gauntlet: {gauntlet_score:.2f} (threshold: {self.global_hof.entry_threshold:.2f})")
                 print(f"   ROI: {metrics['roi']:.2f}% (threshold: {self.global_hof.roi_threshold:.2f}%)")
                 print(f"   Expectancy: {metrics['expectancy']:.4f} (threshold: {self.global_hof.expectancy_threshold:.4f})")
-                print(f"   Criteria: gauntlet > threshold AND (ROI > threshold OR expectancy > threshold)")
+                print(f"   Criteria: gauntlet > threshold AND ROI > threshold AND expectancy > threshold")
 
         except Exception as e:
             print(f"\n   ERROR: {e}")
@@ -1642,7 +1642,7 @@ class AgentEvaluator:
         gauntlet, ROI, and expectancy thresholds to trim agents.
 
         Trim criteria matches promotion criteria:
-        Agent is KEPT if: gauntlet >= threshold AND (ROI >= threshold OR expectancy >= threshold)
+        Agent is KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold
         """
         print(f"\n{'='*70}")
         print(f"Interactive Trim Mode")
@@ -1696,7 +1696,7 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print(f"Enter Trim Thresholds")
         print(f"{'='*70}")
-        print(f"Agents will be KEPT if: gauntlet >= threshold AND (ROI >= threshold OR expectancy >= threshold)")
+        print(f"Agents will be KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold")
         print(f"Press Enter to skip a threshold (use -inf)")
 
         # Get gauntlet threshold
@@ -1747,7 +1747,7 @@ class AgentEvaluator:
 
         # Identify agents to remove
         # Logic depends on which thresholds are active:
-        # - If both ROI and expectancy are active: must pass gauntlet AND (ROI OR expectancy)
+        # - If both ROI and expectancy are active: must pass gauntlet AND ROI AND expectancy
         # - If only ROI is active: must pass gauntlet AND ROI
         # - If only expectancy is active: must pass gauntlet AND expectancy
         # - If neither ROI nor expectancy active: must just pass gauntlet
@@ -1766,8 +1766,8 @@ class AgentEvaluator:
 
             # Check ROI/expectancy based on which are active
             if roi_active and expectancy_active:
-                # Both active: must pass at least one
-                if passes_roi or passes_expectancy:
+                # Both active: must pass both
+                if passes_roi and passes_expectancy:
                     agents_to_keep.append(entry)
                 else:
                     agents_to_remove.append(entry)
@@ -1809,8 +1809,11 @@ class AgentEvaluator:
             if gauntlet_active and not passes_gauntlet:
                 reasons.append("gauntlet")
             if roi_active and expectancy_active:
-                if not passes_roi and not passes_expectancy:
-                    reasons.append("ROI+expect")
+                # Must pass both - show which one(s) failed
+                if not passes_roi:
+                    reasons.append("ROI")
+                if not passes_expectancy:
+                    reasons.append("expectancy")
             elif roi_active and not passes_roi:
                 reasons.append("ROI")
             elif expectancy_active and not passes_expectancy:
@@ -2113,11 +2116,11 @@ class AgentEvaluator:
 
                 # Check if qualifies for promotion using current thresholds
                 # Thresholds are dynamic - recalculated after each promotion
-                # Criteria: gauntlet > threshold AND (ROI > threshold OR expectancy > threshold)
+                # Criteria: gauntlet > threshold AND ROI > threshold AND expectancy > threshold
                 passes_gauntlet = new_score > archive_fill_gauntlet_threshold
                 passes_roi = metrics['roi'] > archive_fill_roi_threshold
                 passes_expectancy = metrics['expectancy'] > archive_fill_expectancy_threshold
-                qualifies = passes_gauntlet and (passes_roi or passes_expectancy)
+                qualifies = passes_gauntlet and passes_roi and passes_expectancy
 
                 if qualifies:
                     print(f"\n  ✓ Agent QUALIFIES for Global 50!")
