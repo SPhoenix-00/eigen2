@@ -2922,7 +2922,15 @@ class ERLTrainer:
             'original_run_name': old_run_name,
             'original_agent_id': old_agent_id,
         }
-        print(f"  Updated roster: member {member_idx} now points to {new_filename}")
+
+        # Persist updated roster to disk so resume works correctly
+        # This ensures we don't lose progress if training crashes during a turnover
+        from committee import CommitteeManager
+        import json
+        manager = CommitteeManager(self.multi_roster['context_window_days'])
+        with open(manager.roster_path, 'w') as f:
+            json.dump(self.multi_roster, f, indent=2)
+        print(f"  Updated roster: member {member_idx} now points to {new_filename} (saved to disk)")
 
         # Update breakthrough count for this member
         self.member_breakthroughs[member_idx] += 1
