@@ -2909,6 +2909,21 @@ class ERLTrainer:
         # Update Global50 ledger
         self._update_global50_for_multi_breakthrough(member_idx, new_filename, score, improved_agent)
 
+        # CRITICAL: Update roster in memory so future loads use the improved agent
+        # Without this, when we return to this member for Turnover #2, we'd load
+        # the old weights and lose all learning from this breakthrough
+        old_run_name = member['run_name']
+        old_agent_id = member['agent_id']
+        self.multi_roster['members'][member_idx] = {
+            'run_name': self.wandb_run_name,
+            'agent_id': improved_agent.agent_id,
+            'gauntlet_score': score,
+            # Preserve other fields if they exist
+            'original_run_name': old_run_name,
+            'original_agent_id': old_agent_id,
+        }
+        print(f"  Updated roster: member {member_idx} now points to {new_filename}")
+
         # Update breakthrough count for this member
         self.member_breakthroughs[member_idx] += 1
 
@@ -2955,7 +2970,7 @@ class ERLTrainer:
     def _process_multi_turnover(self):
         """
         Process a turnover: all 9 members have achieved the same number of breakthroughs.
-        Update committee roster and archive old roster.
+        Save milestone roster and persist updated roster to disk.
         """
         self.turnovers_completed = min(self.member_breakthroughs)
 
@@ -2972,20 +2987,27 @@ class ERLTrainer:
             print(f"   Member {member_idx} ({member['run_name']}_{member['agent_id']}): "
                   f"{bt} breakthroughs")
 
-        # Archive and update committee roster
+        # Save milestone roster and persist updated roster
         from committee import CommitteeManager
+        import json
         context_window = self.multi_roster['context_window_days']
         manager = CommitteeManager(context_window)
 
-        # Archive current roster
         roster_path = manager.roster_path
-        if roster_path.exists():
-            import shutil
-            archive_dir = roster_path.parent / "archive"
-            archive_dir.mkdir(exist_ok=True)
-            archive_path = archive_dir / f"committee_roster_pre_turnover_{self.turnovers_completed}.json"
-            shutil.copy(roster_path, archive_path)
-            print(f"   Archived roster to: {archive_path.name}")
+        archive_dir = roster_path.parent / "archive"
+        archive_dir.mkdir(exist_ok=True)
+
+        # Save milestone archive (this marks the completion of turnover N)
+        milestone_path = archive_dir / f"committee_roster_turnover_{self.turnovers_completed}_complete.json"
+        with open(milestone_path, 'w') as f:
+            json.dump(self.multi_roster, f, indent=2)
+        print(f"   Saved milestone roster: {milestone_path.name}")
+
+        # Persist the updated roster as the active roster
+        # (roster has been incrementally updated in _process_multi_breakthrough)
+        with open(roster_path, 'w') as f:
+            json.dump(self.multi_roster, f, indent=2)
+        print(f"   Updated active roster: {roster_path.name}")
 
         print(f"\n   Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
         print(f"   Progress: {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
