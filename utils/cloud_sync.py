@@ -100,13 +100,14 @@ class CloudSync:
                 print("Falling back to local storage only")
                 self.provider = "local"
 
-    def _upload_file_sync(self, local_path: str, cloud_path: str):
+    def _upload_file_sync(self, local_path: str, cloud_path: str, timeout: int = 60):
         """
         Internal synchronous upload method (runs in background thread).
 
         Args:
             local_path: Path to local file
             cloud_path: Path in cloud storage
+            timeout: Upload timeout in seconds (default: 60)
         """
         try:
             if self.provider == "s3":
@@ -114,7 +115,8 @@ class CloudSync:
 
             elif self.provider == "gcs":
                 blob = self.bucket.blob(cloud_path)
-                blob.upload_from_filename(local_path)
+                # Set timeout to prevent indefinite hangs
+                blob.upload_from_filename(local_path, timeout=timeout)
 
             elif self.provider == "azure":
                 blob_client = self.container_client.get_blob_client(cloud_path)
@@ -252,7 +254,7 @@ class CloudSync:
 
             elif self.provider == "gcs":
                 blob = self.bucket.blob(cloud_path)
-                blob.download_to_filename(local_path)
+                blob.download_to_filename(local_path, timeout=60)
 
             elif self.provider == "azure":
                 blob_client = self.container_client.get_blob_client(cloud_path)
