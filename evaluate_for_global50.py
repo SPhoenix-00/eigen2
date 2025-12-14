@@ -1802,11 +1802,21 @@ class AgentEvaluator:
 
         print(f"\nFound {len(archive_agents)} archived agents")
 
+        # Minimum ROI filter for archive fill (hardcoded)
+        ARCHIVE_FILL_MIN_ROI = 0.01
+
         # Filter out agents already in Global 50 (by run_name + agent_id)
         existing_keys = {(e.run_name, e.agent_id) for e in self.global_hof.entries}
         candidates = [a for a in archive_agents if (a['run_name'], a['agent_id']) not in existing_keys]
+        already_in_g50 = len(archive_agents) - len(candidates)
 
-        print(f"  Already in Global 50: {len(archive_agents) - len(candidates)}")
+        # Filter out agents with ROI below minimum threshold
+        candidates_before_roi_filter = len(candidates)
+        candidates = [a for a in candidates if a.get('roi', 0) >= ARCHIVE_FILL_MIN_ROI]
+        excluded_low_roi = candidates_before_roi_filter - len(candidates)
+
+        print(f"  Already in Global 50: {already_in_g50}")
+        print(f"  Excluded (ROI < {ARCHIVE_FILL_MIN_ROI}%): {excluded_low_roi}")
         print(f"  Candidates for evaluation: {len(candidates)}")
 
         if not candidates:
@@ -1838,6 +1848,11 @@ class AgentEvaluator:
         print(f"  1. Download {len(candidates)} archived agents from cloud")
         print(f"  2. Run full gauntlet evaluation for each agent")
         print(f"  3. Promote qualifying agents to Global 50 (moved from archive/ to agents/)")
+        print(f"\nFilters applied:")
+        print(f"  - Minimum archived ROI: {ARCHIVE_FILL_MIN_ROI}% (excluded {excluded_low_roi} agents)")
+        print(f"  - Gauntlet threshold: {archive_fill_gauntlet_threshold:.2f}")
+        print(f"  - ROI threshold: {archive_fill_roi_threshold:.2f}%")
+        print(f"  - Expectancy threshold: {archive_fill_expectancy_threshold:.4f}")
         print(f"\nEstimated time: ~{len(candidates) * 2} minutes")
 
         while True:
