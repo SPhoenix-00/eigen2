@@ -275,6 +275,11 @@ class AgentEvaluator:
         min_score = float(np.min(scores_without_top))
         gauntlet_score = float((0.67 * mean_score) + (0.33 * min_score))
 
+        # Penalty for agents that consistently refuse to trade
+        # Score between -8.99 and -10 indicates no trades across all slices
+        if -10.0 <= gauntlet_score <= -9.00:
+            gauntlet_score = -2000.0
+
         # Aggregate metrics (same calculations as ERLTrainer)
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
         total_investment = sum([r['total_investment'] for r in slice_results])  # Legacy cumulative
