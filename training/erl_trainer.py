@@ -2926,10 +2926,9 @@ class ERLTrainer:
         # Persist updated roster to disk so resume works correctly
         # This ensures we don't lose progress if training crashes during a turnover
         from committee import CommitteeManager
-        import json
         manager = CommitteeManager(self.multi_roster['context_window_days'])
-        with open(manager.roster_path, 'w') as f:
-            json.dump(self.multi_roster, f, indent=2)
+        # Use save_roster() to handle pathing correctly and sync to cloud
+        manager.save_roster(self.multi_roster)
         print(f"  Updated roster: member {member_idx} now points to {new_filename} (saved to disk)")
 
         # Update breakthrough count for this member
@@ -3001,7 +3000,8 @@ class ERLTrainer:
         context_window = self.multi_roster['context_window_days']
         manager = CommitteeManager(context_window)
 
-        roster_path = manager.roster_path
+        # FIX: Use local_roster_path (defined in committee.py) instead of roster_path
+        roster_path = manager.local_roster_path
         archive_dir = roster_path.parent / "archive"
         archive_dir.mkdir(exist_ok=True)
 
@@ -3011,10 +3011,8 @@ class ERLTrainer:
             json.dump(self.multi_roster, f, indent=2)
         print(f"   Saved milestone roster: {milestone_path.name}")
 
-        # Persist the updated roster as the active roster
-        # (roster has been incrementally updated in _process_multi_breakthrough)
-        with open(roster_path, 'w') as f:
-            json.dump(self.multi_roster, f, indent=2)
+        # Persist the updated roster as the active roster using standard save method
+        manager.save_roster(self.multi_roster)
         print(f"   Updated active roster: {roster_path.name}")
 
         print(f"\n   Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
