@@ -2106,9 +2106,59 @@ class AgentEvaluator:
             else:
                 print("Please enter 'yes' or 'no'.")
 
-        # Evaluate each candidate
-        results = []
-        promoted_count = 0
+        # Tiered promotion criteria (progressively relaxed):
+        # Tier 0: Full criteria - minimums + 2/3 P75 + 1/3 median
+        # Tier 1: Remove median requirement - minimums + 2/3 P75
+        # Tier 2: Relax P75 to 1/3 - minimums + 1/3 P75
+        # Tier 3: Remove P75 requirement - minimums only
+        def should_promote_with_tier(gauntlet_score: float, roi: float, expectancy: float, tier: int) -> bool:
+            """Check promotion with tiered criteria relaxation."""
+            # Criterion 1: Must beat ALL minimum thresholds (always required)
+            if gauntlet_score <= self.global_hof.entry_threshold:
+                return False
+            if roi <= self.global_hof.roi_threshold:
+                return False
+            if expectancy <= self.global_hof.expectancy_threshold:
+                return False
+
+            # Count P75 breaches
+            beats_gauntlet_p75 = gauntlet_score > self.global_hof.gauntlet_p75
+            beats_roi_p75 = roi > self.global_hof.roi_p75
+            beats_expectancy_p75 = expectancy > self.global_hof.expectancy_p75
+            count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
+
+            # Count median breaches
+            beats_gauntlet_median = gauntlet_score > self.global_hof.gauntlet_median
+            beats_roi_median = roi > self.global_hof.roi_median
+            beats_expectancy_median = expectancy > self.global_hof.expectancy_median
+            count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
+
+            if tier == 0:
+                # Full criteria: 2/3 P75 + 1/3 median
+                return count_above_p75 >= 2 and count_above_median >= 1
+            elif tier == 1:
+                # Remove median requirement: 2/3 P75 only
+                return count_above_p75 >= 2
+            elif tier == 2:
+                # Relax P75 to 1/3: 1/3 P75 only
+                return count_above_p75 >= 1
+            else:
+                # Tier 3+: minimums only (already passed above)
+                return True
+
+        def get_tier_description(tier: int) -> str:
+            """Get human-readable description of tier criteria."""
+            if tier == 0:
+                return "Full criteria (minimums + 2/3 P75 + 1/3 median)"
+            elif tier == 1:
+                return "Relaxed (minimums + 2/3 P75, no median requirement)"
+            elif tier == 2:
+                return "Further relaxed (minimums + 1/3 P75)"
+            else:
+                return "Minimums only (no P75/median requirements)"
+
+        # First pass: evaluate all candidates and cache results
+        evaluated_candidates = []  # List of {candidate, agent, new_score, metrics, promoted}
 
         print(f"\n{'='*70}")
         print("Evaluating Archived Agents")
@@ -2129,11 +2179,6 @@ class AgentEvaluator:
                     success = self.cloud_sync.download_file(cloud_archive_path, str(local_agent_path))
                     if not success:
                         print(f"  ✗ Failed to download agent. Skipping.")
-                        results.append({
-                            'candidate': candidate,
-                            'success': False,
-                            'error': 'Download failed'
-                        })
                         continue
 
                 # Load agent
@@ -2152,14 +2197,75 @@ class AgentEvaluator:
                 print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
                 print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
 
-                # Check if qualifies for promotion using GlobalHoF's should_promote
-                # This enforces all criteria: minimums, 2/3 at p75, 1/3 at median
-                qualifies = self.global_hof.should_promote(new_score, metrics['roi'], metrics['expectancy'])
+                evaluated_candidates.append({
+                    'candidate': candidate,
+                    'agent': agent,
+                    'new_score': new_score,
+                    'metrics': metrics,
+                    'promoted': False,
+                    'local_agent_path': local_agent_path,
+                    'cloud_archive_path': cloud_archive_path,
+                    'filename': filename
+                })
+
+            except Exception as e:
+                print(f"  ✗ Error: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Multi-pass promotion with tiered criteria relaxation
+        total_promoted = 0
+        promotions_by_tier = {0: 0, 1: 0, 2: 0, 3: 0}
+
+        for tier in range(4):  # Tiers 0-3
+            # Check if we still have open slots
+            current_size = len(self.global_hof.entries)
+            if current_size >= self.global_hof.CAPACITY:
+                print(f"\n{'='*70}")
+                print(f"Global 50 is full. Stopping promotion passes.")
+                print(f"{'='*70}")
+                break
+
+            open_slots = self.global_hof.CAPACITY - current_size
+
+            print(f"\n{'='*70}")
+            print(f"PROMOTION PASS - TIER {tier}")
+            print(f"{'='*70}")
+            print(f"  Criteria: {get_tier_description(tier)}")
+            print(f"  Open slots: {open_slots}")
+            print(f"  Remaining candidates: {sum(1 for ec in evaluated_candidates if not ec['promoted'])}")
+
+            pass_promoted = 0
+
+            for ec in evaluated_candidates:
+                if ec['promoted']:
+                    continue  # Already promoted in earlier tier
+
+                # Check if we still have slots
+                if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
+                    break
+
+                candidate = ec['candidate']
+                new_score = ec['new_score']
+                metrics = ec['metrics']
+                agent = ec['agent']
+
+                # Check if qualifies at this tier
+                qualifies = should_promote_with_tier(new_score, metrics['roi'], metrics['expectancy'], tier)
 
                 if qualifies:
-                    print(f"\n  ✓ Agent QUALIFIES for Global 50!")
+                    print(f"\n  → {candidate['run_name']} (Agent {candidate['agent_id']})")
+                    print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
 
-                    # Attempt promotion
+                    # Attempt promotion - we bypass should_promote check since we did our own
+                    # Temporarily set thresholds to allow promotion
+                    old_entry_threshold = self.global_hof.entry_threshold
+                    old_roi_threshold = self.global_hof.roi_threshold
+                    old_expectancy_threshold = self.global_hof.expectancy_threshold
+                    self.global_hof.entry_threshold = float('-inf')
+                    self.global_hof.roi_threshold = float('-inf')
+                    self.global_hof.expectancy_threshold = float('-inf')
+
                     promoted = self.global_hof.check_and_promote(
                         agent=agent,
                         gauntlet_score=new_score,
@@ -2169,86 +2275,48 @@ class AgentEvaluator:
                         quality_ratio=metrics['quality_ratio'],
                         win_ratio=metrics['win_ratio'],
                         total_trades=metrics['total_trades'],
-                        run_name=candidate['run_name']  # Preserve original run name from archive
+                        run_name=candidate['run_name']
                     )
 
-                    if promoted:
-                        promoted_count += 1
-                        print(f"  ✓ Successfully promoted to Global 50 (moved to agents/)")
+                    # Restore and recompute thresholds
+                    recompute_thresholds_from_population()
 
-                        # Delete from archive after successful promotion
-                        # (check_and_promote already saved the agent to agents/)
-                        if local_agent_path.exists():
-                            local_agent_path.unlink()
-                        # Also delete JSON scoresheet if exists
-                        scoresheet_path = self.global_hof.local_archive_dir / filename.replace('.pth', '.json')
+                    if promoted:
+                        ec['promoted'] = True
+                        pass_promoted += 1
+                        total_promoted += 1
+                        promotions_by_tier[tier] += 1
+                        print(f"    ✓ Promoted to Global 50 (Tier {tier})")
+
+                        # Delete from archive
+                        if ec['local_agent_path'].exists():
+                            ec['local_agent_path'].unlink()
+                        scoresheet_path = self.global_hof.local_archive_dir / ec['filename'].replace('.pth', '.json')
                         if scoresheet_path.exists():
                             scoresheet_path.unlink()
-                        # Delete from cloud archive
-                        self.cloud_sync.delete_file(cloud_archive_path)
-                        cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{filename.replace('.pth', '.json')}"
+                        self.cloud_sync.delete_file(ec['cloud_archive_path'])
+                        cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{ec['filename'].replace('.pth', '.json')}"
                         self.cloud_sync.delete_file(cloud_scoresheet_path)
-
-                        # Recompute thresholds from the updated population.
-                        # check_and_promote calls _update_entry_threshold which resets to -inf
-                        # when not full, so we need to restore proper thresholds.
-                        recompute_thresholds_from_population()
-                        print(f"  Updated thresholds - Minimums: Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}")
                     else:
-                        print(f"  ⚠ Promotion failed (concurrent update?)")
+                        print(f"    ⚠ Promotion failed (concurrent update?)")
 
-                    results.append({
-                        'candidate': candidate,
-                        'success': True,
-                        'promoted': promoted,
-                        'new_score': new_score,
-                        'metrics': metrics
-                    })
-                else:
-                    # Show detailed failure reasons
-                    print(f"\n  ✗ Agent does not qualify for Global 50")
-                    # Check individual criteria
-                    passes_gauntlet_min = new_score > self.global_hof.entry_threshold
-                    passes_roi_min = metrics['roi'] > self.global_hof.roi_threshold
-                    passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold
-                    beats_gauntlet_p75 = new_score > self.global_hof.gauntlet_p75
-                    beats_roi_p75 = metrics['roi'] > self.global_hof.roi_p75
-                    beats_expectancy_p75 = metrics['expectancy'] > self.global_hof.expectancy_p75
-                    count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
+            print(f"\n  Tier {tier} promoted: {pass_promoted} agents")
 
-                    print(f"     Minimums: Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'}")
-                    print(f"     P75 ({count_above_p75}/3, need 2): Gauntlet {'✓' if beats_gauntlet_p75 else '✗'} | ROI {'✓' if beats_roi_p75 else '✗'} | Expectancy {'✓' if beats_expectancy_p75 else '✗'}")
-
-                    results.append({
-                        'candidate': candidate,
-                        'success': True,
-                        'promoted': False,
-                        'new_score': new_score,
-                        'metrics': metrics
-                    })
-
-            except Exception as e:
-                print(f"  ✗ Error: {e}")
-                import traceback
-                traceback.print_exc()
-                results.append({
-                    'candidate': candidate,
-                    'success': False,
-                    'error': str(e)
-                })
+            # If no promotions at this tier and slots remain, move to next tier
+            if pass_promoted == 0 and len(self.global_hof.entries) < self.global_hof.CAPACITY:
+                print(f"  No qualifying candidates at Tier {tier}, relaxing criteria...")
 
         # Summary
         print(f"\n{'='*70}")
         print("Archive Fill Summary")
         print(f"{'='*70}")
 
-        evaluated = sum(1 for r in results if r['success'])
-        promoted = sum(1 for r in results if r.get('promoted', False))
-        failed = sum(1 for r in results if not r['success'])
-
-        print(f"\n  Candidates evaluated: {evaluated}")
-        print(f"  Promoted to Global 50: {promoted}")
-        print(f"  Failed to evaluate: {failed}")
+        print(f"\n  Candidates evaluated: {len(evaluated_candidates)}")
+        print(f"  Total promoted: {total_promoted}")
+        print(f"\n  Promotions by tier:")
+        for t, count in promotions_by_tier.items():
+            if count > 0:
+                print(f"    Tier {t} ({get_tier_description(t)}): {count}")
 
         # Reload and show final state
         self.global_hof._download_global_ledger()
