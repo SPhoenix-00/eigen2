@@ -1762,17 +1762,11 @@ class AgentEvaluator:
         self.global_hof._update_entry_threshold()
 
         current_size = len(self.global_hof.entries)
-        empty_slots = self.global_hof.CAPACITY - current_size
 
         print(f"\n  Current Global 50 size: {current_size}/{self.global_hof.CAPACITY}")
-        print(f"  Empty slots to fill: {empty_slots}")
 
-        if empty_slots <= 0:
-            print(f"\n✓ Global 50 is already full. No need to fill from archive.")
-            return
-
-        # Override thresholds: use current minimums instead of -inf
-        # This maintains quality standards even when below capacity
+        # Use current minimums as thresholds
+        # Archived agents must beat the current worst to get in (or fill empty slots)
         if current_size > 0:
             archive_fill_gauntlet_threshold = min(e.gauntlet_score for e in self.global_hof.entries)
             archive_fill_roi_threshold = min(e.roi for e in self.global_hof.entries)
