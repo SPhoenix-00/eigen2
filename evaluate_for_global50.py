@@ -410,10 +410,18 @@ class AgentEvaluator:
                     print(f"   WARNING: Promotion failed (concurrent update?)")
             else:
                 print(f"\n   Agent does not qualify for Global 50")
-                print(f"   Gauntlet: {gauntlet_score:.2f} (threshold: {self.global_hof.entry_threshold:.2f})")
-                print(f"   ROI: {metrics['roi']:.2f}% (threshold: {self.global_hof.roi_threshold:.2f}%)")
-                print(f"   Expectancy: {metrics['expectancy']:.4f} (threshold: {self.global_hof.expectancy_threshold:.4f})")
-                print(f"   Criteria: gauntlet > threshold AND ROI > threshold AND expectancy > threshold")
+                # Check individual criteria for detailed feedback
+                passes_gauntlet_min = gauntlet_score > self.global_hof.entry_threshold
+                passes_roi_min = metrics['roi'] > self.global_hof.roi_threshold
+                passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold
+                beats_gauntlet_p75 = gauntlet_score > self.global_hof.gauntlet_p75
+                beats_roi_p75 = metrics['roi'] > self.global_hof.roi_p75
+                beats_expectancy_p75 = metrics['expectancy'] > self.global_hof.expectancy_p75
+                count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
+
+                print(f"   Minimums: Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'}")
+                print(f"   P75 ({count_above_p75}/3, need 2): Gauntlet {'✓' if beats_gauntlet_p75 else '✗'} | ROI {'✓' if beats_roi_p75 else '✗'} | Expectancy {'✓' if beats_expectancy_p75 else '✗'}")
+                print(f"   Criteria: All 3 > min AND 2/3 > P75 AND 1/3 > median")
 
         except Exception as e:
             print(f"\n   ERROR: {e}")
@@ -1641,8 +1649,11 @@ class AgentEvaluator:
         Interactive trim mode: shows current thresholds and prompts for
         gauntlet, ROI, and expectancy thresholds to trim agents.
 
-        Trim criteria matches promotion criteria:
-        Agent is KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold
+        This is a manual trimming tool that allows custom thresholds.
+        Note: Automatic promotion uses stricter criteria:
+        - All 3 metrics must beat minimum thresholds
+        - 2 of 3 metrics must beat 75th percentile
+        - 1 of 3 metrics must beat median
         """
         print(f"\n{'='*70}")
         print(f"Interactive Trim Mode")
@@ -1673,18 +1684,18 @@ class AgentEvaluator:
 
         if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
             print(f"\n  Current Thresholds (population full):")
-            print(f"    Gauntlet:    {self.global_hof.entry_threshold:.2f} (50th rank)")
-            print(f"    ROI:         {self.global_hof.roi_threshold:.2f}% (minimum)")
-            print(f"    Expectancy:  {self.global_hof.expectancy_threshold:.4f} (minimum)")
+            print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}")
+            print(f"    Medians:   Gauntlet={self.global_hof.gauntlet_median:.2f}, ROI={self.global_hof.roi_median:.2f}%, Expectancy={self.global_hof.expectancy_median:.4f}")
+            print(f"    P75:       Gauntlet={self.global_hof.gauntlet_p75:.2f}, ROI={self.global_hof.roi_p75:.2f}%, Expectancy={self.global_hof.expectancy_p75:.4f}")
         else:
             # Show current minimums for reference
             min_gauntlet = min(e.gauntlet_score for e in self.global_hof.entries)
             min_roi = min(e.roi for e in self.global_hof.entries)
             min_expectancy = min(e.expectancy for e in self.global_hof.entries)
             print(f"\n  Current Minimums (population not full, thresholds are -inf):")
-            print(f"    Gauntlet:    {min_gauntlet:.2f} (current min)")
-            print(f"    ROI:         {min_roi:.2f}% (current min)")
-            print(f"    Expectancy:  {min_expectancy:.4f} (current min)")
+            print(f"    Gauntlet:    {min_gauntlet:.2f}")
+            print(f"    ROI:         {min_roi:.2f}%")
+            print(f"    Expectancy:  {min_expectancy:.4f}")
 
         # Show distribution
         print(f"\n  Score Ranges:")
@@ -1697,6 +1708,7 @@ class AgentEvaluator:
         print(f"Enter Trim Thresholds")
         print(f"{'='*70}")
         print(f"Agents will be KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold")
+        print(f"(Note: This is a manual trim. Automatic promotion requires additional p75/median criteria)")
         print(f"Press Enter to skip a threshold (use -inf)")
 
         # Get gauntlet threshold
@@ -1976,22 +1988,15 @@ class AgentEvaluator:
 
         print(f"\n  Current Global 50 size: {current_size}/{self.global_hof.CAPACITY}")
 
-        # Use current minimums as thresholds
-        # Archived agents must beat the current worst to get in (or fill empty slots)
-        if current_size > 0:
-            archive_fill_gauntlet_threshold = min(e.gauntlet_score for e in self.global_hof.entries)
-            archive_fill_roi_threshold = min(e.roi for e in self.global_hof.entries)
-            archive_fill_expectancy_threshold = min(e.expectancy for e in self.global_hof.entries)
-        else:
-            # No agents yet - use -inf (accept any qualifying agent)
-            archive_fill_gauntlet_threshold = float('-inf')
-            archive_fill_roi_threshold = float('-inf')
-            archive_fill_expectancy_threshold = float('-inf')
-
-        print(f"\n  Archive Fill Thresholds (based on current minimums):")
-        print(f"    Gauntlet:    {archive_fill_gauntlet_threshold:.2f}")
-        print(f"    ROI:         {archive_fill_roi_threshold:.2f}%")
-        print(f"    Expectancy:  {archive_fill_expectancy_threshold:.4f}")
+        # Thresholds are managed by GlobalHoF - already updated above
+        print(f"\n  Current Thresholds:")
+        print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}")
+        print(f"    Medians:   Gauntlet={self.global_hof.gauntlet_median:.2f}, ROI={self.global_hof.roi_median:.2f}%, Expectancy={self.global_hof.expectancy_median:.4f}")
+        print(f"    P75:       Gauntlet={self.global_hof.gauntlet_p75:.2f}, ROI={self.global_hof.roi_p75:.2f}%, Expectancy={self.global_hof.expectancy_p75:.4f}")
+        print(f"\n  Promotion Criteria:")
+        print(f"    1. All 3 metrics must beat minimum thresholds")
+        print(f"    2. At least 2 of 3 metrics must beat 75th percentile")
+        print(f"    3. At least 1 metric must beat median (50th percentile)")
 
         # Discover archived agents in cloud storage
         print(f"\n{'='*70}")
@@ -2052,9 +2057,9 @@ class AgentEvaluator:
         print(f"  3. Promote qualifying agents to Global 50 (moved from archive/ to agents/)")
         print(f"\nFilters applied:")
         print(f"  - Minimum archived ROI: {self.MIN_ROI_THRESHOLD}% (excluded {excluded_low_roi} agents)")
-        print(f"  - Gauntlet threshold: {archive_fill_gauntlet_threshold:.2f}")
-        print(f"  - ROI threshold: {archive_fill_roi_threshold:.2f}%")
-        print(f"  - Expectancy threshold: {archive_fill_expectancy_threshold:.4f}")
+        print(f"  - Must beat all 3 minimum thresholds")
+        print(f"  - Must beat 2 of 3 metrics at 75th percentile")
+        print(f"  - Must beat 1 of 3 metrics at median")
         print(f"\nEstimated time: ~{len(candidates) * 2} minutes")
 
         while True:
@@ -2114,27 +2119,14 @@ class AgentEvaluator:
                 print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
                 print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
 
-                # Check if qualifies for promotion using current thresholds
-                # Thresholds are dynamic - recalculated after each promotion
-                # Criteria: gauntlet > threshold AND ROI > threshold AND expectancy > threshold
-                passes_gauntlet = new_score > archive_fill_gauntlet_threshold
-                passes_roi = metrics['roi'] > archive_fill_roi_threshold
-                passes_expectancy = metrics['expectancy'] > archive_fill_expectancy_threshold
-                qualifies = passes_gauntlet and passes_roi and passes_expectancy
+                # Check if qualifies for promotion using GlobalHoF's should_promote
+                # This enforces all criteria: minimums, 2/3 at p75, 1/3 at median
+                qualifies = self.global_hof.should_promote(new_score, metrics['roi'], metrics['expectancy'])
 
                 if qualifies:
                     print(f"\n  ✓ Agent QUALIFIES for Global 50!")
 
                     # Attempt promotion
-                    # Temporarily override thresholds to ensure check_and_promote succeeds
-                    original_entry_threshold = self.global_hof.entry_threshold
-                    original_roi_threshold = self.global_hof.roi_threshold
-                    original_expectancy_threshold = self.global_hof.expectancy_threshold
-
-                    self.global_hof.entry_threshold = archive_fill_gauntlet_threshold
-                    self.global_hof.roi_threshold = archive_fill_roi_threshold
-                    self.global_hof.expectancy_threshold = archive_fill_expectancy_threshold
-
                     promoted = self.global_hof.check_and_promote(
                         agent=agent,
                         gauntlet_score=new_score,
@@ -2146,11 +2138,6 @@ class AgentEvaluator:
                         total_trades=metrics['total_trades'],
                         run_name=candidate['run_name']  # Preserve original run name from archive
                     )
-
-                    # Restore original thresholds
-                    self.global_hof.entry_threshold = original_entry_threshold
-                    self.global_hof.roi_threshold = original_roi_threshold
-                    self.global_hof.expectancy_threshold = original_expectancy_threshold
 
                     if promoted:
                         promoted_count += 1
@@ -2169,13 +2156,9 @@ class AgentEvaluator:
                         cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{filename.replace('.pth', '.json')}"
                         self.cloud_sync.delete_file(cloud_scoresheet_path)
 
-                        # Update thresholds based on new Global 50 state
-                        # This raises the bar as better agents are added
-                        if len(self.global_hof.entries) > 0:
-                            archive_fill_gauntlet_threshold = min(e.gauntlet_score for e in self.global_hof.entries)
-                            archive_fill_roi_threshold = min(e.roi for e in self.global_hof.entries)
-                            archive_fill_expectancy_threshold = min(e.expectancy for e in self.global_hof.entries)
-                            print(f"  Updated thresholds: Gauntlet={archive_fill_gauntlet_threshold:.2f}, ROI={archive_fill_roi_threshold:.2f}%, Expectancy={archive_fill_expectancy_threshold:.4f}")
+                        # Thresholds are automatically updated by check_and_promote
+                        # Just print a summary
+                        print(f"  Updated thresholds - Minimums: Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}")
                     else:
                         print(f"  ⚠ Promotion failed (concurrent update?)")
 
@@ -2187,10 +2170,19 @@ class AgentEvaluator:
                         'metrics': metrics
                     })
                 else:
+                    # Show detailed failure reasons
                     print(f"\n  ✗ Agent does not qualify for Global 50")
-                    print(f"     Gauntlet: {new_score:.2f} (threshold: {archive_fill_gauntlet_threshold:.2f}) {'✓' if passes_gauntlet else '✗'}")
-                    print(f"     ROI: {metrics['roi']:.2f}% (threshold: {archive_fill_roi_threshold:.2f}%) {'✓' if passes_roi else '✗'}")
-                    print(f"     Expectancy: {metrics['expectancy']:.4f} (threshold: {archive_fill_expectancy_threshold:.4f}) {'✓' if passes_expectancy else '✗'}")
+                    # Check individual criteria
+                    passes_gauntlet_min = new_score > self.global_hof.entry_threshold
+                    passes_roi_min = metrics['roi'] > self.global_hof.roi_threshold
+                    passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold
+                    beats_gauntlet_p75 = new_score > self.global_hof.gauntlet_p75
+                    beats_roi_p75 = metrics['roi'] > self.global_hof.roi_p75
+                    beats_expectancy_p75 = metrics['expectancy'] > self.global_hof.expectancy_p75
+                    count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
+
+                    print(f"     Minimums: Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'}")
+                    print(f"     P75 ({count_above_p75}/3, need 2): Gauntlet {'✓' if beats_gauntlet_p75 else '✗'} | ROI {'✓' if beats_roi_p75 else '✗'} | Expectancy {'✓' if beats_expectancy_p75 else '✗'}")
 
                     results.append({
                         'candidate': candidate,

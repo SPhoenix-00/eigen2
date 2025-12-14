@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import threading
+import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 from pydantic import BaseModel, field_validator, model_validator
@@ -151,9 +152,18 @@ class GlobalHallOfFame:
 
         # Local cache
         self.entries: List[GlobalHoFEntry] = []
-        self.entry_threshold: float = float('-inf')
-        self.roi_threshold: float = float('-inf')
-        self.expectancy_threshold: float = float('-inf')
+        # Minimum thresholds (must beat all 3)
+        self.entry_threshold: float = float('-inf')  # Gauntlet score minimum (50th rank)
+        self.roi_threshold: float = float('-inf')    # ROI minimum
+        self.expectancy_threshold: float = float('-inf')  # Expectancy minimum
+        # Median thresholds (50th percentile - must beat at least 1)
+        self.gauntlet_median: float = float('-inf')
+        self.roi_median: float = float('-inf')
+        self.expectancy_median: float = float('-inf')
+        # 75th percentile thresholds (must beat at least 2 of 3)
+        self.gauntlet_p75: float = float('-inf')
+        self.roi_p75: float = float('-inf')
+        self.expectancy_p75: float = float('-inf')
         self.league_compatible: bool = False
 
         # Thread safety for atomic updates
@@ -404,11 +414,18 @@ class GlobalHallOfFame:
             print(f"  Global:  {self._stored_league_rules.to_dict()}")
 
     def _update_entry_threshold(self):
-        """Update the local entry thresholds (gauntlet score, ROI, expectancy)."""
+        """Update the local entry thresholds (gauntlet score, ROI, expectancy) and percentiles."""
         if len(self.entries) < self.CAPACITY:
+            # Not full yet - use -inf for all thresholds (accept any qualifying agent)
             self.entry_threshold = float('-inf')
             self.roi_threshold = float('-inf')
             self.expectancy_threshold = float('-inf')
+            self.gauntlet_median = float('-inf')
+            self.roi_median = float('-inf')
+            self.expectancy_median = float('-inf')
+            self.gauntlet_p75 = float('-inf')
+            self.roi_p75 = float('-inf')
+            self.expectancy_p75 = float('-inf')
         else:
             # Get the 50th ranked agent's score (worst in top 50)
             sorted_entries = sorted(self.entries, key=lambda e: e.gauntlet_score, reverse=True)
@@ -416,6 +433,19 @@ class GlobalHallOfFame:
             # ROI and expectancy thresholds = minimum in the population
             self.roi_threshold = min(e.roi for e in self.entries)
             self.expectancy_threshold = min(e.expectancy for e in self.entries)
+
+            # Calculate median (50th percentile) and 75th percentile for all 3 metrics
+            gauntlet_scores = [e.gauntlet_score for e in self.entries]
+            roi_values = [e.roi for e in self.entries]
+            expectancy_values = [e.expectancy for e in self.entries]
+
+            self.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
+            self.roi_median = float(np.percentile(roi_values, 50))
+            self.expectancy_median = float(np.percentile(expectancy_values, 50))
+
+            self.gauntlet_p75 = float(np.percentile(gauntlet_scores, 75))
+            self.roi_p75 = float(np.percentile(roi_values, 75))
+            self.expectancy_p75 = float(np.percentile(expectancy_values, 75))
 
     def _discover_fallback_leagues(self):
         """
@@ -527,7 +557,10 @@ class GlobalHallOfFame:
         """
         Check if an agent qualifies for Global 50.
 
-        Criteria: gauntlet_score > threshold AND ROI > roi_threshold AND expectancy > expectancy_threshold
+        Criteria (all must be satisfied):
+        1. All 3 metrics must beat their minimum thresholds
+        2. At least 2 of 3 metrics must beat the 75th percentile
+        3. At least 1 metric must beat the median (50th percentile)
 
         Args:
             gauntlet_score: Agent's certified Gauntlet score
@@ -540,12 +573,33 @@ class GlobalHallOfFame:
         if not self.enabled or not self.league_compatible:
             return False
 
-        # Must beat gauntlet threshold
+        # Criterion 1: Must beat ALL minimum thresholds
         if gauntlet_score <= self.entry_threshold:
             return False
+        if roi <= self.roi_threshold:
+            return False
+        if expectancy <= self.expectancy_threshold:
+            return False
 
-        # Must beat BOTH ROI and expectancy thresholds
-        return roi > self.roi_threshold and expectancy > self.expectancy_threshold
+        # Criterion 2: At least 2 of 3 metrics must beat 75th percentile
+        beats_gauntlet_p75 = gauntlet_score > self.gauntlet_p75
+        beats_roi_p75 = roi > self.roi_p75
+        beats_expectancy_p75 = expectancy > self.expectancy_p75
+        count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
+        if count_above_p75 < 2:
+            return False
+
+        # Criterion 3: At least 1 metric must beat median (50th percentile)
+        # Note: If 2+ metrics beat p75, they automatically beat median, so this is always satisfied
+        # But we check explicitly for clarity and edge cases
+        beats_gauntlet_median = gauntlet_score > self.gauntlet_median
+        beats_roi_median = roi > self.roi_median
+        beats_expectancy_median = expectancy > self.expectancy_median
+        count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
+        if count_above_median < 1:
+            return False
+
+        return True
 
     def check_and_promote(self, agent: DDPGAgent, gauntlet_score: float, generation: int,
                           roi: float = 0.0, expectancy: float = 0.0,

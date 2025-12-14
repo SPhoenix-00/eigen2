@@ -4280,7 +4280,7 @@ class ERLTrainer:
                             gauntlet_results.get('roi', 0.0),
                             gauntlet_results.get('expectancy', 0.0)
                         ):
-                            print(f"\n   ⓘ Agent may qualify for Global 50 (score {gauntlet_score:.2f} > threshold {self.global_hof.entry_threshold:.2f})")
+                            print(f"\n   ⓘ Agent may qualify for Global 50 (passes all promotion criteria)")
                             print(f"   Running consistency-aligned re-gauntlet for fair Global 50 comparison...")
 
                             # Temporarily enable consistency mode on eval_env
@@ -4295,7 +4295,7 @@ class ERLTrainer:
                         else:
                             print(f"   ⓘ Agent gauntlet score: {gauntlet_score:.2f}")
                             if self.global_hof.enabled:
-                                print(f"   Global 50 threshold: {self.global_hof.entry_threshold:.2f}")
+                                print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p75: {self.global_hof.gauntlet_p75:.2f}")
 
                     # Attempt promotion if we have a consistency-aligned score
                     if g50_gauntlet_score is not None and self.global_hof.should_promote(
