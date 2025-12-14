@@ -1704,7 +1704,11 @@ class ERLTrainer:
         # Reset mutation parameters to base values
         self.current_mutation_rate = Config.MUTATION_RATE_CONSISTENCY
         self.current_mutation_std = Config.MUTATION_STD
-        self.consecutive_no_improvement = 0
+
+        # Reset plateau detection state for adaptive mutation
+        # Without this, plateau state from previous member would affect new member's mutation
+        self.plateau_detected = False
+        self.validation_fitness_history = []
 
         print(f"  Population initialized: {len(self.population)} agents")
         print(f"  Metrics reset for fresh training")
@@ -4491,6 +4495,11 @@ class ERLTrainer:
         Args:
             fitness_scores: List of fitness scores for the current population (used to find worst agents)
         """
+        # Skip injection in multi-mode: we want to refine each committee member's
+        # specific strategy, not dilute it with external Global50 agents
+        if self.multi_mode:
+            return
+
         # Only trigger if buffer is at least half full
         buffer_half_full = len(self.replay_buffer) >= (self.replay_buffer.capacity // 2)
 
