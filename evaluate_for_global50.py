@@ -13,6 +13,7 @@ Usage:
     python evaluate_for_global50.py --mirror                            # Check sync status
     python evaluate_for_global50.py --eval                              # Re-evaluate all agents
     python evaluate_for_global50.py --trim                              # Interactive trim (prompts for thresholds)
+    python evaluate_for_global50.py --archive-fill                      # Fill Global 50 from archive
     python evaluate_for_global50.py --agent-dir <path> [--run-name <name>]
 
 Example:
@@ -1738,6 +1739,427 @@ class AgentEvaluator:
         print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
         print(f"{'='*70}")
 
+    def archive_fill(self):
+        """
+        Fill Global 50 from archive.
+
+        Downloads archived agents from cloud storage, evaluates them with the gauntlet,
+        and promotes qualifying agents to fill empty slots in the Global 50.
+        """
+        print(f"\n{'='*70}")
+        print("Archive Fill Mode")
+        print(f"{'='*70}")
+
+        if not self.global_hof.enabled:
+            print("⚠ Global 50 not enabled (local mode or disabled)")
+            print("Cannot fill from archive.")
+            return
+
+        # Load current Global 50 state
+        print("\nLoading current Global 50 state...")
+        self.global_hof._download_global_ledger()
+        self.global_hof._load_local_ledger()
+        self.global_hof._update_entry_threshold()
+
+        current_size = len(self.global_hof.entries)
+        empty_slots = self.global_hof.CAPACITY - current_size
+
+        print(f"\n  Current Global 50 size: {current_size}/{self.global_hof.CAPACITY}")
+        print(f"  Empty slots to fill: {empty_slots}")
+
+        if empty_slots <= 0:
+            print(f"\n✓ Global 50 is already full. No need to fill from archive.")
+            return
+
+        # Override thresholds: use current minimums instead of -inf
+        # This maintains quality standards even when below capacity
+        if current_size > 0:
+            archive_fill_gauntlet_threshold = min(e.gauntlet_score for e in self.global_hof.entries)
+            archive_fill_roi_threshold = min(e.roi for e in self.global_hof.entries)
+            archive_fill_expectancy_threshold = min(e.expectancy for e in self.global_hof.entries)
+        else:
+            # No agents yet - use -inf (accept any qualifying agent)
+            archive_fill_gauntlet_threshold = float('-inf')
+            archive_fill_roi_threshold = float('-inf')
+            archive_fill_expectancy_threshold = float('-inf')
+
+        print(f"\n  Archive Fill Thresholds (based on current minimums):")
+        print(f"    Gauntlet:    {archive_fill_gauntlet_threshold:.2f}")
+        print(f"    ROI:         {archive_fill_roi_threshold:.2f}%")
+        print(f"    Expectancy:  {archive_fill_expectancy_threshold:.4f}")
+
+        # Discover archived agents in cloud storage
+        print(f"\n{'='*70}")
+        print("Discovering Archived Agents")
+        print(f"{'='*70}")
+
+        archive_agents = self._discover_archive_agents()
+
+        if not archive_agents:
+            print("\n⚠ No archived agents found in cloud storage.")
+            print(f"  Archive path: gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/archive/")
+            return
+
+        print(f"\nFound {len(archive_agents)} archived agents")
+
+        # Filter out agents already in Global 50 (by run_name + agent_id)
+        existing_keys = {(e.run_name, e.agent_id) for e in self.global_hof.entries}
+        candidates = [a for a in archive_agents if (a['run_name'], a['agent_id']) not in existing_keys]
+
+        print(f"  Already in Global 50: {len(archive_agents) - len(candidates)}")
+        print(f"  Candidates for evaluation: {len(candidates)}")
+
+        if not candidates:
+            print("\n⚠ All archived agents are already in Global 50.")
+            return
+
+        # Sort candidates by their archived gauntlet score (highest first)
+        # This prioritizes agents that were likely good performers
+        candidates.sort(key=lambda a: a.get('gauntlet_score', 0), reverse=True)
+
+        print(f"\n  Will evaluate all {len(candidates)} candidates (sorted by archived score)")
+
+        # Show candidates
+        print(f"\n{'='*70}")
+        print("Candidates for Evaluation")
+        print(f"{'='*70}")
+        print(f"{'#':<4} {'Archived Score':<15} {'ROI %':<10} {'Expectancy':<12} {'Run Name':<30}")
+        print(f"{'-'*75}")
+
+        for i, candidate in enumerate(candidates, 1):
+            print(f"{i:<4} {candidate.get('gauntlet_score', 0):<15.2f} "
+                  f"{candidate.get('roi', 0):<10.2f} "
+                  f"{candidate.get('expectancy', 0):<12.4f} "
+                  f"{candidate['run_name']:<30}")
+
+        # Ask for confirmation
+        print(f"\n{'='*70}")
+        print("⚠ This will:")
+        print(f"  1. Download {len(candidates)} archived agents from cloud")
+        print(f"  2. Run full gauntlet evaluation for each agent")
+        print(f"  3. Promote qualifying agents to Global 50 (moved from archive/ to agents/)")
+        print(f"\nEstimated time: ~{len(candidates) * 2} minutes")
+
+        while True:
+            confirmation = input("\nProceed with archive fill? (yes/no): ").strip().lower()
+            if confirmation in ['yes', 'y']:
+                print("\n→ Starting archive fill...")
+                break
+            elif confirmation in ['no', 'n']:
+                print("\n→ Archive fill cancelled.")
+                return
+            else:
+                print("Please enter 'yes' or 'no'.")
+
+        # Evaluate each candidate
+        results = []
+        promoted_count = 0
+
+        print(f"\n{'='*70}")
+        print("Evaluating Archived Agents")
+        print(f"{'='*70}")
+
+        for i, candidate in enumerate(candidates, 1):
+            # Check if we've filled all slots
+            current_size = len(self.global_hof.entries)
+            if current_size >= self.global_hof.CAPACITY:
+                print(f"\n✓ Global 50 is now full ({current_size}/{self.global_hof.CAPACITY}). Stopping evaluation.")
+                break
+
+            print(f"\n[{i}/{len(candidates)}] {candidate['run_name']} (Agent {candidate['agent_id']})")
+            print(f"  Archived Score: {candidate.get('gauntlet_score', 0):.2f}")
+
+            try:
+                # Download agent from archive
+                filename = f"{candidate['run_name']}_{candidate['agent_id']}.pth"
+                local_agent_path = self.global_hof.local_archive_dir / filename
+                cloud_archive_path = f"{self.global_hof.cloud_base}/archive/{filename}"
+
+                if not local_agent_path.exists():
+                    print(f"  Downloading from archive...")
+                    success = self.cloud_sync.download_file(cloud_archive_path, str(local_agent_path))
+                    if not success:
+                        print(f"  ✗ Failed to download agent. Skipping.")
+                        results.append({
+                            'candidate': candidate,
+                            'success': False,
+                            'error': 'Download failed'
+                        })
+                        continue
+
+                # Load agent
+                print(f"  Loading agent...")
+                agent = DDPGAgent(agent_id=candidate['agent_id'])
+                agent.load(str(local_agent_path))
+
+                # Run gauntlet
+                print(f"  Running gauntlet...")
+                new_score, metrics = self.run_gauntlet(agent, f"{candidate['run_name']}_{candidate['agent_id']}")
+
+                # Show results
+                score_change = new_score - candidate.get('gauntlet_score', 0)
+                score_symbol = "↑" if score_change > 0 else "↓" if score_change < 0 else "="
+                print(f"  New Score: {new_score:.2f} ({score_symbol} {abs(score_change):.2f} from archived)")
+                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
+                print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
+
+                # Check if qualifies for promotion using archive fill thresholds
+                # Criteria: gauntlet > threshold AND (ROI > threshold OR expectancy > threshold)
+                passes_gauntlet = new_score > archive_fill_gauntlet_threshold
+                passes_roi = metrics['roi'] > archive_fill_roi_threshold
+                passes_expectancy = metrics['expectancy'] > archive_fill_expectancy_threshold
+                qualifies = passes_gauntlet and (passes_roi or passes_expectancy)
+
+                if qualifies:
+                    print(f"\n  ✓ Agent QUALIFIES for Global 50!")
+
+                    # Attempt promotion (bypass should_promote check since we already validated)
+                    # Temporarily override thresholds to ensure promotion succeeds
+                    original_entry_threshold = self.global_hof.entry_threshold
+                    original_roi_threshold = self.global_hof.roi_threshold
+                    original_expectancy_threshold = self.global_hof.expectancy_threshold
+
+                    self.global_hof.entry_threshold = archive_fill_gauntlet_threshold
+                    self.global_hof.roi_threshold = archive_fill_roi_threshold
+                    self.global_hof.expectancy_threshold = archive_fill_expectancy_threshold
+
+                    promoted = self.global_hof.check_and_promote(
+                        agent=agent,
+                        gauntlet_score=new_score,
+                        generation=candidate.get('generation', 0),
+                        roi=metrics['roi'],
+                        expectancy=metrics['expectancy'],
+                        quality_ratio=metrics['quality_ratio'],
+                        win_ratio=metrics['win_ratio'],
+                        total_trades=metrics['total_trades']
+                    )
+
+                    # Restore original thresholds
+                    self.global_hof.entry_threshold = original_entry_threshold
+                    self.global_hof.roi_threshold = original_roi_threshold
+                    self.global_hof.expectancy_threshold = original_expectancy_threshold
+
+                    if promoted:
+                        promoted_count += 1
+                        print(f"  ✓ Successfully promoted to Global 50 (moved to agents/)")
+
+                        # Delete from archive after successful promotion
+                        # (check_and_promote already saved the agent to agents/)
+                        if local_agent_path.exists():
+                            local_agent_path.unlink()
+                        # Also delete JSON scoresheet if exists
+                        scoresheet_path = self.global_hof.local_archive_dir / filename.replace('.pth', '.json')
+                        if scoresheet_path.exists():
+                            scoresheet_path.unlink()
+                        # Delete from cloud archive
+                        self.cloud_sync.delete_file(cloud_archive_path)
+                        cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{filename.replace('.pth', '.json')}"
+                        self.cloud_sync.delete_file(cloud_scoresheet_path)
+                    else:
+                        print(f"  ⚠ Promotion failed (concurrent update?)")
+
+                    results.append({
+                        'candidate': candidate,
+                        'success': True,
+                        'promoted': promoted,
+                        'new_score': new_score,
+                        'metrics': metrics
+                    })
+                else:
+                    print(f"\n  ✗ Agent does not qualify for Global 50")
+                    print(f"     Gauntlet: {new_score:.2f} (threshold: {archive_fill_gauntlet_threshold:.2f}) {'✓' if passes_gauntlet else '✗'}")
+                    print(f"     ROI: {metrics['roi']:.2f}% (threshold: {archive_fill_roi_threshold:.2f}%) {'✓' if passes_roi else '✗'}")
+                    print(f"     Expectancy: {metrics['expectancy']:.4f} (threshold: {archive_fill_expectancy_threshold:.4f}) {'✓' if passes_expectancy else '✗'}")
+
+                    results.append({
+                        'candidate': candidate,
+                        'success': True,
+                        'promoted': False,
+                        'new_score': new_score,
+                        'metrics': metrics
+                    })
+
+            except Exception as e:
+                print(f"  ✗ Error: {e}")
+                import traceback
+                traceback.print_exc()
+                results.append({
+                    'candidate': candidate,
+                    'success': False,
+                    'error': str(e)
+                })
+
+        # Summary
+        print(f"\n{'='*70}")
+        print("Archive Fill Summary")
+        print(f"{'='*70}")
+
+        evaluated = sum(1 for r in results if r['success'])
+        promoted = sum(1 for r in results if r.get('promoted', False))
+        failed = sum(1 for r in results if not r['success'])
+
+        print(f"\n  Candidates evaluated: {evaluated}")
+        print(f"  Promoted to Global 50: {promoted}")
+        print(f"  Failed to evaluate: {failed}")
+
+        # Reload and show final state
+        self.global_hof._download_global_ledger()
+        self.global_hof._load_local_ledger()
+        self.global_hof._update_entry_threshold()
+
+        final_size = len(self.global_hof.entries)
+        print(f"\n  Final Global 50 size: {final_size}/{self.global_hof.CAPACITY}")
+
+        if final_size < self.global_hof.CAPACITY:
+            remaining_slots = self.global_hof.CAPACITY - final_size
+            print(f"  Remaining empty slots: {remaining_slots}")
+            print(f"\n  ⚠ Global 50 is not full. You may need to train more agents or")
+            print(f"     lower quality thresholds to fill remaining slots.")
+
+        if final_size > 0:
+            all_scores = [e.gauntlet_score for e in self.global_hof.entries]
+            all_rois = [e.roi for e in self.global_hof.entries]
+            all_expectancies = [e.expectancy for e in self.global_hof.entries]
+
+            print(f"\n  Current Global 50 Metrics:")
+            print(f"    Gauntlet:    min={min(all_scores):.2f}  mean={sum(all_scores)/len(all_scores):.2f}  max={max(all_scores):.2f}")
+            print(f"    ROI:         min={min(all_rois):.2f}%  mean={sum(all_rois)/len(all_rois):.2f}%  max={max(all_rois):.2f}%")
+            print(f"    Expectancy:  min={min(all_expectancies):.4f}  mean={sum(all_expectancies)/len(all_expectancies):.4f}  max={max(all_expectancies):.4f}")
+
+        print(f"\n{'='*70}")
+
+    def _discover_archive_agents(self) -> List[dict]:
+        """
+        Discover all archived agents in cloud storage.
+
+        Returns:
+            List of dicts with agent metadata (run_name, agent_id, gauntlet_score, etc.)
+        """
+        archive_agents = []
+        cloud_archive_prefix = f"{self.global_hof.cloud_base}/archive/"
+
+        try:
+            if self.cloud_sync.provider == "gcs":
+                blobs = self.cloud_sync.bucket.list_blobs(prefix=cloud_archive_prefix)
+                for blob in blobs:
+                    if blob.name.endswith('.json'):
+                        # Download and parse the JSON scoresheet
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                            temp_path = tmp.name
+                        try:
+                            blob.download_to_filename(temp_path)
+                            with open(temp_path, 'r') as f:
+                                data = json.load(f)
+                            archive_agents.append(data)
+                        except Exception as e:
+                            print(f"  ⚠ Could not parse {blob.name}: {e}")
+                        finally:
+                            import os
+                            if os.path.exists(temp_path):
+                                os.unlink(temp_path)
+                    elif blob.name.endswith('.pth'):
+                        # Check if we have a corresponding JSON
+                        json_name = blob.name.replace('.pth', '.json')
+                        # We'll handle .pth files without .json below
+                        pass
+
+            elif self.cloud_sync.provider == "s3":
+                paginator = self.cloud_sync.client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=self.cloud_sync.bucket_name, Prefix=cloud_archive_prefix)
+                for page in pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            if obj['Key'].endswith('.json'):
+                                import tempfile
+                                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                    temp_path = tmp.name
+                                try:
+                                    self.cloud_sync.client.download_file(
+                                        self.cloud_sync.bucket_name, obj['Key'], temp_path
+                                    )
+                                    with open(temp_path, 'r') as f:
+                                        data = json.load(f)
+                                    archive_agents.append(data)
+                                except Exception as e:
+                                    print(f"  ⚠ Could not parse {obj['Key']}: {e}")
+                                finally:
+                                    import os
+                                    if os.path.exists(temp_path):
+                                        os.unlink(temp_path)
+
+            elif self.cloud_sync.provider == "azure":
+                blob_list = self.cloud_sync.container_client.list_blobs(name_starts_with=cloud_archive_prefix)
+                for blob in blob_list:
+                    if blob.name.endswith('.json'):
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                            temp_path = tmp.name
+                        try:
+                            blob_client = self.cloud_sync.container_client.get_blob_client(blob.name)
+                            with open(temp_path, 'wb') as f:
+                                f.write(blob_client.download_blob().readall())
+                            with open(temp_path, 'r') as f:
+                                data = json.load(f)
+                            archive_agents.append(data)
+                        except Exception as e:
+                            print(f"  ⚠ Could not parse {blob.name}: {e}")
+                        finally:
+                            import os
+                            if os.path.exists(temp_path):
+                                os.unlink(temp_path)
+
+            else:
+                # Local provider - check local archive directory
+                print(f"  Checking local archive: {self.global_hof.local_archive_dir}")
+                if self.global_hof.local_archive_dir.exists():
+                    for json_file in self.global_hof.local_archive_dir.glob("*.json"):
+                        try:
+                            with open(json_file, 'r') as f:
+                                data = json.load(f)
+                            archive_agents.append(data)
+                        except Exception as e:
+                            print(f"  ⚠ Could not parse {json_file}: {e}")
+
+        except Exception as e:
+            print(f"  ✗ Error listing archive: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Handle .pth files without corresponding .json scoresheets
+        # Extract run_name and agent_id from filename
+        pth_files = set()
+        json_keys = {(a['run_name'], a['agent_id']) for a in archive_agents}
+
+        try:
+            if self.cloud_sync.provider == "gcs":
+                blobs = self.cloud_sync.bucket.list_blobs(prefix=cloud_archive_prefix)
+                for blob in blobs:
+                    if blob.name.endswith('.pth'):
+                        filename = blob.name.split('/')[-1]
+                        # Parse filename: [run_name]_[agent_id].pth
+                        parts = filename.replace('.pth', '').rsplit('_', 1)
+                        if len(parts) == 2:
+                            run_name = parts[0]
+                            try:
+                                agent_id = int(parts[1])
+                                if (run_name, agent_id) not in json_keys:
+                                    # No JSON scoresheet - create minimal entry
+                                    archive_agents.append({
+                                        'run_name': run_name,
+                                        'agent_id': agent_id,
+                                        'gauntlet_score': 0.0,
+                                        'generation': 0,
+                                        'roi': 0.0,
+                                        'expectancy': 0.0
+                                    })
+                            except ValueError:
+                                pass
+        except Exception:
+            pass  # Already handled above
+
+        return archive_agents
+
     def print_summary(self, results: List[dict]):
         """
         Print summary of evaluation results.
@@ -1812,6 +2234,12 @@ Examples:
 
   # Archive orphan agents (move from agents/ to archive/)
   python evaluate_for_global50.py --cleanup
+
+  # Fill Global 50 from archive (after trimming)
+  python evaluate_for_global50.py --archive-fill
+
+  # Fill Global 50 from archive for a specific context window
+  python evaluate_for_global50.py --archive-fill --cw 504
         """
     )
 
@@ -1870,6 +2298,12 @@ Examples:
         type=int,
         metavar='DAYS',
         help='Context window size in days (e.g., --cw 504 for cw504). Overrides Config.CONTEXT_WINDOW_DAYS for this script only.'
+    )
+
+    parser.add_argument(
+        '--archive-fill',
+        action='store_true',
+        help='Fill Global 50 from archive. Downloads archived agents, evaluates them, and promotes qualifying ones to fill empty slots.'
     )
 
     args = parser.parse_args()
@@ -1963,6 +2397,17 @@ Examples:
 
         dry_run = args.cleanup_dry_run  # --cleanup-dry-run = dry run, --cleanup = actually archive
         evaluator.cleanup_orphan_agents(dry_run=dry_run)
+
+        print("\n" + "="*70)
+        return
+
+    # Handle --archive-fill mode (fill Global 50 from archive)
+    if args.archive_fill:
+        print("\n" + "="*70)
+        print("ARCHIVE FILL MODE")
+        print("="*70)
+
+        evaluator.archive_fill()
 
         print("\n" + "="*70)
         return

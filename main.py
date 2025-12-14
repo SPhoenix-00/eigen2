@@ -143,6 +143,13 @@ def main():
                  'Training seeks 4 breakthroughs of 5%% improvement each.'
         )
         parser.add_argument(
+            '--multi',
+            action='store_true',
+            help='Multi-agent mode: Train all 9 committee members in parallel. '
+                 'Creates 11 agents per member (99 total). Genetic evolution is isolated '
+                 'per parent. Ends after 3 turnovers (each parent achieves 3 breakthroughs).'
+        )
+        parser.add_argument(
             '--cleanup',
             action='store_true',
             help='Clean up orphaned replay buffer files before resuming. Use with --resume or --resume-run. '
@@ -248,6 +255,34 @@ def main():
             print(f"  Consistency mode auto-enabled")
             print(f"  Target: {Config.SINGLE_TARGET_BREAKTHROUGHS} breakthroughs of 5% each")
 
+        # Validate --multi mode (committee roster must exist)
+        if args.multi:
+            from committee import CommitteeManager
+
+            context_window_id = f"cw{Config.CONTEXT_WINDOW_DAYS}"
+            manager = CommitteeManager(Config.CONTEXT_WINDOW_DAYS)
+            roster = manager.load_roster()
+
+            if roster is None:
+                print(f"\n❌ ERROR: No committee roster found for {context_window_id}")
+                print(f"  Run: python committee.py --draft")
+                sys.exit(1)
+
+            if len(roster.get('members', [])) != Config.COMMITTEE_SIZE:
+                print(f"\n❌ ERROR: Committee has {len(roster['members'])} members, expected {Config.COMMITTEE_SIZE}")
+                sys.exit(1)
+
+            # Auto-enable consistency mode for multi-agent training
+            args.consistency = True
+            args.multi_roster = roster
+
+            print(f"\n🎯 MULTI-AGENT MODE")
+            print(f"  Committee members: {len(roster['members'])}")
+            print(f"  Population per member: {Config.MULTI_POPULATION_PER_MEMBER}")
+            print(f"  Total agents: {Config.MULTI_TOTAL_POPULATION}")
+            print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
+            print(f"  Consistency mode: AUTO-ENABLED")
+
         # NOTE: Seed will be set AFTER wandb init in ERLTrainer to ensure unique seeds per run
         # This prevents parallel runs from having identical behavior
 
@@ -327,7 +362,9 @@ def main():
             buffer_storage_path=args.buffer,
             reset_limit=args.reset_limit,
             original_stdout=tee_logger.terminal,
-            original_stderr=tee_logger.terminal
+            original_stderr=tee_logger.terminal,
+            multi_mode=args.multi,
+            multi_roster=getattr(args, 'multi_roster', None)
         )
 
         # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---

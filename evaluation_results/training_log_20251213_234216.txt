@@ -1,0 +1,54 @@
+============================================================
+Project Eigen 2: ERL Stock Trading
+Logging to: evaluation_results/training_log_20251213_234216.txt
+============================================================
+usage: main.py [-h] [--resume] [--resume-run RUN_NAME] [--leverage]
+               [--consistency] [--heroes [HOF_DIR]] [--single AGENT_FILENAME]
+               [--multi] [--cleanup] [--buffer BUFFER_PATH] [--reset-limit]
+
+Run Project Eigen 2 ERL Training
+
+options:
+  -h, --help            show this help message and exit
+  --resume              Resume training from the last run (reads from
+                        last_run.json). This will download checkpoints from
+                        GCS and reconnect to the wandb run.
+  --resume-run RUN_NAME
+                        Resume training from a specific wandb run (e.g.,
+                        "azure-thunder-123"). Overrides --resume. Useful for
+                        resuming older runs.
+  --leverage            Use with --resume to enable leverage mode. Replaces
+                        bottom 5 agents with top 5 Hall of Fame agents
+                        modified to trade with 1.5x coefficients for 5
+                        generations.
+  --consistency         Enable consistency mode. Evaluates agents over 5
+                        episodes with sum (not avg), and magnifies losses to
+                        focus training on reducing drawdowns.
+  --heroes [HOF_DIR]    Path to a Hall of Fame directory. Loads all agents,
+                        evaluates them with current reward function, and
+                        selects best as initial population. Uses reduced
+                        mutant ratio. If flag is used without a path,
+                        automatically uses global50 directory for current
+                        context window.
+  --single AGENT_FILENAME
+                        Load a specific Global50 agent by filename (e.g.,
+                        "azure-thunder-123_42") and run focused refinement
+                        training. Auto-enables consistency mode. Training
+                        seeks 4 breakthroughs of 5% improvement each.
+  --multi               Multi-agent mode: Train all 9 committee members in
+                        parallel. Creates 11 agents per member (99 total).
+                        Genetic evolution is isolated per parent. Ends after 3
+                        turnovers (each parent achieves 3 breakthroughs).
+  --cleanup             Clean up orphaned replay buffer files before resuming.
+                        Use with --resume or --resume-run. Scans
+                        buffer_storage directory and removes files not tracked
+                        in metadata (zombie files from crashes).
+  --buffer BUFFER_PATH  Path to an existing buffer_storage folder to reuse
+                        (e.g., "checkpoints/run-123/buffer_storage"). Allows
+                        starting a new run with pre-filled replay buffer
+                        instead of starting from zero.
+  --reset-limit         Use with --resume to reset the fallback generation
+                        counter to max. In consistency mode, this resets the
+                        "generations since last turnover" counter, giving the
+                        run a fresh runway of MAX_GENERATIONS_GAUNTLET
+                        generations.
