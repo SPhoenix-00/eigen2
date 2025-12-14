@@ -73,6 +73,10 @@ class Global50Fixer:
         self.cloud_agents_prefix = f"{self.cloud_base}/agents/"
         self.cloud_json_path = f"{self.cloud_base}/global50.json"
         self.cloud_archive_prefix = f"{self.cloud_base}/archive/"
+        self.cloud_exclude_prefix = f"{self.cloud_base}/exclude/"
+
+        # Minimum ROI threshold - agents below this are excluded (not real agents)
+        self.MIN_ROI_THRESHOLD = 0.01
 
         # Local temp directory for downloads
         self.temp_dir = Path(tempfile.mkdtemp(prefix="fix_global50_"))
@@ -84,6 +88,7 @@ class Global50Fixer:
         self.local_dir = Path("global50") / self.context_window_id
         self.local_agents_dir = self.local_dir / "agents"
         self.local_archive_dir = self.local_dir / "archive"
+        self.local_exclude_dir = self.local_dir / "exclude"
         self.local_json_path = self.local_dir / "global50.json"
 
         # Initialize gauntlet helper
@@ -132,6 +137,56 @@ class Global50Fixer:
         self.gauntlet_helper.calculate_expectancy = ERLTrainer.calculate_expectancy.__get__(
             self.gauntlet_helper, GauntletHelper
         )
+
+    def get_agent_roi_from_scoresheet(self, filename: str, from_archive: bool = True) -> float:
+        """
+        Get ROI from agent's JSON scoresheet.
+        Returns the ROI value or None if scoresheet doesn't exist or can't be parsed.
+        """
+        json_filename = filename.replace('.pth', '.json')
+        if from_archive:
+            cloud_path = f"{self.cloud_archive_prefix}{json_filename}"
+        else:
+            # For agents/, there's no individual scoresheet, check global50.json instead
+            return None
+
+        try:
+            if self.cloud_sync.provider == "gcs":
+                blob = self.cloud_sync.bucket.blob(cloud_path)
+                if blob.exists():
+                    content = blob.download_as_text()
+                    data = json.loads(content)
+                    return data.get('roi', None)
+        except Exception:
+            pass
+        return None
+
+    def get_roi_from_global50_json(self) -> Dict[str, float]:
+        """
+        Download global50.json and return a dict mapping filename to ROI.
+        """
+        roi_map = {}
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                temp_path = tmp.name
+
+            if self.cloud_sync.download_file(self.cloud_json_path, temp_path):
+                with open(temp_path, 'r') as f:
+                    data = json.load(f)
+                for entry in data.get('entries', []):
+                    run_name = entry.get('run_name', '')
+                    agent_id = entry.get('agent_id', 0)
+                    roi = entry.get('roi', 0.0)
+                    filename = f"{run_name}_{agent_id}.pth"
+                    roi_map[filename] = roi
+
+            import os
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except Exception as e:
+            print(f"   ⚠ Could not load global50.json for ROI lookup: {e}")
+        return roi_map
 
     def list_cloud_agents(self, include_archive: bool = True) -> List[str]:
         """List all .pth files in cloud agents/ directory and optionally archive/."""
@@ -356,16 +411,17 @@ class Global50Fixer:
     def fix(self, dry_run: bool = False):
         """
         Main fix routine:
-        1. Download all agents from cloud
-        2. Evaluate each 3 times
-        3. Select top 50 by average of lowest 2 scores
-        4. Ask for confirmation
-        5. Archive non-selected agents
-        6. Update global50.json
+        1. Discover agents and filter by ROI (from JSON scoresheets)
+        2. Download valid agents
+        3. Evaluate each 3 times (exclude any with ROI < threshold)
+        4. Select top 50 by average of lowest 2 scores
+        5. Ask for confirmation
+        6. Archive non-selected agents
         7. Run final eval for pure scores
+        8. Update global50.json
         """
         print("\n" + "="*70)
-        print("PHASE 1: Download all agents from cloud (agents/ + archive/)")
+        print("PHASE 1: Discover agents and filter by ROI")
         print("="*70)
 
         # List all agents in cloud (both agents/ and archive/)
@@ -378,12 +434,87 @@ class Global50Fixer:
         agents_set = set(agents_files)
         archive_set = set(archive_files)
 
-        print(f"\nDownloading {len(all_files)} agents...")
+        # Get ROI data from global50.json (for agents/) and scoresheets (for archive/)
+        print(f"\nLoading ROI data to filter out low-quality agents (ROI < {self.MIN_ROI_THRESHOLD}%)...")
+        roi_map = self.get_roi_from_global50_json()
+
+        # For archive files, get ROI from their JSON scoresheets
+        for filename in archive_files:
+            if filename not in roi_map:
+                roi = self.get_agent_roi_from_scoresheet(filename, from_archive=True)
+                if roi is not None:
+                    roi_map[filename] = roi
+
+        # Filter out agents with ROI below threshold
+        to_exclude = []
+        valid_files = []
+        for filename in all_files:
+            roi = roi_map.get(filename)
+            if roi is not None and roi < self.MIN_ROI_THRESHOLD:
+                to_exclude.append((filename, roi, filename in archive_set))
+            else:
+                valid_files.append(filename)
+
+        print(f"\n   Total agents found: {len(all_files)}")
+        print(f"   Valid agents (ROI >= {self.MIN_ROI_THRESHOLD}% or unknown): {len(valid_files)}")
+        print(f"   To exclude (ROI < {self.MIN_ROI_THRESHOLD}%): {len(to_exclude)}")
+
+        # Show agents to exclude
+        if to_exclude:
+            print(f"\n   Agents to be moved to exclude/:")
+            for filename, roi, from_archive in to_exclude:
+                location = "archive" if from_archive else "agents"
+                print(f"     - {filename} (ROI: {roi:.4f}%, from {location})")
+
+        # Move excluded agents to exclude/ folder
+        if to_exclude and not dry_run:
+            print(f"\n   Moving {len(to_exclude)} agents to exclude/...")
+            self.local_exclude_dir.mkdir(parents=True, exist_ok=True)
+
+            for filename, roi, from_archive in to_exclude:
+                if from_archive:
+                    cloud_src = f"{self.cloud_archive_prefix}{filename}"
+                else:
+                    cloud_src = f"{self.cloud_agents_prefix}{filename}"
+                cloud_dst = f"{self.cloud_exclude_prefix}{filename}"
+
+                try:
+                    # Download to local exclude
+                    local_exclude_path = self.local_exclude_dir / filename
+                    self.cloud_sync.download_file(cloud_src, str(local_exclude_path))
+
+                    # Upload to cloud exclude
+                    self.cloud_sync.upload_file_verified(str(local_exclude_path), cloud_dst)
+
+                    # Delete from source
+                    if self.cloud_sync.file_exists(cloud_dst):
+                        self.cloud_sync.delete_file(cloud_src)
+                        # Also delete JSON scoresheet if from archive
+                        if from_archive:
+                            json_src = cloud_src.replace('.pth', '.json')
+                            json_dst = cloud_dst.replace('.pth', '.json')
+                            if self.cloud_sync.file_exists(json_src):
+                                # Download scoresheet
+                                local_json = self.local_exclude_dir / filename.replace('.pth', '.json')
+                                self.cloud_sync.download_file(json_src, str(local_json))
+                                self.cloud_sync.upload_file_verified(str(local_json), json_dst)
+                                self.cloud_sync.delete_file(json_src)
+                        print(f"     ✓ {filename}")
+                    else:
+                        print(f"     ⚠ {filename} - upload not verified")
+                except Exception as e:
+                    print(f"     ✗ {filename} - {e}")
+
+        print("\n" + "="*70)
+        print("PHASE 2: Download valid agents")
+        print("="*70)
+
+        print(f"\nDownloading {len(valid_files)} agents...")
         downloaded_paths = []
-        for i, filename in enumerate(all_files, 1):
+        for i, filename in enumerate(valid_files, 1):
             from_archive = filename in archive_set
             location = "archive" if from_archive else "agents"
-            print(f"  [{i}/{len(all_files)}] {filename} ({location})...", end=" ")
+            print(f"  [{i}/{len(valid_files)}] {filename} ({location})...", end=" ")
             path = self.download_agent(filename, from_archive=from_archive)
             if path:
                 downloaded_paths.append(path)
@@ -391,17 +522,19 @@ class Global50Fixer:
             else:
                 print("✗ FAILED")
 
-        print(f"\n✓ Downloaded {len(downloaded_paths)}/{len(all_files)} agents")
+        print(f"\n✓ Downloaded {len(downloaded_paths)}/{len(valid_files)} agents")
 
         if len(downloaded_paths) == 0:
             print("✗ No agents downloaded. Cannot proceed.")
             return
 
         print("\n" + "="*70)
-        print("PHASE 2: Evaluate each agent 3 times")
+        print("PHASE 3: Evaluate each agent 3 times")
         print("="*70)
 
         results = []
+        excluded_after_eval = []  # Agents found to have ROI < threshold after evaluation
+
         for i, agent_path in enumerate(downloaded_paths, 1):
             print(f"\n[{i}/{len(downloaded_paths)}] Evaluating: {agent_path.name}")
             result = self.evaluate_agent_multiple_times(agent_path, num_evals=3)
@@ -412,18 +545,67 @@ class Global50Fixer:
                 print(f"   Avg of lowest 2: {result['avg_lowest_2']:.2f}")
                 print(f"   ROI: {result['median_metrics']['roi']:.2f}%")
                 print(f"   Expectancy: {result['median_metrics']['expectancy']:.4f}")
+
+                # Check if ROI is below threshold - if so, mark for exclusion
+                if result['median_metrics']['roi'] < self.MIN_ROI_THRESHOLD:
+                    print(f"   ⚠ ROI below {self.MIN_ROI_THRESHOLD}% - will be excluded")
+                    excluded_after_eval.append(result)
+                else:
+                    results.append(result)
             else:
                 print(f"   ✗ Error: {result.get('error', 'Unknown')}")
-
-            results.append(result)
+                results.append(result)
 
         # Filter successful results
         successful = [r for r in results if r['success']]
         failed = [r for r in results if not r['success']]
 
         print(f"\n{'='*70}")
-        print(f"PHASE 2 COMPLETE: {len(successful)} successful, {len(failed)} failed")
+        print(f"PHASE 3 COMPLETE: {len(successful)} successful, {len(failed)} failed, {len(excluded_after_eval)} excluded (low ROI)")
         print(f"{'='*70}")
+
+        # Move newly excluded agents to exclude/ folder
+        if excluded_after_eval and not dry_run:
+            print(f"\nMoving {len(excluded_after_eval)} low-ROI agents to exclude/...")
+            self.local_exclude_dir.mkdir(parents=True, exist_ok=True)
+
+            for r in excluded_after_eval:
+                filename = r['filename']
+                from_archive = filename in archive_set
+                if from_archive:
+                    cloud_src = f"{self.cloud_archive_prefix}{filename}"
+                else:
+                    cloud_src = f"{self.cloud_agents_prefix}{filename}"
+                cloud_dst = f"{self.cloud_exclude_prefix}{filename}"
+
+                try:
+                    # Copy from temp to local exclude
+                    src_path = self.temp_agents_dir / filename
+                    local_exclude_path = self.local_exclude_dir / filename
+                    if src_path.exists():
+                        import shutil
+                        shutil.copy(str(src_path), str(local_exclude_path))
+
+                    # Upload to cloud exclude
+                    self.cloud_sync.upload_file_verified(str(local_exclude_path), cloud_dst)
+
+                    # Delete from source in cloud
+                    if self.cloud_sync.file_exists(cloud_dst):
+                        self.cloud_sync.delete_file(cloud_src)
+                        # Also move JSON scoresheet if from archive
+                        if from_archive:
+                            json_src = cloud_src.replace('.pth', '.json')
+                            json_dst = cloud_dst.replace('.pth', '.json')
+                            if self.cloud_sync.file_exists(json_src):
+                                local_json = self.local_exclude_dir / filename.replace('.pth', '.json')
+                                self.cloud_sync.download_file(json_src, str(local_json))
+                                self.cloud_sync.upload_file_verified(str(local_json), json_dst)
+                                self.cloud_sync.delete_file(json_src)
+                        print(f"  ✓ {filename} (ROI: {r['median_metrics']['roi']:.4f}%)")
+                    else:
+                        print(f"  ⚠ {filename} - upload not verified")
+                except Exception as e:
+                    print(f"  ✗ {filename} - {e}")
 
         if failed:
             print("\nFailed agents:")
@@ -431,7 +613,7 @@ class Global50Fixer:
                 print(f"  ✗ {r['filename']}: {r.get('error', 'Unknown')}")
 
         print("\n" + "="*70)
-        print("PHASE 3: Select top 50 by avg of lowest 2 scores")
+        print("PHASE 4: Select top 50 by avg of lowest 2 scores")
         print("="*70)
 
         # Sort by avg_lowest_2 score (descending)
@@ -471,7 +653,7 @@ class Global50Fixer:
                 print(f"{50+i:<6} {r['avg_lowest_2']:<12.2f} [{scores_str}] {r['run_name'][:28]:<30}")
 
         print(f"\n{'='*70}")
-        print("PHASE 4: Confirmation")
+        print("PHASE 5: Confirmation")
         print(f"{'='*70}")
 
         if dry_run:
@@ -492,7 +674,7 @@ class Global50Fixer:
             return
 
         print("\n" + "="*70)
-        print("PHASE 5: Archive non-selected agents")
+        print("PHASE 6: Archive non-selected agents")
         print("="*70)
 
         # Create local directories
@@ -542,7 +724,7 @@ class Global50Fixer:
                 json.dump(scoresheet_data, f, indent=2)
 
         print("\n" + "="*70)
-        print("PHASE 6: Run final evaluation for pure scores")
+        print("PHASE 7: Run final evaluation for pure scores")
         print("="*70)
 
         # Copy selected agents to local agents dir
@@ -602,7 +784,7 @@ class Global50Fixer:
         final_entries.sort(key=lambda e: e.gauntlet_score, reverse=True)
 
         print("\n" + "="*70)
-        print("PHASE 7: Update global50.json")
+        print("PHASE 8: Update global50.json")
         print("="*70)
 
         # Build new global50.json
