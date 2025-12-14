@@ -1990,8 +1990,16 @@ class AgentEvaluator:
         # When Global 50 is not full, _update_entry_threshold sets thresholds to -inf,
         # which would accept any agent. Instead, we compute thresholds from the existing
         # population to maintain quality standards.
-        if current_size > 0 and current_size < self.global_hof.CAPACITY:
-            # Compute actual thresholds from existing population
+        #
+        # We define a helper function to recompute thresholds after each promotion,
+        # since check_and_promote internally calls _update_entry_threshold which resets to -inf.
+        def recompute_thresholds_from_population():
+            """Recompute thresholds from existing population (used during archive-fill)."""
+            if len(self.global_hof.entries) == 0:
+                return  # No entries, can't compute thresholds
+            if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
+                return  # Full, normal thresholds apply
+
             gauntlet_scores = [e.gauntlet_score for e in self.global_hof.entries]
             roi_values = [e.roi for e in self.global_hof.entries]
             expectancy_values = [e.expectancy for e in self.global_hof.entries]
@@ -2009,6 +2017,8 @@ class AgentEvaluator:
             self.global_hof.roi_p75 = float(np.percentile(roi_values, 75))
             self.global_hof.expectancy_p75 = float(np.percentile(expectancy_values, 75))
 
+        if current_size > 0 and current_size < self.global_hof.CAPACITY:
+            recompute_thresholds_from_population()
             print(f"\n  ⚠ Global 50 not full - applying normal promotion thresholds from existing {current_size} agents")
 
         # Thresholds are managed by GlobalHoF - already updated above
@@ -2179,8 +2189,10 @@ class AgentEvaluator:
                         cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{filename.replace('.pth', '.json')}"
                         self.cloud_sync.delete_file(cloud_scoresheet_path)
 
-                        # Thresholds are automatically updated by check_and_promote
-                        # Just print a summary
+                        # Recompute thresholds from the updated population.
+                        # check_and_promote calls _update_entry_threshold which resets to -inf
+                        # when not full, so we need to restore proper thresholds.
+                        recompute_thresholds_from_population()
                         print(f"  Updated thresholds - Minimums: Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}")
                     else:
                         print(f"  ⚠ Promotion failed (concurrent update?)")
