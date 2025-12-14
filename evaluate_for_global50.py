@@ -1875,12 +1875,6 @@ class AgentEvaluator:
         print(f"{'='*70}")
 
         for i, candidate in enumerate(candidates, 1):
-            # Check if we've filled all slots
-            current_size = len(self.global_hof.entries)
-            if current_size >= self.global_hof.CAPACITY:
-                print(f"\n✓ Global 50 is now full ({current_size}/{self.global_hof.CAPACITY}). Stopping evaluation.")
-                break
-
             print(f"\n[{i}/{len(candidates)}] {candidate['run_name']} (Agent {candidate['agent_id']})")
             print(f"  Archived Score: {candidate.get('gauntlet_score', 0):.2f}")
 
@@ -1918,7 +1912,8 @@ class AgentEvaluator:
                 print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
                 print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
 
-                # Check if qualifies for promotion using archive fill thresholds
+                # Check if qualifies for promotion using current thresholds
+                # Thresholds are dynamic - recalculated after each promotion
                 # Criteria: gauntlet > threshold AND (ROI > threshold OR expectancy > threshold)
                 passes_gauntlet = new_score > archive_fill_gauntlet_threshold
                 passes_roi = metrics['roi'] > archive_fill_roi_threshold
@@ -1928,8 +1923,8 @@ class AgentEvaluator:
                 if qualifies:
                     print(f"\n  ✓ Agent QUALIFIES for Global 50!")
 
-                    # Attempt promotion (bypass should_promote check since we already validated)
-                    # Temporarily override thresholds to ensure promotion succeeds
+                    # Attempt promotion
+                    # Temporarily override thresholds to ensure check_and_promote succeeds
                     original_entry_threshold = self.global_hof.entry_threshold
                     original_roi_threshold = self.global_hof.roi_threshold
                     original_expectancy_threshold = self.global_hof.expectancy_threshold
@@ -1970,6 +1965,14 @@ class AgentEvaluator:
                         self.cloud_sync.delete_file(cloud_archive_path)
                         cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{filename.replace('.pth', '.json')}"
                         self.cloud_sync.delete_file(cloud_scoresheet_path)
+
+                        # Update thresholds based on new Global 50 state
+                        # This raises the bar as better agents are added
+                        if len(self.global_hof.entries) > 0:
+                            archive_fill_gauntlet_threshold = min(e.gauntlet_score for e in self.global_hof.entries)
+                            archive_fill_roi_threshold = min(e.roi for e in self.global_hof.entries)
+                            archive_fill_expectancy_threshold = min(e.expectancy for e in self.global_hof.entries)
+                            print(f"  Updated thresholds: Gauntlet={archive_fill_gauntlet_threshold:.2f}, ROI={archive_fill_roi_threshold:.2f}%, Expectancy={archive_fill_expectancy_threshold:.4f}")
                     else:
                         print(f"  ⚠ Promotion failed (concurrent update?)")
 
