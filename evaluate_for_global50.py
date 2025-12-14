@@ -1376,6 +1376,20 @@ class AgentEvaluator:
                 print(f"{r['entry'].run_name:<30} {r['old_score']:<12.2f} {r['new_score']:<12.2f} {symbol} {change_str:<10}")
 
             avg_change = sum(r['change'] for r in successful) / len(successful)
+
+            # Calculate overall metrics from updated entries
+            all_scores = [r['new_score'] for r in successful]
+            all_rois = [r['updated_entry'].roi for r in successful]
+            all_expectancies = [r['updated_entry'].expectancy for r in successful]
+            all_trades = [r['updated_entry'].total_trades for r in successful]
+
+            print(f"\n{'='*70}")
+            print(f"Overall Metrics (after re-evaluation)")
+            print(f"{'='*70}")
+            print(f"  Gauntlet Score:  min={min(all_scores):.2f}  mean={sum(all_scores)/len(all_scores):.2f}  max={max(all_scores):.2f}")
+            print(f"  ROI:             min={min(all_rois):.2f}%  mean={sum(all_rois)/len(all_rois):.2f}%  max={max(all_rois):.2f}%")
+            print(f"  Expectancy:      min={min(all_expectancies):.4f}  mean={sum(all_expectancies)/len(all_expectancies):.4f}  max={max(all_expectancies):.4f}")
+            print(f"  Total Trades:    min={min(all_trades)}  mean={sum(all_trades)/len(all_trades):.1f}  max={max(all_trades)}")
             print(f"\nAverage Score Change: {avg_change:+.2f}")
 
         if len(failed) > 0:
@@ -1702,7 +1716,21 @@ class AgentEvaluator:
         print(f"{'='*70}")
         print(f"  Removed:        {len(agents_to_remove)} agents")
         print(f"  Remaining:      {len(agents_to_keep)} agents")
-        print(f"  New thresholds:")
+
+        # Show overall metrics for remaining agents
+        if len(agents_to_keep) > 0:
+            all_scores = [e.gauntlet_score for e in agents_to_keep]
+            all_rois = [e.roi for e in agents_to_keep]
+            all_expectancies = [e.expectancy for e in agents_to_keep]
+            all_trades = [e.total_trades for e in agents_to_keep]
+
+            print(f"\n  Overall Metrics (remaining agents):")
+            print(f"    Gauntlet:     min={min(all_scores):.2f}  mean={sum(all_scores)/len(all_scores):.2f}  max={max(all_scores):.2f}")
+            print(f"    ROI:          min={min(all_rois):.2f}%  mean={sum(all_rois)/len(all_rois):.2f}%  max={max(all_rois):.2f}%")
+            print(f"    Expectancy:   min={min(all_expectancies):.4f}  mean={sum(all_expectancies)/len(all_expectancies):.4f}  max={max(all_expectancies):.4f}")
+            print(f"    Total Trades: min={min(all_trades)}  mean={sum(all_trades)/len(all_trades):.1f}  max={max(all_trades)}")
+
+        print(f"\n  New thresholds:")
         print(f"    Gauntlet:     {self.global_hof.entry_threshold:.2f}")
         print(f"    ROI:          {self.global_hof.roi_threshold:.2f}%")
         print(f"    Expectancy:   {self.global_hof.expectancy_threshold:.4f}")
