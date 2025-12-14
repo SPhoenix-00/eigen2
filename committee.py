@@ -698,8 +698,9 @@ def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
             'fitness': -Config.ZERO_TRADES_PENALTY_GAUNTLET,
         }
 
-    # Get returns for active positions
-    trade_returns = slice_returns[trades_mask]
+    # Get returns for active positions (only investable stocks)
+    investable_returns = slice_returns[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1]
+    trade_returns = investable_returns[trades_mask]
     trade_weights = active[trades_mask]
 
     # Weighted PnL
@@ -780,7 +781,9 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
     active = np.where(triggers, np.maximum(0, avg_coef - Config.COEFFICIENT_THRESHOLD), 0)
     active = np.minimum(active, 2.0)
 
-    trade_returns = slice_returns[triggers]
+    # Extract returns for investable stocks only
+    investable_returns = slice_returns[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1]
+    trade_returns = investable_returns[triggers]
     trade_weights = active[triggers]
 
     weighted_returns = trade_returns * trade_weights
