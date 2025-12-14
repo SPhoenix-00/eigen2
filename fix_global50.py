@@ -685,26 +685,38 @@ class Global50Fixer:
         # Archive agents that didn't make the cut
         for r in to_archive:
             filename = r['filename']
-            print(f"  Archiving: {filename}...", end=" ")
+            from_archive = filename in archive_set
+            location = "archive" if from_archive else "agents"
+            print(f"  Archiving: {filename} (from {location})...", end=" ")
 
-            # Move to archive in cloud
-            cloud_src = f"{self.cloud_agents_prefix}{filename}"
+            # Determine source path in cloud
+            if from_archive:
+                cloud_src = f"{self.cloud_archive_prefix}{filename}"
+            else:
+                cloud_src = f"{self.cloud_agents_prefix}{filename}"
             cloud_dst = f"{self.cloud_archive_prefix}{filename}"
 
             try:
-                # Download to local archive
+                # Copy from temp dir to local archive (we already have it downloaded)
                 local_archive_path = self.local_archive_dir / filename
-                self.cloud_sync.download_file(cloud_src, str(local_archive_path))
+                src_path = self.temp_agents_dir / filename
+                if src_path.exists():
+                    import shutil
+                    shutil.copy(str(src_path), str(local_archive_path))
 
-                # Upload to cloud archive
-                self.cloud_sync.upload_file_verified(str(local_archive_path), cloud_dst)
+                # Upload to cloud archive (if not already there)
+                if not from_archive:
+                    self.cloud_sync.upload_file_verified(str(local_archive_path), cloud_dst)
 
-                # Delete from cloud agents/
-                if self.cloud_sync.file_exists(cloud_dst):
-                    self.cloud_sync.delete_file(cloud_src)
-                    print("✓")
+                    # Delete from cloud agents/
+                    if self.cloud_sync.file_exists(cloud_dst):
+                        self.cloud_sync.delete_file(cloud_src)
+                        print("✓")
+                    else:
+                        print("⚠ Archive upload not verified")
                 else:
-                    print("⚠ Archive upload not verified")
+                    # Already in archive, just print success
+                    print("✓ (already in archive)")
             except Exception as e:
                 print(f"✗ Error: {e}")
 
@@ -727,13 +739,36 @@ class Global50Fixer:
         print("PHASE 7: Run final evaluation for pure scores")
         print("="*70)
 
-        # Copy selected agents to local agents dir
+        # Copy selected agents to local agents dir and sync to cloud
+        print("\nSyncing top 50 agents to local and cloud agents/...")
         for r in top_50:
-            src = self.temp_agents_dir / r['filename']
-            dst = self.local_agents_dir / r['filename']
+            filename = r['filename']
+            from_archive = filename in archive_set
+            src = self.temp_agents_dir / filename
+            dst = self.local_agents_dir / filename
+
             if src.exists():
                 import shutil
                 shutil.copy(str(src), str(dst))
+
+                # If agent came from archive, upload to cloud agents/ and remove from archive
+                if from_archive:
+                    cloud_agents_path = f"{self.cloud_agents_prefix}{filename}"
+                    cloud_archive_path = f"{self.cloud_archive_prefix}{filename}"
+
+                    # Upload to agents/
+                    self.cloud_sync.upload_file_verified(str(dst), cloud_agents_path)
+
+                    # Delete from archive/
+                    if self.cloud_sync.file_exists(cloud_agents_path):
+                        self.cloud_sync.delete_file(cloud_archive_path)
+                        # Also delete JSON scoresheet from archive
+                        json_archive_path = cloud_archive_path.replace('.pth', '.json')
+                        if self.cloud_sync.file_exists(json_archive_path):
+                            self.cloud_sync.delete_file(json_archive_path)
+                        print(f"  ✓ {filename} (moved from archive to agents)")
+                else:
+                    print(f"  ✓ {filename} (already in agents)")
 
         # Final evaluation (single run for pure scores)
         final_entries = []
@@ -834,6 +869,192 @@ class Global50Fixer:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
         print("✓ Done")
 
+    def cleanup(self):
+        """
+        Cleanup mode: Sync local state with cloud without re-evaluating.
+
+        This assumes we just ran fix() and need to ensure:
+        1. global50.json is consistent (entries match actual agent files)
+        2. agents/ folder has all files for entries in global50.json
+        3. archive/ has agents not in global50.json
+        4. exclude/ has low-ROI agents
+        5. No orphan files exist
+        """
+        print("\n" + "="*70)
+        print("CLEANUP MODE")
+        print("="*70)
+
+        # Create local directories
+        self.local_dir.mkdir(parents=True, exist_ok=True)
+        self.local_agents_dir.mkdir(parents=True, exist_ok=True)
+        self.local_archive_dir.mkdir(parents=True, exist_ok=True)
+        self.local_exclude_dir.mkdir(parents=True, exist_ok=True)
+
+        # Step 1: Download current global50.json
+        print("\n1. Loading global50.json from cloud...")
+        if not self.cloud_sync.download_file(self.cloud_json_path, str(self.local_json_path)):
+            print("   ✗ Failed to download global50.json")
+            return
+
+        with open(self.local_json_path, 'r') as f:
+            data = json.load(f)
+
+        entries = data.get('entries', [])
+        print(f"   Found {len(entries)} entries in global50.json")
+
+        # Build expected filenames from entries
+        expected_agents = {}
+        for entry in entries:
+            filename = f"{entry['run_name']}_{entry['agent_id']}.pth"
+            expected_agents[filename] = entry
+
+        # Step 2: List actual files in cloud
+        print("\n2. Listing files in cloud storage...")
+        all_files, agents_files, archive_files = self.list_cloud_agents(include_archive=True)
+
+        agents_set = set(agents_files)
+        archive_set = set(archive_files)
+
+        # Step 3: Check for missing agent files
+        print("\n3. Checking for missing agent files...")
+        missing_agents = []
+        for filename in expected_agents:
+            if filename not in agents_set:
+                missing_agents.append(filename)
+                print(f"   ⚠ Missing in agents/: {filename}")
+
+        if not missing_agents:
+            print("   ✓ All expected agents present in agents/")
+
+        # Step 4: Check for orphan files in agents/
+        print("\n4. Checking for orphan files in agents/...")
+        orphan_agents = []
+        for filename in agents_files:
+            if filename not in expected_agents:
+                orphan_agents.append(filename)
+                print(f"   ⚠ Orphan in agents/: {filename}")
+
+        if not orphan_agents:
+            print("   ✓ No orphan files in agents/")
+
+        # Step 5: Try to recover missing agents from archive
+        if missing_agents:
+            print("\n5. Attempting to recover missing agents from archive...")
+            for filename in missing_agents:
+                if filename in archive_set:
+                    print(f"   Found {filename} in archive, moving to agents/...")
+                    cloud_src = f"{self.cloud_archive_prefix}{filename}"
+                    cloud_dst = f"{self.cloud_agents_prefix}{filename}"
+                    local_path = self.local_agents_dir / filename
+
+                    # Download from archive
+                    if self.cloud_sync.download_file(cloud_src, str(local_path)):
+                        # Upload to agents
+                        if self.cloud_sync.upload_file_verified(str(local_path), cloud_dst):
+                            # Delete from archive
+                            self.cloud_sync.delete_file(cloud_src)
+                            # Delete JSON scoresheet from archive too
+                            json_src = cloud_src.replace('.pth', '.json')
+                            if self.cloud_sync.file_exists(json_src):
+                                self.cloud_sync.delete_file(json_src)
+                            print(f"   ✓ Recovered {filename}")
+                        else:
+                            print(f"   ✗ Failed to upload {filename}")
+                    else:
+                        print(f"   ✗ Failed to download {filename} from archive")
+                else:
+                    print(f"   ✗ {filename} not found in archive either - entry invalid!")
+        else:
+            print("\n5. No missing agents to recover")
+
+        # Step 6: Move orphan agents to archive
+        if orphan_agents:
+            print("\n6. Moving orphan agents to archive...")
+            for filename in orphan_agents:
+                cloud_src = f"{self.cloud_agents_prefix}{filename}"
+                cloud_dst = f"{self.cloud_archive_prefix}{filename}"
+                local_path = self.local_archive_dir / filename
+
+                # Download to local archive
+                if self.cloud_sync.download_file(cloud_src, str(local_path)):
+                    # Upload to cloud archive
+                    if self.cloud_sync.upload_file_verified(str(local_path), cloud_dst):
+                        # Delete from agents
+                        self.cloud_sync.delete_file(cloud_src)
+                        print(f"   ✓ Archived {filename}")
+
+                        # Create scoresheet for archived agent
+                        scoresheet_path = self.local_archive_dir / filename.replace('.pth', '.json')
+                        scoresheet_data = {
+                            'run_name': filename.rsplit('_', 1)[0],
+                            'agent_id': int(filename.rsplit('_', 1)[1].replace('.pth', '')),
+                            'archived_at': datetime.utcnow().isoformat() + 'Z',
+                            'reason': 'orphan_cleanup'
+                        }
+                        with open(scoresheet_path, 'w') as f:
+                            json.dump(scoresheet_data, f, indent=2)
+                    else:
+                        print(f"   ✗ Failed to archive {filename}")
+                else:
+                    print(f"   ✗ Failed to download {filename}")
+        else:
+            print("\n6. No orphan agents to archive")
+
+        # Step 7: Remove invalid entries from global50.json
+        print("\n7. Validating global50.json entries...")
+        # Re-check which agents actually exist now
+        valid_entries = []
+        invalid_entries = []
+
+        for entry in entries:
+            filename = f"{entry['run_name']}_{entry['agent_id']}.pth"
+            cloud_path = f"{self.cloud_agents_prefix}{filename}"
+            if self.cloud_sync.file_exists(cloud_path):
+                valid_entries.append(entry)
+            else:
+                invalid_entries.append(entry)
+                print(f"   ⚠ Removing invalid entry: {filename}")
+
+        if invalid_entries:
+            print(f"\n   Removing {len(invalid_entries)} invalid entries...")
+            data['entries'] = valid_entries
+            data['last_updated'] = datetime.utcnow().isoformat() + 'Z'
+
+            # Save locally
+            with open(self.local_json_path, 'w') as f:
+                json.dump(data, f, indent=2)
+
+            # Upload to cloud
+            if self.cloud_sync.upload_file_verified(str(self.local_json_path), self.cloud_json_path):
+                print(f"   ✓ Updated global50.json ({len(valid_entries)} entries)")
+            else:
+                print(f"   ✗ Failed to upload global50.json")
+        else:
+            print("   ✓ All entries are valid")
+
+        # Step 8: Sync local directories with cloud
+        print("\n8. Syncing local directories with cloud...")
+
+        # Download all agents to local
+        print("   Syncing agents/...")
+        for filename in expected_agents:
+            cloud_path = f"{self.cloud_agents_prefix}{filename}"
+            local_path = self.local_agents_dir / filename
+            if not local_path.exists():
+                if self.cloud_sync.download_file(cloud_path, str(local_path)):
+                    print(f"   ✓ Downloaded {filename}")
+
+        # Summary
+        print("\n" + "="*70)
+        print("CLEANUP COMPLETE")
+        print("="*70)
+        print(f"\n  Global 50 entries: {len(valid_entries)}")
+        print(f"  Invalid entries removed: {len(invalid_entries)}")
+        print(f"  Missing agents recovered: {len([f for f in missing_agents if f in archive_set])}")
+        print(f"  Orphan agents archived: {len(orphan_agents)}")
+        print(f"\n  Local:  {self.local_dir}")
+        print(f"  Cloud:  gs://{self.cloud_sync.bucket_name}/{self.cloud_base}/")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -841,9 +1062,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python fix_global50.py                    # Fix cw151 (default)
+  python fix_global50.py                    # Fix cw151 (default) - full re-evaluation
   python fix_global50.py --context-window 504   # Fix cw504
   python fix_global50.py --dry-run          # Preview without changes
+  python fix_global50.py --cleanup          # Sync state without re-evaluating
         """
     )
 
@@ -860,10 +1082,20 @@ Examples:
         help='Show what would happen without making changes'
     )
 
+    parser.add_argument(
+        '--cleanup',
+        action='store_true',
+        help='Sync local/cloud state without re-evaluating. Ensures global50.json matches actual files.'
+    )
+
     args = parser.parse_args()
 
     fixer = Global50Fixer(context_window_days=args.context_window)
-    fixer.fix(dry_run=args.dry_run)
+
+    if args.cleanup:
+        fixer.cleanup()
+    else:
+        fixer.fix(dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

@@ -166,11 +166,13 @@ class GlobalHallOfFame:
         self.local_dir = self.LOCAL_BASE_DIR / self.context_window_id
         self.local_agents_dir = self.local_dir / "agents"
         self.local_archive_dir = self.local_dir / "archive"
+        self.local_exclude_dir = self.local_dir / "exclude"
         self.local_json_path = self.local_dir / "global50.json"
 
         # Cloud paths (now include context window subdirectory)
         self.cloud_base = f"{cloud_sync.project_name}/global50/{self.context_window_id}"
         self.cloud_json_path = f"{self.cloud_base}/global50.json"
+        self.cloud_exclude_prefix = f"{self.cloud_base}/exclude/"
 
         # Fallback leagues for diversity injection (populated during initialization)
         self.fallback_leagues: List[Dict] = []
@@ -190,6 +192,7 @@ class GlobalHallOfFame:
         self.local_dir.mkdir(parents=True, exist_ok=True)
         self.local_agents_dir.mkdir(parents=True, exist_ok=True)
         self.local_archive_dir.mkdir(parents=True, exist_ok=True)
+        self.local_exclude_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'='*60}")
         print("Global Hall of Fame - Initialization")

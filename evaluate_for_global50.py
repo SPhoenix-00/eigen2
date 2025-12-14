@@ -44,6 +44,9 @@ from training.erl_trainer import ERLTrainer
 class AgentEvaluator:
     """Evaluates agents and promotes them to Global 50."""
 
+    # Minimum ROI threshold - agents below this are excluded (not real performers)
+    MIN_ROI_THRESHOLD = 0.01  # 0.01%
+
     def __init__(self, run_name: str = "batch-evaluation"):
         """
         Initialize evaluator.
@@ -510,6 +513,85 @@ class AgentEvaluator:
             print(f"   Status: INCOMPLETE - Run --mirror to verify")
         else:
             print(f"   Status: UP TO DATE")
+
+    def move_to_exclude(self, entry: GlobalHoFEntry, reason: str = "low_roi") -> bool:
+        """
+        Move an agent to the exclude/ folder (for agents that don't meet minimum standards).
+
+        This is different from archive - excluded agents are considered invalid/useless
+        (e.g., ROI below minimum threshold), while archived agents are just not in the top 50.
+
+        Args:
+            entry: The GlobalHoFEntry to exclude
+            reason: Reason for exclusion (for logging)
+
+        Returns:
+            True if successfully excluded, False otherwise
+        """
+        import shutil
+
+        filename = entry.get_filename()
+        scoresheet_filename = filename.replace('.pth', '.json')
+
+        print(f"   Excluding: {filename} (reason: {reason})")
+
+        # Local paths
+        local_src_agents = self.global_hof.local_agents_dir / filename
+        local_src_archive = self.global_hof.local_archive_dir / filename
+        local_dst = self.global_hof.local_exclude_dir / filename
+        local_scoresheet_dst = self.global_hof.local_exclude_dir / scoresheet_filename
+
+        # Cloud paths
+        cloud_agents_path = f"{self.global_hof.cloud_base}/agents/{filename}"
+        cloud_archive_path = f"{self.global_hof.cloud_base}/archive/{filename}"
+        cloud_exclude_path = f"{self.global_hof.cloud_exclude_prefix}{filename}"
+        cloud_exclude_scoresheet = f"{self.global_hof.cloud_exclude_prefix}{scoresheet_filename}"
+
+        try:
+            # Find source file (could be in agents/ or archive/)
+            if local_src_agents.exists():
+                shutil.move(str(local_src_agents), str(local_dst))
+                cloud_src_path = cloud_agents_path
+            elif local_src_archive.exists():
+                shutil.move(str(local_src_archive), str(local_dst))
+                cloud_src_path = cloud_archive_path
+            else:
+                # Try to download from cloud
+                if self.cloud_sync.download_file(cloud_agents_path, str(local_dst)):
+                    cloud_src_path = cloud_agents_path
+                elif self.cloud_sync.download_file(cloud_archive_path, str(local_dst)):
+                    cloud_src_path = cloud_archive_path
+                else:
+                    print(f"   ⚠ Could not find {filename} in local or cloud storage")
+                    return False
+
+            # Save metadata scoresheet
+            with open(local_scoresheet_dst, 'w') as f:
+                data = entry.to_dict()
+                data['excluded_reason'] = reason
+                data['excluded_at'] = datetime.now().isoformat()
+                json.dump(data, f, indent=2)
+
+            # Upload to cloud exclude/ with verification
+            if local_dst.exists():
+                self.cloud_sync.upload_file_verified(str(local_dst), cloud_exclude_path)
+            self.cloud_sync.upload_file_verified(str(local_scoresheet_dst), cloud_exclude_scoresheet)
+
+            # Delete from cloud agents/ or archive/ after confirming exclude exists
+            if self.cloud_sync.file_exists(cloud_exclude_path):
+                self.cloud_sync.delete_file(cloud_src_path)
+                # Also try to delete scoresheet from original location
+                original_scoresheet = cloud_src_path.replace('.pth', '.json')
+                self.cloud_sync.delete_file(original_scoresheet)
+                print(f"   ✓ Excluded: {filename}")
+                return True
+            else:
+                print(f"   ⚠ Failed to verify exclude upload for {filename}")
+                return False
+
+        except Exception as e:
+            print(f"   ✗ Error excluding {filename}: {e}")
+            return False
 
     def discover_cloud_context_windows(self) -> List[str]:
         """
@@ -1355,6 +1437,30 @@ class AgentEvaluator:
         else:
             print("\n✓ No behavioral duplicates found - all agents have unique trading patterns")
 
+        # Detect low-ROI agents that should be excluded
+        print(f"\n{'='*70}")
+        print(f"Detecting Low-ROI Agents (threshold: {self.MIN_ROI_THRESHOLD}%)")
+        print(f"{'='*70}")
+
+        low_roi_agents = []
+        for r in successful:
+            if r['updated_entry'].roi < self.MIN_ROI_THRESHOLD:
+                low_roi_agents.append(r)
+
+        if low_roi_agents:
+            print(f"\n⚠ Found {len(low_roi_agents)} agent(s) with ROI below {self.MIN_ROI_THRESHOLD}%:")
+            for r in low_roi_agents:
+                print(f"    - {r['entry'].run_name} (Agent {r['entry'].agent_id}) - ROI: {r['updated_entry'].roi:.4f}%")
+
+            print(f"\n→ These agents will be moved to exclude/ folder")
+
+            # Remove low-ROI agents from successful list and updated_entries
+            low_roi_keys = {(r['entry'].run_name, r['entry'].agent_id) for r in low_roi_agents}
+            successful = [r for r in successful if (r['entry'].run_name, r['entry'].agent_id) not in low_roi_keys]
+            updated_entries = [e for e in updated_entries if (e.run_name, e.agent_id) not in low_roi_keys]
+        else:
+            print(f"\n✓ All agents meet the minimum ROI threshold ({self.MIN_ROI_THRESHOLD}%)")
+
         # Show summary
         print(f"\n{'='*70}")
         print("Re-evaluation Summary")
@@ -1363,6 +1469,7 @@ class AgentEvaluator:
         print(f"\nTotal Agents:      {len(results)}")
         print(f"Successful:        {len(successful)}")
         print(f"Duplicates:        {len(behavioral_duplicates)}")
+        print(f"Low ROI:           {len(low_roi_agents)}")
         print(f"Failed:            {len(failed)}")
 
         if len(successful) > 0:
@@ -1414,6 +1521,10 @@ class AgentEvaluator:
             else:
                 print("Please enter 'yes' or 'no'.")
 
+        # Create sets of agents to exclude/archive
+        low_roi_keys = {(r['entry'].run_name, r['entry'].agent_id) for r in low_roi_agents}
+        duplicate_keys = {(d['entry'].run_name, d['entry'].agent_id) for d in behavioral_duplicates}
+
         # Update entries (only successful ones, keep failed ones with old scores)
         # Create a map of updated entries by (run_name, agent_id)
         update_map = {
@@ -1421,10 +1532,13 @@ class AgentEvaluator:
             for r in successful
         }
 
-        # Update entries list
+        # Update entries list - exclude low_roi and duplicate agents
         final_entries = []
         for entry in self.global_hof.entries:
             key = (entry.run_name, entry.agent_id)
+            # Skip low ROI and duplicate agents
+            if key in low_roi_keys or key in duplicate_keys:
+                continue
             if key in update_map:
                 final_entries.append(update_map[key])
             else:
@@ -1449,10 +1563,67 @@ class AgentEvaluator:
         else:
             self.global_hof._upload_global_ledger()
 
+        # Move low-ROI agents to exclude/ folder
+        if low_roi_agents:
+            print(f"\n{'='*70}")
+            print(f"Moving {len(low_roi_agents)} low-ROI agents to exclude/ folder...")
+            print(f"{'='*70}")
+            excluded_count = 0
+            for r in low_roi_agents:
+                if self.move_to_exclude(r['updated_entry'], reason=f"ROI {r['updated_entry'].roi:.4f}% < {self.MIN_ROI_THRESHOLD}%"):
+                    excluded_count += 1
+            print(f"\n✓ Excluded {excluded_count}/{len(low_roi_agents)} low-ROI agents")
+
+        # Archive behavioral duplicates
+        if behavioral_duplicates:
+            print(f"\n{'='*70}")
+            print(f"Archiving {len(behavioral_duplicates)} behavioral duplicates...")
+            print(f"{'='*70}")
+            import shutil
+            archived_count = 0
+            for dup in behavioral_duplicates:
+                entry = dup['entry']
+                filename = entry.get_filename()
+                local_src = self.global_hof.local_agents_dir / filename
+                local_dst = self.global_hof.local_archive_dir / filename
+
+                try:
+                    if local_src.exists():
+                        shutil.move(str(local_src), str(local_dst))
+
+                    # Save metadata scoresheet
+                    scoresheet_filename = filename.replace('.pth', '.json')
+                    scoresheet_path = self.global_hof.local_archive_dir / scoresheet_filename
+                    with open(scoresheet_path, 'w') as f:
+                        data = dup['updated_entry'].to_dict()
+                        data['archived_reason'] = 'behavioral_duplicate'
+                        json.dump(data, f, indent=2)
+
+                    # Cloud operations
+                    cloud_archive_pth = f"{self.global_hof.cloud_base}/archive/{filename}"
+                    cloud_archive_json = f"{self.global_hof.cloud_base}/archive/{scoresheet_filename}"
+                    cloud_agents_pth = f"{self.global_hof.cloud_base}/agents/{filename}"
+
+                    if local_dst.exists():
+                        self.cloud_sync.upload_file_verified(str(local_dst), cloud_archive_pth)
+                    self.cloud_sync.upload_file_verified(str(scoresheet_path), cloud_archive_json)
+
+                    # Delete from cloud agents/
+                    if self.cloud_sync.file_exists(cloud_archive_pth):
+                        self.cloud_sync.delete_file(cloud_agents_pth)
+                        print(f"   ✓ Archived: {filename}")
+                        archived_count += 1
+                except Exception as e:
+                    print(f"   ⚠ Error archiving {filename}: {e}")
+
+            print(f"\n✓ Archived {archived_count}/{len(behavioral_duplicates)} duplicates")
+
         print(f"\n{'='*70}")
         print("✓ Re-evaluation Complete!")
         print(f"{'='*70}")
         print(f"  Updated:        {len(successful)} agents")
+        print(f"  Excluded:       {len(low_roi_agents)} agents (low ROI)")
+        print(f"  Archived:       {len(behavioral_duplicates)} agents (duplicates)")
         print(f"  Failed:         {len(failed)} agents")
         print(f"  New threshold:  {self.global_hof.entry_threshold:.2f}")
         print(f"  Cloud mirror:   gs://{self.cloud_sync.bucket_name}/{self.global_hof.cloud_base}/")
@@ -1569,8 +1740,17 @@ class AgentEvaluator:
         print(f"    ROI:         {roi_threshold if roi_threshold != float('-inf') else 'skipped (-inf)'}%")
         print(f"    Expectancy:  {expectancy_threshold if expectancy_threshold != float('-inf') else 'skipped (-inf)'}")
 
-        # Identify agents to remove using same logic as promotion
-        # Keep if: gauntlet >= threshold AND (ROI >= threshold OR expectancy >= threshold)
+        # Determine which thresholds are active (not skipped)
+        gauntlet_active = gauntlet_threshold != float('-inf')
+        roi_active = roi_threshold != float('-inf')
+        expectancy_active = expectancy_threshold != float('-inf')
+
+        # Identify agents to remove
+        # Logic depends on which thresholds are active:
+        # - If both ROI and expectancy are active: must pass gauntlet AND (ROI OR expectancy)
+        # - If only ROI is active: must pass gauntlet AND ROI
+        # - If only expectancy is active: must pass gauntlet AND expectancy
+        # - If neither ROI nor expectancy active: must just pass gauntlet
         agents_to_keep = []
         agents_to_remove = []
 
@@ -1579,10 +1759,33 @@ class AgentEvaluator:
             passes_roi = entry.roi >= roi_threshold
             passes_expectancy = entry.expectancy >= expectancy_threshold
 
-            if passes_gauntlet and (passes_roi or passes_expectancy):
-                agents_to_keep.append(entry)
-            else:
+            # Check gauntlet first (if active)
+            if gauntlet_active and not passes_gauntlet:
                 agents_to_remove.append(entry)
+                continue
+
+            # Check ROI/expectancy based on which are active
+            if roi_active and expectancy_active:
+                # Both active: must pass at least one
+                if passes_roi or passes_expectancy:
+                    agents_to_keep.append(entry)
+                else:
+                    agents_to_remove.append(entry)
+            elif roi_active:
+                # Only ROI active: must pass ROI
+                if passes_roi:
+                    agents_to_keep.append(entry)
+                else:
+                    agents_to_remove.append(entry)
+            elif expectancy_active:
+                # Only expectancy active: must pass expectancy
+                if passes_expectancy:
+                    agents_to_keep.append(entry)
+                else:
+                    agents_to_remove.append(entry)
+            else:
+                # Neither active: keep all (only gauntlet matters, already passed above)
+                agents_to_keep.append(entry)
 
         if len(agents_to_remove) == 0:
             print(f"\n✓ No agents would be removed with these thresholds.")
@@ -1603,11 +1806,16 @@ class AgentEvaluator:
             passes_expectancy = entry.expectancy >= expectancy_threshold
 
             reasons = []
-            if not passes_gauntlet:
+            if gauntlet_active and not passes_gauntlet:
                 reasons.append("gauntlet")
-            if not passes_roi and not passes_expectancy:
-                reasons.append("ROI+expect")
-            reason_str = ", ".join(reasons)
+            if roi_active and expectancy_active:
+                if not passes_roi and not passes_expectancy:
+                    reasons.append("ROI+expect")
+            elif roi_active and not passes_roi:
+                reasons.append("ROI")
+            elif expectancy_active and not passes_expectancy:
+                reasons.append("expectancy")
+            reason_str = ", ".join(reasons) if reasons else "filter"
 
             print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.run_name:<25} {entry.agent_id:<8} {reason_str}")
 
@@ -1796,21 +2004,18 @@ class AgentEvaluator:
 
         print(f"\nFound {len(archive_agents)} archived agents")
 
-        # Minimum ROI filter for archive fill (hardcoded)
-        ARCHIVE_FILL_MIN_ROI = 0.01
-
         # Filter out agents already in Global 50 (by run_name + agent_id)
         existing_keys = {(e.run_name, e.agent_id) for e in self.global_hof.entries}
         candidates = [a for a in archive_agents if (a['run_name'], a['agent_id']) not in existing_keys]
         already_in_g50 = len(archive_agents) - len(candidates)
 
-        # Filter out agents with ROI below minimum threshold
+        # Filter out agents with ROI below minimum threshold (using class constant)
         candidates_before_roi_filter = len(candidates)
-        candidates = [a for a in candidates if a.get('roi', 0) >= ARCHIVE_FILL_MIN_ROI]
+        candidates = [a for a in candidates if a.get('roi', 0) >= self.MIN_ROI_THRESHOLD]
         excluded_low_roi = candidates_before_roi_filter - len(candidates)
 
         print(f"  Already in Global 50: {already_in_g50}")
-        print(f"  Excluded (ROI < {ARCHIVE_FILL_MIN_ROI}%): {excluded_low_roi}")
+        print(f"  Excluded (ROI < {self.MIN_ROI_THRESHOLD}%): {excluded_low_roi}")
         print(f"  Candidates for evaluation: {len(candidates)}")
 
         if not candidates:
@@ -1843,7 +2048,7 @@ class AgentEvaluator:
         print(f"  2. Run full gauntlet evaluation for each agent")
         print(f"  3. Promote qualifying agents to Global 50 (moved from archive/ to agents/)")
         print(f"\nFilters applied:")
-        print(f"  - Minimum archived ROI: {ARCHIVE_FILL_MIN_ROI}% (excluded {excluded_low_roi} agents)")
+        print(f"  - Minimum archived ROI: {self.MIN_ROI_THRESHOLD}% (excluded {excluded_low_roi} agents)")
         print(f"  - Gauntlet threshold: {archive_fill_gauntlet_threshold:.2f}")
         print(f"  - ROI threshold: {archive_fill_roi_threshold:.2f}%")
         print(f"  - Expectancy threshold: {archive_fill_expectancy_threshold:.4f}")
