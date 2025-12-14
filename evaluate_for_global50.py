@@ -18,7 +18,7 @@ Usage:
 
 Example:
     python evaluate_for_global50.py --eval                              # Update all metrics
-    python evaluate_for_global50.py --trim                              # Interactive trim with gauntlet/ROI/expectancy
+    python evaluate_for_global50.py --trim                              # Interactive trim with gauntlet/ROI/expectancy/trades
     python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
     python evaluate_for_global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
 """
@@ -1647,7 +1647,7 @@ class AgentEvaluator:
     def trim_agents(self):
         """
         Interactive trim mode: shows current thresholds and prompts for
-        gauntlet, ROI, and expectancy thresholds to trim agents.
+        gauntlet, ROI, expectancy, and total trades thresholds to trim agents.
 
         This is a manual trimming tool that allows custom thresholds.
         Note: Automatic promotion uses stricter criteria:
@@ -1699,17 +1699,18 @@ class AgentEvaluator:
 
         # Show distribution
         print(f"\n  Score Ranges:")
-        print(f"    Gauntlet:    {min(e.gauntlet_score for e in self.global_hof.entries):.2f} to {max(e.gauntlet_score for e in self.global_hof.entries):.2f}")
-        print(f"    ROI:         {min(e.roi for e in self.global_hof.entries):.2f}% to {max(e.roi for e in self.global_hof.entries):.2f}%")
-        print(f"    Expectancy:  {min(e.expectancy for e in self.global_hof.entries):.4f} to {max(e.expectancy for e in self.global_hof.entries):.4f}")
+        print(f"    Gauntlet:     {min(e.gauntlet_score for e in self.global_hof.entries):.2f} to {max(e.gauntlet_score for e in self.global_hof.entries):.2f}")
+        print(f"    ROI:          {min(e.roi for e in self.global_hof.entries):.2f}% to {max(e.roi for e in self.global_hof.entries):.2f}%")
+        print(f"    Expectancy:   {min(e.expectancy for e in self.global_hof.entries):.4f} to {max(e.expectancy for e in self.global_hof.entries):.4f}")
+        print(f"    Total Trades: {min(e.total_trades for e in self.global_hof.entries)} to {max(e.total_trades for e in self.global_hof.entries)}")
 
         # Prompt for thresholds
         print(f"\n{'='*70}")
         print(f"Enter Trim Thresholds")
         print(f"{'='*70}")
-        print(f"Agents will be KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold")
+        print(f"Agents will be KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold AND trades >= threshold")
         print(f"(Note: This is a manual trim. Automatic promotion requires additional p75/median criteria)")
-        print(f"Press Enter to skip a threshold (use -inf)")
+        print(f"Press Enter to skip a threshold (use -inf, or 0 for trades)")
 
         # Get gauntlet threshold
         while True:
@@ -1747,22 +1748,32 @@ class AgentEvaluator:
             except ValueError:
                 print("  Invalid number. Please enter a numeric value.")
 
+        # Get total trades threshold
+        while True:
+            trades_input = input("  Minimum total trades (or Enter to skip): ").strip()
+            if trades_input == "":
+                trades_threshold = 0
+                break
+            try:
+                trades_threshold = int(trades_input)
+                break
+            except ValueError:
+                print("  Invalid number. Please enter an integer value.")
+
         print(f"\n  Selected thresholds:")
-        print(f"    Gauntlet:    {gauntlet_threshold if gauntlet_threshold != float('-inf') else 'skipped (-inf)'}")
-        print(f"    ROI:         {roi_threshold if roi_threshold != float('-inf') else 'skipped (-inf)'}%")
-        print(f"    Expectancy:  {expectancy_threshold if expectancy_threshold != float('-inf') else 'skipped (-inf)'}")
+        print(f"    Gauntlet:     {gauntlet_threshold if gauntlet_threshold != float('-inf') else 'skipped (-inf)'}")
+        print(f"    ROI:          {roi_threshold if roi_threshold != float('-inf') else 'skipped (-inf)'}%")
+        print(f"    Expectancy:   {expectancy_threshold if expectancy_threshold != float('-inf') else 'skipped (-inf)'}")
+        print(f"    Total Trades: {trades_threshold if trades_threshold > 0 else 'skipped (0)'}")
 
         # Determine which thresholds are active (not skipped)
         gauntlet_active = gauntlet_threshold != float('-inf')
         roi_active = roi_threshold != float('-inf')
         expectancy_active = expectancy_threshold != float('-inf')
+        trades_active = trades_threshold > 0
 
         # Identify agents to remove
-        # Logic depends on which thresholds are active:
-        # - If both ROI and expectancy are active: must pass gauntlet AND ROI AND expectancy
-        # - If only ROI is active: must pass gauntlet AND ROI
-        # - If only expectancy is active: must pass gauntlet AND expectancy
-        # - If neither ROI nor expectancy active: must just pass gauntlet
+        # Agent must pass ALL active thresholds to be kept
         agents_to_keep = []
         agents_to_remove = []
 
@@ -1770,33 +1781,22 @@ class AgentEvaluator:
             passes_gauntlet = entry.gauntlet_score >= gauntlet_threshold
             passes_roi = entry.roi >= roi_threshold
             passes_expectancy = entry.expectancy >= expectancy_threshold
+            passes_trades = entry.total_trades >= trades_threshold
 
-            # Check gauntlet first (if active)
+            # Check each active threshold
+            failed = False
             if gauntlet_active and not passes_gauntlet:
-                agents_to_remove.append(entry)
-                continue
+                failed = True
+            if roi_active and not passes_roi:
+                failed = True
+            if expectancy_active and not passes_expectancy:
+                failed = True
+            if trades_active and not passes_trades:
+                failed = True
 
-            # Check ROI/expectancy based on which are active
-            if roi_active and expectancy_active:
-                # Both active: must pass both
-                if passes_roi and passes_expectancy:
-                    agents_to_keep.append(entry)
-                else:
-                    agents_to_remove.append(entry)
-            elif roi_active:
-                # Only ROI active: must pass ROI
-                if passes_roi:
-                    agents_to_keep.append(entry)
-                else:
-                    agents_to_remove.append(entry)
-            elif expectancy_active:
-                # Only expectancy active: must pass expectancy
-                if passes_expectancy:
-                    agents_to_keep.append(entry)
-                else:
-                    agents_to_remove.append(entry)
+            if failed:
+                agents_to_remove.append(entry)
             else:
-                # Neither active: keep all (only gauntlet matters, already passed above)
                 agents_to_keep.append(entry)
 
         if len(agents_to_remove) == 0:
@@ -1808,39 +1808,37 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print(f"⚠ WARNING: {len(agents_to_remove)} agents will be REMOVED from Global 50:")
         print(f"{'='*70}")
-        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'Run Name':<25} {'Agent':<8} {'Reason'}")
-        print(f"{'-'*90}")
+        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'Trades':<8} {'Run Name':<25} {'Agent':<8} {'Reason'}")
+        print(f"{'-'*100}")
 
         for entry in sorted(agents_to_remove, key=lambda e: e.gauntlet_score):
             # Determine why agent fails
             passes_gauntlet = entry.gauntlet_score >= gauntlet_threshold
             passes_roi = entry.roi >= roi_threshold
             passes_expectancy = entry.expectancy >= expectancy_threshold
+            passes_trades = entry.total_trades >= trades_threshold
 
             reasons = []
             if gauntlet_active and not passes_gauntlet:
                 reasons.append("gauntlet")
-            if roi_active and expectancy_active:
-                # Must pass both - show which one(s) failed
-                if not passes_roi:
-                    reasons.append("ROI")
-                if not passes_expectancy:
-                    reasons.append("expectancy")
-            elif roi_active and not passes_roi:
+            if roi_active and not passes_roi:
                 reasons.append("ROI")
-            elif expectancy_active and not passes_expectancy:
+            if expectancy_active and not passes_expectancy:
                 reasons.append("expectancy")
+            if trades_active and not passes_trades:
+                reasons.append("trades")
             reason_str = ", ".join(reasons) if reasons else "filter"
 
-            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.run_name:<25} {entry.agent_id:<8} {reason_str}")
+            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.total_trades:<8} {entry.run_name:<25} {entry.agent_id:<8} {reason_str}")
 
         print(f"\n{len(agents_to_keep)} agents will remain in Global 50.")
 
         if len(agents_to_keep) > 0:
             print(f"\nRemaining score ranges:")
-            print(f"  Gauntlet:    {min(e.gauntlet_score for e in agents_to_keep):.2f} to {max(e.gauntlet_score for e in agents_to_keep):.2f}")
-            print(f"  ROI:         {min(e.roi for e in agents_to_keep):.2f}% to {max(e.roi for e in agents_to_keep):.2f}%")
-            print(f"  Expectancy:  {min(e.expectancy for e in agents_to_keep):.4f} to {max(e.expectancy for e in agents_to_keep):.4f}")
+            print(f"  Gauntlet:     {min(e.gauntlet_score for e in agents_to_keep):.2f} to {max(e.gauntlet_score for e in agents_to_keep):.2f}")
+            print(f"  ROI:          {min(e.roi for e in agents_to_keep):.2f}% to {max(e.roi for e in agents_to_keep):.2f}%")
+            print(f"  Expectancy:   {min(e.expectancy for e in agents_to_keep):.4f} to {max(e.expectancy for e in agents_to_keep):.4f}")
+            print(f"  Total Trades: {min(e.total_trades for e in agents_to_keep)} to {max(e.total_trades for e in agents_to_keep)}")
 
         # Ask for confirmation
         print(f"\n{'='*70}")
@@ -1987,6 +1985,31 @@ class AgentEvaluator:
         current_size = len(self.global_hof.entries)
 
         print(f"\n  Current Global 50 size: {current_size}/{self.global_hof.CAPACITY}")
+
+        # For archive-fill, we need to apply normal promotion guidelines even when not full.
+        # When Global 50 is not full, _update_entry_threshold sets thresholds to -inf,
+        # which would accept any agent. Instead, we compute thresholds from the existing
+        # population to maintain quality standards.
+        if current_size > 0 and current_size < self.global_hof.CAPACITY:
+            # Compute actual thresholds from existing population
+            gauntlet_scores = [e.gauntlet_score for e in self.global_hof.entries]
+            roi_values = [e.roi for e in self.global_hof.entries]
+            expectancy_values = [e.expectancy for e in self.global_hof.entries]
+
+            # Override the -inf thresholds with actual population statistics
+            self.global_hof.entry_threshold = min(gauntlet_scores)
+            self.global_hof.roi_threshold = min(roi_values)
+            self.global_hof.expectancy_threshold = min(expectancy_values)
+
+            self.global_hof.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
+            self.global_hof.roi_median = float(np.percentile(roi_values, 50))
+            self.global_hof.expectancy_median = float(np.percentile(expectancy_values, 50))
+
+            self.global_hof.gauntlet_p75 = float(np.percentile(gauntlet_scores, 75))
+            self.global_hof.roi_p75 = float(np.percentile(roi_values, 75))
+            self.global_hof.expectancy_p75 = float(np.percentile(expectancy_values, 75))
+
+            print(f"\n  ⚠ Global 50 not full - applying normal promotion thresholds from existing {current_size} agents")
 
         # Thresholds are managed by GlobalHoF - already updated above
         print(f"\n  Current Thresholds:")
@@ -2430,7 +2453,7 @@ Examples:
   # Re-evaluate agents in a specific context window (e.g., cw504)
   python evaluate_for_global50.py --eval --cw 504
 
-  # Interactive trim - prompts for gauntlet, ROI, and expectancy thresholds
+  # Interactive trim - prompts for gauntlet, ROI, expectancy, and total trades thresholds
   python evaluate_for_global50.py --trim
 
   # Evaluate agents from Hall of Fame directory
@@ -2485,7 +2508,7 @@ Examples:
     parser.add_argument(
         '--trim',
         action='store_true',
-        help='Interactive trim mode: shows current thresholds and prompts for gauntlet, ROI, and expectancy thresholds'
+        help='Interactive trim mode: shows current thresholds and prompts for gauntlet, ROI, expectancy, and total trades thresholds'
     )
 
     parser.add_argument(
