@@ -1693,7 +1693,21 @@ class ERLTrainer:
             new_population.append(clone)
 
         self.population = new_population
+
+        # Reset metrics for fresh start with new member
+        # This prevents a weaker member from never triggering "New Best" logs
+        # if a stronger member ran previously
+        self.best_fitness = float('-inf')
+        self.best_validation_fitness = float('-inf')
+        self.best_agent = None
+
+        # Reset mutation parameters to base values
+        self.current_mutation_rate = Config.MUTATION_RATE_CONSISTENCY
+        self.current_mutation_std = Config.MUTATION_STD
+        self.consecutive_no_improvement = 0
+
         print(f"  Population initialized: {len(self.population)} agents")
+        print(f"  Metrics reset for fresh training")
         print("="*60 + "\n")
 
     def _advance_to_next_multi_member(self) -> bool:
@@ -2822,10 +2836,9 @@ class ERLTrainer:
         """
         Check for breakthrough on current committee member (sequential mode).
 
-        A breakthrough occurs when the best agent exceeds the threshold:
-        - First breakthrough: baseline * (1 + 0.05)
-        - Second breakthrough: baseline * (1 + 0.10)
-        etc.
+        A breakthrough occurs when the best agent exceeds the current baseline by 5%.
+        After each breakthrough, the baseline is updated to the new score, so the next
+        breakthrough requires 5% improvement over that new baseline (not compounding).
 
         Args:
             validation_scores: Validation fitness scores for population
@@ -2835,11 +2848,10 @@ class ERLTrainer:
         """
         member_idx = self.current_member_idx
         baseline = self.member_baselines[member_idx]
-        current_breakthroughs = self.member_breakthroughs[member_idx]
 
-        # Calculate required threshold for NEXT breakthrough
-        required_improvement = Config.MULTI_BREAKTHROUGH_THRESHOLD * (current_breakthroughs + 1)
-        required_threshold = baseline * (1 + required_improvement)
+        # Constant 5% improvement over current baseline
+        # Note: baseline is updated after each breakthrough in _process_multi_breakthrough
+        required_threshold = baseline * (1 + Config.MULTI_BREAKTHROUGH_THRESHOLD)
 
         # Find best agent
         best_idx = np.argmax(validation_scores)
@@ -5754,10 +5766,18 @@ class ERLTrainer:
                     self._process_multi_breakthrough(improved_agent, score)
                     self._advance_to_next_multi_member()
 
+                    # CRITICAL: Skip evolution for this generation
+                    # The population was just replaced with fresh clones of the new member.
+                    # The fitness_scores computed above belong to the OLD population.
+                    # Calling evolve_population() would apply stale fitness to wrong agents.
+                    # Instead, continue to next iteration for fresh evaluation.
+                    print(f"  [Skipping evolution - new member loaded, will evaluate fresh next gen]")
+                    continue
+
                 # Log multi-mode progress
                 member = self.multi_roster['members'][self.current_member_idx]
                 member_name = f"{member['run_name']}_{member['agent_id']}"
-                if gen % 5 == 0 or breakthrough_result is not None:
+                if gen % 5 == 0:
                     print(f"\n  Multi-Mode Progress: Turnovers {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
                     print(f"    Current member: {self.current_member_idx} ({member_name})")
                     print(f"    Breakthroughs: {self.member_breakthroughs}")
