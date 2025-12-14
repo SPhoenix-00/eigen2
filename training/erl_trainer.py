@@ -580,16 +580,16 @@ class ERLTrainer:
         self.external_buffer_storage_path = buffer_storage_path  # Optional path to reuse existing buffer
         self.reset_limit = reset_limit  # Reset fallback counter on resume
 
-        # Multi-agent committee mode
+        # Multi-agent committee mode (sequential training of each member)
         self.multi_mode = multi_mode
         self.multi_roster = multi_roster
         if multi_mode:
-            self.num_parents = Config.COMMITTEE_SIZE  # 9
-            self.pop_per_parent = Config.MULTI_POPULATION_PER_MEMBER  # 11
-            self.parent_breakthroughs = [0] * self.num_parents
-            self.parent_baselines = [0.0] * self.num_parents  # Original scores per parent
+            self.num_committee_members = Config.COMMITTEE_SIZE  # 9
+            self.member_breakthroughs = [0] * self.num_committee_members  # Breakthroughs per member
+            self.member_baselines = [0.0] * self.num_committee_members  # Original scores
             self.turnovers_completed = 0
-            self.agent_parent_map = {}  # agent_id -> parent_idx
+            self.current_member_idx = 0  # Which committee member we're currently training
+            self.multi_generation_offset = 0  # Track total generations across all members
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -606,11 +606,8 @@ class ERLTrainer:
         print("Computing and caching normalization statistics...")
         self.normalization_stats = data_loader.compute_normalization_stats()
 
-        # Initialize population (multi-mode uses different size)
-        if multi_mode:
-            pop_size = Config.MULTI_TOTAL_POPULATION  # 99 (9 parents × 11 agents)
-        else:
-            pop_size = Config.POPULATION_SIZE  # 96
+        # Initialize population (multi-mode uses standard size, trains one member at a time)
+        pop_size = Config.POPULATION_SIZE  # 96 for all modes
         print(f"Initializing population of {pop_size} agents...")
         self.population = [DDPGAgent(agent_id=i) for i in range(pop_size)]
 
@@ -1577,92 +1574,162 @@ class ERLTrainer:
 
     def load_multi_agents(self):
         """
-        Load all 9 committee members and create 11-agent populations for each.
-        Total: 99 agents grouped by parent with strict genetic isolation.
+        Initialize multi-agent sequential training mode.
 
-        Population composition per parent (from Config):
-        - MULTI_CLONE_FRAC: Pure clones (~45%, 5 agents)
-        - MULTI_NORMAL_MUTATION_FRAC: Normal mutation (~27%, 3 agents)
-        - MULTI_PLATEAU_MUTATION_FRAC: Plateau mutation (~28%, 3 agents)
+        This evaluates all 9 committee members to establish baselines,
+        then loads the first member for training. Members are trained
+        sequentially - one breakthrough per member, rotating until
+        all achieve a turnover.
+
+        Uses same population composition as --single mode (96 agents).
         """
         from committee import get_agent_filepath
 
         print(f"\n{'='*60}")
-        print(f"🎯 MULTI-AGENT MODE - Loading Committee Members")
+        print(f"🎯 MULTI-AGENT MODE - Sequential Committee Training")
         print(f"{'='*60}")
 
         members = self.multi_roster['members']
         context_window = self.multi_roster['context_window_days']
 
-        self.population = []
-        self.agent_parent_map = {}  # agent_id -> parent_idx
+        # First, evaluate all members to establish baselines
+        print(f"\nEvaluating {len(members)} committee members for baselines...")
 
-        # Get mutation parameters
-        base_mutation_rate = Config.MUTATION_RATE_CONSISTENCY
-        base_mutation_std = Config.MUTATION_STD
-        plateau_mutation_rate = min(base_mutation_rate * 1.5, self.max_mutation_rate)
-        plateau_mutation_std = min(base_mutation_std * 1.5, self.max_mutation_std)
-
-        for parent_idx, member in enumerate(members):
+        for member_idx, member in enumerate(members):
             agent_path = get_agent_filepath(member, context_window)
 
             if not agent_path.exists():
                 raise FileNotFoundError(f"Committee member agent not found: {agent_path}")
 
-            # Load parent agent
+            # Load and evaluate member
             source_agent = DDPGAgent(agent_id=0)
             source_agent.load(str(agent_path))
 
-            # Evaluate baseline (5-episode pessimistic)
             baseline = self._evaluate_single_agent_for_baseline(source_agent)
-            self.parent_baselines[parent_idx] = baseline
+            self.member_baselines[member_idx] = baseline
 
-            print(f"  Parent {parent_idx}: {member['run_name']}_{member['agent_id']} "
+            print(f"  Member {member_idx}: {member['run_name']}_{member['agent_id']} "
                   f"baseline={baseline:.2f}")
 
-            # Create 11-agent population for this parent
-            pop_size = self.pop_per_parent
-            num_clones = int(pop_size * Config.MULTI_CLONE_FRAC)  # 5
-            num_normal = int(pop_size * Config.MULTI_NORMAL_MUTATION_FRAC)  # 3
-            num_plateau = pop_size - num_clones - num_normal  # 3
+            # Clean up
+            del source_agent
 
-            base_id = parent_idx * pop_size
-
-            # Pure clones
-            for i in range(num_clones):
-                clone = source_agent.clone()
-                clone.agent_id = base_id + i
-                clone.is_elite = True
-                self.population.append(clone)
-                self.agent_parent_map[clone.agent_id] = parent_idx
-
-            # Normal mutants
-            for i in range(num_normal):
-                mutant = source_agent.clone()
-                mutant.agent_id = base_id + num_clones + i
-                mutant.mutate(mutation_rate=base_mutation_rate, mutation_std=base_mutation_std)
-                mutant.is_elite = False
-                self.population.append(mutant)
-                self.agent_parent_map[mutant.agent_id] = parent_idx
-
-            # Plateau mutants (1.5x mutation)
-            for i in range(num_plateau):
-                mutant = source_agent.clone()
-                mutant.agent_id = base_id + num_clones + num_normal + i
-                mutant.mutate(mutation_rate=plateau_mutation_rate, mutation_std=plateau_mutation_std)
-                mutant.is_elite = False
-                self.population.append(mutant)
-                self.agent_parent_map[mutant.agent_id] = parent_idx
-
-        print(f"\n  Population composition per parent ({self.pop_per_parent} agents):")
-        print(f"    Pure clones: {int(self.pop_per_parent * Config.MULTI_CLONE_FRAC)}")
-        print(f"    Normal mutation: {int(self.pop_per_parent * Config.MULTI_NORMAL_MUTATION_FRAC)}")
-        print(f"    Plateau mutation: {self.pop_per_parent - int(self.pop_per_parent * Config.MULTI_CLONE_FRAC) - int(self.pop_per_parent * Config.MULTI_NORMAL_MUTATION_FRAC)}")
-
-        print(f"\n✓ Loaded {len(self.population)} agents across {self.num_parents} parents")
+        print(f"\n✓ All {len(members)} members evaluated")
         print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
         print(f"  Breakthrough threshold: {Config.MULTI_BREAKTHROUGH_THRESHOLD * 100:.0f}%")
+        print(f"  Training sequence: One breakthrough per member, then rotate")
+
+        # Now load the first member for training
+        self._load_multi_member(0)
+
+    def _load_multi_member(self, member_idx: int):
+        """
+        Load a specific committee member and initialize population for training.
+        Similar to load_single_agent but for multi-mode rotation.
+
+        Args:
+            member_idx: Index of the committee member to load (0-8)
+        """
+        from committee import get_agent_filepath
+
+        self.current_member_idx = member_idx
+        member = self.multi_roster['members'][member_idx]
+        context_window = self.multi_roster['context_window_days']
+
+        print(f"\n{'='*60}")
+        print(f"🎯 MULTI-MODE: Loading Member {member_idx} for Training")
+        print(f"{'='*60}")
+        print(f"  Member: {member['run_name']}_{member['agent_id']}")
+        print(f"  Baseline: {self.member_baselines[member_idx]:.2f}")
+        print(f"  Current breakthroughs: {self.member_breakthroughs[member_idx]}")
+        print(f"  Target for this round: {self.turnovers_completed + 1}")
+
+        agent_path = get_agent_filepath(member, context_window)
+        source_agent = DDPGAgent(agent_id=0)
+        source_agent.load(str(agent_path))
+
+        # Set confirmed baseline for breakthrough detection (used by existing logic)
+        self.confirmed_baseline = self.member_baselines[member_idx]
+        self.initial_single_baseline = self.member_baselines[member_idx]
+
+        # Initialize population with clones + mutations (same as single mode)
+        pop_size = Config.POPULATION_SIZE
+        num_clones = int(pop_size * Config.SINGLE_CLONE_FRAC)
+        num_normal_mutants = int(pop_size * Config.SINGLE_NORMAL_MUTATION_FRAC)
+        num_plateau_mutants = pop_size - num_clones - num_normal_mutants
+
+        print(f"\n  Population initialization ({pop_size} agents):")
+        print(f"    Pure clones: {num_clones} ({Config.SINGLE_CLONE_FRAC*100:.0f}%)")
+        print(f"    Normal mutation: {num_normal_mutants} ({Config.SINGLE_NORMAL_MUTATION_FRAC*100:.0f}%)")
+        print(f"    Plateau mutation: {num_plateau_mutants} ({Config.SINGLE_PLATEAU_MUTATION_FRAC*100:.0f}%)")
+
+        new_population = []
+
+        # Pure clones
+        for i in range(num_clones):
+            clone = source_agent.clone()
+            clone.agent_id = i
+            clone.is_elite = True
+            new_population.append(clone)
+
+        # Normal mutation clones
+        base_mutation_rate = Config.MUTATION_RATE_CONSISTENCY
+        base_mutation_std = Config.MUTATION_STD
+        for i in range(num_normal_mutants):
+            clone = source_agent.clone()
+            clone.agent_id = num_clones + i
+            clone.mutate(mutation_rate=base_mutation_rate, mutation_std=base_mutation_std)
+            clone.is_elite = False
+            new_population.append(clone)
+
+        # Plateau mutation clones (1.5x mutation)
+        plateau_mutation_rate = min(base_mutation_rate * 1.5, self.max_mutation_rate)
+        plateau_mutation_std = min(base_mutation_std * 1.5, self.max_mutation_std)
+        for i in range(num_plateau_mutants):
+            clone = source_agent.clone()
+            clone.agent_id = num_clones + num_normal_mutants + i
+            clone.mutate(mutation_rate=plateau_mutation_rate, mutation_std=plateau_mutation_std)
+            clone.is_elite = False
+            new_population.append(clone)
+
+        self.population = new_population
+        print(f"  Population initialized: {len(self.population)} agents")
         print("="*60 + "\n")
+
+    def _advance_to_next_multi_member(self) -> bool:
+        """
+        Advance to the next committee member that needs a breakthrough for current turnover.
+
+        Returns:
+            True if advanced to next member, False if turnover complete or all done
+        """
+        target_breakthroughs = self.turnovers_completed + 1
+
+        # Find next member that hasn't achieved current target
+        start_idx = self.current_member_idx
+        for offset in range(1, self.num_committee_members + 1):
+            next_idx = (start_idx + offset) % self.num_committee_members
+            if self.member_breakthroughs[next_idx] < target_breakthroughs:
+                self._load_multi_member(next_idx)
+                return True
+
+        # All members have achieved target - check for turnover
+        min_breakthroughs = min(self.member_breakthroughs)
+        if min_breakthroughs > self.turnovers_completed:
+            self.turnovers_completed = min_breakthroughs
+            self._process_multi_turnover()
+
+            # Check if we've reached final target
+            if self.turnovers_completed >= Config.MULTI_TARGET_TURNOVERS:
+                return False  # All done!
+
+            # Start next round with first member that needs breakthrough
+            for idx in range(self.num_committee_members):
+                if self.member_breakthroughs[idx] < self.turnovers_completed + 1:
+                    self._load_multi_member(idx)
+                    return True
+
+        return False  # Should not reach here
 
     def _evaluate_single_agent_for_baseline(self, agent: DDPGAgent) -> float:
         """
@@ -2731,25 +2798,17 @@ class ERLTrainer:
         # Create next generation with adaptive mutation parameters
         # Elitism uses validation fitness for robustness and generalization
         # Tournament selection uses training fitness to maintain exploration
-        if self.multi_mode:
-            # Multi-mode: grouped evolution with strict genetic isolation per parent
-            self.population = self._create_next_generation_grouped(
-                old_population,
-                fitness_scores,
-                validation_scores
-            )
-        else:
-            # Standard single-population evolution
-            self.population = create_next_generation(
-                old_population,
-                fitness_scores,
-                elite_scores=elite_scores,
-                mutation_rate=self.current_mutation_rate,
-                mutation_std=self.current_mutation_std,
-                heroes_mode=self.heroes_hof_dir is not None,
-                injection_pool=injection_pool,
-                injection_count=injection_count
-            )
+        # Note: Multi-mode uses standard evolution (sequential training, one member at a time)
+        self.population = create_next_generation(
+            old_population,
+            fitness_scores,
+            elite_scores=elite_scores,
+            mutation_rate=self.current_mutation_rate,
+            mutation_std=self.current_mutation_std,
+            heroes_mode=self.heroes_hof_dir is not None or self.multi_mode,
+            injection_pool=injection_pool if not self.multi_mode else None,
+            injection_count=injection_count if not self.multi_mode else 0
+        )
 
         # Explicitly delete old agents and force GC
         for agent in old_population:
@@ -2759,172 +2818,106 @@ class ERLTrainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _create_next_generation_grouped(self, old_population, fitness_scores, validation_scores):
+    def _check_multi_breakthrough(self, validation_scores):
         """
-        Create next generation with strict genetic isolation per parent group.
-        Each of the 9 groups evolves independently - agents only crossover/mutate
-        within their own parent group.
+        Check for breakthrough on current committee member (sequential mode).
 
-        Args:
-            old_population: Current population (99 agents)
-            fitness_scores: Training fitness scores for all agents
-            validation_scores: Validation fitness scores for all agents
-
-        Returns:
-            New population (99 agents) with preserved parent groupings
-        """
-        from erl.genetic_ops import elitism_selection, tournament_selection, crossover, mutate
-
-        next_gen = []
-
-        for parent_idx in range(self.num_parents):
-            # Get agents belonging to this parent
-            start_idx = parent_idx * self.pop_per_parent
-            end_idx = start_idx + self.pop_per_parent
-
-            group_agents = old_population[start_idx:end_idx]
-            group_fitness = fitness_scores[start_idx:end_idx]
-            group_validation = validation_scores[start_idx:end_idx] if validation_scores is not None else None
-
-            # Use validation scores for elite selection if available
-            elite_scores = group_validation if group_validation is not None else group_fitness
-
-            # Evolution within group (11 agents)
-            pop_size = self.pop_per_parent
-            num_elites = int(pop_size * Config.HEROES_ELITE_FRAC)  # ~5-6
-            num_offspring = int(pop_size * Config.HEROES_OFFSPRING_FRAC)  # ~4
-            num_mutants = pop_size - num_elites - num_offspring  # ~1-2
-
-            # Elitism - keep best performers
-            elites = elitism_selection(group_agents, elite_scores, num_elites)
-
-            # Crossover (within group only)
-            offspring = []
-            for _ in range(num_offspring):
-                parents = tournament_selection(group_agents, group_fitness, 2)
-                p1, p2 = parents[0], parents[1] if len(parents) > 1 else parents[0]
-                child = crossover(p1, p2)
-                offspring.append(child)
-
-            # Mutation (from group elites only)
-            mutants = []
-            for _ in range(num_mutants):
-                elite = elites[np.random.randint(len(elites))]
-                mutant = mutate(elite, self.current_mutation_rate, self.current_mutation_std)
-                mutants.append(mutant)
-
-            # Combine and assign IDs
-            group_next = elites + offspring + mutants
-            for i, agent in enumerate(group_next):
-                agent.agent_id = start_idx + i
-                self.agent_parent_map[agent.agent_id] = parent_idx
-
-            next_gen.extend(group_next)
-
-        return next_gen
-
-    def _check_multi_breakthroughs(self, validation_scores, generation):
-        """
-        Check for breakthroughs per parent group in multi-mode.
-
-        A breakthrough occurs when the best agent in a parent group exceeds
-        the threshold for the next breakthrough level:
+        A breakthrough occurs when the best agent exceeds the threshold:
         - First breakthrough: baseline * (1 + 0.05)
         - Second breakthrough: baseline * (1 + 0.10)
-        - Third breakthrough: baseline * (1 + 0.15)
         etc.
 
-        Note: No stabilization phase - breakthroughs are detected immediately.
-
         Args:
-            validation_scores: Validation fitness scores for all 99 agents
-            generation: Current generation number (unused, kept for API consistency)
+            validation_scores: Validation fitness scores for population
 
         Returns:
-            List of (parent_idx, best_agent, best_score) for any new breakthroughs
+            (best_agent, best_score) if breakthrough achieved, None otherwise
         """
-        breakthroughs = []
+        member_idx = self.current_member_idx
+        baseline = self.member_baselines[member_idx]
+        current_breakthroughs = self.member_breakthroughs[member_idx]
 
-        for parent_idx in range(self.num_parents):
-            start_idx = parent_idx * self.pop_per_parent
-            end_idx = start_idx + self.pop_per_parent
+        # Calculate required threshold for NEXT breakthrough
+        required_improvement = Config.MULTI_BREAKTHROUGH_THRESHOLD * (current_breakthroughs + 1)
+        required_threshold = baseline * (1 + required_improvement)
 
-            group_scores = validation_scores[start_idx:end_idx]
-            best_local_idx = np.argmax(group_scores)
-            best_idx = start_idx + best_local_idx
-            best_score = group_scores[best_local_idx]
+        # Find best agent
+        best_idx = np.argmax(validation_scores)
+        best_score = validation_scores[best_idx]
 
-            baseline = self.parent_baselines[parent_idx]
-            current_breakthroughs = self.parent_breakthroughs[parent_idx]
+        if best_score >= required_threshold:
+            return (self.population[best_idx], best_score)
 
-            # Calculate required threshold for NEXT breakthrough
-            # Each breakthrough requires an additional 5% improvement from original baseline
-            required_improvement = Config.MULTI_BREAKTHROUGH_THRESHOLD * (current_breakthroughs + 1)
-            required_threshold = baseline * (1 + required_improvement)
+        return None
 
-            if best_score >= required_threshold:
-                breakthroughs.append((parent_idx, self.population[best_idx], best_score))
-
-        return breakthroughs
-
-    def _process_multi_breakthrough(self, parent_idx, improved_agent, score):
+    def _process_multi_breakthrough(self, improved_agent, score):
         """
-        Process a breakthrough: archive parent, add improved agent to Global50.
+        Process a breakthrough for current member: archive, save, update Global50.
 
         Args:
-            parent_idx: Index of the parent (0-8)
             improved_agent: The agent that achieved the breakthrough
             score: The validation score achieved
+
+        Returns:
+            True if should advance to next member, False otherwise
         """
         import shutil
         from committee import get_agent_filepath
 
-        member = self.multi_roster['members'][parent_idx]
+        member_idx = self.current_member_idx
+        member = self.multi_roster['members'][member_idx]
         context_window = self.multi_roster['context_window_days']
 
-        print(f"\n  🎉 BREAKTHROUGH for Parent {parent_idx}: {member['run_name']}_{member['agent_id']}")
-        print(f"     Baseline: {self.parent_baselines[parent_idx]:.2f} -> New: {score:.2f}")
-        print(f"     Improvement: {((score / self.parent_baselines[parent_idx]) - 1) * 100:.1f}%")
+        print(f"\n{'='*60}")
+        print(f"🎉 BREAKTHROUGH for Member {member_idx}: {member['run_name']}_{member['agent_id']}")
+        print(f"{'='*60}")
+        print(f"  Baseline: {self.member_baselines[member_idx]:.2f} -> New: {score:.2f}")
+        print(f"  Improvement: {((score / self.member_baselines[member_idx]) - 1) * 100:.1f}%")
+        print(f"  Breakthrough #{self.member_breakthroughs[member_idx] + 1} for this member")
 
-        # Archive original parent agent
+        # Archive original member agent
         original_path = get_agent_filepath(member, context_window)
         if original_path.exists():
             archive_dir = original_path.parent / "archive"
             archive_dir.mkdir(exist_ok=True)
-            archive_path = archive_dir / f"{original_path.stem}_pre_multi_bt{self.parent_breakthroughs[parent_idx] + 1}.pth"
+            archive_path = archive_dir / f"{original_path.stem}_pre_multi_bt{self.member_breakthroughs[member_idx] + 1}.pth"
             shutil.copy(original_path, archive_path)
-            print(f"     Archived original to: {archive_path.name}")
+            print(f"  Archived original to: {archive_path.name}")
 
         # Save improved agent with new filename
         new_filename = f"{self.wandb_run_name}_{improved_agent.agent_id}.pth"
         new_path = original_path.parent / new_filename
         improved_agent.save(str(new_path))
-        print(f"     Saved improved agent: {new_filename}")
+        print(f"  Saved improved agent: {new_filename}")
 
         # Update Global50 ledger
-        self._update_global50_for_multi_breakthrough(parent_idx, new_filename, score, improved_agent)
+        self._update_global50_for_multi_breakthrough(member_idx, new_filename, score, improved_agent)
 
-        # Update breakthrough count for this parent
-        self.parent_breakthroughs[parent_idx] += 1
+        # Update breakthrough count for this member
+        self.member_breakthroughs[member_idx] += 1
 
-        # Check for turnover (all parents have achieved N breakthroughs)
-        min_breakthroughs = min(self.parent_breakthroughs)
-        if min_breakthroughs > self.turnovers_completed:
-            self._process_multi_turnover()
+        # Update baseline for next breakthrough attempt
+        self.member_baselines[member_idx] = score
 
-    def _update_global50_for_multi_breakthrough(self, parent_idx, new_filename, score, agent):
+        # Print overall progress
+        print(f"\n  Multi-Mode Progress:")
+        print(f"    Turnovers: {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
+        print(f"    Breakthroughs: {self.member_breakthroughs}")
+        print("="*60)
+
+        return True  # Signal to advance to next member
+
+    def _update_global50_for_multi_breakthrough(self, member_idx, new_filename, score, agent):
         """
         Update Global50 ledger with the new improved agent.
 
         Args:
-            parent_idx: Index of the parent being replaced
+            member_idx: Index of the member being improved
             new_filename: Filename of the new agent
             score: Validation score achieved
             agent: The improved agent
         """
-        # Use existing Global50 integration to add the new agent
-        # This will follow the same pattern as normal breakthrough handling
-        member = self.multi_roster['members'][parent_idx]
+        member = self.multi_roster['members'][member_idx]
 
         # Create entry for global50
         new_entry = {
@@ -2945,22 +2938,22 @@ class ERLTrainer:
 
     def _process_multi_turnover(self):
         """
-        Process a turnover: all 9 parents have achieved the same number of breakthroughs.
+        Process a turnover: all 9 members have achieved the same number of breakthroughs.
         Update committee roster and archive old roster.
         """
-        self.turnovers_completed = min(self.parent_breakthroughs)
+        self.turnovers_completed = min(self.member_breakthroughs)
 
         print(f"\n{'='*60}")
         print(f"🎉 TURNOVER {self.turnovers_completed} COMPLETE!")
-        print(f"   All {self.num_parents} committee members have achieved "
+        print(f"   All {self.num_committee_members} committee members have achieved "
               f"{self.turnovers_completed} breakthrough(s)")
         print(f"{'='*60}")
 
-        # Print breakthrough status for each parent
-        for parent_idx in range(self.num_parents):
-            member = self.multi_roster['members'][parent_idx]
-            bt = self.parent_breakthroughs[parent_idx]
-            print(f"   Parent {parent_idx} ({member['run_name']}_{member['agent_id']}): "
+        # Print breakthrough status for each member
+        for member_idx in range(self.num_committee_members):
+            member = self.multi_roster['members'][member_idx]
+            bt = self.member_breakthroughs[member_idx]
+            print(f"   Member {member_idx} ({member['run_name']}_{member['agent_id']}): "
                   f"{bt} breakthroughs")
 
         # Archive and update committee roster
@@ -5451,11 +5444,11 @@ class ERLTrainer:
                 print(f"\n{'='*60}")
                 print(f"🎯 MULTI-AGENT MODE SUCCESS - {Config.MULTI_TARGET_TURNOVERS} TURNOVERS ACHIEVED!")
                 print(f"{'='*60}")
-                print(f"  All {self.num_parents} committee members improved!")
-                for parent_idx in range(self.num_parents):
-                    member = self.multi_roster['members'][parent_idx]
-                    bt = self.parent_breakthroughs[parent_idx]
-                    print(f"    Parent {parent_idx} ({member['run_name']}_{member['agent_id']}): {bt} breakthroughs")
+                print(f"  All {self.num_committee_members} committee members improved!")
+                for member_idx in range(self.num_committee_members):
+                    member = self.multi_roster['members'][member_idx]
+                    bt = self.member_breakthroughs[member_idx]
+                    print(f"    Member {member_idx} ({member['run_name']}_{member['agent_id']}): {bt} breakthroughs")
                 print(f"  Generation: {gen + 1}")
                 print(f"{'='*60}")
                 break
@@ -5466,11 +5459,11 @@ class ERLTrainer:
                 print(f"⏱️ MULTI-AGENT MODE TIMEOUT - {Config.MAX_GENERATIONS_GAUNTLET} GENERATIONS")
                 print(f"{'='*60}")
                 print(f"  Turnovers achieved: {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
-                print(f"  Breakthroughs per parent:")
-                for parent_idx in range(self.num_parents):
-                    member = self.multi_roster['members'][parent_idx]
-                    bt = self.parent_breakthroughs[parent_idx]
-                    print(f"    Parent {parent_idx} ({member['run_name']}_{member['agent_id']}): {bt}")
+                print(f"  Breakthroughs per member:")
+                for member_idx in range(self.num_committee_members):
+                    member = self.multi_roster['members'][member_idx]
+                    bt = self.member_breakthroughs[member_idx]
+                    print(f"    Member {member_idx} ({member['run_name']}_{member['agent_id']}): {bt}")
                 print(f"  Generation: {gen + 1}")
                 print(f"{'='*60}")
                 break
@@ -5750,17 +5743,24 @@ class ERLTrainer:
                 # Process state machine transitions
                 self.process_gauntlet_state_machine(validation_results)
 
-            # --- Multi-Agent Mode Breakthrough Detection ---
+            # --- Multi-Agent Mode Breakthrough Detection (Sequential) ---
             if self.multi_mode:
-                # Check for breakthroughs per parent group
-                multi_breakthroughs = self._check_multi_breakthroughs(validation_scores, gen)
-                for parent_idx, improved_agent, score in multi_breakthroughs:
-                    self._process_multi_breakthrough(parent_idx, improved_agent, score)
+                # Check for breakthrough on current committee member
+                breakthrough_result = self._check_multi_breakthrough(validation_scores)
+
+                if breakthrough_result is not None:
+                    improved_agent, score = breakthrough_result
+                    # Process the breakthrough and advance to next member
+                    self._process_multi_breakthrough(improved_agent, score)
+                    self._advance_to_next_multi_member()
 
                 # Log multi-mode progress
-                if gen % 5 == 0 or len(multi_breakthroughs) > 0:
+                member = self.multi_roster['members'][self.current_member_idx]
+                member_name = f"{member['run_name']}_{member['agent_id']}"
+                if gen % 5 == 0 or breakthrough_result is not None:
                     print(f"\n  Multi-Mode Progress: Turnovers {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
-                    print(f"    Breakthroughs: {self.parent_breakthroughs}")
+                    print(f"    Current member: {self.current_member_idx} ({member_name})")
+                    print(f"    Breakthroughs: {self.member_breakthroughs}")
 
             # --- Comprehensive Validation Logging ---
             # Calculate validation statistics across all agents
@@ -5798,25 +5798,17 @@ class ERLTrainer:
                     "gauntlet/stabilization_phase": self.stabilization_generations_elapsed if self.breakthrough_state == BreakthroughState.STABILIZATION else 0,
                 })
 
-            # Add Multi-Mode metrics (treat best per parent as "HoF" for logging compatibility)
+            # Add Multi-Mode metrics (sequential training of committee members)
             if self.multi_mode:
-                # Collect best agent per parent for HoF-style logging
-                parent_best_scores = []
-                for parent_idx in range(self.num_parents):
-                    start_idx = parent_idx * self.pop_per_parent
-                    end_idx = start_idx + self.pop_per_parent
-                    group_scores = validation_scores[start_idx:end_idx]
-                    parent_best_scores.append(max(group_scores))
-
+                # Log current member and overall progress
                 validation_log.update({
-                    "hof/size": self.num_parents,
-                    "hof/avg_score": np.mean(parent_best_scores),
-                    "hof/min_score": min(parent_best_scores),
-                    "hof/max_score": max(parent_best_scores),
+                    "multi/current_member_idx": self.current_member_idx,
+                    "multi/current_member_baseline": self.member_baselines[self.current_member_idx],
                     "multi/turnovers_completed": self.turnovers_completed,
-                    "multi/min_breakthroughs": min(self.parent_breakthroughs),
-                    "multi/max_breakthroughs": max(self.parent_breakthroughs),
-                    "multi/total_breakthroughs": sum(self.parent_breakthroughs),
+                    "multi/min_breakthroughs": min(self.member_breakthroughs),
+                    "multi/max_breakthroughs": max(self.member_breakthroughs),
+                    "multi/total_breakthroughs": sum(self.member_breakthroughs),
+                    "multi/avg_breakthroughs": np.mean(self.member_breakthroughs),
                 })
 
             wandb.log(validation_log, step=gen)
