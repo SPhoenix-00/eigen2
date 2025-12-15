@@ -1650,7 +1650,8 @@ class ERLTrainer:
             result['base_combined_fitness'] = base_combined_fitness
             result['roi_adjustment'] = roi_adjustment
 
-        # Extract combined fitness scores as baselines
+        # Extract combined fitness scores as baselines (WITH ROI adjustment for multi-mode)
+        # Multi-mode uses ROI expansion to incentivize beating Global50 median ROI
         for member_idx, result in enumerate(validation_results):
             baseline = result['combined_fitness']
             self.member_baselines[member_idx] = baseline
@@ -2923,13 +2924,14 @@ class ERLTrainer:
 
         return None
 
-    def _process_multi_breakthrough(self, improved_agent, score):
+    def _process_multi_breakthrough(self, improved_agent, score, val_result):
         """
         Process a breakthrough for current member: archive, save, update Global50.
 
         Args:
             improved_agent: The agent that achieved the breakthrough
-            score: The validation score achieved
+            score: The validation score achieved (base_combined_fitness)
+            val_result: Full validation result dict with metrics
 
         Returns:
             True if should advance to next member, False otherwise
@@ -2964,7 +2966,7 @@ class ERLTrainer:
         print(f"  Saved improved agent: {new_filename}")
 
         # Update Global50 ledger
-        self._update_global50_for_multi_breakthrough(member_idx, new_filename, score, improved_agent)
+        self._update_global50_for_multi_breakthrough(member_idx, new_filename, score, improved_agent, val_result)
 
         # CRITICAL: Update roster in memory so future loads use the improved agent
         # Without this, when we return to this member for Turnover #2, we'd load
@@ -3002,34 +3004,47 @@ class ERLTrainer:
 
         return True  # Signal to advance to next member
 
-    def _update_global50_for_multi_breakthrough(self, member_idx, new_filename, score, agent):
+    def _update_global50_for_multi_breakthrough(self, member_idx, new_filename, score, agent, val_result):
         """
         Update Global50 ledger with the new improved agent.
 
         Args:
             member_idx: Index of the member being improved
             new_filename: Filename of the new agent
-            score: Validation score achieved
+            score: Validation score achieved (base_combined_fitness)
             agent: The improved agent
+            val_result: Full validation result dict with metrics
         """
         member = self.multi_roster['members'][member_idx]
 
-        # Create entry for global50
-        new_entry = {
-            'run_name': self.run_name,
-            'agent_id': agent.agent_id,
-            'gauntlet_score': score,
-            'roi': 0.0,  # Will be recalculated on next evaluation
-            'expectancy': 0.0,
-            'quality_ratio': 0.0,
-            'win_ratio': 0.0,
-            'generation': self.generation,
-            'parent_of': f"{member['run_name']}_{member['agent_id']}",  # Track lineage
-        }
+        # Extract metrics from validation result
+        roi = val_result.get('roi', 0.0)
+        expectancy = val_result.get('expectancy', 0.0)
+        total_trades = val_result.get('total_trades', 0)
+        quality_count = val_result.get('quality_count', 0)
+        quality_ratio = (quality_count / total_trades) if total_trades > 0 else 0.0
 
-        # Add to Global50 via existing mechanism
-        self.global_hof.add_entry(new_entry)
-        print(f"     Added to Global50: {new_filename}")
+        num_wins = val_result.get('num_wins', 0)
+        num_losses = val_result.get('num_losses', 0)
+        total_decisions = num_wins + num_losses
+        win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
+
+        # Try to promote to Global50 via existing mechanism
+        promoted = self.global_hof.check_and_promote(
+            agent=agent,
+            gauntlet_score=score,
+            generation=self.generation,
+            roi=roi,
+            expectancy=expectancy,
+            quality_ratio=quality_ratio,
+            win_ratio=win_ratio,
+            total_trades=total_trades
+        )
+
+        if promoted:
+            print(f"  ✓ Promoted to Global50: {new_filename}")
+        else:
+            print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={self.global_hof.entry_threshold:.2f})")
 
     def _process_multi_turnover(self):
         """
@@ -5860,8 +5875,11 @@ class ERLTrainer:
 
                 if breakthrough_result is not None:
                     improved_agent, score = breakthrough_result
+                    # Get full validation result for this agent to extract metrics
+                    agent_idx = self.population.index(improved_agent)
+                    agent_val_result = [r for r in validation_results if r['idx'] == agent_idx][0]
                     # Process the breakthrough and advance to next member
-                    self._process_multi_breakthrough(improved_agent, score)
+                    self._process_multi_breakthrough(improved_agent, score, agent_val_result)
                     self._advance_to_next_multi_member()
 
                     # CRITICAL: Skip evolution for this generation
