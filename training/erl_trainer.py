@@ -1616,51 +1616,48 @@ class ERLTrainer:
         self.current_generation_val_slices = self.generate_validation_slices()
         self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
 
-        # Run full validation with ROI adjustment enabled (multi_mode is True)
+        # Run full validation to establish self-referential baselines
         # Note: validate_population_parallel returns raw validation metrics
-        # We need to post-process to add combined_fitness (val_fitness + roi_adjustment)
         validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
 
-        # Get median ROI from Hall of Fame for ROI-based scoring adjustment
-        median_hof_roi = self.hall_of_fame.get_median_roi()
+        # Initialize storage for each member's specific starting ROI
+        # This allows each member to compete against THEMSELVES, not a global median
+        self.member_starting_rois = [0.0] * self.num_committee_members
 
         # Post-process validation results to add combined_fitness
-        # This matches the logic in the training loop (lines 5701-5735)
+        # CRITICAL: Each member's baseline is SELF-REFERENTIAL (ROI adjustment = 0 initially)
+        # This ensures every member starts on equal footing: needing to beat THEIR OWN previous best
         for member_idx, result in enumerate(validation_results):
             val_fitness = result['fitness']
             train_fitness = 0.0  # No training fitness for initial multi-agent eval
             agent_roi = result.get('roi', 0.0)
             quality_count = result.get('quality_count', 0)
 
-            # Multi-mode: ROI Expansion with HoF median benchmark
-            # Combined score: penalize agents with negative training fitness
-            # Formula: combined = val_fitness + min(0, train_fitness)
+            # 1. Capture the agent's specific starting ROI
+            self.member_starting_rois[member_idx] = agent_roi
+
+            # 2. Calculate Base Fitness
             base_combined_fitness = val_fitness + min(0.0, train_fitness)
 
-            # ROI-based scoring adjustment using Hall of Fame median as benchmark
-            # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
-            # Confidence factor: quality_count / target_count (capped at 1.0)
-            confidence_factor = min(1.0, quality_count / Config.ROI_CONFIDENCE_MIN_TRADES)
-            roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
-            roi_adjustment = roi_adjustment * confidence_factor
+            # 3. Force ZERO adjustment for the baseline (Self vs Self = 0)
+            # We want the baseline to represent "no improvement yet"
+            # During training, the hurdle will be set to this member's starting ROI
+            roi_adjustment = 0.0
 
-            # Add combined_fitness to result
+            # 4. Set the baseline (no ROI adjustment for initial baseline)
             combined_fitness = base_combined_fitness + roi_adjustment
+
+            # Store in result
             result['combined_fitness'] = combined_fitness
             result['base_combined_fitness'] = base_combined_fitness
             result['roi_adjustment'] = roi_adjustment
 
-        # Extract combined fitness scores as baselines (WITH ROI adjustment for multi-mode)
-        # Multi-mode uses ROI expansion to incentivize beating Global50 median ROI
-        for member_idx, result in enumerate(validation_results):
-            baseline = result['combined_fitness']
-            self.member_baselines[member_idx] = baseline
+            # Store the baseline
+            self.member_baselines[member_idx] = combined_fitness
 
             member = members[member_idx]
-            roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
             print(f"  Member {member_idx}: {member['run_name']}_{member['agent_id']} "
-                  f"baseline={baseline:.2f} (base={result['base_combined_fitness']:.2f}, "
-                  f"ROI adj={roi_adj_sign}{result['roi_adjustment']:.2f})")
+                  f"ROI={agent_roi:.2f}% -> Baseline={combined_fitness:.2f} (self-referential)")
 
         # Restore population (will be replaced again when loading first member)
         self.population = saved_population
@@ -1691,10 +1688,18 @@ class ERLTrainer:
         member = self.multi_roster['members'][member_idx]
         context_window = self.multi_roster['context_window_days']
 
+        # Set the ROI hurdle to THIS member's starting ROI
+        # This ensures the reward function scales based on improvement over THIS agent
+        # Each member competes against themselves, not a global median
+        target_roi = self.member_starting_rois[member_idx]
+        self.roi_hurdle_ema = target_roi
+
         print(f"\n{'='*60}")
         print(f"🎯 MULTI-MODE: Loading Member {member_idx} for Training")
         print(f"{'='*60}")
         print(f"  Member: {member['run_name']}_{member['agent_id']}")
+        print(f"  Member Starting ROI: {target_roi:.2f}%")
+        print(f"  Training Hurdle set to: {self.roi_hurdle_ema:.2f}%")
         print(f"  Baseline: {self.member_baselines[member_idx]:.2f}")
         print(f"  Current breakthroughs: {self.member_breakthroughs[member_idx]}")
         print(f"  Target for this round: {self.turnovers_completed + 1}")
@@ -2995,6 +3000,13 @@ class ERLTrainer:
 
         # Update baseline for next breakthrough attempt
         self.member_baselines[member_idx] = score
+
+        # Update member's starting ROI for next breakthrough (self-referential hurdle)
+        # This ensures the next breakthrough requires beating the NEW ROI, not the original
+        new_roi = val_result.get('roi', self.member_starting_rois[member_idx])
+        self.member_starting_rois[member_idx] = new_roi
+        self.roi_hurdle_ema = new_roi  # Update training hurdle immediately
+        print(f"  Updated ROI hurdle: {self.member_starting_rois[member_idx]:.2f}%")
 
         # Print overall progress
         print(f"\n  Multi-Mode Progress:")
