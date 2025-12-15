@@ -740,12 +740,13 @@ class CommitteeAgent:
 
         print(f"✓ Committee agent ready with {len(self.loaded_agents)} members")
 
-    def predict_action(self, observation: np.ndarray) -> np.ndarray:
+    def predict_action(self, observation: np.ndarray, held_stock_ids: list = None) -> np.ndarray:
         """
         Generate committee consensus action from observation.
 
         Args:
             observation: Normalized observation [context_window, num_stocks, features]
+            held_stock_ids: Optional list of stock IDs already held (prevents re-signaling)
 
         Returns:
             action: [num_stocks, 2] array with [coefficient, sale_target] per stock
@@ -769,7 +770,7 @@ class CommitteeAgent:
         all_sale_targets = all_actions[:, :, 1]  # [num_members, num_stocks]
 
         # Apply committee consensus logic
-        final_coeffs = self._apply_consensus(all_coeffs)
+        final_coeffs = self._apply_consensus(all_coeffs, held_stock_ids)
 
         # Average sale targets for stocks that passed consensus
         # For stocks with coeff=0 (not approved), sale target doesn't matter
@@ -780,12 +781,13 @@ class CommitteeAgent:
 
         return action
 
-    def _apply_consensus(self, all_coeffs: np.ndarray) -> np.ndarray:
+    def _apply_consensus(self, all_coeffs: np.ndarray, held_stock_ids: list = None) -> np.ndarray:
         """
         Apply committee consensus logic to coefficient predictions.
 
         Args:
             all_coeffs: [num_members, num_stocks] coefficient predictions
+            held_stock_ids: List of stock IDs to exclude from signaling
 
         Returns:
             final_coeffs: [num_stocks] consensus coefficients
@@ -818,6 +820,13 @@ class CommitteeAgent:
         # PASS if: (Quorum OR Conviction) AND (NOT Veto)
         should_trade = (is_quorum | is_conviction) & (~is_vetoed)
 
+        # FILTER: Mask out stocks we already hold to prevent "Ghost Signals" in stats
+        if held_stock_ids:
+            held_mask = np.zeros(num_stocks, dtype=bool)
+            held_mask[held_stock_ids] = True
+            # If we hold it, we don't "trade" it (prevents stats inflation)
+            should_trade = should_trade & (~held_mask)
+
         # Track consensus stats if enabled
         if self.track_consensus:
             self.consensus_history['total_steps'] += 1
@@ -834,14 +843,21 @@ class CommitteeAgent:
             min_consensus = np.sum(vote_counts[should_trade] == Config.COMMITTEE_QUORUM)
             self.consensus_history['min_consensus_count'] += int(min_consensus)
 
-            # Trades by quorum vs conviction
-            quorum_only = is_quorum & (~is_conviction) & (~is_vetoed)
-            conviction_only = (~is_quorum) & is_conviction & (~is_vetoed)
-            self.consensus_history['trades_by_quorum'] += int(np.sum(quorum_only))
-            self.consensus_history['trades_by_conviction'] += int(np.sum(conviction_only))
+            # Trades by Quorum vs Conviction
+            # If a trade meets both, count it as quorum
+            is_quorum_approved = is_quorum & should_trade
+            is_conviction_only = (~is_quorum) & is_conviction & should_trade
 
-            # Trades vetoed
-            vetoed_trades = (is_quorum | is_conviction) & is_vetoed
+            self.consensus_history['trades_by_quorum'] += int(np.sum(is_quorum_approved))
+            self.consensus_history['trades_by_conviction'] += int(np.sum(is_conviction_only))
+
+            # Trades vetoed (Only count vetoes on signals that otherwise would have passed)
+            # This filters out "vetoes" on stocks nobody wanted anyway
+            potential_trades = (is_quorum | is_conviction)
+            if held_stock_ids:
+                potential_trades = potential_trades & (~held_mask)
+
+            vetoed_trades = potential_trades & is_vetoed
             self.consensus_history['trades_vetoed'] += int(np.sum(vetoed_trades))
 
             # Average votes per trade
@@ -1053,8 +1069,11 @@ def evaluate_committee_on_slice(members: list, loader, stats,
     terminated = False
 
     while not terminated:
+        # Get currently held stocks to prevent re-signaling
+        held_ids = list(env.open_positions.keys())
+
         # Get committee consensus action
-        action = committee.predict_action(obs)  # [num_stocks, 2]
+        action = committee.predict_action(obs, held_stock_ids=held_ids)  # [num_stocks, 2]
 
         # Step environment
         obs, reward, terminated, truncated, info = env.step(action)
