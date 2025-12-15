@@ -663,7 +663,126 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
     }
 
 
-# --- Consensus Engine ---
+# --- Committee Agent Class ---
+
+class CommitteeAgent:
+    """
+    Committee-as-Agent: Aggregates multiple agents' decisions into a single action vector.
+
+    This class acts as a drop-in replacement for a single agent, implementing the same
+    interface (predict action from observation) but using committee consensus logic internally.
+    """
+
+    def __init__(self, members: list, context_window_days: int):
+        """
+        Initialize committee agent.
+
+        Args:
+            members: List of member dicts with agent metadata and stats
+            context_window_days: Context window for loading agent files
+        """
+        self.members = members
+        self.context_window_days = context_window_days
+        self.loaded_agents = []
+
+        # Load all member agents (actor only)
+        print(f"Loading {len(members)} committee members...")
+        for member in tqdm(members, desc="Loading agents"):
+            filepath = get_agent_filepath(member, context_window_days)
+            agent = load_agent_actor_only(filepath, member['agent_id'])
+            if agent is None:
+                raise ValueError(f"Failed to load agent: {filepath}")
+            self.loaded_agents.append(agent)
+
+        print(f"✓ Committee agent ready with {len(self.loaded_agents)} members")
+
+    def predict_action(self, observation: np.ndarray) -> np.ndarray:
+        """
+        Generate committee consensus action from observation.
+
+        Args:
+            observation: Normalized observation [context_window, num_stocks, features]
+
+        Returns:
+            action: [num_stocks, 2] array with [coefficient, sale_target] per stock
+        """
+        # Convert to tensor
+        obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(Config.DEVICE)
+
+        # Collect predictions from all members
+        all_actions = []
+
+        with torch.no_grad():
+            for agent in self.loaded_agents:
+                action = agent.actor(obs_tensor).cpu().numpy()[0]  # [num_stocks, 2]
+                all_actions.append(action)
+
+        # Stack: [num_members, num_stocks, 2]
+        all_actions = np.array(all_actions)
+
+        # Extract coefficients and sale targets
+        all_coeffs = all_actions[:, :, 0]  # [num_members, num_stocks]
+        all_sale_targets = all_actions[:, :, 1]  # [num_members, num_stocks]
+
+        # Apply committee consensus logic
+        final_coeffs = self._apply_consensus(all_coeffs)
+
+        # Average sale targets for stocks that passed consensus
+        # For stocks with coeff=0 (not approved), sale target doesn't matter
+        final_sale_targets = np.mean(all_sale_targets, axis=0)
+
+        # Combine into action
+        action = np.stack([final_coeffs, final_sale_targets], axis=1)  # [num_stocks, 2]
+
+        return action
+
+    def _apply_consensus(self, all_coeffs: np.ndarray) -> np.ndarray:
+        """
+        Apply committee consensus logic to coefficient predictions.
+
+        Args:
+            all_coeffs: [num_members, num_stocks] coefficient predictions
+
+        Returns:
+            final_coeffs: [num_stocks] consensus coefficients
+        """
+        num_members, num_stocks = all_coeffs.shape
+
+        # 1. Standard Voting (Quorum)
+        votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD
+        vote_counts = np.sum(votes, axis=0)  # [num_stocks]
+        is_quorum = vote_counts >= Config.COMMITTEE_QUORUM
+
+        # 2. Conviction Check (Stock-Specific Override)
+        conviction_thresholds = np.array([
+            m['stats']['conviction_threshold_vector'] for m in self.members
+        ])  # [num_members, num_stocks]
+
+        agent_convictions = all_coeffs > conviction_thresholds
+        is_conviction = np.any(agent_convictions, axis=0)  # [num_stocks]
+
+        # 3. Veto Check (Fixed number of silent members)
+        is_silent = all_coeffs < 0.1
+        silent_counts = np.sum(is_silent, axis=0)
+        is_vetoed = silent_counts >= Config.COMMITTEE_VETO_COUNT
+
+        # 4. Final Decision Logic
+        # PASS if: (Quorum OR Conviction) AND (NOT Veto)
+        should_trade = (is_quorum | is_conviction) & (~is_vetoed)
+
+        # 5. Signal Aggregation (Mean of ALL members, but zero out rejected stocks)
+        avg_coef = np.mean(all_coeffs, axis=0)  # [num_stocks]
+        final_coeffs = np.where(should_trade, avg_coef, 0.0)
+
+        return final_coeffs
+
+    def cleanup(self):
+        """Release GPU memory from loaded agents."""
+        for agent in self.loaded_agents:
+            del agent
+        self.loaded_agents.clear()
+        torch.cuda.empty_cache()
+
 
 def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray) -> np.ndarray:
     """
@@ -694,335 +813,145 @@ def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray) -> np.n
     return p95_vector
 
 
-def committee_consensus_engine(all_coeffs: np.ndarray, member_stats: list,
-                                quorum: int, veto_threshold: float = 0.4) -> tuple:
-    """
-    Aggregates agent actions into committee decision using Quorum, Conviction, and Veto.
-
-    Args:
-        all_coeffs: [Num_Members, Days, Stocks] coefficient predictions
-        member_stats: List of dicts with 'conviction_threshold_vector' for each member
-        quorum: Number of members required for standard approval
-        veto_threshold: Fraction of members needed to veto (e.g., 0.4 = 40%)
-
-    Returns:
-        (final_coeffs, voting_stats, detailed_masks)
-    """
-    num_members, num_days, num_stocks = all_coeffs.shape
-
-    # 1. Standard Voting (Quorum)
-    votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD
-    vote_counts = np.sum(votes, axis=0)  # [Days, Stocks]
-    is_quorum = vote_counts >= quorum
-
-    # 2. Conviction Check (Stock-Specific Override)
-    conviction_thresholds = np.array([
-        m['stats']['conviction_threshold_vector'] for m in member_stats
-    ])  # [Members, Stocks]
-    # Broadcast comparison: [Members, Days, Stocks] > [Members, 1, Stocks]
-    agent_convictions = all_coeffs > conviction_thresholds[:, np.newaxis, :]
-    is_conviction = np.any(agent_convictions, axis=0)  # [Days, Stocks]
-
-    # 3. Veto Check (Negative Quorum for indifference)
-    is_silent = all_coeffs < 0.1
-    silent_counts = np.sum(is_silent, axis=0)
-    veto_needed = int(num_members * veto_threshold)
-    is_vetoed = silent_counts >= veto_needed
-
-    # 4. Final Decision Logic
-    # PASS if: (Quorum OR Conviction) AND (NOT Veto)
-    should_trade = (is_quorum | is_conviction) & (~is_vetoed)
-
-    # 5. Signal Aggregation (Mean of ALL members)
-    avg_coef = np.mean(all_coeffs, axis=0)  # [Days, Stocks]
-    final_coeffs = np.where(should_trade, avg_coef, 0.0)
-
-    # Debug statistics
-    voting_stats = {
-        'quorum_triggers': int(np.sum(is_quorum)),
-        'conviction_triggers': int(np.sum(is_conviction)),
-        'conviction_only_triggers': int(np.sum(is_conviction & ~is_quorum)),
-        'vetoes': int(np.sum(is_vetoed)),
-        'final_trades': int(np.sum(should_trade))
-    }
-
-    # Detailed masks for analysis
-    detailed_masks = {
-        'is_quorum': is_quorum,
-        'is_conviction': is_conviction,
-        'is_vetoed': is_vetoed,
-        'vote_counts': vote_counts
-    }
-
-    return final_coeffs, voting_stats, detailed_masks
-
-
 # --- Validation ---
 
-def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
-                            slice_returns: np.ndarray) -> dict:
+def evaluate_agent_on_slice(agent_path: Path, loader, stats,
+                            slice_start_idx: int, slice_end_idx: int) -> dict:
     """
-    Evaluate a single agent on a holdout slice.
+    Evaluate a single agent on a holdout slice using TradingEnvironment.
 
-    Returns dict with comprehensive fitness metrics.
+    Args:
+        agent_path: Path to agent weights file
+        loader: StockDataLoader instance
+        stats: Normalization statistics
+        slice_start_idx: Starting day index for slice
+        slice_end_idx: Ending day index for slice (exclusive)
+
+    Returns:
+        Dict with comprehensive fitness metrics matching environment rules
     """
+    from environment.trading_env import TradingEnvironment
+
+    # Load agent (actor only)
     agent = load_agent_actor_only(agent_path, 0)
     if agent is None:
         return {'error': 'Failed to load agent'}
 
-    with torch.no_grad():
-        actions = agent.actor(slice_tensor).cpu().numpy()
-
-    coeffs = actions[:, :, 0]  # [Days, Stocks]
-
-    # Active positions (coefficient > threshold)
-    active = np.maximum(0, coeffs - Config.COEFFICIENT_THRESHOLD)
-    active = np.minimum(active, 2.0)  # Cap leverage
-
-    # Calculate trades and PnL
-    trades_mask = active > 0
-    num_trades = np.sum(trades_mask)
-
-    if num_trades == 0:
-        del agent
-        return {
-            'num_trades': 0,
-            'win_rate': 0.0,
-            'quality_ratio': 0.0,
-            'expectancy': 0.0,
-            'roi': 0.0,
-            'fitness': -Config.ZERO_TRADES_PENALTY_GAUNTLET,
-        }
-
-    # Get returns for active positions (only investable stocks)
-    investable_returns = slice_returns[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1]
-    trade_returns = investable_returns[trades_mask]
-    trade_weights = active[trades_mask]
-
-    # Weighted PnL
-    weighted_returns = trade_returns * trade_weights
-    total_pnl = np.sum(weighted_returns)
-    total_investment = np.sum(trade_weights)
-
-    roi = (total_pnl / total_investment * 100) if total_investment > 0 else 0.0
-    win_rate = np.mean(trade_returns > 0) if len(trade_returns) > 0 else 0.0
-
-    # Quality ratio (winners / losers)
-    winners = np.sum(trade_returns > 0)
-    losers = np.sum(trade_returns <= 0)
-    quality_ratio = (winners / losers) if losers > 0 else float('inf')
-
-    # Expectancy (average return per trade)
-    expectancy = float(np.mean(weighted_returns)) if len(weighted_returns) > 0 else 0.0
-
-    # Simple fitness approximation
-    fitness = roi * np.log10(abs(total_pnl) + 10)
-    if roi > 0:
-        fitness *= (1 + win_rate ** 2)
-
-    del agent
-    torch.cuda.empty_cache()
-
-    return {
-        'num_trades': int(num_trades),
-        'win_rate': float(win_rate),
-        'quality_ratio': float(quality_ratio),
-        'expectancy': expectancy,
-        'roi': float(roi),
-        'fitness': float(fitness),
-    }
-
-
-def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
-                                 slice_returns: np.ndarray,
-                                 context_window_days: int,
-                                 slice_start_idx: int = None,
-                                 export_trades: bool = False) -> dict:
-    """
-    Evaluate committee consensus on a holdout slice.
-
-    Uses voting mechanism: trade triggers when majority of committee agrees.
-    Returns detailed consensus statistics.
-    """
-    all_coeffs = []
-
-    for entry in members:
-        filepath = get_agent_filepath(entry, context_window_days)
-        agent = load_agent_actor_only(filepath, entry['agent_id'])
-        if agent is None:
-            continue
-
-        with torch.no_grad():
-            actions = agent.actor(slice_tensor).cpu().numpy()
-
-        coeffs = actions[:, :, 0]
-        all_coeffs.append(coeffs)
-
-        del agent
-        torch.cuda.empty_cache()
-
-    if not all_coeffs:
-        return {'error': 'No agents loaded'}
-
-    # Stack coefficients: [Agents, Days, Stocks]
-    all_coeffs = np.array(all_coeffs)
-    num_members = len(all_coeffs)
-
-    # Use consensus engine with Quorum, Conviction, and Veto logic
-    final_coeffs, voting_stats, detailed_masks = committee_consensus_engine(
-        all_coeffs,
-        members,  # Must have 'stats' field with 'conviction_threshold_vector'
-        quorum=Config.COMMITTEE_QUORUM,
-        veto_threshold=Config.COMMITTEE_VETO_THRESHOLD
+    # Create trading environment for this slice
+    env = TradingEnvironment(
+        data_array=loader.data_array,
+        dates=loader.dates,
+        normalization_stats=stats,
+        start_idx=slice_start_idx,
+        end_idx=slice_end_idx,
+        data_array_full=loader.data_array_full,
+        is_training=False,  # No observation noise during validation
+        gauntlet_mode=True  # Use soft zero-trades penalty
     )
 
-    # Determine triggers and active positions from consensus
-    triggers = final_coeffs > 0.0
-    active = np.minimum(final_coeffs, 2.0)  # Cap at 2x leverage
+    # Run episode
+    obs, info = env.reset()
+    terminated = False
 
-    # Get vote counts for consensus statistics
-    vote_counts = detailed_masks['vote_counts']
-    num_trades = voting_stats['final_trades']
+    with torch.no_grad():
+        while not terminated:
+            # Convert observation to tensor and get action
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(Config.DEVICE)
+            action = agent.actor(obs_tensor).cpu().numpy()[0]  # [num_stocks, 2]
 
-    # Extract returns for investable stocks only
-    investable_returns = slice_returns[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1]
+            # Step environment
+            obs, reward, terminated, truncated, info = env.step(action)
 
-    # Consensus statistics
-    consensus_stats = {
-        'unanimity_count': 0,
-        'unanimity_pct': 0.0,
-        'unanimity_win_rate': 0.0,
-        'unanimity_quality_ratio': 0.0,
-        'min_consensus_count': 0,
-        'min_consensus_pct': 0.0,
-        'min_consensus_win_rate': 0.0,
-        'min_consensus_quality_ratio': 0.0,
-        'avg_consensus_votes': 0.0,
-        'consensus_distribution': {},  # votes -> count
-    }
+    # Get episode summary
+    summary = env.get_episode_summary()
 
-    if num_trades == 0:
-        return {
-            'num_trades': 0,
-            'win_rate': 0.0,
-            'roi': 0.0,
-            'fitness': -Config.ZERO_TRADES_PENALTY_GAUNTLET,
-            'consensus_stats': consensus_stats,
-        }
+    # Clean up
+    del agent
+    del env
+    torch.cuda.empty_cache()
 
-    # Analyze consensus levels for triggered trades
-    triggered_vote_counts = vote_counts[triggers]
-
-    # Unanimity trades (all members agree)
-    unanimity_mask = triggered_vote_counts == num_members
-    unanimity_count = np.sum(unanimity_mask)
-
-    # Minimum consensus trades (exactly quorum votes)
-    min_consensus_mask = triggered_vote_counts == Config.COMMITTEE_QUORUM
-    min_consensus_count = np.sum(min_consensus_mask)
-
-    # Average number of votes per trade
-    avg_votes = float(np.mean(triggered_vote_counts))
-
-    # Consensus distribution
-    unique_votes, vote_freq = np.unique(triggered_vote_counts, return_counts=True)
-    consensus_distribution = {int(v): int(f) for v, f in zip(unique_votes, vote_freq)}
-
-    # Calculate metrics for unanimity trades
-    if unanimity_count > 0:
-        unanimity_returns = investable_returns[triggers][unanimity_mask]
-        unanimity_win_rate = float(np.mean(unanimity_returns > 0))
-        unanimity_winners = np.sum(unanimity_returns > 0)
-        unanimity_losers = np.sum(unanimity_returns <= 0)
-        unanimity_quality_ratio = (unanimity_winners / unanimity_losers) if unanimity_losers > 0 else float('inf')
-    else:
-        unanimity_win_rate = 0.0
-        unanimity_quality_ratio = 0.0
-
-    # Calculate metrics for minimum consensus trades
-    if min_consensus_count > 0:
-        min_consensus_returns = investable_returns[triggers][min_consensus_mask]
-        min_consensus_win_rate = float(np.mean(min_consensus_returns > 0))
-        min_consensus_winners = np.sum(min_consensus_returns > 0)
-        min_consensus_losers = np.sum(min_consensus_returns <= 0)
-        min_consensus_quality_ratio = (min_consensus_winners / min_consensus_losers) if min_consensus_losers > 0 else float('inf')
-    else:
-        min_consensus_win_rate = 0.0
-        min_consensus_quality_ratio = 0.0
-
-    consensus_stats = {
-        'unanimity_count': int(unanimity_count),
-        'unanimity_pct': float(unanimity_count / num_trades * 100) if num_trades > 0 else 0.0,
-        'unanimity_win_rate': unanimity_win_rate,
-        'unanimity_quality_ratio': unanimity_quality_ratio,
-        'min_consensus_count': int(min_consensus_count),
-        'min_consensus_pct': float(min_consensus_count / num_trades * 100) if num_trades > 0 else 0.0,
-        'min_consensus_win_rate': min_consensus_win_rate,
-        'min_consensus_quality_ratio': min_consensus_quality_ratio,
-        'avg_consensus_votes': avg_votes,
-        'consensus_distribution': consensus_distribution,
-        # Add new consensus engine stats
-        'quorum_triggers': voting_stats['quorum_triggers'],
-        'conviction_triggers': voting_stats['conviction_triggers'],
-        'conviction_only_triggers': voting_stats['conviction_only_triggers'],
-        'vetoes': voting_stats['vetoes'],
-    }
-
-    # Active positions already computed by consensus engine (final_coeffs capped at 2.0)
-
-    trade_returns = investable_returns[triggers]
-    trade_weights = active[triggers]
-
-    weighted_returns = trade_returns * trade_weights
-    total_pnl = np.sum(weighted_returns)
-    total_investment = np.sum(trade_weights)
-
-    roi = (total_pnl / total_investment * 100) if total_investment > 0 else 0.0
-    win_rate = np.mean(trade_returns > 0) if len(trade_returns) > 0 else 0.0
-
-    # Quality ratio (winners / losers)
-    winners = np.sum(trade_returns > 0)
-    losers = np.sum(trade_returns <= 0)
-    quality_ratio = (winners / losers) if losers > 0 else float('inf')
-
-    # Expectancy (average return per trade)
-    expectancy = float(np.mean(weighted_returns)) if len(weighted_returns) > 0 else 0.0
-
-    fitness = roi * np.log10(abs(total_pnl) + 10)
-    if roi > 0:
-        fitness *= (1 + win_rate ** 2)
-
-    # Export trade details if requested
-    trade_details = None
-    if export_trades:
-        # Get indices of triggered trades
-        trigger_indices = np.argwhere(triggers)  # [(day_idx, stock_idx), ...]
-
-        trade_details = []
-        for idx, (day_idx, stock_idx) in enumerate(trigger_indices):
-            # Adjust stock index to investable range
-            actual_stock_idx = stock_idx + Config.INVESTABLE_START_COL
-
-            trade_details.append({
-                'day_idx': int(slice_start_idx + day_idx) if slice_start_idx is not None else int(day_idx),
-                'stock_idx': int(actual_stock_idx),
-                'coefficient': float(final_coeffs[day_idx, stock_idx]),
-                'position_size': float(active[day_idx, stock_idx]),
-                'return': float(trade_returns[idx]),
-                'weighted_return': float(weighted_returns[idx]),
-                'vote_count': int(triggered_vote_counts[idx]),
-                'is_winner': bool(trade_returns[idx] > 0),
-            })
-
+    # Return metrics in expected format
     return {
-        'num_trades': int(num_trades),
-        'win_rate': float(win_rate),
-        'quality_ratio': quality_ratio,
-        'expectancy': expectancy,
-        'roi': float(roi),
-        'fitness': float(fitness),
-        'consensus_stats': consensus_stats,
-        'trade_details': trade_details,
+        'num_trades': summary['num_trades'],
+        'win_rate': summary['win_rate'],
+        'quality_ratio': (summary['num_wins'] / summary['num_losses']) if summary['num_losses'] > 0 else float('inf'),
+        'expectancy': summary['avg_reward_per_trade'],
+        'roi': summary['roi'],
+        'fitness': summary['total_reward'],  # Total reward is the fitness
+    }
+
+
+def evaluate_committee_on_slice(members: list, loader, stats,
+                                 context_window_days: int,
+                                 slice_start_idx: int,
+                                 slice_end_idx: int) -> dict:
+    """
+    Evaluate committee consensus on a holdout slice using TradingEnvironment.
+
+    The committee acts as a single agent, using consensus logic to generate actions
+    that are then executed through the standard trading environment.
+
+    Args:
+        members: List of committee member dicts with agent metadata and stats
+        loader: StockDataLoader instance
+        stats: Normalization statistics
+        context_window_days: Context window for loading agent files
+        slice_start_idx: Starting day index for slice
+        slice_end_idx: Ending day index for slice (exclusive)
+
+    Returns:
+        Dict with comprehensive metrics matching environment rules
+    """
+    from environment.trading_env import TradingEnvironment
+
+    # Create committee agent (loads all members)
+    committee = CommitteeAgent(members, context_window_days)
+
+    # Create trading environment for this slice
+    env = TradingEnvironment(
+        data_array=loader.data_array,
+        dates=loader.dates,
+        normalization_stats=stats,
+        start_idx=slice_start_idx,
+        end_idx=slice_end_idx,
+        data_array_full=loader.data_array_full,
+        is_training=False,  # No observation noise during validation
+        gauntlet_mode=True  # Use soft zero-trades penalty
+    )
+
+    # Run episode with committee making decisions
+    obs, info = env.reset()
+    terminated = False
+
+    while not terminated:
+        # Get committee consensus action
+        action = committee.predict_action(obs)  # [num_stocks, 2]
+
+        # Step environment
+        obs, reward, terminated, truncated, info = env.step(action)
+
+    # Get episode summary
+    summary = env.get_episode_summary()
+
+    # Clean up
+    committee.cleanup()
+    del env
+    torch.cuda.empty_cache()
+
+    # Return metrics in expected format
+    # Note: Consensus stats would require tracking votes per step, which we skip for now
+    # The committee's consensus logic is applied inside CommitteeAgent.predict_action()
+    return {
+        'num_trades': summary['num_trades'],
+        'win_rate': summary['win_rate'],
+        'quality_ratio': (summary['num_wins'] / summary['num_losses']) if summary['num_losses'] > 0 else float('inf'),
+        'expectancy': summary['avg_reward_per_trade'],
+        'roi': summary['roi'],
+        'fitness': summary['total_reward'],  # Total reward is the fitness
+        'consensus_stats': {
+            # Placeholder - would need to track votes per step to populate these
+            'note': 'Consensus applied per-step inside CommitteeAgent'
+        }
     }
 
 
@@ -1045,27 +974,18 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     members = roster['members']
     num_slices = Config.COMMITTEE_VALIDATION_SLICES
 
-    # Get full holdout data
-    holdout_tensor, valid_indices = get_holdout_data(loader, stats, holdout_info)
+    # Calculate holdout range (absolute day indices)
+    holdout_start_idx = holdout_info['holdout_start']
+    holdout_end_idx = holdout_info['holdout_end'] + 1  # +1 for exclusive end
 
-    # Calculate returns
-    close_idx = 1
-    full_closes = loader.data_array_full[:, :, close_idx]
+    # Split holdout into slices
+    holdout_days = holdout_end_idx - holdout_start_idx
+    slice_size = holdout_days // num_slices
 
-    holdout_returns = []
-    for t in valid_indices:
-        entry_price = full_closes[t]
-        exit_price = full_closes[t + Config.MIN_HOLDING_PERIOD]
-        ret = np.where(entry_price > 0, (exit_price - entry_price) / entry_price, 0.0)
-        holdout_returns.append(ret)
-    holdout_returns = np.array(holdout_returns)
-
-    # Split into slices
-    slice_size = len(valid_indices) // num_slices
-
-    print(f"\n  Holdout days: {len(valid_indices)}")
+    print(f"\n  Holdout range: indices {holdout_start_idx} to {holdout_end_idx-1}")
+    print(f"  Holdout days: {holdout_days}")
     print(f"  Slices: {num_slices}")
-    print(f"  Days per slice: {slice_size}")
+    print(f"  Days per slice: ~{slice_size}")
 
     results = {
         'individual_agents': [],
@@ -1100,13 +1020,14 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         }
 
         for s in range(num_slices):
-            start_idx = s * slice_size
-            end_idx = (s + 1) * slice_size if s < num_slices - 1 else len(valid_indices)
+            # Calculate absolute slice indices
+            slice_start = holdout_start_idx + (s * slice_size)
+            if s < num_slices - 1:
+                slice_end = holdout_start_idx + ((s + 1) * slice_size)
+            else:
+                slice_end = holdout_end_idx  # Last slice gets remainder
 
-            slice_tensor = holdout_tensor[start_idx:end_idx]
-            slice_returns = holdout_returns[start_idx:end_idx]
-
-            metrics = evaluate_agent_on_slice(filepath, slice_tensor, slice_returns)
+            metrics = evaluate_agent_on_slice(filepath, loader, stats, slice_start, slice_end)
             agent_results['slice_metrics'].append({
                 'slice': s,
                 'fitness': metrics.get('fitness', 0.0),
@@ -1129,22 +1050,16 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     # Validate committee consensus on each slice
     print(f"\nValidating committee consensus...")
 
-    all_trades_data = []  # Collect all trades across slices
-
     for s in range(num_slices):
-        start_idx = s * slice_size
-        end_idx = (s + 1) * slice_size if s < num_slices - 1 else len(valid_indices)
-
-        slice_tensor = holdout_tensor[start_idx:end_idx]
-        slice_returns = holdout_returns[start_idx:end_idx]
-
-        # Get absolute day index for trade export
-        slice_start_day_idx = valid_indices[start_idx]
+        # Calculate absolute slice indices
+        slice_start = holdout_start_idx + (s * slice_size)
+        if s < num_slices - 1:
+            slice_end = holdout_start_idx + ((s + 1) * slice_size)
+        else:
+            slice_end = holdout_end_idx  # Last slice gets remainder
 
         metrics = evaluate_committee_on_slice(
-            members, slice_tensor, slice_returns, context_window_days,
-            slice_start_idx=slice_start_day_idx,
-            export_trades=True
+            members, loader, stats, context_window_days, slice_start, slice_end
         )
 
         slice_result = {
@@ -1155,16 +1070,10 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             'expectancy': metrics.get('expectancy', 0.0),
             'roi': metrics.get('roi', 0.0),
             'num_trades': metrics.get('num_trades', 0),
-            'consensus_stats': metrics.get('consensus_stats', {}),
+            'consensus_stats': metrics.get('consensus_stats', {'note': 'Consensus applied per-step'}),
         }
 
         results['committee_slices'].append(slice_result)
-
-        # Collect trade details for CSV export
-        if metrics.get('trade_details'):
-            for trade in metrics['trade_details']:
-                trade['slice'] = s
-                all_trades_data.append(trade)
 
     # Calculate committee aggregates
     results['committee_aggregate']['mean_fitness'] = float(
@@ -1186,16 +1095,10 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         sum([s['num_trades'] for s in results['committee_slices']])
     )
 
-    # Calculate consensus summary
-    results['consensus_summary']['avg_unanimity_pct'] = float(
-        np.mean([s['consensus_stats']['unanimity_pct'] for s in results['committee_slices']])
-    )
-    results['consensus_summary']['avg_min_consensus_pct'] = float(
-        np.mean([s['consensus_stats']['min_consensus_pct'] for s in results['committee_slices']])
-    )
-    results['consensus_summary']['avg_consensus_votes'] = float(
-        np.mean([s['consensus_stats']['avg_consensus_votes'] for s in results['committee_slices']])
-    )
+    # Consensus summary not available with new architecture (would need per-step tracking)
+    results['consensus_summary'] = {
+        'note': 'Consensus metrics require per-step tracking - not implemented in new architecture'
+    }
 
     # Print comprehensive results
     print(f"\n{'='*60}")
@@ -1232,26 +1135,10 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         print(f"    Trades: {s['num_trades']}")
         print(f"")
 
+        # Consensus stats note
         cs = s['consensus_stats']
-        print(f"    Consensus Breakdown:")
-        print(f"      Unanimity: {cs['unanimity_count']} trades ({cs['unanimity_pct']:.1f}%)")
-        if cs['unanimity_count'] > 0:
-            print(f"        Win Rate: {cs['unanimity_win_rate']:.2%}")
-            print(f"        Quality Ratio: {cs['unanimity_quality_ratio']:.3f}")
-
-        print(f"      Min Consensus: {cs['min_consensus_count']} trades ({cs['min_consensus_pct']:.1f}%)")
-        if cs['min_consensus_count'] > 0:
-            print(f"        Win Rate: {cs['min_consensus_win_rate']:.2%}")
-            print(f"        Quality Ratio: {cs['min_consensus_quality_ratio']:.3f}")
-
-        print(f"      Avg Votes per Trade: {cs['avg_consensus_votes']:.2f}")
-        print(f"      Vote Distribution: {cs['consensus_distribution']}")
-        print(f"")
-        print(f"    Consensus Engine Stats:")
-        print(f"      Quorum Triggers: {cs['quorum_triggers']}")
-        print(f"      Conviction Triggers: {cs['conviction_triggers']} "
-              f"(Conviction-Only: {cs['conviction_only_triggers']})")
-        print(f"      Vetoes: {cs['vetoes']}")
+        if 'note' in cs:
+            print(f"    Consensus: {cs['note']}")
 
     print("\n" + "-"*60)
     print("COMMITTEE AGGREGATE PERFORMANCE")
@@ -1265,12 +1152,11 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     print(f"  Total Trades (All Slices): {ca['total_trades']}")
 
     print("\n" + "-"*60)
-    print("CONSENSUS SUMMARY (Across All Slices)")
+    print("CONSENSUS SUMMARY")
     print("-"*60)
     cs_sum = results['consensus_summary']
-    print(f"  Avg Unanimity %: {cs_sum['avg_unanimity_pct']:.1f}%")
-    print(f"  Avg Min Consensus %: {cs_sum['avg_min_consensus_pct']:.1f}%")
-    print(f"  Avg Votes per Trade: {cs_sum['avg_consensus_votes']:.2f}")
+    if 'note' in cs_sum:
+        print(f"  {cs_sum['note']}")
 
     print("\n" + "-"*60)
     print("COMMITTEE VS INDIVIDUAL COMPARISON")
@@ -1287,49 +1173,6 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     print(f"  Avg Individual: {avg_individual:.2f}")
     print(f"  Committee vs Best: {committee_mean - best_individual:+.2f} ({((committee_mean / best_individual - 1) * 100):+.1f}%)")
     print(f"  Committee vs Avg: {committee_mean - avg_individual:+.2f} ({((committee_mean / avg_individual - 1) * 100):+.1f}%)")
-
-    # Export trades to CSV files
-    if all_trades_data:
-        print(f"\n" + "-"*60)
-        print("EXPORTING TRADE DATA")
-        print("-"*60)
-
-        # Export all trades to a single CSV
-        trades_df = pd.DataFrame(all_trades_data)
-        all_trades_csv = manager.local_committee_dir / "committee_all_trades.csv"
-        trades_df.to_csv(all_trades_csv, index=False)
-        print(f"  ✓ All trades: {all_trades_csv}")
-        print(f"    Total trades: {len(trades_df)}")
-
-        # Export per-slice CSVs
-        for s in range(num_slices):
-            slice_trades = [t for t in all_trades_data if t['slice'] == s]
-            if slice_trades:
-                slice_df = pd.DataFrame(slice_trades)
-                slice_csv = manager.local_committee_dir / f"committee_slice_{s}_trades.csv"
-                slice_df.to_csv(slice_csv, index=False)
-                print(f"  ✓ Slice {s}: {slice_csv} ({len(slice_df)} trades)")
-
-        # Upload CSVs to cloud
-        if manager.cloud_sync.provider != "local":
-            print(f"\n  Syncing trade CSVs to cloud...")
-
-            # Upload all trades CSV
-            cloud_all_trades = f"{manager.cloud_committee_base}/committee_all_trades.csv"
-            if manager.cloud_sync.upload_file_verified(str(all_trades_csv), cloud_all_trades):
-                print(f"    ✓ Uploaded: committee_all_trades.csv")
-            else:
-                print(f"    ✗ Failed to upload: committee_all_trades.csv")
-
-            # Upload slice CSVs
-            for s in range(num_slices):
-                slice_csv = manager.local_committee_dir / f"committee_slice_{s}_trades.csv"
-                if slice_csv.exists():
-                    cloud_slice_csv = f"{manager.cloud_committee_base}/committee_slice_{s}_trades.csv"
-                    if manager.cloud_sync.upload_file_verified(str(slice_csv), cloud_slice_csv):
-                        print(f"    ✓ Uploaded: committee_slice_{s}_trades.csv")
-                    else:
-                        print(f"    ✗ Failed to upload: committee_slice_{s}_trades.csv")
 
     return results
 
