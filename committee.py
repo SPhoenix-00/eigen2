@@ -753,13 +753,17 @@ class CommitteeAgent:
         vote_counts = np.sum(votes, axis=0)  # [num_stocks]
         is_quorum = vote_counts >= Config.COMMITTEE_QUORUM
 
-        # 2. Conviction Check (Stock-Specific Override)
+        # 2. Conviction Check (Stock-Specific Override) WITH SOCIAL PROOF
         conviction_thresholds = np.array([
             m['stats']['conviction_threshold_vector'] for m in self.members
         ])  # [num_members, num_stocks]
 
         agent_convictions = all_coeffs > conviction_thresholds
-        is_conviction = np.any(agent_convictions, axis=0)  # [num_stocks]
+        is_conviction_raw = np.any(agent_convictions, axis=0)  # [num_stocks]
+
+        # SOCIAL PROOF: A conviction trade requires at least 1 backer (total votes >= 2)
+        # This prevents a single hallucinating agent from triggering trades alone.
+        is_conviction = is_conviction_raw & (vote_counts >= 2)
 
         # 3. Veto Check (Fixed number of silent members)
         is_silent = all_coeffs < 0.1
@@ -770,9 +774,30 @@ class CommitteeAgent:
         # PASS if: (Quorum OR Conviction) AND (NOT Veto)
         should_trade = (is_quorum | is_conviction) & (~is_vetoed)
 
-        # 5. Signal Aggregation (Mean of ALL members, but zero out rejected stocks)
-        avg_coef = np.mean(all_coeffs, axis=0)  # [num_stocks]
-        final_coeffs = np.where(should_trade, avg_coef, 0.0)
+        # 5. Signal Aggregation
+        # For approved trades, average ONLY the coefficients from agents who voted YES
+        # This represents the true conviction of the supporting agents
+        final_coeffs = np.zeros(num_stocks, dtype=np.float32)
+
+        for stock_idx in range(num_stocks):
+            if should_trade[stock_idx]:
+                # Get coefficients from agents who voted for this stock
+                voting_agents_mask = votes[:, stock_idx]  # Boolean mask of voters
+
+                if np.any(voting_agents_mask):
+                    # Average only the voting agents' coefficients
+                    voting_coeffs = all_coeffs[voting_agents_mask, stock_idx]
+                    final_coeffs[stock_idx] = np.mean(voting_coeffs)
+                else:
+                    # Conviction-only trade (no standard voters, but conviction triggered)
+                    # Use the mean of agents who exceeded conviction threshold
+                    conviction_agents_mask = agent_convictions[:, stock_idx]
+                    if np.any(conviction_agents_mask):
+                        conviction_coeffs = all_coeffs[conviction_agents_mask, stock_idx]
+                        final_coeffs[stock_idx] = np.mean(conviction_coeffs)
+                    else:
+                        # Fallback to threshold (shouldn't happen, but safety)
+                        final_coeffs[stock_idx] = Config.COEFFICIENT_THRESHOLD
 
         return final_coeffs
 
