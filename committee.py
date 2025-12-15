@@ -812,7 +812,7 @@ class CommitteeAgent:
         is_conviction = is_conviction_raw & (vote_counts >= 2)
 
         # 3. Veto Check (Fixed number of silent members)
-        is_silent = all_coeffs < 0.1
+        is_silent = all_coeffs < 0.5
         silent_counts = np.sum(is_silent, axis=0)
         is_vetoed = silent_counts >= Config.COMMITTEE_VETO_COUNT
 
@@ -843,13 +843,16 @@ class CommitteeAgent:
             min_consensus = np.sum(vote_counts[should_trade] == Config.COMMITTEE_QUORUM)
             self.consensus_history['min_consensus_count'] += int(min_consensus)
 
-            # Trades by Quorum vs Conviction
-            # If a trade meets both, count it as quorum
-            is_quorum_approved = is_quorum & should_trade
-            is_conviction_only = (~is_quorum) & is_conviction & should_trade
+            # Trades by Quorum vs Conviction (MUTUALLY EXCLUSIVE)
+            # For trades that actually happened, determine which mechanism approved them
+            # If quorum was met, credit quorum (even if conviction also triggered)
+            # Only credit conviction for trades where quorum was NOT met (conviction "rescues")
+            is_quorum_trade = is_quorum & should_trade
+            is_conviction_only_trade = (~is_quorum) & should_trade
 
-            self.consensus_history['trades_by_quorum'] += int(np.sum(is_quorum_approved))
-            self.consensus_history['trades_by_conviction'] += int(np.sum(is_conviction_only))
+            # Verify mathematical correctness: these should sum to total trades
+            self.consensus_history['trades_by_quorum'] += int(np.sum(is_quorum_trade))
+            self.consensus_history['trades_by_conviction'] += int(np.sum(is_conviction_only_trade))
 
             # Trades vetoed (Only count vetoes on signals that otherwise would have passed)
             # This filters out "vetoes" on stocks nobody wanted anyway
