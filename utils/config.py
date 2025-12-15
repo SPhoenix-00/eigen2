@@ -247,7 +247,7 @@ class Config:
     COMMITTEE_CORRELATION_EXPONENT = 2  # Exponent for correlation penalty: (1 - avg_corr^exp)
     COMMITTEE_VALIDATION_SLICES = 3  # Number of holdout slices for validation
     COMMITTEE_QUORUM = 3  # Number of committee members required to agree for a trade
-    COMMITTEE_VETO_COUNT = 3  # Number of silent members needed to veto a trade
+    COMMITTEE_VETO_COUNT = 5  # Number of silent members needed to veto a trade
 
     # Breakthrough goals - stopping condition based on confirmed breakthroughs
     TARGET_BREAKTHROUGHS_NORMAL = 4  # Number of confirmed breakthroughs in normal mode
