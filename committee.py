@@ -778,8 +778,8 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
     votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD  # [Agents, Days, Stocks]
     vote_counts = np.sum(votes, axis=0)  # [Days, Stocks]
 
-    # Quorum: majority (> half) must agree
-    quorum = num_members // 2 + 1
+    # Quorum: configurable number of members must agree
+    quorum = Config.COMMITTEE_QUORUM
     triggers = vote_counts >= quorum  # [Days, Stocks]
 
     num_trades = np.sum(triggers)
@@ -864,9 +864,13 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
     }
 
     # Average coefficient for triggered trades (consensus strength)
+    # Use mean of ALL agents (including those who voted 0) to properly aggregate signals
     avg_coef = np.mean(all_coeffs, axis=0)  # [Days, Stocks]
-    active = np.where(triggers, np.maximum(0, avg_coef - Config.COEFFICIENT_THRESHOLD), 0)
-    active = np.minimum(active, 2.0)
+
+    # For triggered trades, use the averaged coefficient directly (no re-thresholding)
+    # The quorum already decided IF we trade; now we use the average to decide HOW MUCH
+    active = np.where(triggers, avg_coef, 0)
+    active = np.minimum(active, 2.0)  # Cap at 2x leverage
 
     trade_returns = investable_returns[triggers]
     trade_weights = active[triggers]
