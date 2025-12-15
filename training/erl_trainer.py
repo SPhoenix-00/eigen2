@@ -1541,21 +1541,19 @@ class ERLTrainer:
         base_mutation_rate = Config.MUTATION_RATE_CONSISTENCY
         base_mutation_std = Config.MUTATION_STD
         for i in range(num_normal_mutants):
-            clone = source_agent.clone()
-            clone.agent_id = num_clones + i
-            clone.mutate(mutation_rate=base_mutation_rate, mutation_std=base_mutation_std)
-            clone.is_elite = False
-            new_population.append(clone)
+            mutated_clone = mutate(source_agent, mutation_rate=base_mutation_rate, mutation_std=base_mutation_std)
+            mutated_clone.agent_id = num_clones + i
+            mutated_clone.is_elite = False
+            new_population.append(mutated_clone)
 
         # Plateau mutation clones (1.5x mutation)
         plateau_mutation_rate = min(base_mutation_rate * 1.5, self.max_mutation_rate)
         plateau_mutation_std = min(base_mutation_std * 1.5, self.max_mutation_std)
         for i in range(num_plateau_mutants):
-            clone = source_agent.clone()
-            clone.agent_id = num_clones + num_normal_mutants + i
-            clone.mutate(mutation_rate=plateau_mutation_rate, mutation_std=plateau_mutation_std)
-            clone.is_elite = False
-            new_population.append(clone)
+            mutated_clone = mutate(source_agent, mutation_rate=plateau_mutation_rate, mutation_std=plateau_mutation_std)
+            mutated_clone.agent_id = num_clones + num_normal_mutants + i
+            mutated_clone.is_elite = False
+            new_population.append(mutated_clone)
 
         self.population = new_population
         print(f"  Population initialized: {len(self.population)} agents")
@@ -1676,21 +1674,19 @@ class ERLTrainer:
         base_mutation_rate = Config.MUTATION_RATE_CONSISTENCY
         base_mutation_std = Config.MUTATION_STD
         for i in range(num_normal_mutants):
-            clone = source_agent.clone()
-            clone.agent_id = num_clones + i
-            clone.mutate(mutation_rate=base_mutation_rate, mutation_std=base_mutation_std)
-            clone.is_elite = False
-            new_population.append(clone)
+            mutated_clone = mutate(source_agent, mutation_rate=base_mutation_rate, mutation_std=base_mutation_std)
+            mutated_clone.agent_id = num_clones + i
+            mutated_clone.is_elite = False
+            new_population.append(mutated_clone)
 
         # Plateau mutation clones (1.5x mutation)
         plateau_mutation_rate = min(base_mutation_rate * 1.5, self.max_mutation_rate)
         plateau_mutation_std = min(base_mutation_std * 1.5, self.max_mutation_std)
         for i in range(num_plateau_mutants):
-            clone = source_agent.clone()
-            clone.agent_id = num_clones + num_normal_mutants + i
-            clone.mutate(mutation_rate=plateau_mutation_rate, mutation_std=plateau_mutation_std)
-            clone.is_elite = False
-            new_population.append(clone)
+            mutated_clone = mutate(source_agent, mutation_rate=plateau_mutation_rate, mutation_std=plateau_mutation_std)
+            mutated_clone.agent_id = num_clones + num_normal_mutants + i
+            mutated_clone.is_elite = False
+            new_population.append(mutated_clone)
 
         self.population = new_population
 
