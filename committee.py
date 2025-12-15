@@ -814,7 +814,7 @@ class CommitteeAgent:
         is_conviction = is_conviction_raw & (vote_counts >= 2)
 
         # 3. Veto Check (Fixed number of silent members)
-        is_silent = all_coeffs < 0.9
+        is_silent = all_coeffs < Config.COMMITTEE_VETO_THRESHOLD
         silent_counts = np.sum(is_silent, axis=0)
         is_vetoed = silent_counts >= Config.COMMITTEE_VETO_COUNT
 
@@ -1125,12 +1125,12 @@ def evaluate_committee_on_slice(members: list, loader, stats,
 def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
                    context_window_days: int) -> dict:
     """
-    Run 3-slice holdout validation on the committee.
+    Run 5-slice validation on the committee: 3 slices on validation data, 2 slices on holdout data.
 
     Returns validation results dict with comprehensive metrics.
     """
     print("\n" + "="*60)
-    print("PHASE 2: VALIDATION (3-Slice Holdout Test)")
+    print("PHASE 2: VALIDATION (3 Val Slices + 2 Holdout Slices)")
     print("="*60)
 
     roster = manager.load_roster()
@@ -1141,18 +1141,29 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     members = roster['members']
     num_slices = Config.COMMITTEE_VALIDATION_SLICES
 
+    # Calculate validation range (absolute day indices)
+    val_start_idx = holdout_info['val_start']
+    val_end_idx = holdout_info['val_end'] + 1  # +1 for exclusive end
+
     # Calculate holdout range (absolute day indices)
     holdout_start_idx = holdout_info['holdout_start']
     holdout_end_idx = holdout_info['holdout_end'] + 1  # +1 for exclusive end
 
-    # Split holdout into slices
+    # Split: 3 slices from validation period, 2 slices from holdout period
+    val_days = val_end_idx - val_start_idx
     holdout_days = holdout_end_idx - holdout_start_idx
-    slice_size = holdout_days // num_slices
 
-    print(f"\n  Holdout range: indices {holdout_start_idx} to {holdout_end_idx-1}")
-    print(f"  Holdout days: {holdout_days}")
-    print(f"  Slices: {num_slices}")
-    print(f"  Days per slice: ~{slice_size}")
+    num_val_slices = 3
+    num_holdout_slices = 2
+
+    val_slice_size = val_days // num_val_slices
+    holdout_slice_size = holdout_days // num_holdout_slices
+
+    print(f"\n  Validation range: indices {val_start_idx} to {val_end_idx-1} ({val_days} days)")
+    print(f"    → {num_val_slices} slices of ~{val_slice_size} days each")
+    print(f"  Holdout range: indices {holdout_start_idx} to {holdout_end_idx-1} ({holdout_days} days)")
+    print(f"    → {num_holdout_slices} slices of ~{holdout_slice_size} days each")
+    print(f"  Total slices: {num_slices}")
 
     results = {
         'individual_agents': [],
@@ -1187,16 +1198,38 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         }
 
         for s in range(num_slices):
-            # Calculate absolute slice indices
-            slice_start = holdout_start_idx + (s * slice_size)
-            if s < num_slices - 1:
-                slice_end = holdout_start_idx + ((s + 1) * slice_size)
+            # Calculate absolute slice indices (deterministic using integer division)
+            if s < num_val_slices:
+                # Validation slices (0, 1, 2)
+                slice_start = val_start_idx + (s * val_slice_size)
+                if s < num_val_slices - 1:
+                    slice_end = val_start_idx + ((s + 1) * val_slice_size)
+                else:
+                    slice_end = val_end_idx  # Last val slice gets remainder
+                slice_type = 'validation'
             else:
-                slice_end = holdout_end_idx  # Last slice gets remainder
+                # Holdout slices (3, 4)
+                holdout_slice_idx = s - num_val_slices
+                slice_start = holdout_start_idx + (holdout_slice_idx * holdout_slice_size)
+                if holdout_slice_idx < num_holdout_slices - 1:
+                    slice_end = holdout_start_idx + ((holdout_slice_idx + 1) * holdout_slice_size)
+                else:
+                    slice_end = holdout_end_idx  # Last holdout slice gets remainder
+                slice_type = 'holdout'
+
+            # Get date strings for this slice
+            start_date = loader.dates[slice_start]
+            end_date = loader.dates[slice_end - 1]  # -1 because slice_end is exclusive
 
             metrics = evaluate_agent_on_slice(filepath, loader, stats, slice_start, slice_end)
             agent_results['slice_metrics'].append({
                 'slice': s,
+                'slice_type': slice_type,
+                'start_idx': slice_start,
+                'end_idx': slice_end - 1,  # Store inclusive end
+                'start_date': start_date,
+                'end_date': end_date,
+                'num_days': slice_end - slice_start,
                 'fitness': metrics.get('fitness', 0.0),
                 'win_rate': metrics.get('win_rate', 0.0),
                 'quality_ratio': metrics.get('quality_ratio', 0.0),
@@ -1218,12 +1251,28 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     print(f"\nValidating committee consensus...")
 
     for s in range(num_slices):
-        # Calculate absolute slice indices
-        slice_start = holdout_start_idx + (s * slice_size)
-        if s < num_slices - 1:
-            slice_end = holdout_start_idx + ((s + 1) * slice_size)
+        # Calculate absolute slice indices (deterministic using integer division)
+        if s < num_val_slices:
+            # Validation slices (0, 1, 2)
+            slice_start = val_start_idx + (s * val_slice_size)
+            if s < num_val_slices - 1:
+                slice_end = val_start_idx + ((s + 1) * val_slice_size)
+            else:
+                slice_end = val_end_idx  # Last val slice gets remainder
+            slice_type = 'validation'
         else:
-            slice_end = holdout_end_idx  # Last slice gets remainder
+            # Holdout slices (3, 4)
+            holdout_slice_idx = s - num_val_slices
+            slice_start = holdout_start_idx + (holdout_slice_idx * holdout_slice_size)
+            if holdout_slice_idx < num_holdout_slices - 1:
+                slice_end = holdout_start_idx + ((holdout_slice_idx + 1) * holdout_slice_size)
+            else:
+                slice_end = holdout_end_idx  # Last holdout slice gets remainder
+            slice_type = 'holdout'
+
+        # Get date strings for this slice
+        start_date = loader.dates[slice_start]
+        end_date = loader.dates[slice_end - 1]  # -1 because slice_end is exclusive
 
         metrics = evaluate_committee_on_slice(
             members, loader, stats, context_window_days, slice_start, slice_end
@@ -1231,6 +1280,12 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
 
         slice_result = {
             'slice': s,
+            'slice_type': slice_type,
+            'start_idx': slice_start,
+            'end_idx': slice_end - 1,  # Store inclusive end
+            'start_date': start_date,
+            'end_date': end_date,
+            'num_days': slice_end - slice_start,
             'fitness': metrics.get('fitness', 0.0),
             'win_rate': metrics.get('win_rate', 0.0),
             'quality_ratio': metrics.get('quality_ratio', 0.0),
@@ -1297,16 +1352,17 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
               f"expectancy={agent['fresh_mean_expectancy']:.6f}, "
               f"roi={agent['fresh_mean_roi']:.2f}%")
         for m in agent['slice_metrics']:
-            print(f"      Slice {m['slice']}: fitness={m['fitness']:.2f}, "
-                  f"win_rate={m['win_rate']:.2%}, quality_ratio={m['quality_ratio']:.3f}, "
-                  f"expectancy={m['expectancy']:.6f}, roi={m['roi']:.2f}%, "
-                  f"trades={m['num_trades']}")
+            print(f"      Slice {m['slice']} ({m['slice_type']}) [{m['start_date']} to {m['end_date']}, {m['num_days']} days]:")
+            print(f"        fitness={m['fitness']:.2f}, win_rate={m['win_rate']:.2%}, "
+                  f"quality_ratio={m['quality_ratio']:.3f}, expectancy={m['expectancy']:.6f}, "
+                  f"roi={m['roi']:.2f}%, trades={m['num_trades']}")
 
     print("\n" + "-"*60)
     print("COMMITTEE PERFORMANCE (Per Slice)")
     print("-"*60)
     for s in results['committee_slices']:
-        print(f"\n  Slice {s['slice']}:")
+        print(f"\n  Slice {s['slice']} ({s['slice_type'].upper()})")
+        print(f"    Period: {s['start_date']} to {s['end_date']} ({s['num_days']} days)")
         print(f"    Fitness: {s['fitness']:.2f}")
         print(f"    Win Rate: {s['win_rate']:.2%}")
         print(f"    Quality Ratio: {s['quality_ratio']:.3f}")
