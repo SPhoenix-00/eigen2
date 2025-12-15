@@ -1105,6 +1105,9 @@ def evaluate_committee_on_slice(members: list, loader, stats,
     # Get consensus statistics
     consensus_stats = committee.get_consensus_summary()
 
+    # Extract closed trades for CSV export
+    closed_trades = summary.get('closed_trades', [])
+
     # Clean up
     committee.cleanup()
     del env
@@ -1118,7 +1121,10 @@ def evaluate_committee_on_slice(members: list, loader, stats,
         'expectancy': summary['avg_reward_per_trade'],
         'roi': summary['roi'],
         'fitness': summary['total_reward'],  # Total reward is the fitness
-        'consensus_stats': consensus_stats
+        'consensus_stats': consensus_stats,
+        'closed_trades': closed_trades,  # Include for CSV export
+        'raw_pnl': summary.get('raw_pnl', 0.0),
+        'peak_capital_employed': summary.get('peak_capital_employed', 0.0),
     }
 
 
@@ -1278,6 +1284,28 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             members, loader, stats, context_window_days, slice_start, slice_end
         )
 
+        # Save closed trades to CSV and upload to cloud
+        closed_trades = metrics.get('closed_trades', [])
+        if closed_trades:
+            csv_filename = f"committee_slice_{s}_{slice_type}_{start_date}_to_{end_date}.csv"
+            csv_path = manager.local_committee_dir / csv_filename
+
+            # Write CSV
+            import csv
+            with open(csv_path, 'w', newline='') as f:
+                if len(closed_trades) > 0:
+                    writer = csv.DictWriter(f, fieldnames=closed_trades[0].keys())
+                    writer.writeheader()
+                    writer.writerows(closed_trades)
+
+            # Upload to cloud
+            cloud_csv_path = f"{manager.cloud_committee_base}/{csv_filename}"
+            if manager.cloud_sync.provider != "local":
+                if manager.cloud_sync.upload_file_verified(str(csv_path), cloud_csv_path):
+                    print(f"  ✓ Uploaded CSV: {csv_filename}")
+                else:
+                    print(f"  ✗ Failed to upload CSV: {csv_filename}")
+
         slice_result = {
             'slice': s,
             'slice_type': slice_type,
@@ -1293,6 +1321,9 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             'roi': metrics.get('roi', 0.0),
             'num_trades': metrics.get('num_trades', 0),
             'consensus_stats': metrics.get('consensus_stats', {'note': 'Consensus applied per-step'}),
+            'raw_pnl': metrics.get('raw_pnl', 0.0),
+            'peak_capital_employed': metrics.get('peak_capital_employed', 0.0),
+            'csv_filename': csv_filename if closed_trades else None,
         }
 
         results['committee_slices'].append(slice_result)
@@ -1367,8 +1398,10 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         print(f"    Win Rate: {s['win_rate']:.2%}")
         print(f"    Quality Ratio: {s['quality_ratio']:.3f}")
         print(f"    Expectancy: {s['expectancy']:.6f}")
-        print(f"    ROI: {s['roi']:.2f}%")
+        print(f"    ROI: {s['roi']:.2f}% (Raw P&L: ${s['raw_pnl']:.2f}, Peak Capital: ${s['peak_capital_employed']:.2f})")
         print(f"    Trades: {s['num_trades']}")
+        if s.get('csv_filename'):
+            print(f"    CSV: {s['csv_filename']}")
         print(f"")
 
         # Consensus stats
