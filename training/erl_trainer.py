@@ -1612,6 +1612,10 @@ class ERLTrainer:
         saved_population = self.population
         self.population = temp_population
 
+        # Generate validation slices before running validation
+        self.current_generation_val_slices = self.generate_validation_slices()
+        self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
+
         # Run full validation with ROI adjustment enabled (multi_mode is True)
         # This will compute combined_fitness = val_fitness + roi_adjustment
         validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
