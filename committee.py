@@ -663,6 +663,100 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
     }
 
 
+# --- Consensus Engine ---
+
+def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray) -> np.ndarray:
+    """
+    Calculates the 95th percentile conviction threshold for each stock.
+
+    Args:
+        agent_coeff_history_2d: Numpy array [Days, Stocks] for a single agent
+
+    Returns:
+        p95_vector: Numpy array [Stocks] of 95th percentile conviction thresholds
+    """
+    days, num_stocks = agent_coeff_history_2d.shape
+    p95_vector = np.zeros(num_stocks, dtype=np.float32)
+
+    # Global P99 fallback for stocks with insufficient data
+    all_active = agent_coeff_history_2d[agent_coeff_history_2d > 0.01]
+    global_p99 = np.percentile(all_active, 99) if len(all_active) > 0 else 0.0
+
+    for i in range(num_stocks):
+        stock_coeffs = agent_coeff_history_2d[:, i]
+        active_coeffs = stock_coeffs[stock_coeffs > 0.01]
+
+        if len(active_coeffs) >= 20:
+            p95_vector[i] = np.percentile(active_coeffs, 95)
+        else:
+            p95_vector[i] = global_p99
+
+    return p95_vector
+
+
+def committee_consensus_engine(all_coeffs: np.ndarray, member_stats: list,
+                                quorum: int, veto_threshold: float = 0.4) -> tuple:
+    """
+    Aggregates agent actions into committee decision using Quorum, Conviction, and Veto.
+
+    Args:
+        all_coeffs: [Num_Members, Days, Stocks] coefficient predictions
+        member_stats: List of dicts with 'conviction_threshold_vector' for each member
+        quorum: Number of members required for standard approval
+        veto_threshold: Fraction of members needed to veto (e.g., 0.4 = 40%)
+
+    Returns:
+        (final_coeffs, voting_stats, detailed_masks)
+    """
+    num_members, num_days, num_stocks = all_coeffs.shape
+
+    # 1. Standard Voting (Quorum)
+    votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD
+    vote_counts = np.sum(votes, axis=0)  # [Days, Stocks]
+    is_quorum = vote_counts >= quorum
+
+    # 2. Conviction Check (Stock-Specific Override)
+    conviction_thresholds = np.array([
+        m['stats']['conviction_threshold_vector'] for m in member_stats
+    ])  # [Members, Stocks]
+    # Broadcast comparison: [Members, Days, Stocks] > [Members, 1, Stocks]
+    agent_convictions = all_coeffs > conviction_thresholds[:, np.newaxis, :]
+    is_conviction = np.any(agent_convictions, axis=0)  # [Days, Stocks]
+
+    # 3. Veto Check (Negative Quorum for indifference)
+    is_silent = all_coeffs < 0.1
+    silent_counts = np.sum(is_silent, axis=0)
+    veto_needed = int(num_members * veto_threshold)
+    is_vetoed = silent_counts >= veto_needed
+
+    # 4. Final Decision Logic
+    # PASS if: (Quorum OR Conviction) AND (NOT Veto)
+    should_trade = (is_quorum | is_conviction) & (~is_vetoed)
+
+    # 5. Signal Aggregation (Mean of ALL members)
+    avg_coef = np.mean(all_coeffs, axis=0)  # [Days, Stocks]
+    final_coeffs = np.where(should_trade, avg_coef, 0.0)
+
+    # Debug statistics
+    voting_stats = {
+        'quorum_triggers': int(np.sum(is_quorum)),
+        'conviction_triggers': int(np.sum(is_conviction)),
+        'conviction_only_triggers': int(np.sum(is_conviction & ~is_quorum)),
+        'vetoes': int(np.sum(is_vetoed)),
+        'final_trades': int(np.sum(should_trade))
+    }
+
+    # Detailed masks for analysis
+    detailed_masks = {
+        'is_quorum': is_quorum,
+        'is_conviction': is_conviction,
+        'is_vetoed': is_vetoed,
+        'vote_counts': vote_counts
+    }
+
+    return final_coeffs, voting_stats, detailed_masks
+
+
 # --- Validation ---
 
 def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
@@ -774,15 +868,21 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
     all_coeffs = np.array(all_coeffs)
     num_members = len(all_coeffs)
 
-    # Voting: each agent votes if coefficient > threshold
-    votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD  # [Agents, Days, Stocks]
-    vote_counts = np.sum(votes, axis=0)  # [Days, Stocks]
+    # Use consensus engine with Quorum, Conviction, and Veto logic
+    final_coeffs, voting_stats, detailed_masks = committee_consensus_engine(
+        all_coeffs,
+        members,  # Must have 'stats' field with 'conviction_threshold_vector'
+        quorum=Config.COMMITTEE_QUORUM,
+        veto_threshold=Config.COMMITTEE_VETO_THRESHOLD
+    )
 
-    # Quorum: configurable number of members must agree
-    quorum = Config.COMMITTEE_QUORUM
-    triggers = vote_counts >= quorum  # [Days, Stocks]
+    # Determine triggers and active positions from consensus
+    triggers = final_coeffs > 0.0
+    active = np.minimum(final_coeffs, 2.0)  # Cap at 2x leverage
 
-    num_trades = np.sum(triggers)
+    # Get vote counts for consensus statistics
+    vote_counts = detailed_masks['vote_counts']
+    num_trades = voting_stats['final_trades']
 
     # Extract returns for investable stocks only
     investable_returns = slice_returns[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1]
@@ -818,7 +918,7 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
     unanimity_count = np.sum(unanimity_mask)
 
     # Minimum consensus trades (exactly quorum votes)
-    min_consensus_mask = triggered_vote_counts == quorum
+    min_consensus_mask = triggered_vote_counts == Config.COMMITTEE_QUORUM
     min_consensus_count = np.sum(min_consensus_mask)
 
     # Average number of votes per trade
@@ -852,25 +952,23 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
 
     consensus_stats = {
         'unanimity_count': int(unanimity_count),
-        'unanimity_pct': float(unanimity_count / num_trades * 100),
+        'unanimity_pct': float(unanimity_count / num_trades * 100) if num_trades > 0 else 0.0,
         'unanimity_win_rate': unanimity_win_rate,
         'unanimity_quality_ratio': unanimity_quality_ratio,
         'min_consensus_count': int(min_consensus_count),
-        'min_consensus_pct': float(min_consensus_count / num_trades * 100),
+        'min_consensus_pct': float(min_consensus_count / num_trades * 100) if num_trades > 0 else 0.0,
         'min_consensus_win_rate': min_consensus_win_rate,
         'min_consensus_quality_ratio': min_consensus_quality_ratio,
         'avg_consensus_votes': avg_votes,
         'consensus_distribution': consensus_distribution,
+        # Add new consensus engine stats
+        'quorum_triggers': voting_stats['quorum_triggers'],
+        'conviction_triggers': voting_stats['conviction_triggers'],
+        'conviction_only_triggers': voting_stats['conviction_only_triggers'],
+        'vetoes': voting_stats['vetoes'],
     }
 
-    # Average coefficient for triggered trades (consensus strength)
-    # Use mean of ALL agents (including those who voted 0) to properly aggregate signals
-    avg_coef = np.mean(all_coeffs, axis=0)  # [Days, Stocks]
-
-    # For triggered trades, use the averaged coefficient directly (no re-thresholding)
-    # The quorum already decided IF we trade; now we use the average to decide HOW MUCH
-    active = np.where(triggers, avg_coef, 0)
-    active = np.minimum(active, 2.0)  # Cap at 2x leverage
+    # Active positions already computed by consensus engine (final_coeffs capped at 2.0)
 
     trade_returns = investable_returns[triggers]
     trade_weights = active[triggers]
@@ -908,7 +1006,7 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
             trade_details.append({
                 'day_idx': int(slice_start_idx + day_idx) if slice_start_idx is not None else int(day_idx),
                 'stock_idx': int(actual_stock_idx),
-                'coefficient': float(avg_coef[day_idx, stock_idx]),
+                'coefficient': float(final_coeffs[day_idx, stock_idx]),
                 'position_size': float(active[day_idx, stock_idx]),
                 'return': float(trade_returns[idx]),
                 'weighted_return': float(weighted_returns[idx]),
@@ -1148,6 +1246,12 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
 
         print(f"      Avg Votes per Trade: {cs['avg_consensus_votes']:.2f}")
         print(f"      Vote Distribution: {cs['consensus_distribution']}")
+        print(f"")
+        print(f"    Consensus Engine Stats:")
+        print(f"      Quorum Triggers: {cs['quorum_triggers']}")
+        print(f"      Conviction Triggers: {cs['conviction_triggers']} "
+              f"(Conviction-Only: {cs['conviction_only_triggers']})")
+        print(f"      Vetoes: {cs['vetoes']}")
 
     print("\n" + "-"*60)
     print("COMMITTEE AGGREGATE PERFORMANCE")
@@ -1280,10 +1384,23 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
         for j in range(n):
             committee_corr[i, j] = corr_matrix[committee_indices[i], committee_indices[j]]
 
-    roster_data = {
-        'committee_size': len(committee_members),
-        'members': [
-            {
+    # Calculate conviction thresholds for each committee member
+    print(f"\nCalculating conviction thresholds for committee members...")
+    members_with_stats = []
+    for idx, e in enumerate(committee_members):
+        original_idx = committee_indices[idx]
+        agent_coeffs_1d = coefficients[original_idx]
+
+        if agent_coeffs_1d is not None:
+            # Reshape to [Days, Stocks]
+            num_days = len(valid_indices)
+            num_stocks = Config.NUM_INVESTABLE_STOCKS
+            agent_coeffs_2d = agent_coeffs_1d.reshape(num_days, num_stocks)
+
+            # Calculate conviction threshold vector
+            conviction_threshold_vector = calculate_agent_stats_vectorized(agent_coeffs_2d)
+
+            member_data = {
                 'filename': f"{e['run_name']}_{e['agent_id']}.pth",
                 'agent_id': e['agent_id'],
                 'run_name': e['run_name'],
@@ -1292,9 +1409,19 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
                 'expectancy': e.get('expectancy', 0.0),
                 'quality_ratio': e.get('quality_ratio', 0.0),
                 'win_ratio': e.get('win_ratio', 0.0),
+                'stats': {
+                    'conviction_threshold_vector': conviction_threshold_vector.tolist()
+                }
             }
-            for e in committee_members
-        ],
+            members_with_stats.append(member_data)
+            print(f"  ✓ {e['run_name']}_{e['agent_id']}: "
+                  f"p95_mean={np.mean(conviction_threshold_vector):.3f}")
+        else:
+            print(f"  ⚠ {e['run_name']}_{e['agent_id']}: No coefficient data available")
+
+    roster_data = {
+        'committee_size': len(members_with_stats),
+        'members': members_with_stats,
         'aggregate_score': result['score_sum'],
         'objective_value': result['objective'],
         'correlation': {
