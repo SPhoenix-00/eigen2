@@ -103,9 +103,12 @@ class CommitteeManager:
         Returns:
             True if save and sync succeeded
         """
+        # Convert numpy types to native Python types for JSON serialization
+        roster_data_clean = convert_numpy_types(roster_data)
+
         # Save roster JSON locally
         with open(self.local_roster_path, 'w') as f:
-            json.dump(roster_data, f, indent=2)
+            json.dump(roster_data_clean, f, indent=2)
         print(f"✓ Roster saved locally: {self.local_roster_path}")
 
         # Save correlation heatmap if provided
@@ -306,6 +309,32 @@ class CommitteeManager:
 
 
 # --- Helper Functions ---
+
+def convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to native Python types for JSON serialization.
+
+    Args:
+        obj: Object to convert (dict, list, numpy type, or primitive)
+
+    Returns:
+        Object with all numpy types converted to Python types
+    """
+    if isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
+
 
 def calculate_max_drawdown(cumulative_returns):
     """Calculates Maximum Drawdown from a cumulative return series."""
@@ -673,17 +702,32 @@ class CommitteeAgent:
     interface (predict action from observation) but using committee consensus logic internally.
     """
 
-    def __init__(self, members: list, context_window_days: int):
+    def __init__(self, members: list, context_window_days: int, track_consensus: bool = False):
         """
         Initialize committee agent.
 
         Args:
             members: List of member dicts with agent metadata and stats
             context_window_days: Context window for loading agent files
+            track_consensus: If True, track consensus statistics per step
         """
         self.members = members
         self.context_window_days = context_window_days
         self.loaded_agents = []
+        self.track_consensus = track_consensus
+
+        # Consensus tracking
+        if self.track_consensus:
+            self.consensus_history = {
+                'unanimity_count': 0,
+                'min_consensus_count': 0,
+                'total_steps': 0,
+                'total_trades': 0,
+                'trades_by_quorum': 0,
+                'trades_by_conviction': 0,
+                'trades_vetoed': 0,
+                'avg_votes_per_trade': [],
+            }
 
         # Load all member agents (actor only)
         print(f"Loading {len(members)} committee members...")
@@ -774,6 +818,37 @@ class CommitteeAgent:
         # PASS if: (Quorum OR Conviction) AND (NOT Veto)
         should_trade = (is_quorum | is_conviction) & (~is_vetoed)
 
+        # Track consensus stats if enabled
+        if self.track_consensus:
+            self.consensus_history['total_steps'] += 1
+
+            # Count trades approved by each mechanism
+            trades_approved = np.sum(should_trade)
+            self.consensus_history['total_trades'] += int(trades_approved)
+
+            # Unanimity: all members voted for the trade
+            unanimity = np.sum(vote_counts[should_trade] == num_members)
+            self.consensus_history['unanimity_count'] += int(unanimity)
+
+            # Min consensus: exactly quorum votes
+            min_consensus = np.sum(vote_counts[should_trade] == Config.COMMITTEE_QUORUM)
+            self.consensus_history['min_consensus_count'] += int(min_consensus)
+
+            # Trades by quorum vs conviction
+            quorum_only = is_quorum & (~is_conviction) & (~is_vetoed)
+            conviction_only = (~is_quorum) & is_conviction & (~is_vetoed)
+            self.consensus_history['trades_by_quorum'] += int(np.sum(quorum_only))
+            self.consensus_history['trades_by_conviction'] += int(np.sum(conviction_only))
+
+            # Trades vetoed
+            vetoed_trades = (is_quorum | is_conviction) & is_vetoed
+            self.consensus_history['trades_vetoed'] += int(np.sum(vetoed_trades))
+
+            # Average votes per trade
+            if trades_approved > 0:
+                avg_votes = np.mean(vote_counts[should_trade])
+                self.consensus_history['avg_votes_per_trade'].append(float(avg_votes))
+
         # 5. Signal Aggregation
         # For approved trades, average ONLY the coefficients from agents who voted YES
         # This represents the true conviction of the supporting agents
@@ -800,6 +875,35 @@ class CommitteeAgent:
                         final_coeffs[stock_idx] = Config.COEFFICIENT_THRESHOLD
 
         return final_coeffs
+
+    def get_consensus_summary(self) -> dict:
+        """
+        Get summary of consensus statistics from tracked history.
+
+        Returns:
+            Dict with consensus metrics (empty if tracking disabled)
+        """
+        if not self.track_consensus:
+            return {'note': 'Consensus tracking was not enabled'}
+
+        history = self.consensus_history
+        total_steps = history['total_steps']
+        total_trades = history['total_trades']
+
+        if total_steps == 0:
+            return {'note': 'No steps recorded'}
+
+        return {
+            'total_steps': total_steps,
+            'total_trades': total_trades,
+            'avg_trades_per_step': total_trades / total_steps if total_steps > 0 else 0,
+            'unanimity_pct': 100.0 * history['unanimity_count'] / total_trades if total_trades > 0 else 0,
+            'min_consensus_pct': 100.0 * history['min_consensus_count'] / total_trades if total_trades > 0 else 0,
+            'trades_by_quorum': history['trades_by_quorum'],
+            'trades_by_conviction': history['trades_by_conviction'],
+            'trades_vetoed': history['trades_vetoed'],
+            'avg_consensus_votes': float(np.mean(history['avg_votes_per_trade'])) if history['avg_votes_per_trade'] else 0,
+        }
 
     def cleanup(self):
         """Release GPU memory from loaded agents."""
@@ -929,8 +1033,8 @@ def evaluate_committee_on_slice(members: list, loader, stats,
     """
     from environment.trading_env import TradingEnvironment
 
-    # Create committee agent (loads all members)
-    committee = CommitteeAgent(members, context_window_days)
+    # Create committee agent (loads all members) with consensus tracking enabled
+    committee = CommitteeAgent(members, context_window_days, track_consensus=True)
 
     # Create trading environment for this slice
     env = TradingEnvironment(
@@ -958,14 +1062,15 @@ def evaluate_committee_on_slice(members: list, loader, stats,
     # Get episode summary
     summary = env.get_episode_summary()
 
+    # Get consensus statistics
+    consensus_stats = committee.get_consensus_summary()
+
     # Clean up
     committee.cleanup()
     del env
     torch.cuda.empty_cache()
 
     # Return metrics in expected format
-    # Note: Consensus stats would require tracking votes per step, which we skip for now
-    # The committee's consensus logic is applied inside CommitteeAgent.predict_action()
     return {
         'num_trades': summary['num_trades'],
         'win_rate': summary['win_rate'],
@@ -973,10 +1078,7 @@ def evaluate_committee_on_slice(members: list, loader, stats,
         'expectancy': summary['avg_reward_per_trade'],
         'roi': summary['roi'],
         'fitness': summary['total_reward'],  # Total reward is the fitness
-        'consensus_stats': {
-            # Placeholder - would need to track votes per step to populate these
-            'note': 'Consensus applied per-step inside CommitteeAgent'
-        }
+        'consensus_stats': consensus_stats
     }
 
 
@@ -1120,10 +1222,23 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         sum([s['num_trades'] for s in results['committee_slices']])
     )
 
-    # Consensus summary not available with new architecture (would need per-step tracking)
-    results['consensus_summary'] = {
-        'note': 'Consensus metrics require per-step tracking - not implemented in new architecture'
-    }
+    # Aggregate consensus stats across all slices
+    all_consensus_stats = [s['consensus_stats'] for s in results['committee_slices']]
+
+    # Calculate averages only if we have valid tracking data
+    if all(isinstance(cs, dict) and 'avg_consensus_votes' in cs for cs in all_consensus_stats):
+        results['consensus_summary'] = {
+            'avg_unanimity_pct': float(np.mean([cs['unanimity_pct'] for cs in all_consensus_stats])),
+            'avg_min_consensus_pct': float(np.mean([cs['min_consensus_pct'] for cs in all_consensus_stats])),
+            'avg_consensus_votes': float(np.mean([cs['avg_consensus_votes'] for cs in all_consensus_stats])),
+            'total_trades_by_quorum': int(sum([cs['trades_by_quorum'] for cs in all_consensus_stats])),
+            'total_trades_by_conviction': int(sum([cs['trades_by_conviction'] for cs in all_consensus_stats])),
+            'total_trades_vetoed': int(sum([cs['trades_vetoed'] for cs in all_consensus_stats])),
+        }
+    else:
+        results['consensus_summary'] = {
+            'note': 'Consensus tracking was not enabled or no data available'
+        }
 
     # Print comprehensive results
     print(f"\n{'='*60}")
@@ -1160,10 +1275,18 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         print(f"    Trades: {s['num_trades']}")
         print(f"")
 
-        # Consensus stats note
+        # Consensus stats
         cs = s['consensus_stats']
         if 'note' in cs:
             print(f"    Consensus: {cs['note']}")
+        elif 'avg_consensus_votes' in cs:
+            print(f"    Consensus:")
+            print(f"      Unanimity: {cs['unanimity_pct']:.1f}%, "
+                  f"Min Quorum: {cs['min_consensus_pct']:.1f}%, "
+                  f"Avg Votes: {cs['avg_consensus_votes']:.2f}")
+            print(f"      By Quorum: {cs['trades_by_quorum']}, "
+                  f"By Conviction: {cs['trades_by_conviction']}, "
+                  f"Vetoed: {cs['trades_vetoed']}")
 
     print("\n" + "-"*60)
     print("COMMITTEE AGGREGATE PERFORMANCE")
@@ -1182,6 +1305,13 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     cs_sum = results['consensus_summary']
     if 'note' in cs_sum:
         print(f"  {cs_sum['note']}")
+    else:
+        print(f"  Unanimity Rate: {cs_sum['avg_unanimity_pct']:.1f}%")
+        print(f"  Min Consensus Rate: {cs_sum['avg_min_consensus_pct']:.1f}%")
+        print(f"  Avg Votes per Trade: {cs_sum['avg_consensus_votes']:.2f}")
+        print(f"  Trades by Quorum: {cs_sum['total_trades_by_quorum']}")
+        print(f"  Trades by Conviction: {cs_sum['total_trades_by_conviction']}")
+        print(f"  Trades Vetoed: {cs_sum['total_trades_vetoed']}")
 
     print("\n" + "-"*60)
     print("COMMITTEE VS INDIVIDUAL COMPARISON")
