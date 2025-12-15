@@ -1147,28 +1147,43 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     members = roster['members']
     num_slices = Config.COMMITTEE_VALIDATION_SLICES
 
+    # Episode structure (matching training):
+    # - Each episode is TRADING_PERIOD_DAYS (125) + SETTLEMENT_PERIOD_DAYS (30) = 155 days
+    # - Episodes can overlap
+    episode_length = Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+
     # Calculate validation range (absolute day indices)
     val_start_idx = holdout_info['val_start']
-    val_end_idx = holdout_info['val_end'] + 1  # +1 for exclusive end
+    val_end_idx = holdout_info['val_end']
 
     # Calculate holdout range (absolute day indices)
     holdout_start_idx = holdout_info['holdout_start']
-    holdout_end_idx = holdout_info['holdout_end'] + 1  # +1 for exclusive end
+    holdout_end_idx = holdout_info['holdout_end']
 
-    # Split: 3 slices from validation period, 2 slices from holdout period
-    val_days = val_end_idx - val_start_idx
-    holdout_days = holdout_end_idx - holdout_start_idx
+    # Total available data
+    val_days = val_end_idx - val_start_idx + 1
+    holdout_days = holdout_end_idx - holdout_start_idx + 1
+    total_days = val_days + holdout_days
 
+    # Generate deterministic slices: 3 from validation, 2 from holdout
+    # Each slice is exactly episode_length days
     num_val_slices = 3
     num_holdout_slices = 2
 
-    val_slice_size = val_days // num_val_slices
-    holdout_slice_size = holdout_days // num_holdout_slices
+    # Calculate deterministic start points (evenly spaced)
+    # For validation: divide available range into num_val_slices segments
+    val_usable_range = val_days - episode_length
+    val_step = val_usable_range // (num_val_slices - 1) if num_val_slices > 1 else 0
 
-    print(f"\n  Validation range: indices {val_start_idx} to {val_end_idx-1} ({val_days} days)")
-    print(f"    → {num_val_slices} slices of ~{val_slice_size} days each")
-    print(f"  Holdout range: indices {holdout_start_idx} to {holdout_end_idx-1} ({holdout_days} days)")
-    print(f"    → {num_holdout_slices} slices of ~{holdout_slice_size} days each")
+    # For holdout: divide available range into num_holdout_slices segments
+    holdout_usable_range = holdout_days - episode_length
+    holdout_step = holdout_usable_range // (num_holdout_slices - 1) if num_holdout_slices > 1 else 0
+
+    print(f"\n  Episode length: {episode_length} days ({Config.TRADING_PERIOD_DAYS} trading + {Config.SETTLEMENT_PERIOD_DAYS} settlement)")
+    print(f"  Validation range: indices {val_start_idx} to {val_end_idx} ({val_days} days)")
+    print(f"    → {num_val_slices} episodes of {episode_length} days each")
+    print(f"  Holdout range: indices {holdout_start_idx} to {holdout_end_idx} ({holdout_days} days)")
+    print(f"    → {num_holdout_slices} episodes of {episode_length} days each")
     print(f"  Total slices: {num_slices}")
 
     results = {
@@ -1204,23 +1219,18 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         }
 
         for s in range(num_slices):
-            # Calculate absolute slice indices (deterministic using integer division)
+            # Calculate absolute slice indices (deterministic, evenly spaced)
+            # Each slice is exactly episode_length days
             if s < num_val_slices:
-                # Validation slices (0, 1, 2)
-                slice_start = val_start_idx + (s * val_slice_size)
-                if s < num_val_slices - 1:
-                    slice_end = val_start_idx + ((s + 1) * val_slice_size)
-                else:
-                    slice_end = val_end_idx  # Last val slice gets remainder
+                # Validation slices (0, 1, 2) - evenly spaced across validation period
+                slice_start = val_start_idx + (s * val_step)
+                slice_end = slice_start + episode_length  # Exclusive end
                 slice_type = 'validation'
             else:
-                # Holdout slices (3, 4)
+                # Holdout slices (3, 4) - evenly spaced across holdout period
                 holdout_slice_idx = s - num_val_slices
-                slice_start = holdout_start_idx + (holdout_slice_idx * holdout_slice_size)
-                if holdout_slice_idx < num_holdout_slices - 1:
-                    slice_end = holdout_start_idx + ((holdout_slice_idx + 1) * holdout_slice_size)
-                else:
-                    slice_end = holdout_end_idx  # Last holdout slice gets remainder
+                slice_start = holdout_start_idx + (holdout_slice_idx * holdout_step)
+                slice_end = slice_start + episode_length  # Exclusive end
                 slice_type = 'holdout'
 
             # Get date strings for this slice
@@ -1257,23 +1267,18 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     print(f"\nValidating committee consensus...")
 
     for s in range(num_slices):
-        # Calculate absolute slice indices (deterministic using integer division)
+        # Calculate absolute slice indices (deterministic, evenly spaced)
+        # Each slice is exactly episode_length days
         if s < num_val_slices:
-            # Validation slices (0, 1, 2)
-            slice_start = val_start_idx + (s * val_slice_size)
-            if s < num_val_slices - 1:
-                slice_end = val_start_idx + ((s + 1) * val_slice_size)
-            else:
-                slice_end = val_end_idx  # Last val slice gets remainder
+            # Validation slices (0, 1, 2) - evenly spaced across validation period
+            slice_start = val_start_idx + (s * val_step)
+            slice_end = slice_start + episode_length  # Exclusive end
             slice_type = 'validation'
         else:
-            # Holdout slices (3, 4)
+            # Holdout slices (3, 4) - evenly spaced across holdout period
             holdout_slice_idx = s - num_val_slices
-            slice_start = holdout_start_idx + (holdout_slice_idx * holdout_slice_size)
-            if holdout_slice_idx < num_holdout_slices - 1:
-                slice_end = holdout_start_idx + ((holdout_slice_idx + 1) * holdout_slice_size)
-            else:
-                slice_end = holdout_end_idx  # Last holdout slice gets remainder
+            slice_start = holdout_start_idx + (holdout_slice_idx * holdout_step)
+            slice_end = slice_start + episode_length  # Exclusive end
             slice_type = 'holdout'
 
         # Get date strings for this slice
