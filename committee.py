@@ -670,7 +670,7 @@ def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
     """
     Evaluate a single agent on a holdout slice.
 
-    Returns dict with fitness metrics.
+    Returns dict with comprehensive fitness metrics.
     """
     agent = load_agent_actor_only(agent_path, 0)
     if agent is None:
@@ -694,6 +694,8 @@ def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
         return {
             'num_trades': 0,
             'win_rate': 0.0,
+            'quality_ratio': 0.0,
+            'expectancy': 0.0,
             'roi': 0.0,
             'fitness': -Config.ZERO_TRADES_PENALTY_GAUNTLET,
         }
@@ -711,6 +713,14 @@ def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
     roi = (total_pnl / total_investment * 100) if total_investment > 0 else 0.0
     win_rate = np.mean(trade_returns > 0) if len(trade_returns) > 0 else 0.0
 
+    # Quality ratio (winners / losers)
+    winners = np.sum(trade_returns > 0)
+    losers = np.sum(trade_returns <= 0)
+    quality_ratio = (winners / losers) if losers > 0 else float('inf')
+
+    # Expectancy (average return per trade)
+    expectancy = float(np.mean(weighted_returns)) if len(weighted_returns) > 0 else 0.0
+
     # Simple fitness approximation
     fitness = roi * np.log10(abs(total_pnl) + 10)
     if roi > 0:
@@ -722,6 +732,8 @@ def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
     return {
         'num_trades': int(num_trades),
         'win_rate': float(win_rate),
+        'quality_ratio': float(quality_ratio),
+        'expectancy': expectancy,
         'roi': float(roi),
         'fitness': float(fitness),
     }
@@ -729,11 +741,14 @@ def evaluate_agent_on_slice(agent_path: Path, slice_tensor: torch.Tensor,
 
 def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
                                  slice_returns: np.ndarray,
-                                 context_window_days: int) -> dict:
+                                 context_window_days: int,
+                                 slice_start_idx: int = None,
+                                 export_trades: bool = False) -> dict:
     """
     Evaluate committee consensus on a holdout slice.
 
     Uses voting mechanism: trade triggers when majority of committee agrees.
+    Returns detailed consensus statistics.
     """
     all_coeffs = []
 
@@ -757,16 +772,34 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
 
     # Stack coefficients: [Agents, Days, Stocks]
     all_coeffs = np.array(all_coeffs)
+    num_members = len(all_coeffs)
 
     # Voting: each agent votes if coefficient > threshold
     votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD  # [Agents, Days, Stocks]
     vote_counts = np.sum(votes, axis=0)  # [Days, Stocks]
 
     # Quorum: majority (> half) must agree
-    quorum = len(members) // 2 + 1
+    quorum = num_members // 2 + 1
     triggers = vote_counts >= quorum  # [Days, Stocks]
 
     num_trades = np.sum(triggers)
+
+    # Extract returns for investable stocks only
+    investable_returns = slice_returns[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1]
+
+    # Consensus statistics
+    consensus_stats = {
+        'unanimity_count': 0,
+        'unanimity_pct': 0.0,
+        'unanimity_win_rate': 0.0,
+        'unanimity_quality_ratio': 0.0,
+        'min_consensus_count': 0,
+        'min_consensus_pct': 0.0,
+        'min_consensus_win_rate': 0.0,
+        'min_consensus_quality_ratio': 0.0,
+        'avg_consensus_votes': 0.0,
+        'consensus_distribution': {},  # votes -> count
+    }
 
     if num_trades == 0:
         return {
@@ -774,15 +807,67 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
             'win_rate': 0.0,
             'roi': 0.0,
             'fitness': -Config.ZERO_TRADES_PENALTY_GAUNTLET,
+            'consensus_stats': consensus_stats,
         }
+
+    # Analyze consensus levels for triggered trades
+    triggered_vote_counts = vote_counts[triggers]
+
+    # Unanimity trades (all members agree)
+    unanimity_mask = triggered_vote_counts == num_members
+    unanimity_count = np.sum(unanimity_mask)
+
+    # Minimum consensus trades (exactly quorum votes)
+    min_consensus_mask = triggered_vote_counts == quorum
+    min_consensus_count = np.sum(min_consensus_mask)
+
+    # Average number of votes per trade
+    avg_votes = float(np.mean(triggered_vote_counts))
+
+    # Consensus distribution
+    unique_votes, vote_freq = np.unique(triggered_vote_counts, return_counts=True)
+    consensus_distribution = {int(v): int(f) for v, f in zip(unique_votes, vote_freq)}
+
+    # Calculate metrics for unanimity trades
+    if unanimity_count > 0:
+        unanimity_returns = investable_returns[triggers][unanimity_mask]
+        unanimity_win_rate = float(np.mean(unanimity_returns > 0))
+        unanimity_winners = np.sum(unanimity_returns > 0)
+        unanimity_losers = np.sum(unanimity_returns <= 0)
+        unanimity_quality_ratio = (unanimity_winners / unanimity_losers) if unanimity_losers > 0 else float('inf')
+    else:
+        unanimity_win_rate = 0.0
+        unanimity_quality_ratio = 0.0
+
+    # Calculate metrics for minimum consensus trades
+    if min_consensus_count > 0:
+        min_consensus_returns = investable_returns[triggers][min_consensus_mask]
+        min_consensus_win_rate = float(np.mean(min_consensus_returns > 0))
+        min_consensus_winners = np.sum(min_consensus_returns > 0)
+        min_consensus_losers = np.sum(min_consensus_returns <= 0)
+        min_consensus_quality_ratio = (min_consensus_winners / min_consensus_losers) if min_consensus_losers > 0 else float('inf')
+    else:
+        min_consensus_win_rate = 0.0
+        min_consensus_quality_ratio = 0.0
+
+    consensus_stats = {
+        'unanimity_count': int(unanimity_count),
+        'unanimity_pct': float(unanimity_count / num_trades * 100),
+        'unanimity_win_rate': unanimity_win_rate,
+        'unanimity_quality_ratio': unanimity_quality_ratio,
+        'min_consensus_count': int(min_consensus_count),
+        'min_consensus_pct': float(min_consensus_count / num_trades * 100),
+        'min_consensus_win_rate': min_consensus_win_rate,
+        'min_consensus_quality_ratio': min_consensus_quality_ratio,
+        'avg_consensus_votes': avg_votes,
+        'consensus_distribution': consensus_distribution,
+    }
 
     # Average coefficient for triggered trades (consensus strength)
     avg_coef = np.mean(all_coeffs, axis=0)  # [Days, Stocks]
     active = np.where(triggers, np.maximum(0, avg_coef - Config.COEFFICIENT_THRESHOLD), 0)
     active = np.minimum(active, 2.0)
 
-    # Extract returns for investable stocks only
-    investable_returns = slice_returns[:, Config.INVESTABLE_START_COL:Config.INVESTABLE_END_COL+1]
     trade_returns = investable_returns[triggers]
     trade_weights = active[triggers]
 
@@ -793,15 +878,49 @@ def evaluate_committee_on_slice(members: list, slice_tensor: torch.Tensor,
     roi = (total_pnl / total_investment * 100) if total_investment > 0 else 0.0
     win_rate = np.mean(trade_returns > 0) if len(trade_returns) > 0 else 0.0
 
+    # Quality ratio (winners / losers)
+    winners = np.sum(trade_returns > 0)
+    losers = np.sum(trade_returns <= 0)
+    quality_ratio = (winners / losers) if losers > 0 else float('inf')
+
+    # Expectancy (average return per trade)
+    expectancy = float(np.mean(weighted_returns)) if len(weighted_returns) > 0 else 0.0
+
     fitness = roi * np.log10(abs(total_pnl) + 10)
     if roi > 0:
         fitness *= (1 + win_rate ** 2)
 
+    # Export trade details if requested
+    trade_details = None
+    if export_trades:
+        # Get indices of triggered trades
+        trigger_indices = np.argwhere(triggers)  # [(day_idx, stock_idx), ...]
+
+        trade_details = []
+        for idx, (day_idx, stock_idx) in enumerate(trigger_indices):
+            # Adjust stock index to investable range
+            actual_stock_idx = stock_idx + Config.INVESTABLE_START_COL
+
+            trade_details.append({
+                'day_idx': int(slice_start_idx + day_idx) if slice_start_idx is not None else int(day_idx),
+                'stock_idx': int(actual_stock_idx),
+                'coefficient': float(avg_coef[day_idx, stock_idx]),
+                'position_size': float(active[day_idx, stock_idx]),
+                'return': float(trade_returns[idx]),
+                'weighted_return': float(weighted_returns[idx]),
+                'vote_count': int(triggered_vote_counts[idx]),
+                'is_winner': bool(trade_returns[idx] > 0),
+            })
+
     return {
         'num_trades': int(num_trades),
         'win_rate': float(win_rate),
+        'quality_ratio': quality_ratio,
+        'expectancy': expectancy,
         'roi': float(roi),
         'fitness': float(fitness),
+        'consensus_stats': consensus_stats,
+        'trade_details': trade_details,
     }
 
 
@@ -810,7 +929,7 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     """
     Run 3-slice holdout validation on the committee.
 
-    Returns validation results dict.
+    Returns validation results dict with comprehensive metrics.
     """
     print("\n" + "="*60)
     print("PHASE 2: VALIDATION (3-Slice Holdout Test)")
@@ -848,13 +967,23 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
 
     results = {
         'individual_agents': [],
+        'committee_slices': [],
         'committee_aggregate': {
-            'slice_scores': [],
-            'mean': 0.0,
+            'mean_fitness': 0.0,
+            'mean_win_rate': 0.0,
+            'mean_quality_ratio': 0.0,
+            'mean_expectancy': 0.0,
+            'mean_roi': 0.0,
+            'total_trades': 0,
+        },
+        'consensus_summary': {
+            'avg_unanimity_pct': 0.0,
+            'avg_min_consensus_pct': 0.0,
+            'avg_consensus_votes': 0.0,
         }
     }
 
-    # Validate individual agents
+    # Validate individual agents on each slice
     print(f"\nValidating {len(members)} individual agents...")
 
     for member in tqdm(members, desc="Agents"):
@@ -865,7 +994,7 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             'agent_id': entry['agent_id'],
             'run_name': entry['run_name'],
             'stored_gauntlet': entry['gauntlet_score'],
-            'slice_scores': [],
+            'slice_metrics': [],
         }
 
         for s in range(num_slices):
@@ -876,13 +1005,29 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             slice_returns = holdout_returns[start_idx:end_idx]
 
             metrics = evaluate_agent_on_slice(filepath, slice_tensor, slice_returns)
-            agent_results['slice_scores'].append(metrics.get('fitness', 0.0))
+            agent_results['slice_metrics'].append({
+                'slice': s,
+                'fitness': metrics.get('fitness', 0.0),
+                'win_rate': metrics.get('win_rate', 0.0),
+                'quality_ratio': metrics.get('quality_ratio', 0.0),
+                'expectancy': metrics.get('expectancy', 0.0),
+                'roi': metrics.get('roi', 0.0),
+                'num_trades': metrics.get('num_trades', 0),
+            })
 
-        agent_results['fresh_mean'] = float(np.mean(agent_results['slice_scores']))
+        # Calculate aggregates for this agent
+        agent_results['fresh_mean_fitness'] = float(np.mean([m['fitness'] for m in agent_results['slice_metrics']]))
+        agent_results['fresh_mean_win_rate'] = float(np.mean([m['win_rate'] for m in agent_results['slice_metrics']]))
+        agent_results['fresh_mean_quality_ratio'] = float(np.mean([m['quality_ratio'] for m in agent_results['slice_metrics']]))
+        agent_results['fresh_mean_expectancy'] = float(np.mean([m['expectancy'] for m in agent_results['slice_metrics']]))
+        agent_results['fresh_mean_roi'] = float(np.mean([m['roi'] for m in agent_results['slice_metrics']]))
+
         results['individual_agents'].append(agent_results)
 
-    # Validate committee consensus
+    # Validate committee consensus on each slice
     print(f"\nValidating committee consensus...")
+
+    all_trades_data = []  # Collect all trades across slices
 
     for s in range(num_slices):
         start_idx = s * slice_size
@@ -891,29 +1036,192 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         slice_tensor = holdout_tensor[start_idx:end_idx]
         slice_returns = holdout_returns[start_idx:end_idx]
 
-        metrics = evaluate_committee_on_slice(
-            members, slice_tensor, slice_returns, context_window_days
-        )
-        results['committee_aggregate']['slice_scores'].append(metrics.get('fitness', 0.0))
+        # Get absolute day index for trade export
+        slice_start_day_idx = valid_indices[start_idx]
 
-    results['committee_aggregate']['mean'] = float(
-        np.mean(results['committee_aggregate']['slice_scores'])
+        metrics = evaluate_committee_on_slice(
+            members, slice_tensor, slice_returns, context_window_days,
+            slice_start_idx=slice_start_day_idx,
+            export_trades=True
+        )
+
+        slice_result = {
+            'slice': s,
+            'fitness': metrics.get('fitness', 0.0),
+            'win_rate': metrics.get('win_rate', 0.0),
+            'quality_ratio': metrics.get('quality_ratio', 0.0),
+            'expectancy': metrics.get('expectancy', 0.0),
+            'roi': metrics.get('roi', 0.0),
+            'num_trades': metrics.get('num_trades', 0),
+            'consensus_stats': metrics.get('consensus_stats', {}),
+        }
+
+        results['committee_slices'].append(slice_result)
+
+        # Collect trade details for CSV export
+        if metrics.get('trade_details'):
+            for trade in metrics['trade_details']:
+                trade['slice'] = s
+                all_trades_data.append(trade)
+
+    # Calculate committee aggregates
+    results['committee_aggregate']['mean_fitness'] = float(
+        np.mean([s['fitness'] for s in results['committee_slices']])
+    )
+    results['committee_aggregate']['mean_win_rate'] = float(
+        np.mean([s['win_rate'] for s in results['committee_slices']])
+    )
+    results['committee_aggregate']['mean_quality_ratio'] = float(
+        np.mean([s['quality_ratio'] for s in results['committee_slices']])
+    )
+    results['committee_aggregate']['mean_expectancy'] = float(
+        np.mean([s['expectancy'] for s in results['committee_slices']])
+    )
+    results['committee_aggregate']['mean_roi'] = float(
+        np.mean([s['roi'] for s in results['committee_slices']])
+    )
+    results['committee_aggregate']['total_trades'] = int(
+        sum([s['num_trades'] for s in results['committee_slices']])
     )
 
-    # Print results
+    # Calculate consensus summary
+    results['consensus_summary']['avg_unanimity_pct'] = float(
+        np.mean([s['consensus_stats']['unanimity_pct'] for s in results['committee_slices']])
+    )
+    results['consensus_summary']['avg_min_consensus_pct'] = float(
+        np.mean([s['consensus_stats']['min_consensus_pct'] for s in results['committee_slices']])
+    )
+    results['consensus_summary']['avg_consensus_votes'] = float(
+        np.mean([s['consensus_stats']['avg_consensus_votes'] for s in results['committee_slices']])
+    )
+
+    # Print comprehensive results
     print(f"\n{'='*60}")
     print("VALIDATION RESULTS")
     print(f"{'='*60}")
 
-    print("\nIndividual Agents:")
+    print("\n" + "-"*60)
+    print("INDIVIDUAL AGENTS (Slice Performance)")
+    print("-"*60)
     for agent in results['individual_agents']:
-        print(f"  {agent['run_name']}_{agent['agent_id']}: "
-              f"stored={agent['stored_gauntlet']:.2f}, "
-              f"fresh_mean={agent['fresh_mean']:.2f}")
+        print(f"\n  {agent['run_name']}_{agent['agent_id']}:")
+        print(f"    Stored Gauntlet: {agent['stored_gauntlet']:.2f}")
+        print(f"    Fresh Averages: fitness={agent['fresh_mean_fitness']:.2f}, "
+              f"win_rate={agent['fresh_mean_win_rate']:.2%}, "
+              f"quality_ratio={agent['fresh_mean_quality_ratio']:.3f}, "
+              f"expectancy={agent['fresh_mean_expectancy']:.6f}, "
+              f"roi={agent['fresh_mean_roi']:.2f}%")
+        for m in agent['slice_metrics']:
+            print(f"      Slice {m['slice']}: fitness={m['fitness']:.2f}, "
+                  f"win_rate={m['win_rate']:.2%}, quality_ratio={m['quality_ratio']:.3f}, "
+                  f"expectancy={m['expectancy']:.6f}, roi={m['roi']:.2f}%, "
+                  f"trades={m['num_trades']}")
 
-    print(f"\nCommittee Consensus:")
-    print(f"  Slice scores: {results['committee_aggregate']['slice_scores']}")
-    print(f"  Mean: {results['committee_aggregate']['mean']:.2f}")
+    print("\n" + "-"*60)
+    print("COMMITTEE PERFORMANCE (Per Slice)")
+    print("-"*60)
+    for s in results['committee_slices']:
+        print(f"\n  Slice {s['slice']}:")
+        print(f"    Fitness: {s['fitness']:.2f}")
+        print(f"    Win Rate: {s['win_rate']:.2%}")
+        print(f"    Quality Ratio: {s['quality_ratio']:.3f}")
+        print(f"    Expectancy: {s['expectancy']:.6f}")
+        print(f"    ROI: {s['roi']:.2f}%")
+        print(f"    Trades: {s['num_trades']}")
+        print(f"")
+
+        cs = s['consensus_stats']
+        print(f"    Consensus Breakdown:")
+        print(f"      Unanimity: {cs['unanimity_count']} trades ({cs['unanimity_pct']:.1f}%)")
+        if cs['unanimity_count'] > 0:
+            print(f"        Win Rate: {cs['unanimity_win_rate']:.2%}")
+            print(f"        Quality Ratio: {cs['unanimity_quality_ratio']:.3f}")
+
+        print(f"      Min Consensus: {cs['min_consensus_count']} trades ({cs['min_consensus_pct']:.1f}%)")
+        if cs['min_consensus_count'] > 0:
+            print(f"        Win Rate: {cs['min_consensus_win_rate']:.2%}")
+            print(f"        Quality Ratio: {cs['min_consensus_quality_ratio']:.3f}")
+
+        print(f"      Avg Votes per Trade: {cs['avg_consensus_votes']:.2f}")
+        print(f"      Vote Distribution: {cs['consensus_distribution']}")
+
+    print("\n" + "-"*60)
+    print("COMMITTEE AGGREGATE PERFORMANCE")
+    print("-"*60)
+    ca = results['committee_aggregate']
+    print(f"  Mean Fitness: {ca['mean_fitness']:.2f}")
+    print(f"  Mean Win Rate: {ca['mean_win_rate']:.2%}")
+    print(f"  Mean Quality Ratio: {ca['mean_quality_ratio']:.3f}")
+    print(f"  Mean Expectancy: {ca['mean_expectancy']:.6f}")
+    print(f"  Mean ROI: {ca['mean_roi']:.2f}%")
+    print(f"  Total Trades (All Slices): {ca['total_trades']}")
+
+    print("\n" + "-"*60)
+    print("CONSENSUS SUMMARY (Across All Slices)")
+    print("-"*60)
+    cs_sum = results['consensus_summary']
+    print(f"  Avg Unanimity %: {cs_sum['avg_unanimity_pct']:.1f}%")
+    print(f"  Avg Min Consensus %: {cs_sum['avg_min_consensus_pct']:.1f}%")
+    print(f"  Avg Votes per Trade: {cs_sum['avg_consensus_votes']:.2f}")
+
+    print("\n" + "-"*60)
+    print("COMMITTEE VS INDIVIDUAL COMPARISON")
+    print("-"*60)
+    committee_mean = ca['mean_fitness']
+    individual_means = [agent['fresh_mean_fitness'] for agent in results['individual_agents']]
+    best_individual = max(individual_means)
+    worst_individual = min(individual_means)
+    avg_individual = np.mean(individual_means)
+
+    print(f"  Committee Fitness: {committee_mean:.2f}")
+    print(f"  Best Individual: {best_individual:.2f}")
+    print(f"  Worst Individual: {worst_individual:.2f}")
+    print(f"  Avg Individual: {avg_individual:.2f}")
+    print(f"  Committee vs Best: {committee_mean - best_individual:+.2f} ({((committee_mean / best_individual - 1) * 100):+.1f}%)")
+    print(f"  Committee vs Avg: {committee_mean - avg_individual:+.2f} ({((committee_mean / avg_individual - 1) * 100):+.1f}%)")
+
+    # Export trades to CSV files
+    if all_trades_data:
+        print(f"\n" + "-"*60)
+        print("EXPORTING TRADE DATA")
+        print("-"*60)
+
+        # Export all trades to a single CSV
+        trades_df = pd.DataFrame(all_trades_data)
+        all_trades_csv = manager.local_committee_dir / "committee_all_trades.csv"
+        trades_df.to_csv(all_trades_csv, index=False)
+        print(f"  ✓ All trades: {all_trades_csv}")
+        print(f"    Total trades: {len(trades_df)}")
+
+        # Export per-slice CSVs
+        for s in range(num_slices):
+            slice_trades = [t for t in all_trades_data if t['slice'] == s]
+            if slice_trades:
+                slice_df = pd.DataFrame(slice_trades)
+                slice_csv = manager.local_committee_dir / f"committee_slice_{s}_trades.csv"
+                slice_df.to_csv(slice_csv, index=False)
+                print(f"  ✓ Slice {s}: {slice_csv} ({len(slice_df)} trades)")
+
+        # Upload CSVs to cloud
+        if manager.cloud_sync.provider != "local":
+            print(f"\n  Syncing trade CSVs to cloud...")
+
+            # Upload all trades CSV
+            cloud_all_trades = f"{manager.cloud_committee_base}/committee_all_trades.csv"
+            if manager.cloud_sync.upload_file_verified(str(all_trades_csv), cloud_all_trades):
+                print(f"    ✓ Uploaded: committee_all_trades.csv")
+            else:
+                print(f"    ✗ Failed to upload: committee_all_trades.csv")
+
+            # Upload slice CSVs
+            for s in range(num_slices):
+                slice_csv = manager.local_committee_dir / f"committee_slice_{s}_trades.csv"
+                if slice_csv.exists():
+                    cloud_slice_csv = f"{manager.cloud_committee_base}/committee_slice_{s}_trades.csv"
+                    if manager.cloud_sync.upload_file_verified(str(slice_csv), cloud_slice_csv):
+                        print(f"    ✓ Uploaded: committee_slice_{s}_trades.csv")
+                    else:
+                        print(f"    ✗ Failed to upload: committee_slice_{s}_trades.csv")
 
     return results
 
