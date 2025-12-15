@@ -145,9 +145,9 @@ def main():
         parser.add_argument(
             '--multi',
             action='store_true',
-            help='Multi-agent mode: Train all 9 committee members in parallel. '
-                 'Creates 11 agents per member (99 total). Genetic evolution is isolated '
-                 'per parent. Ends after 3 turnovers (each parent achieves 3 breakthroughs).'
+            help='Multi-agent mode: Train all 9 committee members sequentially. '
+                 'Trains one member at a time until breakthrough (5%% improvement), then rotates to next. '
+                 'Ends after 3 turnovers (all 9 members achieve 3 breakthroughs each).'
         )
         parser.add_argument(
             '--cleanup',
@@ -278,8 +278,8 @@ def main():
 
             print(f"\n🎯 MULTI-AGENT MODE")
             print(f"  Committee members: {len(roster['members'])}")
-            print(f"  Population per member: {Config.MULTI_POPULATION_PER_MEMBER}")
-            print(f"  Total agents: {Config.MULTI_TOTAL_POPULATION}")
+            print(f"  Population size: {Config.POPULATION_SIZE} (standard)")
+            print(f"  Training mode: Sequential (one member at a time)")
             print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
             print(f"  Consistency mode: AUTO-ENABLED")
 

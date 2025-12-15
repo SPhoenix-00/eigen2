@@ -2248,8 +2248,13 @@ class ERLTrainer:
         total_inv = stats.get('total_investment', 0.0)
         roi_pct = (raw_pnl / total_inv * 100) if total_inv > 0 else 0.0
 
-        # Clip ROI for stability (prevent one outlier from breaking scale)
-        roi_score = np.clip(roi_pct, -25, 25)
+        # ROI Expansion Mode: Uncap ROI and apply super-linear scaling
+        # Power law (** 1.1) makes high ROI disproportionately valuable
+        # Sign preservation: apply power to absolute value, then restore sign
+        if roi_pct >= 0:
+            roi_score = (roi_pct ** 1.1)
+        else:
+            roi_score = -(abs(roi_pct) ** 1.1)
 
         # 3. Volume Scalar (Log Magnitude)
         # Adding 10 ensures log is always > 1, providing a baseline score
@@ -5673,8 +5678,8 @@ class ERLTrainer:
                 total_trades = val_results.get('total_trades', 0)
                 quality_count = val_results.get('quality_count', 0)
 
-                if self.consistency_mode:
-                    # Consistency mode: Use the Pessimistic Score from validate_agent
+                if self.consistency_mode and not self.multi_mode:
+                    # Consistency mode (non-multi): Use the Pessimistic Score from validate_agent
                     # This is the CORRECT approach: trust the robustness score (0.4*mean + 0.6*min)
                     # already calculated in validate_agent, which heavily penalizes blow-up slices.
                     #
@@ -5688,7 +5693,7 @@ class ERLTrainer:
                     base_combined_fitness = combined_fitness
                     roi_adjustment = 0.0
                 else:
-                    # Standard mode: original fitness calculation
+                    # Standard mode OR Multi-mode: ROI Expansion with HoF median benchmark
                     # Combined score: penalize agents with negative training fitness
                     # This prevents "lucky" agents that do well on validation but poorly on training
                     # Formula: combined = val_fitness + min(0, train_fitness)
@@ -5697,6 +5702,7 @@ class ERLTrainer:
                     # ROI-based scoring adjustment using Hall of Fame median as benchmark
                     # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
                     # This rewards agents that outperform the HoF median ROI and penalizes those below
+                    # MULTI-MODE: This forces committee members to beat the Global50 ROI median
 
                     # Confidence factor: quality_count / target_count (capped at 1.0)
                     # This ensures agents only get full ROI bonus credit if they have enough quality trades
@@ -5737,22 +5743,25 @@ class ERLTrainer:
 
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
-            if self.consistency_mode:
+            if self.consistency_mode and not self.multi_mode:
                 print("Consistency mode: WR^2 × QR × ROI × volume_scalar fitness function")
             else:
                 print(f"ROI Hurdle EMA: {median_hof_roi:.2f}% (raw HoF median: {raw_median_hof_roi:.2f}%)")
                 print(f"Quality threshold: {quality_threshold:.2f}% (min gain_pct for quality trades, need {Config.ROI_CONFIDENCE_MIN_TRADES} for full bonus)")
+                if self.multi_mode:
+                    print("🎯 MULTI-MODE: ROI Expansion enabled - agents must beat Global50 median ROI")
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
 
-            if self.consistency_mode:
+            if self.consistency_mode and not self.multi_mode:
                 # Simplified output for consistency mode (no ROI adjustment)
                 print("Top 5 by Combined Fitness - used for elite selection:")
                 for i, result in enumerate(validation_results[:5]):
                     quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
                     print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
             else:
-                # Detailed output for standard mode (with ROI adjustment)
-                print("Top 5 by Combined Fitness (with ROI adjustment) - used for elite selection:")
+                # Detailed output for standard mode and multi-mode (with ROI adjustment)
+                mode_label = "MULTI-MODE ROI Expansion" if self.multi_mode else "with ROI adjustment"
+                print(f"Top 5 by Combined Fitness ({mode_label}) - used for elite selection:")
                 for i, result in enumerate(validation_results[:5]):
                     roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
                     quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0

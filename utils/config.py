@@ -152,20 +152,11 @@ class Config:
     SINGLE_STABILIZATION_GENERATIONS = 5  # Generations before breakthrough detection starts
     SINGLE_TARGET_BREAKTHROUGHS = 4       # Training ends after 4 confirmed breakthroughs
 
-    # Multi-agent mode - parallel refinement of all 9 committee members
-    # Population: 9 committee parents × 11 agents each = 99 total agents
-    MULTI_POPULATION_PER_MEMBER = 11
-    MULTI_TOTAL_POPULATION = 9 * MULTI_POPULATION_PER_MEMBER  # 99 (9 = COMMITTEE_SIZE)
-
-    # Population composition per parent (must sum to 1.0)
-    MULTI_CLONE_FRAC = 0.45           # 5 pure clones (~45%)
-    MULTI_NORMAL_MUTATION_FRAC = 0.27 # 3 normal mutants (~27%)
-    MULTI_PLATEAU_MUTATION_FRAC = 0.28 # 3 plateau mutants (~28%)
-
-    # Breakthrough and turnover
-    MULTI_BREAKTHROUGH_THRESHOLD = 0.05  # 5% improvement over parent's original score
-    MULTI_TARGET_TURNOVERS = 3           # End after 3 turnovers
-    # Note: No stabilization phase in multi-mode - breakthroughs detected immediately
+    # Multi-agent mode - sequential refinement of all 9 committee members
+    # Trains one committee member at a time using standard POPULATION_SIZE
+    # Rotates to next member after each breakthrough (5% improvement)
+    MULTI_BREAKTHROUGH_THRESHOLD = 0.05  # 5% improvement over member's baseline score
+    MULTI_TARGET_TURNOVERS = 3           # End after 3 complete turnovers (all 9 members get 3 breakthroughs each)
 
     # Consistency mode - loss magnification for training on consistency
     # Applied ONLY when --consistency flag is used. Normal mode uses 1.0 (no magnification)
