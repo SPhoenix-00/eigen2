@@ -728,6 +728,8 @@ class CommitteeAgent:
                 'trades_vetoed': 0,
                 'avg_votes_per_trade': [],
             }
+            # Track stocks already signaled this episode to prevent double-counting
+            self.signaled_stocks = set()
 
         # Load all member agents (actor only)
         print(f"Loading {len(members)} committee members...")
@@ -812,7 +814,7 @@ class CommitteeAgent:
         is_conviction = is_conviction_raw & (vote_counts >= 2)
 
         # 3. Veto Check (Fixed number of silent members)
-        is_silent = all_coeffs < 0.5
+        is_silent = all_coeffs < 0.9
         silent_counts = np.sum(is_silent, axis=0)
         is_vetoed = silent_counts >= Config.COMMITTEE_VETO_COUNT
 
@@ -831,24 +833,32 @@ class CommitteeAgent:
         if self.track_consensus:
             self.consensus_history['total_steps'] += 1
 
-            # Count trades approved by each mechanism
-            trades_approved = np.sum(should_trade)
+            # Filter to only count stocks we haven't signaled before (prevents double-counting)
+            stocks_to_count = should_trade.copy()
+            for stock_id in range(num_stocks):
+                if should_trade[stock_id] and stock_id in self.signaled_stocks:
+                    stocks_to_count[stock_id] = False  # Already counted this stock
+                elif should_trade[stock_id]:
+                    self.signaled_stocks.add(stock_id)  # Mark as signaled
+
+            # Count trades approved by each mechanism (only new signals)
+            trades_approved = np.sum(stocks_to_count)
             self.consensus_history['total_trades'] += int(trades_approved)
 
             # Unanimity: all members voted for the trade
-            unanimity = np.sum(vote_counts[should_trade] == num_members)
+            unanimity = np.sum(vote_counts[stocks_to_count] == num_members)
             self.consensus_history['unanimity_count'] += int(unanimity)
 
             # Min consensus: exactly quorum votes
-            min_consensus = np.sum(vote_counts[should_trade] == Config.COMMITTEE_QUORUM)
+            min_consensus = np.sum(vote_counts[stocks_to_count] == Config.COMMITTEE_QUORUM)
             self.consensus_history['min_consensus_count'] += int(min_consensus)
 
             # Trades by Quorum vs Conviction (MUTUALLY EXCLUSIVE)
             # For trades that actually happened, determine which mechanism approved them
             # If quorum was met, credit quorum (even if conviction also triggered)
             # Only credit conviction for trades where quorum was NOT met (conviction "rescues")
-            is_quorum_trade = is_quorum & should_trade
-            is_conviction_only_trade = (~is_quorum) & should_trade
+            is_quorum_trade = is_quorum & stocks_to_count
+            is_conviction_only_trade = (~is_quorum) & stocks_to_count
 
             # Verify mathematical correctness: these should sum to total trades
             self.consensus_history['trades_by_quorum'] += int(np.sum(is_quorum_trade))
@@ -865,7 +875,7 @@ class CommitteeAgent:
 
             # Average votes per trade
             if trades_approved > 0:
-                avg_votes = np.mean(vote_counts[should_trade])
+                avg_votes = np.mean(vote_counts[stocks_to_count])
                 self.consensus_history['avg_votes_per_trade'].append(float(avg_votes))
 
         # 5. Signal Aggregation
@@ -923,6 +933,11 @@ class CommitteeAgent:
             'trades_vetoed': history['trades_vetoed'],
             'avg_consensus_votes': float(np.mean(history['avg_votes_per_trade'])) if history['avg_votes_per_trade'] else 0,
         }
+
+    def reset_episode(self):
+        """Reset episode-level tracking (call at start of each new episode)."""
+        if self.track_consensus:
+            self.signaled_stocks = set()
 
     def cleanup(self):
         """Release GPU memory from loaded agents."""
@@ -1070,6 +1085,9 @@ def evaluate_committee_on_slice(members: list, loader, stats,
     # Run episode with committee making decisions
     obs, info = env.reset()
     terminated = False
+
+    # Reset committee episode tracking
+    committee.reset_episode()
 
     while not terminated:
         # Get currently held stocks to prevent re-signaling
