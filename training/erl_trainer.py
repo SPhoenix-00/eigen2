@@ -1617,8 +1617,38 @@ class ERLTrainer:
         self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
 
         # Run full validation with ROI adjustment enabled (multi_mode is True)
-        # This will compute combined_fitness = val_fitness + roi_adjustment
+        # Note: validate_population_parallel returns raw validation metrics
+        # We need to post-process to add combined_fitness (val_fitness + roi_adjustment)
         validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
+
+        # Get median ROI from Hall of Fame for ROI-based scoring adjustment
+        median_hof_roi = self.hall_of_fame.get_median_roi()
+
+        # Post-process validation results to add combined_fitness
+        # This matches the logic in the training loop (lines 5701-5735)
+        for member_idx, result in enumerate(validation_results):
+            val_fitness = result['fitness']
+            train_fitness = 0.0  # No training fitness for initial multi-agent eval
+            agent_roi = result.get('roi', 0.0)
+            quality_count = result.get('quality_count', 0)
+
+            # Multi-mode: ROI Expansion with HoF median benchmark
+            # Combined score: penalize agents with negative training fitness
+            # Formula: combined = val_fitness + min(0, train_fitness)
+            base_combined_fitness = val_fitness + min(0.0, train_fitness)
+
+            # ROI-based scoring adjustment using Hall of Fame median as benchmark
+            # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
+            # Confidence factor: quality_count / target_count (capped at 1.0)
+            confidence_factor = min(1.0, quality_count / Config.ROI_CONFIDENCE_MIN_TRADES)
+            roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
+            roi_adjustment = roi_adjustment * confidence_factor
+
+            # Add combined_fitness to result
+            combined_fitness = base_combined_fitness + roi_adjustment
+            result['combined_fitness'] = combined_fitness
+            result['base_combined_fitness'] = base_combined_fitness
+            result['roi_adjustment'] = roi_adjustment
 
         # Extract combined fitness scores as baselines
         for member_idx, result in enumerate(validation_results):
@@ -1626,8 +1656,10 @@ class ERLTrainer:
             self.member_baselines[member_idx] = baseline
 
             member = members[member_idx]
+            roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
             print(f"  Member {member_idx}: {member['run_name']}_{member['agent_id']} "
-                  f"baseline={baseline:.2f} (with ROI adjustment)")
+                  f"baseline={baseline:.2f} (base={result['base_combined_fitness']:.2f}, "
+                  f"ROI adj={roi_adj_sign}{result['roi_adjustment']:.2f})")
 
         # Restore population (will be replaced again when loading first member)
         self.population = saved_population
