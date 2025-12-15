@@ -590,6 +590,7 @@ class ERLTrainer:
             self.turnovers_completed = 0
             self.current_member_idx = 0  # Which committee member we're currently training
             self.multi_generation_offset = 0  # Track total generations across all members
+            self.member_training_start_gen = 0  # Track when current member started training for warmup enforcement
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -1687,6 +1688,9 @@ class ERLTrainer:
         self.current_member_idx = member_idx
         member = self.multi_roster['members'][member_idx]
         context_window = self.multi_roster['context_window_days']
+
+        # Record when this member started training for warmup enforcement
+        self.member_training_start_gen = self.generation
 
         # Set the ROI hurdle to THIS member's starting ROI
         # This ensures the reward function scales based on improvement over THIS agent
@@ -3041,22 +3045,26 @@ class ERLTrainer:
         total_decisions = num_wins + num_losses
         win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
 
-        # Try to promote to Global50 via existing mechanism
-        promoted = self.global_hof.check_and_promote(
-            agent=agent,
-            gauntlet_score=score,
-            generation=self.generation,
-            roi=roi,
-            expectancy=expectancy,
-            quality_ratio=quality_ratio,
-            win_ratio=win_ratio,
-            total_trades=total_trades
-        )
+        # DISABLED: Multi-mode trains committee members in isolation.
+        # Global 50 promotion should happen only when the final improved committee is ready.
+        # This prevents polluting the global leaderboard with partial improvements.
+        # promoted = self.global_hof.check_and_promote(
+        #     agent=agent,
+        #     gauntlet_score=score,
+        #     generation=self.generation,
+        #     roi=roi,
+        #     expectancy=expectancy,
+        #     quality_ratio=quality_ratio,
+        #     win_ratio=win_ratio,
+        #     total_trades=total_trades
+        # )
+        #
+        # if promoted:
+        #     print(f"  ✓ Promoted to Global50: {new_filename}")
+        # else:
+        #     print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={self.global_hof.entry_threshold:.2f})")
 
-        if promoted:
-            print(f"  ✓ Promoted to Global50: {new_filename}")
-        else:
-            print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={self.global_hof.entry_threshold:.2f})")
+        print(f"  ℹ Global 50 promotion disabled during multi-mode training (prevents polluting global leaderboard with partial improvements)")
 
     def _process_multi_turnover(self):
         """
@@ -5882,8 +5890,18 @@ class ERLTrainer:
 
             # --- Multi-Agent Mode Breakthrough Detection (Sequential) ---
             if self.multi_mode:
-                # Check for breakthrough on current committee member
-                breakthrough_result = self._check_multi_breakthrough(validation_scores)
+                # Enforce warmup period before allowing breakthroughs
+                # Each member gets fresh warmup period starting when they were loaded
+                generations_trained = self.generation - self.member_training_start_gen
+                warmup_generations = Config.BREAKTHROUGH_WARMUP_GENERATIONS  # Default: 5
+
+                if generations_trained < warmup_generations:
+                    breakthrough_result = None
+                    if generations_trained == warmup_generations - 1:
+                        print(f"  ⏳ Member {self.current_member_idx} warmup completes next generation")
+                else:
+                    # Check for breakthrough on current committee member
+                    breakthrough_result = self._check_multi_breakthrough(validation_scores)
 
                 if breakthrough_result is not None:
                     improved_agent, score = breakthrough_result
@@ -5906,8 +5924,11 @@ class ERLTrainer:
                 member = self.multi_roster['members'][self.current_member_idx]
                 member_name = f"{member['run_name']}_{member['agent_id']}"
                 if gen % 5 == 0:
+                    current_baseline = self.member_baselines[self.current_member_idx]
+                    current_roi_hurdle = self.member_starting_rois[self.current_member_idx]
                     print(f"\n  Multi-Mode Progress: Turnovers {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
                     print(f"    Current member: {self.current_member_idx} ({member_name})")
+                    print(f"    Baseline: {current_baseline:.2f}, ROI Hurdle: {current_roi_hurdle:.2f}%, Best: {max(validation_scores):.2f}")
                     print(f"    Breakthroughs: {self.member_breakthroughs}")
 
             # --- Comprehensive Validation Logging ---
@@ -5962,62 +5983,68 @@ class ERLTrainer:
             wandb.log(validation_log, step=gen)
 
             # --- Hall of Fame Admission Logic ---
-            # Re-evaluate all existing HoF entries with current median (EMA-based erosion)
-            # This ensures historical agents don't have unfair ROI advantages as median rises
-            # Erosion uses EMA smoothing: α=0.33 means gradual adjustment over ~3 generations
-            if len(self.hall_of_fame.entries) > 0:
-                erosion_alpha = getattr(Config, 'HOF_EROSION_ALPHA', 0.33)  # Default: α=0.33 ≈ 3 gen convergence
-                updated_count = self.hall_of_fame.recompute_all_scores(
-                    current_median_roi=median_hof_roi,
-                    roi_adjustment_multiplier=Config.ROI_ADJUSTMENT_MULTIPLIER,
-                    min_trades_threshold=Config.ROI_CONFIDENCE_MIN_TRADES,
-                    erosion_alpha=erosion_alpha,
-                    consistency_mode=self.consistency_mode
-                )
-                if updated_count > 0:
-                    print(f"\n🔄 Re-evaluated {updated_count}/{len(self.hall_of_fame.entries)} HoF agents with current median ({median_hof_roi:.2f}%) [EMA α={erosion_alpha:.2f}]")
+            # In multi-mode, skip HoF updates to preserve member-specific ROI hurdles
+            if not self.multi_mode:
+                # Re-evaluate all existing HoF entries with current median (EMA-based erosion)
+                # This ensures historical agents don't have unfair ROI advantages as median rises
+                # Erosion uses EMA smoothing: α=0.33 means gradual adjustment over ~3 generations
+                if len(self.hall_of_fame.entries) > 0:
+                    erosion_alpha = getattr(Config, 'HOF_EROSION_ALPHA', 0.33)  # Default: α=0.33 ≈ 3 gen convergence
+                    updated_count = self.hall_of_fame.recompute_all_scores(
+                        current_median_roi=median_hof_roi,
+                        roi_adjustment_multiplier=Config.ROI_ADJUSTMENT_MULTIPLIER,
+                        min_trades_threshold=Config.ROI_CONFIDENCE_MIN_TRADES,
+                        erosion_alpha=erosion_alpha,
+                        consistency_mode=self.consistency_mode
+                    )
+                    if updated_count > 0:
+                        print(f"\n🔄 Re-evaluated {updated_count}/{len(self.hall_of_fame.entries)} HoF agents with current median ({median_hof_roi:.2f}%) [EMA α={erosion_alpha:.2f}]")
 
-            # Build candidate list from all agents in this generation
-            candidates = []
-            for result in validation_results:
-                agent_idx = result['idx']
-                combined_score = result['combined_fitness']
-                agent_roi = result['roi']
-                agent_expectancy = result['expectancy']
-                train_fitness = result['training_fitness']
-                quality_count = result['quality_count']
-                total_trades = result['total_trades']
-                val_fitness = result['validation_fitness']
-                base_combined_fitness = result['base_combined_fitness']
-                candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
-                                 train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
+                # Build candidate list from all agents in this generation
+                candidates = []
+                for result in validation_results:
+                    agent_idx = result['idx']
+                    combined_score = result['combined_fitness']
+                    agent_roi = result['roi']
+                    agent_expectancy = result['expectancy']
+                    train_fitness = result['training_fitness']
+                    quality_count = result['quality_count']
+                    total_trades = result['total_trades']
+                    val_fitness = result['validation_fitness']
+                    base_combined_fitness = result['base_combined_fitness']
+                    candidates.append((self.population[agent_idx], combined_score, agent_idx, agent_roi, agent_expectancy,
+                                     train_fitness, quality_count, total_trades, val_fitness, base_combined_fitness))
 
-            # Use batch update with aggressive admission and cascading swaps
-            admission_results = self.hall_of_fame.update_from_generation(candidates, gen)
+                # Use batch update with aggressive admission and cascading swaps
+                admission_results = self.hall_of_fame.update_from_generation(candidates, gen)
 
-            # Print admission results
-            admitted = [(idx, score, action) for idx, score, action in admission_results
-                       if action == 'admitted' or action.startswith('replaced_')]
-            if admitted:
-                hof_stats = self.hall_of_fame.get_stats()
-                print(f"\n⭐ Hall of Fame updates ({len(admitted)} changes):")
-                for agent_idx, score, action in admitted:
-                    if action == 'admitted':
-                        print(f"   + Agent {agent_idx} admitted (Combined: {score:.2f})")
-                    elif action.startswith('replaced_'):
-                        old_score = action.replace('replaced_', '')
-                        print(f"   ↑ Agent {agent_idx} (Combined: {score:.2f}) replaced {old_score}")
-                print(f"   HoF size: {hof_stats['size']}/{self.hall_of_fame.capacity}, "
-                      f"Worst: {hof_stats['worst_score']:.2f}, Best: {hof_stats['best_score']:.2f}")
+                # Print admission results
+                admitted = [(idx, score, action) for idx, score, action in admission_results
+                           if action == 'admitted' or action.startswith('replaced_')]
+                if admitted:
+                    hof_stats = self.hall_of_fame.get_stats()
+                    print(f"\n⭐ Hall of Fame updates ({len(admitted)} changes):")
+                    for agent_idx, score, action in admitted:
+                        if action == 'admitted':
+                            print(f"   + Agent {agent_idx} admitted (Combined: {score:.2f})")
+                        elif action.startswith('replaced_'):
+                            old_score = action.replace('replaced_', '')
+                            print(f"   ↑ Agent {agent_idx} (Combined: {score:.2f}) replaced {old_score}")
+                    print(f"   HoF size: {hof_stats['size']}/{self.hall_of_fame.capacity}, "
+                          f"Worst: {hof_stats['worst_score']:.2f}, Best: {hof_stats['best_score']:.2f}")
 
-            # Update ROI hurdle EMA after HoF changes
-            # EMA with α=0.2: converges to static target in ~5 iterations
-            # This smooths the hurdle so it rises gradually as training progresses
-            new_median_roi = self.hall_of_fame.get_median_roi()
-            old_ema = self.roi_hurdle_ema
-            self.roi_hurdle_ema = 0.2 * new_median_roi + 0.8 * self.roi_hurdle_ema
-            if admitted:  # Only log if there were changes
-                print(f"   ROI Hurdle EMA: {old_ema:.2f}% → {self.roi_hurdle_ema:.2f}% (new median: {new_median_roi:.2f}%)")
+                # Update ROI hurdle EMA after HoF changes
+                # EMA with α=0.2: converges to static target in ~5 iterations
+                # This smooths the hurdle so it rises gradually as training progresses
+                new_median_roi = self.hall_of_fame.get_median_roi()
+                old_ema = self.roi_hurdle_ema
+                self.roi_hurdle_ema = 0.2 * new_median_roi + 0.8 * self.roi_hurdle_ema
+                if admitted:  # Only log if there were changes
+                    print(f"   ROI Hurdle EMA: {old_ema:.2f}% → {self.roi_hurdle_ema:.2f}% (new median: {new_median_roi:.2f}%)")
+            else:
+                # Multi-mode: Skip Hall of Fame updates to preserve member-specific ROI hurdles
+                if gen % 10 == 0:
+                    print(f"\n  ℹ Multi-mode: Hall of Fame updates disabled (preserving member ROI hurdle: {self.roi_hurdle_ema:.2f}%)")
 
             # Log Hall of Fame metrics after admission check
             hof_stats = self.hall_of_fame.get_stats()
