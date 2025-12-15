@@ -1590,8 +1590,12 @@ class ERLTrainer:
         members = self.multi_roster['members']
         context_window = self.multi_roster['context_window_days']
 
-        # First, evaluate all members to establish baselines
-        print(f"\nEvaluating {len(members)} committee members for baselines...")
+        # Re-evaluate all members with ROI adjustment enabled to establish proper baselines
+        # This is critical because stored gauntlet scores don't include ROI adjustment
+        print(f"\nRe-evaluating {len(members)} committee members with ROI adjustment for baselines...")
+
+        # Temporarily create a single-agent population for validation
+        temp_population = []
 
         for member_idx, member in enumerate(members):
             agent_path = get_agent_filepath(member, context_window)
@@ -1599,18 +1603,34 @@ class ERLTrainer:
             if not agent_path.exists():
                 raise FileNotFoundError(f"Committee member agent not found: {agent_path}")
 
-            # Load and evaluate member
-            source_agent = DDPGAgent(agent_id=0)
-            source_agent.load(str(agent_path))
+            # Load member agent
+            agent = DDPGAgent(agent_id=member_idx)
+            agent.load(str(agent_path))
+            temp_population.append(agent)
 
-            baseline = self._evaluate_single_agent_for_baseline(source_agent)
+        # Save current population and replace with committee members
+        saved_population = self.population
+        self.population = temp_population
+
+        # Run full validation with ROI adjustment enabled (multi_mode is True)
+        # This will compute combined_fitness = val_fitness + roi_adjustment
+        validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
+
+        # Extract combined fitness scores as baselines
+        for member_idx, result in enumerate(validation_results):
+            baseline = result['combined_fitness']
             self.member_baselines[member_idx] = baseline
 
+            member = members[member_idx]
             print(f"  Member {member_idx}: {member['run_name']}_{member['agent_id']} "
-                  f"baseline={baseline:.2f}")
+                  f"baseline={baseline:.2f} (with ROI adjustment)")
 
-            # Clean up
-            del source_agent
+        # Restore population (will be replaced again when loading first member)
+        self.population = saved_population
+
+        # Clean up temporary agents
+        for agent in temp_population:
+            del agent
 
         print(f"\n✓ All {len(members)} members evaluated")
         print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
@@ -2902,7 +2922,7 @@ class ERLTrainer:
             print(f"  Archived original to: {archive_path.name}")
 
         # Save improved agent with new filename
-        new_filename = f"{self.wandb_run_name}_{improved_agent.agent_id}.pth"
+        new_filename = f"{self.run_name}_{improved_agent.agent_id}.pth"
         new_path = original_path.parent / new_filename
         improved_agent.save(str(new_path))
         print(f"  Saved improved agent: {new_filename}")
@@ -2916,7 +2936,7 @@ class ERLTrainer:
         old_run_name = member['run_name']
         old_agent_id = member['agent_id']
         self.multi_roster['members'][member_idx] = {
-            'run_name': self.wandb_run_name,
+            'run_name': self.run_name,
             'agent_id': improved_agent.agent_id,
             'gauntlet_score': score,
             # Preserve other fields if they exist
@@ -2960,7 +2980,7 @@ class ERLTrainer:
 
         # Create entry for global50
         new_entry = {
-            'run_name': self.wandb_run_name,
+            'run_name': self.run_name,
             'agent_id': agent.agent_id,
             'gauntlet_score': score,
             'roi': 0.0,  # Will be recalculated on next evaluation
