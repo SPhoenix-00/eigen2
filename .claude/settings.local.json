@@ -46,7 +46,8 @@
       "Bash(tree:*)",
       "Bash(git merge-base:*)",
       "Bash(find:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(gsutil cat:*)"
     ],
     "deny": [],
     "ask": []

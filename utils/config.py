@@ -211,7 +211,7 @@ class Config:
     GAUNTLET_MODE_ENABLED = True  # Enable Gauntlet Mode breakthrough validation
 
     # Breakthrough detection
-    BREAKTHROUGH_WARMUP_GENERATIONS = 5  # No breakthrough detection until Generation > this value (let population churn)
+    BREAKTHROUGH_WARMUP_GENERATIONS = 3  # No breakthrough detection until Generation > this value (let population churn)
     BREAKTHROUGH_THRESHOLD_NORMAL = 0.10  # 10% improvement over baseline in normal mode
     BREAKTHROUGH_THRESHOLD_CONSISTENCY = 0.05  # 5% improvement in consistency mode (stricter)
 

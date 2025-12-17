@@ -2784,12 +2784,13 @@ class ERLTrainer:
 
         print(f"\n--- Training Population (Buffer: {len(self.replay_buffer)}) ---")
 
-        # Use reduced gradient steps during stabilization phase for faster iteration
+        # Use reduced gradient steps during stabilization phase or multi-mode for faster iteration
         # Normal: 32 steps × 192 batch = 6,144 samples (full exploration)
-        # Stabilization: 10 steps × 192 batch = 1,920 samples (maintenance training)
-        if self.breakthrough_state == BreakthroughState.STABILIZATION:
+        # Stabilization/Multi: 10 steps × 192 batch = 1,920 samples (maintenance training)
+        if self.breakthrough_state == BreakthroughState.STABILIZATION or self.multi_mode:
             gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION_STABILIZATION
-            print(f"  [Stabilization Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} normal)]")
+            mode_name = "Multi-Agent" if self.multi_mode else "Stabilization"
+            print(f"  [{mode_name} Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} normal)]")
         else:
             gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION
 
@@ -4828,6 +4829,18 @@ class ERLTrainer:
             # ROI hurdle tracking
             'roi_hurdle_ema': self.roi_hurdle_ema,
 
+            # Multi-Agent Mode State
+            'multi_mode': self.multi_mode,
+            'multi_state': {
+                'current_member_idx': self.current_member_idx,
+                'turnovers_completed': self.turnovers_completed,
+                'member_breakthroughs': self.member_breakthroughs,
+                'member_training_start_gen': self.member_training_start_gen,
+                # We save these to ensure continuity, though load_multi_agents recalculates them
+                'member_baselines': self.member_baselines,
+                'member_starting_rois': getattr(self, 'member_starting_rois', []),
+            } if self.multi_mode else None,
+
             # Gauntlet Mode state
             'gauntlet_mode_enabled': self.gauntlet_mode_enabled,
             'breakthrough_state': self.breakthrough_state.value if self.gauntlet_mode_enabled else None,
@@ -5006,6 +5019,28 @@ class ERLTrainer:
                 # Load leverage mode state
                 self.leverage_mode_active = trainer_state.get('leverage_mode_active', False)
                 self.leverage_generations_remaining = trainer_state.get('leverage_generations_remaining', 0)
+
+                # Restore Multi-Agent Mode State
+                multi_state = trainer_state.get('multi_state')
+                if self.multi_mode and multi_state:
+                    self.current_member_idx = multi_state.get('current_member_idx', 0)
+                    self.turnovers_completed = multi_state.get('turnovers_completed', 0)
+                    self.member_breakthroughs = multi_state.get('member_breakthroughs', [0]*self.num_committee_members)
+                    self.member_training_start_gen = multi_state.get('member_training_start_gen', 0)
+
+                    # Restore baselines if available (critical for breakthrough calculation)
+                    saved_baselines = multi_state.get('member_baselines')
+                    if saved_baselines:
+                        self.member_baselines = saved_baselines
+
+                    saved_starting_rois = multi_state.get('member_starting_rois')
+                    if saved_starting_rois:
+                        self.member_starting_rois = saved_starting_rois
+
+                    print(f"✓ Multi-Mode state restored:")
+                    print(f"  Current Member: {self.current_member_idx}")
+                    print(f"  Turnovers: {self.turnovers_completed}")
+                    print(f"  Breakthroughs: {self.member_breakthroughs}")
 
                 # Load ROI hurdle EMA (defaults to None for old checkpoints)
                 self.roi_hurdle_ema = trainer_state.get('roi_hurdle_ema', None)
@@ -5789,7 +5824,8 @@ class ERLTrainer:
                     # ROI-based scoring adjustment using Hall of Fame median as benchmark
                     # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
                     # This rewards agents that outperform the HoF median ROI and penalizes those below
-                    # MULTI-MODE: This forces committee members to beat the Global50 ROI median
+                    # MULTI-MODE: In multi-mode, median_hof_roi = member's starting ROI (self-referential baseline)
+                    #             Each member competes against their own starting performance, not the global median
 
                     # Confidence factor: quality_count / target_count (capped at 1.0)
                     # This ensures agents only get full ROI bonus credit if they have enough quality trades
@@ -5836,7 +5872,7 @@ class ERLTrainer:
                 print(f"ROI Hurdle EMA: {median_hof_roi:.2f}% (raw HoF median: {raw_median_hof_roi:.2f}%)")
                 print(f"Quality threshold: {quality_threshold:.2f}% (min gain_pct for quality trades, need {Config.ROI_CONFIDENCE_MIN_TRADES} for full bonus)")
                 if self.multi_mode:
-                    print("🎯 MULTI-MODE: ROI Expansion enabled - agents must beat Global50 median ROI")
+                    print("🎯 MULTI-MODE: ROI Expansion enabled - agents must beat parent's ROI for bonus")
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
 
             if self.consistency_mode and not self.multi_mode:
@@ -5893,7 +5929,7 @@ class ERLTrainer:
                 # Enforce warmup period before allowing breakthroughs
                 # Each member gets fresh warmup period starting when they were loaded
                 generations_trained = self.generation - self.member_training_start_gen
-                warmup_generations = Config.BREAKTHROUGH_WARMUP_GENERATIONS  # Default: 5
+                warmup_generations = Config.BREAKTHROUGH_WARMUP_GENERATIONS  # Default: 3
 
                 if generations_trained < warmup_generations:
                     breakthrough_result = None
