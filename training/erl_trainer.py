@@ -3041,13 +3041,45 @@ class ERLTrainer:
         self._update_global50_for_multi_improvement(member_idx, new_filename, score, improved_agent, val_result)
 
         # CRITICAL: Update roster in memory so future loads use the improved agent
+        # Must include ALL fields required by committee.py for consensus logic:
+        # - filename, agent_id, run_name, gauntlet_score (identification)
+        # - roi, expectancy, quality_ratio, win_ratio (metrics)
+        # - stats.conviction_threshold_vector (95th percentile thresholds for conviction trades)
         old_run_name = member['run_name']
         old_agent_id = member['agent_id']
+
+        # Extract metrics from validation result
+        roi = val_result.get('roi', 0.0)
+        expectancy = val_result.get('expectancy', 0.0)
+        total_trades = val_result.get('total_trades', 0)
+        quality_count = val_result.get('quality_count', 0)
+        quality_ratio = (quality_count / total_trades) if total_trades > 0 else 0.0
+
+        num_wins = val_result.get('num_wins', 0)
+        num_losses = val_result.get('num_losses', 0)
+        total_decisions = num_wins + num_losses
+        win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
+
+        # Calculate fresh conviction_threshold_vector for the improved agent
+        # This is required because the agent may have evolved different trading patterns
+        # The 95th percentile thresholds determine when conviction trades trigger
+        print(f"  Calculating conviction thresholds for improved agent...")
+        conviction_threshold_vector = self.calculate_conviction_threshold_vector(improved_agent)
+        print(f"  ✓ Conviction thresholds calculated (mean p95: {np.mean(conviction_threshold_vector):.3f})")
+
         self.multi_roster['members'][member_idx] = {
+            'filename': new_filename,
             'run_name': self.run_name,
             'agent_id': improved_agent.agent_id,
             'gauntlet_score': score,
-            # Preserve other fields if they exist
+            'roi': roi,
+            'expectancy': expectancy,
+            'quality_ratio': quality_ratio,
+            'win_ratio': win_ratio,
+            'stats': {
+                'conviction_threshold_vector': conviction_threshold_vector
+            },
+            # Preserve original identity for tracking lineage
             'original_run_name': member.get('original_run_name', old_run_name),
             'original_agent_id': member.get('original_agent_id', old_agent_id),
         }
@@ -3231,6 +3263,67 @@ class ERLTrainer:
         expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
 
         return expectancy
+
+    def calculate_conviction_threshold_vector(self, agent) -> list:
+        """
+        Calculate the 95th percentile conviction threshold vector for an agent.
+
+        This runs the agent on validation data to collect coefficient predictions,
+        then calculates the 95th percentile for each stock. This is used by the
+        committee consensus logic to determine "conviction trades" - signals where
+        an agent is exceptionally confident.
+
+        Args:
+            agent: The DDPGAgent to calculate thresholds for
+
+        Returns:
+            List of per-stock 95th percentile thresholds (length = NUM_INVESTABLE_STOCKS)
+        """
+        from committee import calculate_agent_stats_vectorized
+
+        # Use validation slices to collect coefficient predictions
+        # This gives us a representative sample of the agent's behavior
+        if not self.current_generation_val_slices:
+            # Generate validation slices if not available
+            self.current_generation_val_slices = self.generate_validation_slices()
+
+        # Collect coefficient predictions across multiple days
+        all_coefficients = []
+
+        agent.actor.eval()
+        with torch.no_grad():
+            for start_idx, end_idx, _ in self.current_generation_val_slices:
+                # Iterate through each day in the slice
+                for day_idx in range(start_idx, min(end_idx, start_idx + Config.TRADING_PERIOD_DAYS)):
+                    # Get observation for this day
+                    window_start = day_idx - Config.CONTEXT_WINDOW_DAYS
+                    if window_start < 0:
+                        continue
+
+                    # Build observation
+                    window = self.data_loader.data_array[window_start:day_idx]
+                    normalized = (window - self.normalization_stats['mean']) / self.normalization_stats['std']
+                    obs_tensor = torch.FloatTensor(normalized).unsqueeze(0).to(Config.DEVICE)
+
+                    # Get action from agent
+                    action = agent.actor(obs_tensor).cpu().numpy()[0]  # [num_stocks, 2]
+
+                    # Extract coefficients (first dimension)
+                    coefficients = action[:, 0]  # [num_stocks]
+                    all_coefficients.append(coefficients)
+
+        if len(all_coefficients) == 0:
+            # Fallback: return zeros (no conviction trades will trigger)
+            print("  ⚠ No coefficient data collected for conviction threshold calculation")
+            return [0.0] * Config.NUM_INVESTABLE_STOCKS
+
+        # Stack into [Days, Stocks] array
+        coeff_history = np.array(all_coefficients)  # [Days, Stocks]
+
+        # Calculate 95th percentile for each stock
+        p95_vector = calculate_agent_stats_vectorized(coeff_history)
+
+        return p95_vector.tolist()
 
     def validate_agent(self, agent, quality_threshold: float = None) -> Dict:
         """
