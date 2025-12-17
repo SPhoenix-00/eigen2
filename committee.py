@@ -949,16 +949,16 @@ class CommitteeAgent:
 
 def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray) -> np.ndarray:
     """
-    Calculates the 95th percentile conviction threshold for each stock.
+    Calculates the 99th percentile conviction threshold for each stock.
 
     Args:
         agent_coeff_history_2d: Numpy array [Days, Stocks] for a single agent
 
     Returns:
-        p95_vector: Numpy array [Stocks] of 95th percentile conviction thresholds
+        p99_vector: Numpy array [Stocks] of 99th percentile conviction thresholds
     """
     days, num_stocks = agent_coeff_history_2d.shape
-    p95_vector = np.zeros(num_stocks, dtype=np.float32)
+    p99_vector = np.zeros(num_stocks, dtype=np.float32)
 
     # Global P99 fallback for stocks with insufficient data
     all_active = agent_coeff_history_2d[agent_coeff_history_2d > 0.01]
@@ -969,11 +969,11 @@ def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray) -> np.n
         active_coeffs = stock_coeffs[stock_coeffs > 0.01]
 
         if len(active_coeffs) >= 20:
-            p95_vector[i] = np.percentile(active_coeffs, 95)
+            p99_vector[i] = np.percentile(active_coeffs, 99)
         else:
-            p95_vector[i] = global_p99
+            p99_vector[i] = global_p99
 
-    return p95_vector
+    return p99_vector
 
 
 # --- Validation ---
@@ -1547,7 +1547,7 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
             }
             members_with_stats.append(member_data)
             print(f"  ✓ {e['run_name']}_{e['agent_id']}: "
-                  f"p95_mean={np.mean(conviction_threshold_vector):.3f}")
+                  f"p99_mean={np.mean(conviction_threshold_vector):.3f}")
         else:
             print(f"  ⚠ {e['run_name']}_{e['agent_id']}: No coefficient data available")
 
