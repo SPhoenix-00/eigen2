@@ -591,6 +591,10 @@ class ERLTrainer:
             self.current_member_idx = 0  # Which committee member we're currently training
             self.multi_generation_offset = 0  # Track total generations across all members
             self.member_training_start_gen = 0  # Track when current member started training for warmup enforcement
+            # Stuck detection for multi-mode (post-warmup)
+            self.multi_parent_agent = None  # Reference to the parent agent for parent mutant injection
+            self.multi_gens_since_improvement = 0  # Generations since last improvement (post-warmup)
+            self.multi_best_score_for_member = float('-inf')  # Best score seen for current member
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -1711,6 +1715,14 @@ class ERLTrainer:
         agent_path = get_agent_filepath(member, context_window)
         source_agent = DDPGAgent(agent_id=0)
         source_agent.load(str(agent_path))
+
+        # Store the parent agent for potential stuck recovery (parent mutant injection)
+        self.multi_parent_agent = source_agent.clone()
+        self.multi_parent_agent.agent_id = -1  # Mark as parent template
+
+        # Reset stuck detection for this member
+        self.multi_gens_since_improvement = 0
+        self.multi_best_score_for_member = float('-inf')
 
         # Set confirmed baseline for breakthrough detection (used by existing logic)
         self.confirmed_baseline = self.member_baselines[member_idx]
@@ -2881,6 +2893,20 @@ class ERLTrainer:
             injection_count = self.global50_injection_count
             print(f"  Global50 injection active (until first breakthrough): max {injection_count} agents")
 
+        # Multi-mode stuck recovery: inject parent mutants after 5 generations without improvement
+        # This helps the evolution "find its way back" if it drifted too far from the parent
+        if self.multi_mode and self.multi_gens_since_improvement >= 5 and self.multi_parent_agent is not None:
+            # Calculate how many mutant slots to use for parent mutants (half of total mutants)
+            pop_size = Config.POPULATION_SIZE
+            num_elites = int(pop_size * Config.HEROES_ELITE_FRAC)
+            num_offspring = int(pop_size * Config.HEROES_OFFSPRING_FRAC)
+            num_mutants = pop_size - num_elites - num_offspring
+            parent_injection_count = num_mutants // 2  # Half of mutants are parent-derived
+
+            injection_pool = [self.multi_parent_agent]
+            injection_count = parent_injection_count
+            print(f"  🔄 STUCK RECOVERY: Injecting {parent_injection_count} parent mutants (stuck for {self.multi_gens_since_improvement} gens)")
+
         # Create next generation with adaptive mutation parameters
         # Elitism uses validation fitness for robustness and generalization
         # Tournament selection uses training fitness to maintain exploration
@@ -2892,8 +2918,8 @@ class ERLTrainer:
             mutation_rate=self.current_mutation_rate,
             mutation_std=self.current_mutation_std,
             heroes_mode=self.heroes_hof_dir is not None or self.multi_mode,
-            injection_pool=injection_pool if not self.multi_mode else None,
-            injection_count=injection_count if not self.multi_mode else 0
+            injection_pool=injection_pool,
+            injection_count=injection_count
         )
 
         # Explicitly delete old agents and force GC
@@ -2934,9 +2960,138 @@ class ERLTrainer:
 
         return None
 
+    def _process_multi_improvement(self, improved_agent, score, val_result, is_breakthrough=False):
+        """
+        Process ANY improvement for current member: archive, save, update Global50 & committee.
+
+        This is called whenever an agent beats the current baseline, regardless of whether
+        it meets the 5% breakthrough threshold. This ensures we never lose progress.
+
+        Args:
+            improved_agent: The agent that achieved the improvement
+            score: The validation score achieved (base_combined_fitness)
+            val_result: Full validation result dict with metrics
+            is_breakthrough: If True, this improvement also qualifies as a breakthrough (5%+)
+        """
+        import shutil
+        from committee import get_agent_filepath
+
+        member_idx = self.current_member_idx
+        member = self.multi_roster['members'][member_idx]
+        context_window = self.multi_roster['context_window_days']
+
+        improvement_pct = ((score / self.member_baselines[member_idx]) - 1) * 100 if self.member_baselines[member_idx] > 0 else 0
+
+        if is_breakthrough:
+            print(f"\n{'='*60}")
+            print(f"🎉 BREAKTHROUGH for Member {member_idx}: {member['run_name']}_{member['agent_id']}")
+            print(f"{'='*60}")
+            print(f"  Breakthrough #{self.member_breakthroughs[member_idx] + 1} for this member")
+        else:
+            print(f"\n{'='*60}")
+            print(f"📈 IMPROVEMENT for Member {member_idx}: {member['run_name']}_{member['agent_id']}")
+            print(f"{'='*60}")
+
+        print(f"  Baseline: {self.member_baselines[member_idx]:.2f} -> New: {score:.2f}")
+        print(f"  Improvement: {improvement_pct:.1f}%")
+
+        # Archive original member agent (locally and in cloud Global50)
+        original_path = get_agent_filepath(member, context_window)
+        old_filename = f"{member['run_name']}_{member['agent_id']}.pth"
+
+        # Archive locally
+        if original_path.exists():
+            archive_dir = original_path.parent / "archive"
+            archive_dir.mkdir(exist_ok=True)
+            suffix = f"_pre_multi_bt{self.member_breakthroughs[member_idx] + 1}" if is_breakthrough else f"_pre_multi_imp_gen{self.generation}"
+            archive_path = archive_dir / f"{original_path.stem}{suffix}.pth"
+            shutil.copy(original_path, archive_path)
+            print(f"  Archived original to: {archive_path.name}")
+
+        # Archive in cloud Global50 (move from agents/ to archive/)
+        # This prevents orphan agents from accumulating in cloud storage
+        cloud_agents_path = f"{self.global_hof.cloud_base}/agents/{old_filename}"
+        cloud_archive_path = f"{self.global_hof.cloud_base}/archive/{old_filename}"
+
+        if self.global_hof.enabled and self.cloud_sync.file_exists(cloud_agents_path):
+            # Download to local archive if we don't have it
+            local_archive_path = self.global_hof.local_archive_dir / old_filename
+            if not local_archive_path.exists():
+                self.cloud_sync.download_file(cloud_agents_path, str(local_archive_path))
+
+            # Upload to cloud archive
+            if local_archive_path.exists():
+                upload_success = self.cloud_sync.upload_file_verified(str(local_archive_path), cloud_archive_path)
+                if upload_success:
+                    # Delete from cloud agents/ only after verified archive
+                    if self.cloud_sync.delete_file(cloud_agents_path):
+                        print(f"  Archived parent in cloud: {old_filename} (agents/ -> archive/)")
+                    else:
+                        print(f"  ⚠ Parent archived but failed to delete from cloud agents/: {old_filename}")
+                else:
+                    print(f"  ⚠ Failed to archive parent in cloud: {old_filename}")
+
+        # Save improved agent with new filename
+        new_filename = f"{self.run_name}_{improved_agent.agent_id}.pth"
+        new_path = original_path.parent / new_filename
+        improved_agent.save(str(new_path))
+        print(f"  Saved improved agent: {new_filename}")
+
+        # Update Global50 ledger
+        self._update_global50_for_multi_improvement(member_idx, new_filename, score, improved_agent, val_result)
+
+        # CRITICAL: Update roster in memory so future loads use the improved agent
+        old_run_name = member['run_name']
+        old_agent_id = member['agent_id']
+        self.multi_roster['members'][member_idx] = {
+            'run_name': self.run_name,
+            'agent_id': improved_agent.agent_id,
+            'gauntlet_score': score,
+            # Preserve other fields if they exist
+            'original_run_name': member.get('original_run_name', old_run_name),
+            'original_agent_id': member.get('original_agent_id', old_agent_id),
+        }
+
+        # Persist updated roster to disk so resume works correctly
+        from committee import CommitteeManager
+        manager = CommitteeManager(self.multi_roster['context_window_days'])
+        manager.save_roster(self.multi_roster)
+        print(f"  Updated roster: member {member_idx} now points to {new_filename} (synced to cloud)")
+
+        # Update baseline for next improvement/breakthrough attempt
+        self.member_baselines[member_idx] = score
+
+        # Update member's starting ROI (self-referential hurdle)
+        new_roi = val_result.get('roi', self.member_starting_rois[member_idx])
+        self.member_starting_rois[member_idx] = new_roi
+        self.roi_hurdle_ema = new_roi
+        print(f"  Updated ROI hurdle: {self.member_starting_rois[member_idx]:.2f}%")
+
+        # Update parent agent reference (for stuck recovery - now tracks latest improvement)
+        self.multi_parent_agent = improved_agent.clone()
+        self.multi_parent_agent.agent_id = -1
+
+        # Reset stuck counter since we made progress
+        self.multi_gens_since_improvement = 0
+        self.multi_best_score_for_member = score
+
+        if is_breakthrough:
+            # Update breakthrough count for this member
+            self.member_breakthroughs[member_idx] += 1
+
+            # Print overall progress
+            print(f"\n  Multi-Mode Progress:")
+            print(f"    Turnovers: {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
+            print(f"    Breakthroughs: {self.member_breakthroughs}")
+
+        print("="*60)
+
     def _process_multi_breakthrough(self, improved_agent, score, val_result):
         """
-        Process a breakthrough for current member: archive, save, update Global50.
+        Process a breakthrough (5%+ improvement) for current member.
+
+        This is a wrapper around _process_multi_improvement that also handles
+        breakthrough-specific logic (counting breakthroughs, advancing to next member).
 
         Args:
             improved_agent: The agent that achieved the breakthrough
@@ -2946,84 +3101,14 @@ class ERLTrainer:
         Returns:
             True if should advance to next member, False otherwise
         """
-        import shutil
-        from committee import get_agent_filepath
-
-        member_idx = self.current_member_idx
-        member = self.multi_roster['members'][member_idx]
-        context_window = self.multi_roster['context_window_days']
-
-        print(f"\n{'='*60}")
-        print(f"🎉 BREAKTHROUGH for Member {member_idx}: {member['run_name']}_{member['agent_id']}")
-        print(f"{'='*60}")
-        print(f"  Baseline: {self.member_baselines[member_idx]:.2f} -> New: {score:.2f}")
-        print(f"  Improvement: {((score / self.member_baselines[member_idx]) - 1) * 100:.1f}%")
-        print(f"  Breakthrough #{self.member_breakthroughs[member_idx] + 1} for this member")
-
-        # Archive original member agent
-        original_path = get_agent_filepath(member, context_window)
-        if original_path.exists():
-            archive_dir = original_path.parent / "archive"
-            archive_dir.mkdir(exist_ok=True)
-            archive_path = archive_dir / f"{original_path.stem}_pre_multi_bt{self.member_breakthroughs[member_idx] + 1}.pth"
-            shutil.copy(original_path, archive_path)
-            print(f"  Archived original to: {archive_path.name}")
-
-        # Save improved agent with new filename
-        new_filename = f"{self.run_name}_{improved_agent.agent_id}.pth"
-        new_path = original_path.parent / new_filename
-        improved_agent.save(str(new_path))
-        print(f"  Saved improved agent: {new_filename}")
-
-        # Update Global50 ledger
-        self._update_global50_for_multi_breakthrough(member_idx, new_filename, score, improved_agent, val_result)
-
-        # CRITICAL: Update roster in memory so future loads use the improved agent
-        # Without this, when we return to this member for Turnover #2, we'd load
-        # the old weights and lose all learning from this breakthrough
-        old_run_name = member['run_name']
-        old_agent_id = member['agent_id']
-        self.multi_roster['members'][member_idx] = {
-            'run_name': self.run_name,
-            'agent_id': improved_agent.agent_id,
-            'gauntlet_score': score,
-            # Preserve other fields if they exist
-            'original_run_name': old_run_name,
-            'original_agent_id': old_agent_id,
-        }
-
-        # Persist updated roster to disk so resume works correctly
-        # This ensures we don't lose progress if training crashes during a turnover
-        from committee import CommitteeManager
-        manager = CommitteeManager(self.multi_roster['context_window_days'])
-        # Use save_roster() to handle pathing correctly and sync to cloud
-        manager.save_roster(self.multi_roster)
-        print(f"  Updated roster: member {member_idx} now points to {new_filename} (saved to disk)")
-
-        # Update breakthrough count for this member
-        self.member_breakthroughs[member_idx] += 1
-
-        # Update baseline for next breakthrough attempt
-        self.member_baselines[member_idx] = score
-
-        # Update member's starting ROI for next breakthrough (self-referential hurdle)
-        # This ensures the next breakthrough requires beating the NEW ROI, not the original
-        new_roi = val_result.get('roi', self.member_starting_rois[member_idx])
-        self.member_starting_rois[member_idx] = new_roi
-        self.roi_hurdle_ema = new_roi  # Update training hurdle immediately
-        print(f"  Updated ROI hurdle: {self.member_starting_rois[member_idx]:.2f}%")
-
-        # Print overall progress
-        print(f"\n  Multi-Mode Progress:")
-        print(f"    Turnovers: {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
-        print(f"    Breakthroughs: {self.member_breakthroughs}")
-        print("="*60)
+        # Process the improvement with breakthrough flag
+        self._process_multi_improvement(improved_agent, score, val_result, is_breakthrough=True)
 
         return True  # Signal to advance to next member
 
-    def _update_global50_for_multi_breakthrough(self, member_idx, new_filename, score, agent, val_result):
+    def _update_global50_for_multi_improvement(self, member_idx, new_filename, score, agent, val_result):
         """
-        Update Global50 ledger with the new improved agent.
+        Update Global50 ledger with the improved agent.
 
         Args:
             member_idx: Index of the member being improved
@@ -3046,26 +3131,22 @@ class ERLTrainer:
         total_decisions = num_wins + num_losses
         win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
 
-        # DISABLED: Multi-mode trains committee members in isolation.
-        # Global 50 promotion should happen only when the final improved committee is ready.
-        # This prevents polluting the global leaderboard with partial improvements.
-        # promoted = self.global_hof.check_and_promote(
-        #     agent=agent,
-        #     gauntlet_score=score,
-        #     generation=self.generation,
-        #     roi=roi,
-        #     expectancy=expectancy,
-        #     quality_ratio=quality_ratio,
-        #     win_ratio=win_ratio,
-        #     total_trades=total_trades
-        # )
-        #
-        # if promoted:
-        #     print(f"  ✓ Promoted to Global50: {new_filename}")
-        # else:
-        #     print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={self.global_hof.entry_threshold:.2f})")
+        # Upload to Global50 on every improvement
+        promoted = self.global_hof.check_and_promote(
+            agent=agent,
+            gauntlet_score=score,
+            generation=self.generation,
+            roi=roi,
+            expectancy=expectancy,
+            quality_ratio=quality_ratio,
+            win_ratio=win_ratio,
+            total_trades=total_trades
+        )
 
-        print(f"  ℹ Global 50 promotion disabled during multi-mode training (prevents polluting global leaderboard with partial improvements)")
+        if promoted:
+            print(f"  ✓ Promoted to Global50: {new_filename}")
+        else:
+            print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={self.global_hof.entry_threshold:.2f})")
 
     def _process_multi_turnover(self):
         """
@@ -4839,6 +4920,9 @@ class ERLTrainer:
                 # We save these to ensure continuity, though load_multi_agents recalculates them
                 'member_baselines': self.member_baselines,
                 'member_starting_rois': getattr(self, 'member_starting_rois', []),
+                # Stuck detection state
+                'multi_gens_since_improvement': getattr(self, 'multi_gens_since_improvement', 0),
+                'multi_best_score_for_member': getattr(self, 'multi_best_score_for_member', float('-inf')),
             } if self.multi_mode else None,
 
             # Gauntlet Mode state
@@ -5037,10 +5121,25 @@ class ERLTrainer:
                     if saved_starting_rois:
                         self.member_starting_rois = saved_starting_rois
 
+                    # Restore stuck detection state
+                    self.multi_gens_since_improvement = multi_state.get('multi_gens_since_improvement', 0)
+                    self.multi_best_score_for_member = multi_state.get('multi_best_score_for_member', float('-inf'))
+
+                    # Reload the parent agent for the current member (needed for stuck recovery)
+                    # The population was restored from checkpoint, but multi_parent_agent is separate
+                    from committee import get_agent_filepath
+                    member = self.multi_roster['members'][self.current_member_idx]
+                    context_window = self.multi_roster['context_window_days']
+                    agent_path = get_agent_filepath(member, context_window)
+                    if agent_path.exists():
+                        self.multi_parent_agent = DDPGAgent(agent_id=-1)
+                        self.multi_parent_agent.load(str(agent_path))
+
                     print(f"✓ Multi-Mode state restored:")
                     print(f"  Current Member: {self.current_member_idx}")
                     print(f"  Turnovers: {self.turnovers_completed}")
                     print(f"  Breakthroughs: {self.member_breakthroughs}")
+                    print(f"  Gens since improvement: {self.multi_gens_since_improvement}")
 
                 # Load ROI hurdle EMA (defaults to None for old checkpoints)
                 self.roi_hurdle_ema = trainer_state.get('roi_hurdle_ema', None)
@@ -5629,20 +5728,8 @@ class ERLTrainer:
                 print(f"{'='*60}")
                 break
 
-            # Multi-agent mode fallback timeout
-            if self.multi_mode and gen >= Config.MAX_GENERATIONS_GAUNTLET:
-                print(f"\n{'='*60}")
-                print(f"⏱️ MULTI-AGENT MODE TIMEOUT - {Config.MAX_GENERATIONS_GAUNTLET} GENERATIONS")
-                print(f"{'='*60}")
-                print(f"  Turnovers achieved: {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
-                print(f"  Breakthroughs per member:")
-                for member_idx in range(self.num_committee_members):
-                    member = self.multi_roster['members'][member_idx]
-                    bt = self.member_breakthroughs[member_idx]
-                    print(f"    Member {member_idx} ({member['run_name']}_{member['agent_id']}): {bt}")
-                print(f"  Generation: {gen + 1}")
-                print(f"{'='*60}")
-                break
+            # Multi-agent mode: NO fallback timeout - train until target turnovers achieved
+            # (fallback timeout disabled for --multi mode)
 
             if self.consistency_mode and self.hof_turnover_count >= self.target_hof_turnovers:
                 print(f"\n{'='*60}")
@@ -5657,7 +5744,8 @@ class ERLTrainer:
 
             # Consistency mode fallback: reset counter with each turnover
             # This gives more runway after each successful turnover instead of a hard global limit
-            if self.consistency_mode and self.gauntlet_mode_enabled:
+            # Skip this fallback in multi_mode (multi_mode has no fallback - trains until target turnovers)
+            if self.consistency_mode and self.gauntlet_mode_enabled and not self.multi_mode:
                 generations_since_turnover = gen - self.generation_at_last_turnover
                 if generations_since_turnover >= Config.MAX_GENERATIONS_GAUNTLET:
                     print(f"\n{'='*60}")
@@ -5955,6 +6043,47 @@ class ERLTrainer:
                     # Instead, continue to next iteration for fresh evaluation.
                     print(f"  [Skipping evolution - new member loaded, will evaluate fresh next gen]")
                     continue
+
+                # --- Multi-Mode Improvement & Stuck Detection (post-warmup only) ---
+                # Check for ANY improvement over baseline (save immediately to Global50/committee)
+                # Also track stuck generations for local optima detection
+                if generations_trained >= warmup_generations:
+                    best_idx = np.argmax(validation_scores)
+                    best_score_this_gen = validation_scores[best_idx]
+                    current_baseline = self.member_baselines[self.current_member_idx]
+
+                    # Check for improvement over baseline (any amount, not just 5%)
+                    if best_score_this_gen > current_baseline:
+                        improved_agent = self.population[best_idx]
+                        agent_val_result = [r for r in validation_results if r['idx'] == best_idx][0]
+
+                        # Save improvement immediately (updates Global50, committee, baseline)
+                        # Note: This is NOT a breakthrough (no advance to next member)
+                        self._process_multi_improvement(improved_agent, best_score_this_gen, agent_val_result, is_breakthrough=False)
+
+                        # _process_multi_improvement already resets stuck counter and updates best score
+                    else:
+                        # No improvement over baseline - check if we at least improved over previous best
+                        if best_score_this_gen > self.multi_best_score_for_member:
+                            self.multi_best_score_for_member = best_score_this_gen
+                            self.multi_gens_since_improvement = 0
+                        else:
+                            self.multi_gens_since_improvement += 1
+
+                    # Local optima detection: 20 generations without improvement = move on
+                    if self.multi_gens_since_improvement >= 20:
+                        print(f"\n{'='*60}")
+                        print(f"🔄 LOCAL OPTIMA DETECTED - Member {self.current_member_idx} stuck for 20 generations")
+                        print(f"{'='*60}")
+                        print(f"  Best score achieved: {self.multi_best_score_for_member:.2f}")
+                        print(f"  Baseline required: {self.member_baselines[self.current_member_idx]:.2f}")
+                        print(f"  Treating as completed - advancing to next member")
+                        print(f"{'='*60}")
+
+                        # Advance without recording a breakthrough (no baseline update)
+                        self._advance_to_next_multi_member()
+                        print(f"  [Skipping evolution - new member loaded after local optima]")
+                        continue
 
                 # Log multi-mode progress
                 member = self.multi_roster['members'][self.current_member_idx]
