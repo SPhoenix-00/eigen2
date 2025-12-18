@@ -3201,7 +3201,7 @@ class ERLTrainer:
                   f"{bt} breakthroughs")
 
         # Save milestone roster and persist updated roster
-        from committee import CommitteeManager
+        from committee import CommitteeManager, convert_numpy_types
         import json
         context_window = self.multi_roster['context_window_days']
         manager = CommitteeManager(context_window)
@@ -3212,9 +3212,10 @@ class ERLTrainer:
         archive_dir.mkdir(exist_ok=True)
 
         # Save milestone archive (this marks the completion of turnover N)
+        # Convert numpy types to native Python types for JSON serialization
         milestone_path = archive_dir / f"committee_roster_turnover_{self.turnovers_completed}_complete.json"
         with open(milestone_path, 'w') as f:
-            json.dump(self.multi_roster, f, indent=2)
+            json.dump(convert_numpy_types(self.multi_roster), f, indent=2)
         print(f"   Saved milestone roster: {milestone_path.name}")
 
         # Persist the updated roster as the active roster using standard save method
