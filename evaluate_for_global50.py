@@ -14,12 +14,28 @@ Usage:
     python evaluate_for_global50.py --eval                              # Re-evaluate all agents
     python evaluate_for_global50.py --trim                              # Interactive trim (prompts for thresholds)
     python evaluate_for_global50.py --archive-fill                      # Fill Global 50 from archive
+    python evaluate_for_global50.py --cleanup                           # Archive orphan agents
+    python evaluate_for_global50.py --cleanup-dry-run                   # Report orphans (no changes)
     python evaluate_for_global50.py --agent-dir <path> [--run-name <name>]
 
-Example:
+Options:
+    --init              First-time setup. Creates empty global50.json and validates cloud sync.
+    --mirror            Check mirror status between local and GCP. Downloads missing agent files.
+    --eval              Re-evaluate all agents in Global 50 with current evaluation logic.
+    --trim              Interactive trim mode: prompts for gauntlet, ROI, expectancy, and trades thresholds.
+    --archive-fill      Fill Global 50 from archive. Evaluates archived agents and promotes qualifying ones.
+    --cleanup           Find and archive orphan agents (files in agents/ not in global50.json).
+    --cleanup-dry-run   Like --cleanup but only reports orphans without archiving them.
+    --cw DAYS           Context window size in days (e.g., --cw 504 for cw504).
+    --agent-dir PATH    Directory containing agent .pth files to evaluate.
+    --run-name NAME     Run name for evaluation batch (default: batch-evaluation).
+
+Examples:
     python evaluate_for_global50.py --eval                              # Update all metrics
-    python evaluate_for_global50.py --trim                              # Interactive trim with gauntlet/ROI/expectancy/trades
-    python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
+    python evaluate_for_global50.py --trim                              # Interactive trim
+    python evaluate_for_global50.py --cleanup-dry-run                   # Preview orphan cleanup
+    python evaluate_for_global50.py --cleanup                           # Archive orphan agents
+    python evaluate_for_global50.py --agent-dir checkpoints/run-123/hall_of_fame
     python evaluate_for_global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
 """
 
@@ -1515,6 +1531,7 @@ class AgentEvaluator:
             all_scores = [r['new_score'] for r in successful]
             all_rois = [r['updated_entry'].roi for r in successful]
             all_expectancies = [r['updated_entry'].expectancy for r in successful]
+            all_cvs = [r['updated_entry'].cv for r in successful]
             all_trades = [r['updated_entry'].total_trades for r in successful]
 
             print(f"\n{'='*70}")
@@ -1523,6 +1540,7 @@ class AgentEvaluator:
             print(f"  Gauntlet Score:  min={min(all_scores):.2f}  mean={sum(all_scores)/len(all_scores):.2f}  max={max(all_scores):.2f}")
             print(f"  ROI:             min={min(all_rois):.2f}%  mean={sum(all_rois)/len(all_rois):.2f}%  max={max(all_rois):.2f}%")
             print(f"  Expectancy:      min={min(all_expectancies):.4f}  mean={sum(all_expectancies)/len(all_expectancies):.4f}  max={max(all_expectancies):.4f}")
+            print(f"  CV:              min={min(all_cvs):.4f}  mean={sum(all_cvs)/len(all_cvs):.4f}  max={max(all_cvs):.4f}")
             print(f"  Total Trades:    min={min(all_trades)}  mean={sum(all_trades)/len(all_trades):.1f}  max={max(all_trades)}")
             print(f"\nAverage Score Change: {avg_change:+.2f}")
 
@@ -2135,9 +2153,9 @@ class AgentEvaluator:
         print(f"  3. Promote qualifying agents to Global 50 (moved from archive/ to agents/)")
         print(f"\nFilters applied:")
         print(f"  - Minimum archived ROI: {self.MIN_ROI_THRESHOLD}% (excluded {excluded_low_roi} agents)")
-        print(f"  - Must beat all 3 minimum thresholds")
-        print(f"  - Must beat 2 of 3 metrics at 75th percentile")
-        print(f"  - Must beat 1 of 3 metrics at median")
+        print(f"  - Must beat all 4 minimum thresholds (Gauntlet, ROI, Expectancy, CV)")
+        print(f"  - Must beat 2 of 3 metrics at P75 (Gauntlet, ROI, Expectancy)")
+        print(f"  - Must beat 1 of 3 metrics at median (Gauntlet, ROI, Expectancy)")
         print(f"\nEstimated time: ~{len(candidates) * 2} minutes")
 
         while True:
@@ -2342,7 +2360,8 @@ class AgentEvaluator:
                     quality_ratio=metrics['quality_ratio'],
                     win_ratio=metrics['win_ratio'],
                     total_trades=metrics['total_trades'],
-                    run_name=candidate['run_name']
+                    run_name=candidate['run_name'],
+                    suppress_threshold_output=True  # Suppress -inf threshold during archive-fill
                 )
 
                 # Restore and recompute thresholds
@@ -2403,11 +2422,19 @@ class AgentEvaluator:
             all_scores = [e.gauntlet_score for e in self.global_hof.entries]
             all_rois = [e.roi for e in self.global_hof.entries]
             all_expectancies = [e.expectancy for e in self.global_hof.entries]
+            all_cvs = [e.cv for e in self.global_hof.entries]
 
             print(f"\n  Current Global 50 Metrics:")
             print(f"    Gauntlet:    min={min(all_scores):.2f}  mean={sum(all_scores)/len(all_scores):.2f}  max={max(all_scores):.2f}")
             print(f"    ROI:         min={min(all_rois):.2f}%  mean={sum(all_rois)/len(all_rois):.2f}%  max={max(all_rois):.2f}%")
             print(f"    Expectancy:  min={min(all_expectancies):.4f}  mean={sum(all_expectancies)/len(all_expectancies):.4f}  max={max(all_expectancies):.4f}")
+            print(f"    CV:          min={min(all_cvs):.3f}  mean={sum(all_cvs)/len(all_cvs):.3f}  max={max(all_cvs):.3f}")
+
+            # Show updated thresholds
+            print(f"\n  Updated Thresholds:")
+            print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}, CV={self.global_hof.cv_threshold:.3f}")
+            print(f"    Medians:   Gauntlet={self.global_hof.gauntlet_median:.2f}, ROI={self.global_hof.roi_median:.2f}%, Expectancy={self.global_hof.expectancy_median:.4f}")
+            print(f"    P75:       Gauntlet={self.global_hof.gauntlet_p75:.2f}, ROI={self.global_hof.roi_p75:.2f}%, Expectancy={self.global_hof.expectancy_p75:.4f}")
 
         print(f"\n{'='*70}")
 

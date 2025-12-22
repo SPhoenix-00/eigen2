@@ -3749,11 +3749,11 @@ class ERLTrainer:
         return {
             'gauntlet_score': gauntlet_score,
             'cv': cv,  # Coefficient of Variation - lower is more stable
-            'fitness_median': median_score,
-            'fitness_std': std_score,
-            'fitness_mean': mean_score,
-            'fitness_min': min_score,
-            'fitness_max': max_score,
+            'median_fitness': median_score,
+            'std_fitness': std_score,
+            'mean_fitness': mean_score,
+            'min_fitness': min_score,
+            'max_fitness': max_score,
             'fitness_all_slices': fitness_scores,
             'roi': roi,
             'win_rate': global_win_rate,

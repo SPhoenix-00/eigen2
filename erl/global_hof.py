@@ -616,7 +616,8 @@ class GlobalHallOfFame:
     def check_and_promote(self, agent: DDPGAgent, gauntlet_score: float, generation: int,
                           roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0,
                           quality_ratio: float = 0.0, win_ratio: float = 0.0,
-                          total_trades: int = 0, run_name: Optional[str] = None) -> bool:
+                          total_trades: int = 0, run_name: Optional[str] = None,
+                          suppress_threshold_output: bool = False) -> bool:
         """
         Phase C: The Promotion Routine (Atomic Update)
 
@@ -718,7 +719,8 @@ class GlobalHallOfFame:
             print(f"  Rank: #{new_rank}")
             print(f"  Score: {gauntlet_score:.2f}")
             print(f"  Run: {self.run_name}")
-            print(f"  New Threshold: {self.entry_threshold:.2f}")
+            if not suppress_threshold_output:
+                print(f"  New Threshold: {self.entry_threshold:.2f}")
 
             if dropouts:
                 for dropout in dropouts:
