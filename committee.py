@@ -1105,8 +1105,26 @@ def evaluate_committee_on_slice(members: list, loader, stats,
     # Get consensus statistics
     consensus_stats = committee.get_consensus_summary()
 
-    # Extract closed trades for CSV export
+    # Extract closed trades for CSV export and enrich with additional fields
     closed_trades = summary.get('closed_trades', [])
+
+    # Enrich closed trades with stock_name and exit_date
+    for trade in closed_trades:
+        # Add stock_name from loader's column_names
+        stock_id = trade.get('stock_id')
+        if stock_id is not None and loader.column_names:
+            # stock_id is relative to investable stocks (starts at column 9)
+            actual_col_idx = Config.INVESTABLE_START_COL + stock_id
+            if actual_col_idx < len(loader.column_names):
+                trade['stock_name'] = loader.column_names[actual_col_idx]
+            else:
+                trade['stock_name'] = f"UNKNOWN_{stock_id}"
+        else:
+            trade['stock_name'] = f"UNKNOWN_{stock_id}"
+
+        # Add exit_date (calendar date when position was closed)
+        # The 'day' field in the trade is already the exit date (when close action occurred)
+        trade['exit_date'] = trade.get('day', '')
 
     # Clean up
     committee.cleanup()
@@ -1295,11 +1313,23 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             csv_filename = f"committee_slice_{s}_{slice_type}_{start_date}_to_{end_date}.csv"
             csv_path = manager.local_committee_dir / csv_filename
 
-            # Write CSV
+            # Write CSV with explicit column ordering for readability
             import csv
+            # Define preferred column order (new fields: stock_name, exit_date)
+            preferred_columns = [
+                'stock_id', 'stock_name', 'entry_date', 'exit_date', 'days_held',
+                'entry_price', 'exit_price', 'gain_pct', 'reason',
+                'base_reward', 'forced_exit_penalty', 'reward', 'day', 'action'
+            ]
+            # Get actual columns from first trade, preserving any extras
+            actual_columns = list(closed_trades[0].keys())
+            # Order: preferred columns first (if present), then any remaining
+            fieldnames = [c for c in preferred_columns if c in actual_columns]
+            fieldnames += [c for c in actual_columns if c not in fieldnames]
+
             with open(csv_path, 'w', newline='') as f:
                 if len(closed_trades) > 0:
-                    writer = csv.DictWriter(f, fieldnames=closed_trades[0].keys())
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
                     writer.writeheader()
                     writer.writerows(closed_trades)
 
