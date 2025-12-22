@@ -269,15 +269,25 @@ class AgentEvaluator:
         # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Exclude top slice from gauntlet score calculation (prevents lucky outliers from inflating score)
-        # But keep max_score for display purposes
+        # Calculate statistics for Penalized Median scoring
         max_score = float(np.max(fitness_scores))
-        scores_without_top = sorted(fitness_scores)[:-1]  # Remove the highest score
+        min_score = float(np.min(fitness_scores))
+        mean_score = float(np.mean(fitness_scores))
+        median_score = float(np.median(fitness_scores))
+        std_score = float(np.std(fitness_scores))
 
-        # Use same aggregator as ERLTrainer: 0.67*mean + 0.33*min (excluding top slice)
-        mean_score = float(np.mean(scores_without_top))
-        min_score = float(np.min(scores_without_top))
-        gauntlet_score = float((0.67 * mean_score) + (0.33 * min_score))
+        # Calculate Coefficient of Variation (CV) - measures "noise" relative to "signal"
+        # CV = StdDev / |Mean| (use absolute value to handle negative means)
+        # Lower CV = more stable/consistent agent
+        if abs(mean_score) > 1e-10:
+            cv = std_score / abs(mean_score)
+        else:
+            cv = float('inf')  # Undefined CV when mean is ~0
+
+        # NEW SCORING FORMULA: Penalized Median
+        # This rewards agents that reliably perform well while penalizing volatility
+        # gauntlet_score = Median - (0.5 * StdDev)
+        gauntlet_score = float(median_score - (0.5 * std_score))
 
         # Penalty for agents that consistently refuse to trade
         # Score between -8.99 and -10 indicates no trades across all slices
@@ -318,8 +328,11 @@ class AgentEvaluator:
         detailed_metrics = {
             'gauntlet_score': gauntlet_score,
             'mean_fitness': mean_score,
+            'median_fitness': median_score,
+            'std_fitness': std_score,
             'min_fitness': min_score,
             'max_fitness': max_score,
+            'cv': cv,  # Coefficient of Variation - lower is more stable
             'roi': roi,
             'total_trades': total_trades,
             'quality_count': quality_count,
@@ -370,9 +383,10 @@ class AgentEvaluator:
             gauntlet_score, metrics = self.run_gauntlet(agent, agent_name)
 
             print(f"\nGauntlet Results:")
-            print(f"   Gauntlet Score:    {gauntlet_score:>10.2f}")
-            print(f"   Mean Fitness:      {metrics['mean_fitness']:>10.2f}")
-            print(f"   Min Fitness:       {metrics['min_fitness']:>10.2f}")
+            print(f"   Gauntlet Score:    {gauntlet_score:>10.2f}  (Penalized Median)")
+            print(f"   Median Fitness:    {metrics['median_fitness']:>10.2f}")
+            print(f"   Std Fitness:       {metrics['std_fitness']:>10.2f}")
+            print(f"   CV (Stability):    {metrics['cv']:>10.3f}  (lower = more stable)")
             print(f"   ROI:               {metrics['roi']:>10.2f}%")
             print(f"   Total Trades:      {metrics['total_trades']:>10}")
             print(f"   Quality Ratio:     {metrics['quality_ratio']:>10.3f}")
@@ -382,12 +396,13 @@ class AgentEvaluator:
             result.update(metrics)
             result['success'] = True
 
-            # Check if qualifies for Global 50
-            if self.global_hof.should_promote(gauntlet_score, metrics['roi'], metrics['expectancy']):
+            # Check if qualifies for Global 50 (now includes CV as 4th criterion)
+            if self.global_hof.should_promote(gauntlet_score, metrics['roi'], metrics['expectancy'], metrics['cv']):
                 print(f"\n   Agent QUALIFIES for Global 50!")
                 print(f"   Gauntlet Threshold: {self.global_hof.entry_threshold:.2f}")
                 print(f"   ROI Threshold: {self.global_hof.roi_threshold:.2f}%")
                 print(f"   Expectancy Threshold: {self.global_hof.expectancy_threshold:.4f}")
+                print(f"   CV Threshold: {self.global_hof.cv_threshold:.3f} (max allowed)")
                 print(f"   Attempting promotion...")
 
                 # Attempt promotion
@@ -397,6 +412,7 @@ class AgentEvaluator:
                     generation=generation,
                     roi=metrics['roi'],
                     expectancy=metrics['expectancy'],
+                    cv=metrics['cv'],
                     quality_ratio=metrics['quality_ratio'],
                     win_ratio=metrics['win_ratio'],
                     total_trades=metrics['total_trades']
@@ -410,18 +426,19 @@ class AgentEvaluator:
                     print(f"   WARNING: Promotion failed (concurrent update?)")
             else:
                 print(f"\n   Agent does not qualify for Global 50")
-                # Check individual criteria for detailed feedback
+                # Check individual criteria for detailed feedback (4/4 minimums required)
                 passes_gauntlet_min = gauntlet_score > self.global_hof.entry_threshold
                 passes_roi_min = metrics['roi'] > self.global_hof.roi_threshold
                 passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold
+                passes_cv_min = metrics['cv'] < self.global_hof.cv_threshold  # CV: lower is better
                 beats_gauntlet_p75 = gauntlet_score > self.global_hof.gauntlet_p75
                 beats_roi_p75 = metrics['roi'] > self.global_hof.roi_p75
                 beats_expectancy_p75 = metrics['expectancy'] > self.global_hof.expectancy_p75
                 count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
 
-                print(f"   Minimums: Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'}")
+                print(f"   Minimums (4/4 required): Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'} | CV {'✓' if passes_cv_min else '✗'}")
                 print(f"   P75 ({count_above_p75}/3, need 2): Gauntlet {'✓' if beats_gauntlet_p75 else '✗'} | ROI {'✓' if beats_roi_p75 else '✗'} | Expectancy {'✓' if beats_expectancy_p75 else '✗'}")
-                print(f"   Criteria: All 3 > min AND 2/3 > P75 AND 1/3 > median")
+                print(f"   Criteria: All 4 > min AND 2/3 > P75 AND 1/3 > median")
 
         except Exception as e:
             print(f"\n   ERROR: {e}")
@@ -1368,6 +1385,7 @@ class AgentEvaluator:
                     generation=entry.generation,
                     roi=metrics['roi'],
                     expectancy=metrics['expectancy'],
+                    cv=metrics['cv'],
                     quality_ratio=metrics['quality_ratio'],
                     win_ratio=metrics['win_ratio'],
                     total_trades=metrics['total_trades']
@@ -1377,7 +1395,7 @@ class AgentEvaluator:
                 score_change = new_score - entry.gauntlet_score
                 score_symbol = "↑" if score_change > 0 else "↓" if score_change < 0 else "="
                 print(f"  New Score: {new_score:.2f} ({score_symbol} {abs(score_change):.2f})")
-                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f}")
+                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f} | CV: {metrics['cv']:.3f}")
                 print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
 
                 results.append({
@@ -1684,7 +1702,7 @@ class AgentEvaluator:
 
         if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
             print(f"\n  Current Thresholds (population full):")
-            print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}")
+            print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}, CV={self.global_hof.cv_threshold:.3f}")
             print(f"    Medians:   Gauntlet={self.global_hof.gauntlet_median:.2f}, ROI={self.global_hof.roi_median:.2f}%, Expectancy={self.global_hof.expectancy_median:.4f}")
             print(f"    P75:       Gauntlet={self.global_hof.gauntlet_p75:.2f}, ROI={self.global_hof.roi_p75:.2f}%, Expectancy={self.global_hof.expectancy_p75:.4f}")
         else:
@@ -1692,16 +1710,19 @@ class AgentEvaluator:
             min_gauntlet = min(e.gauntlet_score for e in self.global_hof.entries)
             min_roi = min(e.roi for e in self.global_hof.entries)
             min_expectancy = min(e.expectancy for e in self.global_hof.entries)
-            print(f"\n  Current Minimums (population not full, thresholds are -inf):")
+            max_cv = max(e.cv for e in self.global_hof.entries)
+            print(f"\n  Current Minimums (population not full, thresholds are -inf/+inf):")
             print(f"    Gauntlet:    {min_gauntlet:.2f}")
             print(f"    ROI:         {min_roi:.2f}%")
             print(f"    Expectancy:  {min_expectancy:.4f}")
+            print(f"    CV (max):    {max_cv:.3f} (lower is better)")
 
         # Show distribution
         print(f"\n  Score Ranges:")
         print(f"    Gauntlet:     {min(e.gauntlet_score for e in self.global_hof.entries):.2f} to {max(e.gauntlet_score for e in self.global_hof.entries):.2f}")
         print(f"    ROI:          {min(e.roi for e in self.global_hof.entries):.2f}% to {max(e.roi for e in self.global_hof.entries):.2f}%")
         print(f"    Expectancy:   {min(e.expectancy for e in self.global_hof.entries):.4f} to {max(e.expectancy for e in self.global_hof.entries):.4f}")
+        print(f"    CV:           {min(e.cv for e in self.global_hof.entries):.3f} to {max(e.cv for e in self.global_hof.entries):.3f} (lower is better)")
         print(f"    Total Trades: {min(e.total_trades for e in self.global_hof.entries)} to {max(e.total_trades for e in self.global_hof.entries)}")
 
         # Prompt for thresholds
@@ -2003,11 +2024,14 @@ class AgentEvaluator:
             gauntlet_scores = [e.gauntlet_score for e in self.global_hof.entries]
             roi_values = [e.roi for e in self.global_hof.entries]
             expectancy_values = [e.expectancy for e in self.global_hof.entries]
+            cv_values = [e.cv for e in self.global_hof.entries]
 
-            # Override the -inf thresholds with actual population statistics
+            # Override the -inf/+inf thresholds with actual population statistics
             self.global_hof.entry_threshold = min(gauntlet_scores)
             self.global_hof.roi_threshold = min(roi_values)
             self.global_hof.expectancy_threshold = min(expectancy_values)
+            # CV threshold = max CV in population (worst allowed volatility, lower is better)
+            self.global_hof.cv_threshold = max(cv_values)
 
             self.global_hof.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
             self.global_hof.roi_median = float(np.percentile(roi_values, 50))
@@ -2023,11 +2047,11 @@ class AgentEvaluator:
 
         # Thresholds are managed by GlobalHoF - already updated above
         print(f"\n  Current Thresholds:")
-        print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}")
+        print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}, CV={self.global_hof.cv_threshold:.3f}")
         print(f"    Medians:   Gauntlet={self.global_hof.gauntlet_median:.2f}, ROI={self.global_hof.roi_median:.2f}%, Expectancy={self.global_hof.expectancy_median:.4f}")
         print(f"    P75:       Gauntlet={self.global_hof.gauntlet_p75:.2f}, ROI={self.global_hof.roi_p75:.2f}%, Expectancy={self.global_hof.expectancy_p75:.4f}")
         print(f"\n  Promotion Criteria:")
-        print(f"    1. All 3 metrics must beat minimum thresholds")
+        print(f"    1. All 4 metrics must beat minimum thresholds (CV: lower is better)")
         print(f"    2. At least 2 of 3 metrics must beat 75th percentile")
         print(f"    3. At least 1 metric must beat median (50th percentile)")
 
@@ -2107,18 +2131,21 @@ class AgentEvaluator:
                 print("Please enter 'yes' or 'no'.")
 
         # Tiered promotion criteria (progressively relaxed):
-        # Tier 0: Full criteria - minimums + 2/3 P75 + 1/3 median
-        # Tier 1: Remove median requirement - minimums + 2/3 P75
-        # Tier 2: Relax P75 to 1/3 - minimums + 1/3 P75
-        # Tier 3: Remove P75 requirement - minimums only
-        def should_promote_with_tier(gauntlet_score: float, roi: float, expectancy: float, tier: int) -> bool:
+        # Tier 0: Full criteria - minimums (4/4) + 2/3 P75 + 1/3 median
+        # Tier 1: Remove median requirement - minimums (4/4) + 2/3 P75
+        # Tier 2: Relax P75 to 1/3 - minimums (4/4) + 1/3 P75
+        # Tier 3: Remove P75 requirement - minimums only (4/4)
+        def should_promote_with_tier(gauntlet_score: float, roi: float, expectancy: float, cv: float, tier: int) -> bool:
             """Check promotion with tiered criteria relaxation."""
-            # Criterion 1: Must beat ALL minimum thresholds (always required)
+            # Criterion 1: Must beat ALL 4 minimum thresholds (always required)
             if gauntlet_score <= self.global_hof.entry_threshold:
                 return False
             if roi <= self.global_hof.roi_threshold:
                 return False
             if expectancy <= self.global_hof.expectancy_threshold:
+                return False
+            # CV check: lower is better, so agent CV must be < threshold
+            if cv >= self.global_hof.cv_threshold:
                 return False
 
             # Count P75 breaches
@@ -2194,7 +2221,7 @@ class AgentEvaluator:
                 score_change = new_score - candidate.get('gauntlet_score', 0)
                 score_symbol = "↑" if score_change > 0 else "↓" if score_change < 0 else "="
                 print(f"  New Score: {new_score:.2f} ({score_symbol} {abs(score_change):.2f} from archived)")
-                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
+                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f}")
                 print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
 
                 evaluated_candidates.append({
@@ -2248,7 +2275,7 @@ class AgentEvaluator:
                 metrics = ec['metrics']
 
                 # Check if qualifies at this tier
-                qualifies = should_promote_with_tier(new_score, metrics['roi'], metrics['expectancy'], tier)
+                qualifies = should_promote_with_tier(new_score, metrics['roi'], metrics['expectancy'], metrics['cv'], tier)
                 if qualifies:
                     qualifying_candidates.append(ec)
 
@@ -2269,13 +2296,14 @@ class AgentEvaluator:
                 agent = ec['agent']
 
                 print(f"\n  → {candidate['run_name']} (Agent {candidate['agent_id']})")
-                print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f}")
+                print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f}")
 
                 # Attempt promotion - we bypass should_promote check since we did our own
-                # Temporarily set all thresholds (minimums, medians, P75) to -inf to allow promotion
+                # Temporarily set all thresholds (minimums, medians, P75) to -inf/+inf to allow promotion
                 self.global_hof.entry_threshold = float('-inf')
                 self.global_hof.roi_threshold = float('-inf')
                 self.global_hof.expectancy_threshold = float('-inf')
+                self.global_hof.cv_threshold = float('inf')  # CV: lower is better, so +inf allows all
                 self.global_hof.gauntlet_median = float('-inf')
                 self.global_hof.roi_median = float('-inf')
                 self.global_hof.expectancy_median = float('-inf')
@@ -2289,6 +2317,7 @@ class AgentEvaluator:
                     generation=candidate.get('generation', 0),
                     roi=metrics['roi'],
                     expectancy=metrics['expectancy'],
+                    cv=metrics['cv'],
                     quality_ratio=metrics['quality_ratio'],
                     win_ratio=metrics['win_ratio'],
                     total_trades=metrics['total_trades'],

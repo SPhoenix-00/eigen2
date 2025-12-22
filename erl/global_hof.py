@@ -57,6 +57,7 @@ class GlobalHoFEntry(BaseModel):
     generation: int
     roi: float = 0.0
     expectancy: float = 0.0
+    cv: float = 100.0  # Coefficient of Variation - lower is more stable. Default 100.0 for legacy records.
     quality_ratio: float = 0.0
     win_ratio: float = 0.0
     total_trades: int = 0
@@ -71,7 +72,7 @@ class GlobalHoFEntry(BaseModel):
             return v.item()
         return v
 
-    @field_validator('gauntlet_score', 'roi', 'expectancy', 'quality_ratio', 'win_ratio', mode='before')
+    @field_validator('gauntlet_score', 'roi', 'expectancy', 'cv', 'quality_ratio', 'win_ratio', mode='before')
     @classmethod
     def convert_numpy_float(cls, v: Any) -> float:
         """Convert numpy float types to Python native float."""
@@ -152,10 +153,11 @@ class GlobalHallOfFame:
 
         # Local cache
         self.entries: List[GlobalHoFEntry] = []
-        # Minimum thresholds (must beat all 3)
+        # Minimum thresholds (must beat all 4)
         self.entry_threshold: float = float('-inf')  # Gauntlet score minimum (50th rank)
         self.roi_threshold: float = float('-inf')    # ROI minimum
         self.expectancy_threshold: float = float('-inf')  # Expectancy minimum
+        self.cv_threshold: float = float('inf')      # CV maximum (lower is better, so threshold is max allowed)
         # Median thresholds (50th percentile - must beat at least 1)
         self.gauntlet_median: float = float('-inf')
         self.roi_median: float = float('-inf')
@@ -313,6 +315,7 @@ class GlobalHallOfFame:
             print(f"✓ Gauntlet Threshold: {self.entry_threshold:.2f} (Rank #50)")
             print(f"✓ ROI Threshold: {self.roi_threshold:.2f}% (Min in G50)")
             print(f"✓ Expectancy Threshold: {self.expectancy_threshold:.4f} (Min in G50)")
+            print(f"✓ CV Threshold: {self.cv_threshold:.3f} (Max in G50, lower is better)")
             print(f"✓ Current Global 50 Size: {len(self.entries)}")
         else:
             print(f"✗ League Validation: FAILED")
@@ -414,12 +417,13 @@ class GlobalHallOfFame:
             print(f"  Global:  {self._stored_league_rules.to_dict()}")
 
     def _update_entry_threshold(self):
-        """Update the local entry thresholds (gauntlet score, ROI, expectancy) and percentiles."""
+        """Update the local entry thresholds (gauntlet score, ROI, expectancy, CV) and percentiles."""
         if len(self.entries) < self.CAPACITY:
-            # Not full yet - use -inf for all thresholds (accept any qualifying agent)
+            # Not full yet - use -inf/+inf for all thresholds (accept any qualifying agent)
             self.entry_threshold = float('-inf')
             self.roi_threshold = float('-inf')
             self.expectancy_threshold = float('-inf')
+            self.cv_threshold = float('inf')  # CV: lower is better, so threshold is +inf when not full
             self.gauntlet_median = float('-inf')
             self.roi_median = float('-inf')
             self.expectancy_median = float('-inf')
@@ -433,6 +437,9 @@ class GlobalHallOfFame:
             # ROI and expectancy thresholds = minimum in the population
             self.roi_threshold = min(e.roi for e in self.entries)
             self.expectancy_threshold = min(e.expectancy for e in self.entries)
+            # CV threshold = maximum in the population (worst allowed volatility)
+            # Lower CV is better, so new agents must have CV below the worst current CV
+            self.cv_threshold = max(e.cv for e in self.entries)
 
             # Calculate median (50th percentile) and 75th percentile for all 3 metrics
             gauntlet_scores = [e.gauntlet_score for e in self.entries]
@@ -553,19 +560,21 @@ class GlobalHallOfFame:
         else:
             print(f"  Total fallback leagues: {len(self.fallback_leagues)}")
 
-    def should_promote(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0) -> bool:
+    def should_promote(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0) -> bool:
         """
         Check if an agent qualifies for Global 50.
 
         Criteria (all must be satisfied):
-        1. All 3 metrics must beat their minimum thresholds
-        2. At least 2 of 3 metrics must beat the 75th percentile
+        1. All 4 metrics must beat their minimum thresholds (gauntlet, ROI, expectancy, CV)
+           Note: For CV, "beating" means being LOWER (more stable)
+        2. At least 2 of 3 metrics must beat the 75th percentile (gauntlet, ROI, expectancy)
         3. At least 1 metric must beat the median (50th percentile)
 
         Args:
-            gauntlet_score: Agent's certified Gauntlet score
+            gauntlet_score: Agent's certified Gauntlet score (Penalized Median)
             roi: Agent's ROI percentage
             expectancy: Agent's expectancy metric
+            cv: Agent's Coefficient of Variation (lower = more stable)
 
         Returns:
             True if agent should be promoted, False otherwise
@@ -573,12 +582,15 @@ class GlobalHallOfFame:
         if not self.enabled or not self.league_compatible:
             return False
 
-        # Criterion 1: Must beat ALL minimum thresholds
+        # Criterion 1: Must beat ALL 4 minimum thresholds
         if gauntlet_score <= self.entry_threshold:
             return False
         if roi <= self.roi_threshold:
             return False
         if expectancy <= self.expectancy_threshold:
+            return False
+        # CV check: lower is better, so agent CV must be < threshold (max CV in population)
+        if cv >= self.cv_threshold:
             return False
 
         # Criterion 2: At least 2 of 3 metrics must beat 75th percentile
@@ -602,7 +614,7 @@ class GlobalHallOfFame:
         return True
 
     def check_and_promote(self, agent: DDPGAgent, gauntlet_score: float, generation: int,
-                          roi: float = 0.0, expectancy: float = 0.0,
+                          roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0,
                           quality_ratio: float = 0.0, win_ratio: float = 0.0,
                           total_trades: int = 0, run_name: Optional[str] = None) -> bool:
         """
@@ -613,10 +625,11 @@ class GlobalHallOfFame:
 
         Args:
             agent: The DDPGAgent instance to promote
-            gauntlet_score: Certified Gauntlet score (DO NOT re-test)
+            gauntlet_score: Certified Gauntlet score (Penalized Median)
             generation: Generation when agent passed Gauntlet
             roi: Return on Investment percentage
             expectancy: Expectancy metric
+            cv: Coefficient of Variation (lower = more stable)
             quality_ratio: Ratio of quality trades to total trades
             win_ratio: Ratio of winning trades to total trades
             total_trades: Total trades
@@ -624,7 +637,7 @@ class GlobalHallOfFame:
         Returns:
             True if agent was promoted, False otherwise
         """
-        if not self.should_promote(gauntlet_score, roi, expectancy):
+        if not self.should_promote(gauntlet_score, roi, expectancy, cv):
             return False
 
         with self._lock:
@@ -654,6 +667,7 @@ class GlobalHallOfFame:
                 generation=generation,
                 roi=roi,
                 expectancy=expectancy,
+                cv=cv,
                 quality_ratio=quality_ratio,
                 win_ratio=win_ratio,
                 total_trades=total_trades
