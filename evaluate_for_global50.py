@@ -1665,11 +1665,11 @@ class AgentEvaluator:
     def trim_agents(self):
         """
         Interactive trim mode: shows current thresholds and prompts for
-        gauntlet, ROI, expectancy, and total trades thresholds to trim agents.
+        gauntlet, ROI, expectancy, CV, and total trades thresholds to trim agents.
 
         This is a manual trimming tool that allows custom thresholds.
         Note: Automatic promotion uses stricter criteria:
-        - All 3 metrics must beat minimum thresholds
+        - All 4 metrics must beat minimum thresholds (including CV)
         - 2 of 3 metrics must beat 75th percentile
         - 1 of 3 metrics must beat median
         """
@@ -1729,9 +1729,9 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print(f"Enter Trim Thresholds")
         print(f"{'='*70}")
-        print(f"Agents will be KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold AND trades >= threshold")
-        print(f"(Note: This is a manual trim. Automatic promotion requires additional p75/median criteria)")
-        print(f"Press Enter to skip a threshold (use -inf, or 0 for trades)")
+        print(f"Agents will be KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold AND CV <= threshold AND trades >= threshold")
+        print(f"(Note: CV uses <= because lower is better. This is a manual trim. Automatic promotion requires additional p75/median criteria)")
+        print(f"Press Enter to skip a threshold (use -inf for min thresholds, +inf for CV, or 0 for trades)")
 
         # Get gauntlet threshold
         while True:
@@ -1769,6 +1769,18 @@ class AgentEvaluator:
             except ValueError:
                 print("  Invalid number. Please enter a numeric value.")
 
+        # Get CV threshold (lower is better, so we use <= comparison)
+        while True:
+            cv_input = input("  CV threshold (max allowed, lower is better; Enter to skip): ").strip()
+            if cv_input == "":
+                cv_threshold = float('inf')
+                break
+            try:
+                cv_threshold = float(cv_input)
+                break
+            except ValueError:
+                print("  Invalid number. Please enter a numeric value.")
+
         # Get total trades threshold
         while True:
             trades_input = input("  Minimum total trades (or Enter to skip): ").strip()
@@ -1785,12 +1797,14 @@ class AgentEvaluator:
         print(f"    Gauntlet:     {gauntlet_threshold if gauntlet_threshold != float('-inf') else 'skipped (-inf)'}")
         print(f"    ROI:          {roi_threshold if roi_threshold != float('-inf') else 'skipped (-inf)'}%")
         print(f"    Expectancy:   {expectancy_threshold if expectancy_threshold != float('-inf') else 'skipped (-inf)'}")
+        print(f"    CV:           {cv_threshold if cv_threshold != float('inf') else 'skipped (+inf)'} (max allowed)")
         print(f"    Total Trades: {trades_threshold if trades_threshold > 0 else 'skipped (0)'}")
 
         # Determine which thresholds are active (not skipped)
         gauntlet_active = gauntlet_threshold != float('-inf')
         roi_active = roi_threshold != float('-inf')
         expectancy_active = expectancy_threshold != float('-inf')
+        cv_active = cv_threshold != float('inf')
         trades_active = trades_threshold > 0
 
         # Identify agents to remove
@@ -1802,6 +1816,7 @@ class AgentEvaluator:
             passes_gauntlet = entry.gauntlet_score >= gauntlet_threshold
             passes_roi = entry.roi >= roi_threshold
             passes_expectancy = entry.expectancy >= expectancy_threshold
+            passes_cv = entry.cv <= cv_threshold  # CV: lower is better, so use <=
             passes_trades = entry.total_trades >= trades_threshold
 
             # Check each active threshold
@@ -1811,6 +1826,8 @@ class AgentEvaluator:
             if roi_active and not passes_roi:
                 failed = True
             if expectancy_active and not passes_expectancy:
+                failed = True
+            if cv_active and not passes_cv:
                 failed = True
             if trades_active and not passes_trades:
                 failed = True
@@ -1829,14 +1846,15 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print(f"⚠ WARNING: {len(agents_to_remove)} agents will be REMOVED from Global 50:")
         print(f"{'='*70}")
-        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'Trades':<8} {'Run Name':<25} {'Agent':<8} {'Reason'}")
-        print(f"{'-'*100}")
+        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'CV':<8} {'Trades':<8} {'Run Name':<25} {'Agent':<8} {'Reason'}")
+        print(f"{'-'*110}")
 
         for entry in sorted(agents_to_remove, key=lambda e: e.gauntlet_score):
             # Determine why agent fails
             passes_gauntlet = entry.gauntlet_score >= gauntlet_threshold
             passes_roi = entry.roi >= roi_threshold
             passes_expectancy = entry.expectancy >= expectancy_threshold
+            passes_cv = entry.cv <= cv_threshold
             passes_trades = entry.total_trades >= trades_threshold
 
             reasons = []
@@ -1846,11 +1864,13 @@ class AgentEvaluator:
                 reasons.append("ROI")
             if expectancy_active and not passes_expectancy:
                 reasons.append("expectancy")
+            if cv_active and not passes_cv:
+                reasons.append("CV")
             if trades_active and not passes_trades:
                 reasons.append("trades")
             reason_str = ", ".join(reasons) if reasons else "filter"
 
-            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.total_trades:<8} {entry.run_name:<25} {entry.agent_id:<8} {reason_str}")
+            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.cv:<8.3f} {entry.total_trades:<8} {entry.run_name:<25} {entry.agent_id:<8} {reason_str}")
 
         print(f"\n{len(agents_to_keep)} agents will remain in Global 50.")
 
@@ -1859,6 +1879,7 @@ class AgentEvaluator:
             print(f"  Gauntlet:     {min(e.gauntlet_score for e in agents_to_keep):.2f} to {max(e.gauntlet_score for e in agents_to_keep):.2f}")
             print(f"  ROI:          {min(e.roi for e in agents_to_keep):.2f}% to {max(e.roi for e in agents_to_keep):.2f}%")
             print(f"  Expectancy:   {min(e.expectancy for e in agents_to_keep):.4f} to {max(e.expectancy for e in agents_to_keep):.4f}")
+            print(f"  CV:           {min(e.cv for e in agents_to_keep):.3f} to {max(e.cv for e in agents_to_keep):.3f} (lower is better)")
             print(f"  Total Trades: {min(e.total_trades for e in agents_to_keep)} to {max(e.total_trades for e in agents_to_keep)}")
 
         # Ask for confirmation

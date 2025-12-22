@@ -3154,6 +3154,7 @@ class ERLTrainer:
         # Extract metrics from validation result
         roi = val_result.get('roi', 0.0)
         expectancy = val_result.get('expectancy', 0.0)
+        cv = val_result.get('cv', 100.0)  # Default to high CV if not available
         total_trades = val_result.get('total_trades', 0)
         quality_count = val_result.get('quality_count', 0)
         quality_ratio = (quality_count / total_trades) if total_trades > 0 else 0.0
@@ -3170,6 +3171,7 @@ class ERLTrainer:
             generation=self.generation,
             roi=roi,
             expectancy=expectancy,
+            cv=cv,
             quality_ratio=quality_ratio,
             win_ratio=win_ratio,
             total_trades=total_trades
@@ -3617,7 +3619,7 @@ class ERLTrainer:
         Unlike normal validation (7 slices, validation-only), the Gauntlet:
         - Uses 20+ slices (10 from training, 10 from validation)
         - Tests across ALL market conditions, not just validation period
-        - Uses pessimistic aggregator (0.4*mean + 0.6*min) to heavily penalize blow-ups
+        - Uses Penalized Median scoring: Median - (0.5 * StdDev) to reward stability
 
         This prevents "Ghost Scores" where agents get lucky on specific
         validation slices but fail when tested more broadly.
@@ -3682,16 +3684,26 @@ class ERLTrainer:
         # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Exclude top slice from gauntlet score calculation (prevents lucky outliers from inflating score)
-        # But keep max_score for display purposes
-        max_score = np.max(fitness_scores)
-        scores_without_top = sorted(fitness_scores)[:-1]  # Remove the highest score
+        # Calculate statistics for Penalized Median scoring
+        scores_np = np.array(fitness_scores)
+        max_score = float(np.max(scores_np))
+        min_score = float(np.min(scores_np))
+        mean_score = float(np.mean(scores_np))
+        median_score = float(np.median(scores_np))
+        std_score = float(np.std(scores_np))
 
-        # Aggregator: 0.67*mean + 0.33*min (excluding top slice)
-        # Weights average performance more heavily while still penalizing worst case
-        mean_score = np.mean(scores_without_top)
-        min_score = np.min(scores_without_top)
-        gauntlet_score = (0.67 * mean_score) + (0.33 * min_score)
+        # Calculate Coefficient of Variation (CV) - measures "noise" relative to "signal"
+        # CV = StdDev / |Mean| (use absolute value to handle negative means)
+        # Lower CV = more stable/consistent agent
+        if abs(mean_score) > 1e-10:
+            cv = std_score / abs(mean_score)
+        else:
+            cv = float('inf')  # Undefined CV when mean is ~0
+
+        # NEW SCORING FORMULA: Penalized Median
+        # This rewards agents that reliably perform well while penalizing volatility
+        # gauntlet_score = Median - (0.5 * StdDev)
+        gauntlet_score = float(median_score - (0.5 * std_score))
 
         # Calculate aggregate metrics
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -3736,6 +3748,9 @@ class ERLTrainer:
 
         return {
             'gauntlet_score': gauntlet_score,
+            'cv': cv,  # Coefficient of Variation - lower is more stable
+            'fitness_median': median_score,
+            'fitness_std': std_score,
             'fitness_mean': mean_score,
             'fitness_min': min_score,
             'fitness_max': max_score,
@@ -4546,7 +4561,8 @@ class ERLTrainer:
                         if self.global_hof.enabled and self.global_hof.should_promote(
                             gauntlet_score,
                             gauntlet_results.get('roi', 0.0),
-                            gauntlet_results.get('expectancy', 0.0)
+                            gauntlet_results.get('expectancy', 0.0),
+                            gauntlet_results.get('cv', 100.0)
                         ):
                             print(f"\n   ⓘ Agent may qualify for Global 50 (passes all promotion criteria)")
                             print(f"   Running consistency-aligned re-gauntlet for fair Global 50 comparison...")
@@ -4569,11 +4585,13 @@ class ERLTrainer:
                     if g50_gauntlet_score is not None and self.global_hof.should_promote(
                         g50_gauntlet_score,
                         g50_gauntlet_results.get('roi', 0.0),
-                        g50_gauntlet_results.get('expectancy', 0.0)
+                        g50_gauntlet_results.get('expectancy', 0.0),
+                        g50_gauntlet_results.get('cv', 100.0)
                     ):
                         agent_to_admit = self.breakthrough_candidate.agent
                         agent_roi = g50_gauntlet_results['roi']
                         agent_expectancy = g50_gauntlet_results['expectancy']
+                        agent_cv = g50_gauntlet_results.get('cv', 100.0)
                         quality_count = g50_gauntlet_results.get('quality_count', 0)
                         total_trades = g50_gauntlet_results.get('total_trades', 0)
                         win_rate = g50_gauntlet_results.get('win_rate', 0.0)
@@ -4588,6 +4606,7 @@ class ERLTrainer:
                             generation=self.generation,
                             roi=agent_roi,
                             expectancy=agent_expectancy,
+                            cv=agent_cv,
                             quality_ratio=quality_ratio,
                             win_ratio=win_rate,
                             total_trades=total_trades

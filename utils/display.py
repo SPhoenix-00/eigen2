@@ -404,26 +404,28 @@ def visualize_gauntlet_slices(fitness_scores: List[float], mean_score: float, mi
         mean_score: Mean fitness across all slices
         min_score: Minimum fitness score
         max_score: Maximum fitness score
-        gauntlet_score: Final aggregated gauntlet score (0.67*mean + 0.33*min, excluding top slice)
+        gauntlet_score: Final aggregated gauntlet score (Penalized Median = Median - 0.5*StdDev)
     """
     print("\n" + "="*70)
     print(f"{'GAUNTLET SLICE ANALYSIS':^70}")
     print("="*70)
 
     # Statistical analysis
-    std_dev = np.std(fitness_scores)
-    # Coefficient of Variation: measure of volatility (std dev / mean)
+    median_score = float(np.median(fitness_scores))
+    std_dev = float(np.std(fitness_scores))
+    # Coefficient of Variation: measure of volatility (std dev / |mean|)
     # Higher CV = more volatile performance across slices
     cv = (std_dev / abs(mean_score)) * 100 if abs(mean_score) > 0.001 else 0
 
     print("\n📊 STATISTICAL SUMMARY")
     print("-" * 70)
-    print(f"  Gauntlet Score:    {gauntlet_score:>12.2f}  (0.67*mean + 0.33*min, excl. top)")
+    print(f"  Gauntlet Score:    {gauntlet_score:>12.2f}  (Penalized Median = Median - 0.5*StdDev)")
+    print(f"  Median:            {median_score:>12.2f}")
     print(f"  Mean:              {mean_score:>12.2f}")
     print(f"  Min:               {min_score:>12.2f}")
     print(f"  Max:               {max_score:>12.2f}")
     print(f"  Std Dev:           {std_dev:>12.2f}")
-    print(f"  Coefficient of Variation: {cv:>8.1f}%  {'⚠️  High volatility!' if cv > 50 else '✓ Stable' if cv < 25 else '~ Moderate'}")
+    print(f"  CV (StdDev/|Mean|):{cv/100:>12.3f}  {'⚠️  High volatility!' if cv > 50 else '✓ Stable' if cv < 25 else '~ Moderate'}")
     print(f"  Range:             {max_score - min_score:>12.2f}")
 
     # Identify problematic slices (below mean - 0.5*std_dev)
