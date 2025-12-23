@@ -402,7 +402,7 @@ class AgentEvaluator:
             print(f"   Gauntlet Score:    {gauntlet_score:>10.2f}  (Penalized Median)")
             print(f"   Median Fitness:    {metrics['median_fitness']:>10.2f}")
             print(f"   Std Fitness:       {metrics['std_fitness']:>10.2f}")
-            print(f"   CV (Stability):    {metrics['cv']:>10.3f}  (lower = more stable)")
+            print(f"   CV (Stability):    {metrics['cv']:>10.3f}")
             print(f"   ROI:               {metrics['roi']:>10.2f}%")
             print(f"   Total Trades:      {metrics['total_trades']:>10}")
             print(f"   Quality Ratio:     {metrics['quality_ratio']:>10.3f}")
@@ -452,9 +452,9 @@ class AgentEvaluator:
                 beats_expectancy_p75 = metrics['expectancy'] > self.global_hof.expectancy_p75
                 count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
 
-                print(f"   Minimums (4/4 required): Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'} | CV {'✓' if passes_cv_min else '✗'}")
-                print(f"   P75 ({count_above_p75}/3, need 2): Gauntlet {'✓' if beats_gauntlet_p75 else '✗'} | ROI {'✓' if beats_roi_p75 else '✗'} | Expectancy {'✓' if beats_expectancy_p75 else '✗'}")
-                print(f"   Criteria: All 4 > min AND 2/3 > P75 AND 1/3 > median")
+                count_above_min = sum([passes_gauntlet_min, passes_roi_min, passes_expectancy_min, passes_cv_min])
+                print(f"   Minimums ({count_above_min}/4, 4 required): Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'} | CV {'✓' if passes_cv_min else '✗'}")
+                print(f"   P75 ({count_above_p75}/3, 2 required): Gauntlet {'✓' if beats_gauntlet_p75 else '✗'} | ROI {'✓' if beats_roi_p75 else '✗'} | Expectancy {'✓' if beats_expectancy_p75 else '✗'}")
 
         except Exception as e:
             print(f"\n   ERROR: {e}")
