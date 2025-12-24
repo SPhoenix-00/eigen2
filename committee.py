@@ -448,6 +448,40 @@ def get_holdout_data(loader, stats, holdout_info):
     return inputs_tensor, valid_indices
 
 
+def get_validation_data(loader, stats, holdout_info):
+    """
+    Get VALIDATION data tensor for correlation calculation during Draft.
+
+    IMPORTANT: This uses validation data (NOT holdout) to prevent data leakage.
+    The holdout period must remain unseen until final validation.
+
+    Returns:
+        (inputs_tensor, valid_indices)
+    """
+    val_start = holdout_info['val_start']
+    val_end = holdout_info['val_end']
+
+    input_data = loader.data_array  # [Days, Stocks, 5_feats]
+
+    # Valid inference points within validation period
+    # Need context window before and room for MIN_HOLDING_PERIOD forward
+    valid_indices = list(range(
+        max(val_start, Config.CONTEXT_WINDOW_DAYS),
+        val_end - Config.MIN_HOLDING_PERIOD + 1
+    ))
+
+    inputs = []
+    for i in valid_indices:
+        window = input_data[i - Config.CONTEXT_WINDOW_DAYS : i]
+        normalized = (window - stats['mean']) / stats['std']
+        inputs.append(normalized)
+
+    inputs = np.array(inputs)
+    inputs_tensor = torch.FloatTensor(inputs).to(Config.DEVICE)
+
+    return inputs_tensor, valid_indices
+
+
 # --- Global50 Loading ---
 
 def load_global50_candidates(context_window_days: int) -> list:
@@ -552,11 +586,119 @@ def calculate_coefficient_correlations(entries: list, holdout_tensor: torch.Tens
 
 # --- Objective Function ---
 
+def find_highest_correlation_pair(committee_indices: tuple, entries: list,
+                                   corr_matrix: np.ndarray) -> tuple:
+    """
+    Find the pair of agents in the committee with the highest correlation.
+
+    Args:
+        committee_indices: Tuple of agent indices in the committee
+        entries: Full list of Global50 entries
+        corr_matrix: Full NxN correlation matrix
+
+    Returns:
+        (agent1_idx, agent2_idx, correlation_value, agent1_entry, agent2_entry)
+        where agent1 has lower fitness than agent2 (agent1 is the swap candidate)
+    """
+    max_corr = -1.0
+    max_pair = (None, None)
+
+    n = len(committee_indices)
+    for i_idx in range(n):
+        for j_idx in range(i_idx + 1, n):
+            i = committee_indices[i_idx]
+            j = committee_indices[j_idx]
+            corr = corr_matrix[i, j]
+
+            if corr > max_corr:
+                max_corr = corr
+                max_pair = (i, j)
+
+    if max_pair[0] is None:
+        return None, None, 0.0, None, None
+
+    # Determine which agent has lower fitness (swap candidate)
+    i, j = max_pair
+    fitness_i = entries[i]['gauntlet_score']
+    fitness_j = entries[j]['gauntlet_score']
+
+    if fitness_i <= fitness_j:
+        # Agent i has lower fitness, swap it out
+        return i, j, max_corr, entries[i], entries[j]
+    else:
+        # Agent j has lower fitness, swap it out
+        return j, i, max_corr, entries[j], entries[i]
+
+
+def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: list,
+                              corr_matrix: np.ndarray) -> tuple:
+    """
+    Find the agent from the entire Global50 that minimizes average correlation
+    when swapped in for the dropped agent.
+
+    Args:
+        committee_indices: Current committee indices
+        drop_idx: Index of agent being dropped
+        entries: Full list of Global50 entries
+        corr_matrix: Full NxN correlation matrix
+
+    Returns:
+        (best_candidate_idx, new_committee_indices, new_objective, new_score_sum,
+         new_avg_corr, new_max_corr, candidate_entry)
+    """
+    # Build remaining committee (without the dropped agent)
+    remaining = [idx for idx in committee_indices if idx != drop_idx]
+
+    best_candidate = None
+    best_objective = float('-inf')
+    best_new_indices = None
+    best_score_sum = 0
+    best_avg_corr = 0
+    best_max_corr = 0
+
+    # Valid entries have self-correlation = 1
+    valid_entries = [i for i in range(len(entries))
+                     if corr_matrix[i, i] == 1.0]
+
+    for candidate_idx in valid_entries:
+        # Skip if already in committee
+        if candidate_idx in committee_indices:
+            continue
+
+        # Create new committee with swap
+        new_indices = tuple(sorted(remaining + [candidate_idx]))
+
+        # Calculate objective
+        obj, score_sum, avg_corr, max_corr = committee_objective(
+            new_indices, entries, corr_matrix
+        )
+
+        if obj > best_objective:
+            best_objective = obj
+            best_candidate = candidate_idx
+            best_new_indices = new_indices
+            best_score_sum = score_sum
+            best_avg_corr = avg_corr
+            best_max_corr = max_corr
+
+    if best_candidate is None:
+        return None, None, 0, 0, 0, 0, None
+
+    return (best_candidate, best_new_indices, best_objective, best_score_sum,
+            best_avg_corr, best_max_corr, entries[best_candidate])
+
+
 def committee_objective(indices: tuple, entries: list, corr_matrix: np.ndarray) -> tuple:
     """
     Calculate committee objective value.
 
-    Objective = Σ(gauntlet_scores) * (1 - avg_correlation^EXPONENT)
+    Objective = Σ(gauntlet_scores) * (1 - avg_correlation)
+
+    The correlation multiplier rewards anti-correlation (hedging) and penalizes
+    positive correlation (redundancy):
+      - avg_corr = -0.5 → multiplier = 1.5 (50% bonus for hedging)
+      - avg_corr =  0.0 → multiplier = 1.0 (neutral)
+      - avg_corr = +0.5 → multiplier = 0.5 (50% penalty for redundancy)
 
     Args:
         indices: Tuple of agent indices in the committee
@@ -572,7 +714,7 @@ def committee_objective(indices: tuple, entries: list, corr_matrix: np.ndarray) 
     # Extract submatrix for committee members
     n = len(indices)
     pairs = []
-    max_corr = 0.0
+    max_corr = -1.0  # Track actual max (can be negative)
 
     for i_idx in range(n):
         for j_idx in range(i_idx + 1, n):
@@ -585,9 +727,10 @@ def committee_objective(indices: tuple, entries: list, corr_matrix: np.ndarray) 
 
     avg_corr = np.mean(pairs) if pairs else 0.0
 
-    # Objective with correlation penalty
-    penalty = 1.0 - (avg_corr ** Config.COMMITTEE_CORRELATION_EXPONENT)
-    objective = score_sum * penalty
+    # Objective with linear correlation penalty (no exponent)
+    # This properly rewards anti-correlation and penalizes positive correlation
+    multiplier = 1.0 - avg_corr
+    objective = score_sum * multiplier
 
     return objective, score_sum, avg_corr, max_corr
 
@@ -690,6 +833,126 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
         'avg_correlation': best_avg_corr,
         'max_correlation': best_max_corr,
     }
+
+
+def interactive_correlation_refinement(committee_indices: tuple, entries: list,
+                                         corr_matrix: np.ndarray) -> tuple:
+    """
+    Interactive refinement pass: iteratively swap out high-correlation agents.
+
+    For each iteration:
+    1. Find the highest correlation pair in the committee
+    2. Offer to swap out the lower-fitness agent
+    3. If user accepts, find best replacement from entire Global50
+    4. Show old vs new metrics, confirm swap
+    5. Repeat until user declines a swap
+
+    Args:
+        committee_indices: Initial committee indices from optimization
+        entries: Full list of Global50 entries
+        corr_matrix: Full NxN correlation matrix
+
+    Returns:
+        Final committee indices after all swaps
+    """
+    current_indices = committee_indices
+    swap_count = 0
+
+    print(f"\n{'='*60}")
+    print("PHASE 1b: CORRELATION REFINEMENT (Interactive)")
+    print(f"{'='*60}")
+    print("This pass allows you to iteratively reduce correlation by swapping agents.")
+    print("Press Enter for 'no' to skip, or type 'y' to swap.\n")
+
+    while True:
+        # Calculate current metrics
+        curr_obj, curr_score_sum, curr_avg_corr, curr_max_corr = committee_objective(
+            current_indices, entries, corr_matrix
+        )
+
+        # Find highest correlation pair
+        drop_idx, keep_idx, max_corr, drop_entry, keep_entry = find_highest_correlation_pair(
+            current_indices, entries, corr_matrix
+        )
+
+        if drop_idx is None:
+            print("  No valid pairs found in committee.")
+            break
+
+        # Display the high-correlation pair
+        print(f"\n  {'─'*56}")
+        print(f"  HIGHEST CORRELATION PAIR:")
+        print(f"    Agent A: {drop_entry['run_name']}_{drop_entry['agent_id']} "
+              f"(fitness: {drop_entry['gauntlet_score']:.2f})")
+        print(f"    Agent B: {keep_entry['run_name']}_{keep_entry['agent_id']} "
+              f"(fitness: {keep_entry['gauntlet_score']:.2f})")
+        print(f"    Correlation: {max_corr:.4f}")
+        print(f"\n  Current Committee Metrics:")
+        print(f"    Objective: {curr_obj:.2f}")
+        print(f"    Aggregate Score: {curr_score_sum:.2f}")
+        print(f"    Avg Correlation: {curr_avg_corr:.4f}")
+        print(f"    Max Correlation: {curr_max_corr:.4f}")
+
+        # Ask if user wants to swap
+        print(f"\n  → Swap out {drop_entry['run_name']}_{drop_entry['agent_id']} (lower fitness)?")
+        response = input("    [y/N]: ").strip().lower()
+
+        if response != 'y':
+            print(f"\n  ✓ Committee composition confirmed.")
+            break
+
+        # Find best replacement
+        print(f"\n  Searching for best replacement across Global50...")
+        (candidate_idx, new_indices, new_obj, new_score_sum,
+         new_avg_corr, new_max_corr, candidate_entry) = find_best_swap_candidate(
+            current_indices, drop_idx, entries, corr_matrix
+        )
+
+        if candidate_idx is None:
+            print("  ⚠ No valid replacement found.")
+            break
+
+        # Show comparison
+        print(f"\n  PROPOSED SWAP:")
+        print(f"    OUT: {drop_entry['run_name']}_{drop_entry['agent_id']} "
+              f"(fitness: {drop_entry['gauntlet_score']:.2f})")
+        print(f"    IN:  {candidate_entry['run_name']}_{candidate_entry['agent_id']} "
+              f"(fitness: {candidate_entry['gauntlet_score']:.2f})")
+
+        print(f"\n  {'METRIC':<20} {'BEFORE':>12} {'AFTER':>12} {'CHANGE':>12}")
+        print(f"  {'-'*56}")
+        print(f"  {'Objective':<20} {curr_obj:>12.2f} {new_obj:>12.2f} "
+              f"{new_obj - curr_obj:>+12.2f}")
+        print(f"  {'Aggregate Score':<20} {curr_score_sum:>12.2f} {new_score_sum:>12.2f} "
+              f"{new_score_sum - curr_score_sum:>+12.2f}")
+        print(f"  {'Avg Correlation':<20} {curr_avg_corr:>12.4f} {new_avg_corr:>12.4f} "
+              f"{new_avg_corr - curr_avg_corr:>+12.4f}")
+        print(f"  {'Max Correlation':<20} {curr_max_corr:>12.4f} {new_max_corr:>12.4f} "
+              f"{new_max_corr - curr_max_corr:>+12.4f}")
+
+        # Confirm swap
+        print(f"\n  → Confirm this swap?")
+        confirm = input("    [y/N]: ").strip().lower()
+
+        if confirm == 'y':
+            current_indices = new_indices
+            swap_count += 1
+            print(f"\n  ✓ Swap #{swap_count} confirmed.")
+        else:
+            print(f"\n  ✗ Swap cancelled. Keeping current composition.")
+            # Don't break - still offer to check the next highest correlation pair
+            # But since we declined this swap, the user probably wants to stop
+            print(f"\n  ✓ Committee composition confirmed.")
+            break
+
+    if swap_count > 0:
+        print(f"\n  {'='*56}")
+        print(f"  REFINEMENT COMPLETE: {swap_count} swap(s) made")
+        print(f"  {'='*56}")
+    else:
+        print(f"\n  No swaps made. Original committee retained.")
+
+    return current_indices
 
 
 # --- Committee Agent Class ---
@@ -796,12 +1059,13 @@ class CommitteeAgent:
         """
         num_members, num_stocks = all_coeffs.shape
 
-        # 1. Standard Voting (Quorum)
+        # 1. Standard Voting (Quorum) - coeff >= global threshold
         votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD
         vote_counts = np.sum(votes, axis=0)  # [num_stocks]
         is_quorum = vote_counts >= Config.COMMITTEE_QUORUM
 
-        # 2. Conviction Check (Stock-Specific Override) WITH SOCIAL PROOF
+        # 2. Conviction Check (Stock-Specific Override)
+        # Conviction = agent exceeds their own P99 threshold for that stock
         conviction_thresholds = np.array([
             m['stats']['conviction_threshold_vector'] for m in self.members
         ])  # [num_members, num_stocks]
@@ -809,9 +1073,15 @@ class CommitteeAgent:
         agent_convictions = all_coeffs > conviction_thresholds
         is_conviction_raw = np.any(agent_convictions, axis=0)  # [num_stocks]
 
-        # SOCIAL PROOF: A conviction trade requires at least 1 backer (total votes >= 2)
+        # SOCIAL PROOF: Conviction counts as a vote for the social proof check.
+        # An agent with conviction is "voting" even if below global threshold.
+        # This allows a specialist (coeff=0.9, p99=0.8) to count toward social proof.
+        effective_votes = votes | agent_convictions  # [num_members, num_stocks]
+        effective_vote_counts = np.sum(effective_votes, axis=0)  # [num_stocks]
+
+        # A conviction trade requires at least 2 total supporters (votes OR convictions)
         # This prevents a single hallucinating agent from triggering trades alone.
-        is_conviction = is_conviction_raw & (vote_counts >= 2)
+        is_conviction = is_conviction_raw & (effective_vote_counts >= 2)
 
         # 3. Veto Check (Fixed number of silent members)
         is_silent = all_coeffs < Config.COMMITTEE_VETO_THRESHOLD
@@ -879,29 +1149,23 @@ class CommitteeAgent:
                 self.consensus_history['avg_votes_per_trade'].append(float(avg_votes))
 
         # 5. Signal Aggregation
-        # For approved trades, average ONLY the coefficients from agents who voted YES
-        # This represents the true conviction of the supporting agents
+        # For approved trades, average coefficients from ALL supporting agents
+        # (both standard voters AND conviction agents)
         final_coeffs = np.zeros(num_stocks, dtype=np.float32)
 
         for stock_idx in range(num_stocks):
             if should_trade[stock_idx]:
-                # Get coefficients from agents who voted for this stock
-                voting_agents_mask = votes[:, stock_idx]  # Boolean mask of voters
+                # Get all agents who support this trade (vote OR conviction)
+                # This ensures the conviction specialist is included in the average
+                supporting_agents_mask = effective_votes[:, stock_idx]  # Boolean mask
 
-                if np.any(voting_agents_mask):
-                    # Average only the voting agents' coefficients
-                    voting_coeffs = all_coeffs[voting_agents_mask, stock_idx]
-                    final_coeffs[stock_idx] = np.mean(voting_coeffs)
+                if np.any(supporting_agents_mask):
+                    # Average coefficients from all supporting agents
+                    supporting_coeffs = all_coeffs[supporting_agents_mask, stock_idx]
+                    final_coeffs[stock_idx] = np.mean(supporting_coeffs)
                 else:
-                    # Conviction-only trade (no standard voters, but conviction triggered)
-                    # Use the mean of agents who exceeded conviction threshold
-                    conviction_agents_mask = agent_convictions[:, stock_idx]
-                    if np.any(conviction_agents_mask):
-                        conviction_coeffs = all_coeffs[conviction_agents_mask, stock_idx]
-                        final_coeffs[stock_idx] = np.mean(conviction_coeffs)
-                    else:
-                        # Fallback to threshold (shouldn't happen, but safety)
-                        final_coeffs[stock_idx] = Config.COEFFICIENT_THRESHOLD
+                    # Fallback to threshold (shouldn't happen, but safety)
+                    final_coeffs[stock_idx] = Config.COEFFICIENT_THRESHOLD
 
         return final_coeffs
 
@@ -1501,6 +1765,9 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
 def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
     """
     Phase 1: Select committee from Global50 using coefficient correlation optimization.
+
+    IMPORTANT: Correlation is calculated on VALIDATION data (not holdout) to prevent
+    data leakage. The holdout period remains unseen until Phase 2 validation.
     """
     print("\n" + "="*60)
     print("PHASE 1: DRAFT DAY (Global50 Selection)")
@@ -1519,13 +1786,14 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
         print(f"    {i+1}. {e['run_name']}_{e['agent_id']}: "
               f"score={e['gauntlet_score']:.2f}, roi={e.get('roi', 0):.2f}%")
 
-    # 2. Prepare holdout data
-    holdout_tensor, valid_indices = get_holdout_data(loader, stats, holdout_info)
-    print(f"\n  Holdout tensor shape: {holdout_tensor.shape}")
+    # 2. Prepare VALIDATION data for correlation calculation (NOT holdout - prevents data leakage)
+    val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+    print(f"\n  Validation tensor shape: {val_tensor.shape}")
+    print(f"  (Using validation period for correlation - holdout remains unseen)")
 
-    # 3. Calculate coefficient correlations
+    # 3. Calculate coefficient correlations on validation data
     corr_matrix, coefficients, _ = calculate_coefficient_correlations(
-        entries, holdout_tensor, context_window_days
+        entries, val_tensor, context_window_days
     )
 
     # 4. Optimize committee selection
@@ -1535,8 +1803,18 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
         print("❌ Optimization failed")
         return None
 
+    # 4b. Interactive correlation refinement pass
+    refined_indices = interactive_correlation_refinement(
+        result['committee_indices'], entries, corr_matrix
+    )
+
+    # Recalculate metrics after refinement
+    final_obj, final_score_sum, final_avg_corr, final_max_corr = committee_objective(
+        refined_indices, entries, corr_matrix
+    )
+
     # 5. Build roster
-    committee_indices = result['committee_indices']
+    committee_indices = refined_indices
     committee_members = [entries[i] for i in committee_indices]
 
     # Build correlation matrix for committee
@@ -1584,11 +1862,11 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
     roster_data = {
         'committee_size': len(members_with_stats),
         'members': members_with_stats,
-        'aggregate_score': result['score_sum'],
-        'objective_value': result['objective'],
+        'aggregate_score': final_score_sum,
+        'objective_value': final_obj,
         'correlation': {
-            'average': result['avg_correlation'],
-            'max_pair': result['max_correlation'],
+            'average': final_avg_corr,
+            'max_pair': final_max_corr,
             'matrix': committee_corr.tolist(),
         },
         'context_window_days': context_window_days,
@@ -1605,17 +1883,17 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
 
     # Print committee
     print(f"\n{'='*60}")
-    print("SELECTED COMMITTEE")
+    print("FINAL COMMITTEE")
     print(f"{'='*60}")
 
     for i, m in enumerate(roster_data['members']):
         print(f"  {i+1}. {m['run_name']}_{m['agent_id']}: "
               f"score={m['gauntlet_score']:.2f}, roi={m['roi']:.2f}%")
 
-    print(f"\n  Aggregate Score: {result['score_sum']:.2f}")
-    print(f"  Objective Value: {result['objective']:.2f}")
-    print(f"  Avg Correlation: {result['avg_correlation']:.3f}")
-    print(f"  Max Pair Correlation: {result['max_correlation']:.3f}")
+    print(f"\n  Aggregate Score: {final_score_sum:.2f}")
+    print(f"  Objective Value: {final_obj:.2f}")
+    print(f"  Avg Correlation: {final_avg_corr:.3f}")
+    print(f"  Max Pair Correlation: {final_max_corr:.3f}")
 
     return roster_data
 
