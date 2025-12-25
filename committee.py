@@ -641,9 +641,10 @@ def find_highest_correlation_pair(committee_indices: tuple, entries: list,
 
 
 def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: list,
-                              corr_matrix: np.ndarray) -> tuple:
+                              corr_matrix: np.ndarray,
+                              optimize_for: str = 'objective') -> tuple:
     """
-    Find the agent from the entire Global50 that minimizes average correlation
+    Find the agent from the entire Global50 that best improves the committee
     when swapped in for the dropped agent.
 
     Args:
@@ -651,6 +652,7 @@ def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: l
         drop_idx: Index of agent being dropped
         entries: Full list of Global50 entries
         corr_matrix: Full NxN correlation matrix
+        optimize_for: What to optimize - 'objective' (default) or 'max_corr'
 
     Returns:
         (best_candidate_idx, new_committee_indices, new_objective, new_score_sum,
@@ -661,10 +663,11 @@ def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: l
 
     best_candidate = None
     best_objective = float('-inf')
+    best_max_corr = float('inf')  # For max_corr optimization
     best_new_indices = None
     best_score_sum = 0
     best_avg_corr = 0
-    best_max_corr = 0
+    best_max_corr_result = 0
 
     # Valid entries have self-correlation = 1
     valid_entries = [i for i in range(len(entries))
@@ -683,19 +686,32 @@ def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: l
             new_indices, entries, corr_matrix
         )
 
-        if obj > best_objective:
-            best_objective = obj
-            best_candidate = candidate_idx
-            best_new_indices = new_indices
-            best_score_sum = score_sum
-            best_avg_corr = avg_corr
-            best_max_corr = max_corr
+        # Choose based on optimization target
+        if optimize_for == 'max_corr':
+            # Minimize max correlation (lower is better)
+            if max_corr < best_max_corr:
+                best_max_corr = max_corr
+                best_candidate = candidate_idx
+                best_new_indices = new_indices
+                best_objective = obj
+                best_score_sum = score_sum
+                best_avg_corr = avg_corr
+                best_max_corr_result = max_corr
+        else:
+            # Maximize objective (higher is better)
+            if obj > best_objective:
+                best_objective = obj
+                best_candidate = candidate_idx
+                best_new_indices = new_indices
+                best_score_sum = score_sum
+                best_avg_corr = avg_corr
+                best_max_corr_result = max_corr
 
     if best_candidate is None:
         return None, None, 0, 0, 0, 0, None
 
     return (best_candidate, best_new_indices, best_objective, best_score_sum,
-            best_avg_corr, best_max_corr, entries[best_candidate])
+            best_avg_corr, best_max_corr_result, entries[best_candidate])
 
 
 def committee_objective(indices: tuple, entries: list, corr_matrix: np.ndarray) -> tuple:
@@ -899,13 +915,19 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
             print("  No valid pairs found in committee.")
             break
 
-        # Find best replacement BEFORE asking user
-        (candidate_idx, new_indices, new_obj, new_score_sum,
-         new_avg_corr, new_max_corr, candidate_entry) = find_best_swap_candidate(
-            current_indices, drop_idx, entries, corr_matrix
+        # Find best replacement for OBJECTIVE (default)
+        (obj_candidate_idx, obj_new_indices, obj_new_obj, obj_new_score_sum,
+         obj_new_avg_corr, obj_new_max_corr, obj_candidate_entry) = find_best_swap_candidate(
+            current_indices, drop_idx, entries, corr_matrix, optimize_for='objective'
         )
 
-        if candidate_idx is None:
+        # Find best replacement for MAX CORRELATION reduction
+        (corr_candidate_idx, corr_new_indices, corr_new_obj, corr_new_score_sum,
+         corr_new_avg_corr, corr_new_max_corr, corr_candidate_entry) = find_best_swap_candidate(
+            current_indices, drop_idx, entries, corr_matrix, optimize_for='max_corr'
+        )
+
+        if obj_candidate_idx is None and corr_candidate_idx is None:
             print("  ⚠ No valid replacement found for highest correlation pair.")
             break
 
@@ -918,42 +940,90 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
               f"(fitness: {keep_entry['gauntlet_score']:.2f})")
         print(f"    Correlation: {max_corr:.4f}")
 
-        print(f"\n  PROPOSED SWAP:")
-        print(f"    OUT: {drop_entry['run_name']}_{drop_entry['agent_id']} "
-              f"(fitness: {drop_entry['gauntlet_score']:.2f})")
-        print(f"    IN:  {candidate_entry['run_name']}_{candidate_entry['agent_id']} "
-              f"(fitness: {candidate_entry['gauntlet_score']:.2f})")
+        # Check if the two strategies give different candidates
+        same_candidate = (obj_candidate_idx == corr_candidate_idx)
 
-        # Calculate correlation of new agent with the kept agent from the pair
-        new_agent_corr_with_kept = corr_matrix[candidate_idx, keep_idx]
-        print(f"    New pair correlation: {new_agent_corr_with_kept:.4f} "
-              f"(was {max_corr:.4f}, Δ{new_agent_corr_with_kept - max_corr:+.4f})")
+        if same_candidate:
+            # Single option - same candidate for both strategies
+            candidate_idx = obj_candidate_idx
+            new_indices = obj_new_indices
+            new_obj = obj_new_obj
+            new_score_sum = obj_new_score_sum
+            new_avg_corr = obj_new_avg_corr
+            new_max_corr = obj_new_max_corr
+            candidate_entry = obj_candidate_entry
 
-        print(f"\n  {'METRIC':<20} {'BEFORE':>12} {'AFTER':>12} {'CHANGE':>12}")
-        print(f"  {'-'*56}")
-        print(f"  {'Objective':<20} {curr_obj:>12.2f} {new_obj:>12.2f} "
-              f"{new_obj - curr_obj:>+12.2f}")
-        print(f"  {'Aggregate Score':<20} {curr_score_sum:>12.2f} {new_score_sum:>12.2f} "
-              f"{new_score_sum - curr_score_sum:>+12.2f}")
-        print(f"  {'Avg Correlation':<20} {curr_avg_corr:>12.4f} {new_avg_corr:>12.4f} "
-              f"{new_avg_corr - curr_avg_corr:>+12.4f}")
-        print(f"  {'Max Correlation':<20} {curr_max_corr:>12.4f} {new_max_corr:>12.4f} "
-              f"{new_max_corr - curr_max_corr:>+12.4f}")
+            print(f"\n  PROPOSED SWAP:")
+            print(f"    OUT: {drop_entry['run_name']}_{drop_entry['agent_id']} "
+                  f"(fitness: {drop_entry['gauntlet_score']:.2f})")
+            print(f"    IN:  {candidate_entry['run_name']}_{candidate_entry['agent_id']} "
+                  f"(fitness: {candidate_entry['gauntlet_score']:.2f})")
 
-        # Single confirmation prompt with all info visible
-        print(f"\n  → Accept this swap?")
-        confirm = input("    [y/N]: ").strip().lower()
+            new_agent_corr_with_kept = corr_matrix[candidate_idx, keep_idx]
+            print(f"    New pair correlation: {new_agent_corr_with_kept:.4f} "
+                  f"(was {max_corr:.4f}, Δ{new_agent_corr_with_kept - max_corr:+.4f})")
 
-        if confirm == 'y':
-            current_indices = new_indices
-            swap_count += 1
-            print(f"\n  ✓ Swap #{swap_count} confirmed.")
+            print(f"\n  {'METRIC':<20} {'BEFORE':>12} {'AFTER':>12} {'CHANGE':>12}")
+            print(f"  {'-'*56}")
+            print(f"  {'Objective':<20} {curr_obj:>12.2f} {new_obj:>12.2f} "
+                  f"{new_obj - curr_obj:>+12.2f}")
+            print(f"  {'Aggregate Score':<20} {curr_score_sum:>12.2f} {new_score_sum:>12.2f} "
+                  f"{new_score_sum - curr_score_sum:>+12.2f}")
+            print(f"  {'Avg Correlation':<20} {curr_avg_corr:>12.4f} {new_avg_corr:>12.4f} "
+                  f"{new_avg_corr - curr_avg_corr:>+12.4f}")
+            print(f"  {'Max Correlation':<20} {curr_max_corr:>12.4f} {new_max_corr:>12.4f} "
+                  f"{new_max_corr - curr_max_corr:>+12.4f}")
+
+            print(f"\n  → Accept this swap?")
+            confirm = input("    [y/N]: ").strip().lower()
+
+            if confirm in ('y', 'yes'):
+                current_indices = new_indices
+                swap_count += 1
+                print(f"\n  ✓ Swap #{swap_count} confirmed.")
+            else:
+                print(f"\n  ✗ Swap cancelled. Keeping current composition.")
+                print(f"\n  ✓ Committee composition confirmed.")
+                break
         else:
-            print(f"\n  ✗ Swap cancelled. Keeping current composition.")
-            # Don't break - still offer to check the next highest correlation pair
-            # But since we declined this swap, the user probably wants to stop
-            print(f"\n  ✓ Committee composition confirmed.")
-            break
+            # Two different options - show both
+            print(f"\n  TWO SWAP OPTIONS AVAILABLE:")
+            print(f"    OUT: {drop_entry['run_name']}_{drop_entry['agent_id']} "
+                  f"(fitness: {drop_entry['gauntlet_score']:.2f})")
+
+            # Option 1: Best for objective
+            print(f"\n  [1] BEST FOR OBJECTIVE:")
+            print(f"      IN:  {obj_candidate_entry['run_name']}_{obj_candidate_entry['agent_id']} "
+                  f"(fitness: {obj_candidate_entry['gauntlet_score']:.2f})")
+            obj_corr_with_kept = corr_matrix[obj_candidate_idx, keep_idx]
+            print(f"      Pair corr: {obj_corr_with_kept:.4f} (Δ{obj_corr_with_kept - max_corr:+.4f})")
+            print(f"      Objective: {obj_new_obj:.2f} (Δ{obj_new_obj - curr_obj:+.2f}), "
+                  f"Max corr: {obj_new_max_corr:.4f} (Δ{obj_new_max_corr - curr_max_corr:+.4f})")
+
+            # Option 2: Best for max correlation
+            print(f"\n  [2] BEST FOR MAX CORRELATION:")
+            print(f"      IN:  {corr_candidate_entry['run_name']}_{corr_candidate_entry['agent_id']} "
+                  f"(fitness: {corr_candidate_entry['gauntlet_score']:.2f})")
+            corr_corr_with_kept = corr_matrix[corr_candidate_idx, keep_idx]
+            print(f"      Pair corr: {corr_corr_with_kept:.4f} (Δ{corr_corr_with_kept - max_corr:+.4f})")
+            print(f"      Objective: {corr_new_obj:.2f} (Δ{corr_new_obj - curr_obj:+.2f}), "
+                  f"Max corr: {corr_new_max_corr:.4f} (Δ{corr_new_max_corr - curr_max_corr:+.4f})")
+
+            print(f"\n  → Choose swap: [1] objective, [2] max-corr, [N] skip")
+            confirm = input("    [1/2/N]: ").strip().lower()
+
+            if confirm == '1':
+                current_indices = obj_new_indices
+                swap_count += 1
+                print(f"\n  ✓ Swap #{swap_count} confirmed (objective-optimized).")
+            elif confirm == '2':
+                current_indices = corr_new_indices
+                swap_count += 1
+                print(f"\n  ✓ Swap #{swap_count} confirmed (max-corr-optimized).")
+            else:
+                print(f"\n  ✗ Swap cancelled. Keeping current composition.")
+                print(f"\n  ✓ Committee composition confirmed.")
+                break
 
     if swap_count > 0:
         print(f"\n  {'='*56}")
