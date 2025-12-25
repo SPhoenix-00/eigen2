@@ -1223,31 +1223,50 @@ class CommitteeAgent:
 
 def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray) -> np.ndarray:
     """
-    Calculates the 99th percentile conviction threshold for each stock.
+    Calculates the 95th percentile conviction threshold for each stock.
+
+    CRITICAL: Only considers coefficients that would actually trigger a trade
+    (>= Config.COEFFICIENT_THRESHOLD). Including non-trading noise (< 1.0) drags
+    the P95 down, allowing sub-threshold signals to masquerade as 'high conviction'.
 
     Args:
         agent_coeff_history_2d: Numpy array [Days, Stocks] for a single agent
 
     Returns:
-        p99_vector: Numpy array [Stocks] of 99th percentile conviction thresholds
+        p95_vector: Numpy array [Stocks] of 95th percentile conviction thresholds
     """
     days, num_stocks = agent_coeff_history_2d.shape
-    p99_vector = np.zeros(num_stocks, dtype=np.float32)
+    p95_vector = np.zeros(num_stocks, dtype=np.float32)
 
-    # Global P99 fallback for stocks with insufficient data
-    all_active = agent_coeff_history_2d[agent_coeff_history_2d > 0.01]
-    global_p99 = np.percentile(all_active, 99) if len(all_active) > 0 else 0.0
+    # Filter: Only look at coefficients that are actual trades
+    # We use Config.COEFFICIENT_THRESHOLD (1.0) as the floor
+    valid_trades_mask = agent_coeff_history_2d >= Config.COEFFICIENT_THRESHOLD
+    all_active = agent_coeff_history_2d[valid_trades_mask]
+
+    # Calculate Global P95 fallback
+    # If the agent has NEVER traded (or very rarely), we set a high fallback
+    # so it cannot easily trigger conviction on noise.
+    if len(all_active) > 0:
+        global_p95 = np.percentile(all_active, 95)
+    else:
+        # Agent is a ghost (no trades > 1.0). Set P95 to infinity to disable conviction.
+        global_p95 = 100.0
 
     for i in range(num_stocks):
+        # Extract history for this specific stock
         stock_coeffs = agent_coeff_history_2d[:, i]
-        active_coeffs = stock_coeffs[stock_coeffs > 0.01]
+
+        # Only calculate P95 based on actual trades for this stock
+        active_coeffs = stock_coeffs[stock_coeffs >= Config.COEFFICIENT_THRESHOLD]
 
         if len(active_coeffs) >= 20:
-            p99_vector[i] = np.percentile(active_coeffs, 99)
+            # Sufficient history for this stock
+            p95_vector[i] = np.percentile(active_coeffs, 95)
         else:
-            p99_vector[i] = global_p99
+            # Insufficient history, fallback to global P95
+            p95_vector[i] = global_p95
 
-    return p99_vector
+    return p95_vector
 
 
 # --- Validation ---

@@ -48,7 +48,8 @@
       "Bash(find:*)",
       "Bash(grep:*)",
       "Bash(gsutil cat:*)",
-      "Bash(git diff:*)"
+      "Bash(git diff:*)",
+      "Bash(gcloud storage ls:*)"
     ],
     "deny": [],
     "ask": []
