@@ -574,6 +574,7 @@ class TradingEnvironment(gym.Env):
                     'exit_price': exit_price,
                     'days_held': position.days_held,
                     'gain_pct': gain_pct,
+                    'coefficient': position.coefficient,
                     'base_reward': base_reward,
                     'forced_exit_penalty': forced_exit_penalty,
                     'reward': reward,

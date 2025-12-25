@@ -1678,10 +1678,10 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
 
             # Write CSV with explicit column ordering for readability
             import csv
-            # Define preferred column order (new fields: stock_name, exit_date)
+            # Define preferred column order (new fields: stock_name, exit_date, coefficient)
             preferred_columns = [
                 'stock_id', 'stock_name', 'entry_date', 'exit_date', 'days_held',
-                'entry_price', 'exit_price', 'gain_pct', 'reason',
+                'entry_price', 'exit_price', 'gain_pct', 'coefficient', 'reason',
                 'base_reward', 'forced_exit_penalty', 'reward', 'day', 'action'
             ]
             # Get actual columns from first trade, preserving any extras
@@ -1954,7 +1954,7 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
             }
             members_with_stats.append(member_data)
             print(f"  ✓ {e['run_name']}_{e['agent_id']}: "
-                  f"p99_mean={np.mean(conviction_threshold_vector):.3f}")
+                  f"p95_mean={np.mean(conviction_threshold_vector):.3f}")
         else:
             print(f"  ⚠ {e['run_name']}_{e['agent_id']}: No coefficient data available")
 
