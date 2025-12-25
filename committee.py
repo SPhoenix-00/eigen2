@@ -899,7 +899,17 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
             print("  No valid pairs found in committee.")
             break
 
-        # Display the high-correlation pair
+        # Find best replacement BEFORE asking user
+        (candidate_idx, new_indices, new_obj, new_score_sum,
+         new_avg_corr, new_max_corr, candidate_entry) = find_best_swap_candidate(
+            current_indices, drop_idx, entries, corr_matrix
+        )
+
+        if candidate_idx is None:
+            print("  ⚠ No valid replacement found for highest correlation pair.")
+            break
+
+        # Display the complete swap proposal upfront
         print(f"\n  {'─'*56}")
         print(f"  HIGHEST CORRELATION PAIR:")
         print(f"    Agent A: {drop_entry['run_name']}_{drop_entry['agent_id']} "
@@ -907,37 +917,17 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
         print(f"    Agent B: {keep_entry['run_name']}_{keep_entry['agent_id']} "
               f"(fitness: {keep_entry['gauntlet_score']:.2f})")
         print(f"    Correlation: {max_corr:.4f}")
-        print(f"\n  Current Committee Metrics:")
-        print(f"    Objective: {curr_obj:.2f}")
-        print(f"    Aggregate Score: {curr_score_sum:.2f}")
-        print(f"    Avg Correlation: {curr_avg_corr:.4f}")
-        print(f"    Max Correlation: {curr_max_corr:.4f}")
 
-        # Ask if user wants to swap
-        print(f"\n  → Swap out {drop_entry['run_name']}_{drop_entry['agent_id']} (lower fitness)?")
-        response = input("    [y/N]: ").strip().lower()
-
-        if response != 'y':
-            print(f"\n  ✓ Committee composition confirmed.")
-            break
-
-        # Find best replacement
-        print(f"\n  Searching for best replacement across Global50...")
-        (candidate_idx, new_indices, new_obj, new_score_sum,
-         new_avg_corr, new_max_corr, candidate_entry) = find_best_swap_candidate(
-            current_indices, drop_idx, entries, corr_matrix
-        )
-
-        if candidate_idx is None:
-            print("  ⚠ No valid replacement found.")
-            break
-
-        # Show comparison
         print(f"\n  PROPOSED SWAP:")
         print(f"    OUT: {drop_entry['run_name']}_{drop_entry['agent_id']} "
               f"(fitness: {drop_entry['gauntlet_score']:.2f})")
         print(f"    IN:  {candidate_entry['run_name']}_{candidate_entry['agent_id']} "
               f"(fitness: {candidate_entry['gauntlet_score']:.2f})")
+
+        # Calculate correlation of new agent with the kept agent from the pair
+        new_agent_corr_with_kept = corr_matrix[candidate_idx, keep_idx]
+        print(f"    New pair correlation: {new_agent_corr_with_kept:.4f} "
+              f"(was {max_corr:.4f}, Δ{new_agent_corr_with_kept - max_corr:+.4f})")
 
         print(f"\n  {'METRIC':<20} {'BEFORE':>12} {'AFTER':>12} {'CHANGE':>12}")
         print(f"  {'-'*56}")
@@ -950,8 +940,8 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
         print(f"  {'Max Correlation':<20} {curr_max_corr:>12.4f} {new_max_corr:>12.4f} "
               f"{new_max_corr - curr_max_corr:>+12.4f}")
 
-        # Confirm swap
-        print(f"\n  → Confirm this swap?")
+        # Single confirmation prompt with all info visible
+        print(f"\n  → Accept this swap?")
         confirm = input("    [y/N]: ").strip().lower()
 
         if confirm == 'y':
