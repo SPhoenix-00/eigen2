@@ -728,9 +728,19 @@ def committee_objective(indices: tuple, entries: list, corr_matrix: np.ndarray) 
 
     avg_corr = np.mean(pairs) if pairs else 0.0
 
-    # Objective with linear correlation penalty (no exponent)
-    # This properly rewards anti-correlation and penalizes positive correlation
-    multiplier = 1.0 - avg_corr
+    # Objective with directional correlation penalty
+    # The multiplier must push the objective AWAY from zero when correlation is high.
+    #
+    # If score_sum > 0: High correlation should reduce it (multiply by < 1)
+    # If score_sum < 0: High correlation should make it MORE negative (multiply by > 1)
+    #
+    # Without this fix, negative scores get "shrunk" toward zero by high correlation,
+    # causing the optimizer to favor redundant failure over diverse success.
+    if score_sum >= 0:
+        multiplier = 1.0 - avg_corr
+    else:
+        multiplier = 1.0 + avg_corr
+
     objective = score_sum * multiplier
 
     return objective, score_sum, avg_corr, max_corr
