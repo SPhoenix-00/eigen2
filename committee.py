@@ -557,12 +557,21 @@ def calculate_coefficient_correlations(entries: list, data_tensor: torch.Tensor,
             continue
 
         with torch.no_grad():
-            # Get coefficient predictions [Days, Stocks, 2]
-            actions = agent.actor(data_tensor).cpu().numpy()
+            # Process in batches to avoid OOM on large validation sets
+            batch_size = 32
+            num_samples = data_tensor.shape[0]
+            all_coefs = []
 
-        # Extract coefficients (first output dimension)
-        # Flatten to 1D for correlation: [Days * Stocks]
-        coefs = actions[:, :, 0].flatten()
+            for start_idx in range(0, num_samples, batch_size):
+                end_idx = min(start_idx + batch_size, num_samples)
+                batch = data_tensor[start_idx:end_idx]
+                batch_actions = agent.actor(batch).cpu().numpy()
+                # Extract coefficients (first output dimension)
+                all_coefs.append(batch_actions[:, :, 0])
+
+            # Concatenate and flatten to 1D for correlation: [Days * Stocks]
+            coefs = np.concatenate(all_coefs, axis=0).flatten()
+
         coefficients[idx] = coefs
         loaded_agents.append(agent)
 
