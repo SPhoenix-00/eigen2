@@ -521,14 +521,15 @@ def get_agent_filepath(entry: dict, context_window_days: int) -> Path:
 
 # --- Correlation Calculation ---
 
-def calculate_coefficient_correlations(entries: list, holdout_tensor: torch.Tensor,
+def calculate_coefficient_correlations(entries: list, data_tensor: torch.Tensor,
                                         context_window_days: int) -> tuple:
     """
     Calculate pairwise coefficient correlations between agents.
 
     Args:
         entries: List of Global50 entry dicts
-        holdout_tensor: Prepared holdout data tensor [Days, Context, Stocks, Features]
+        data_tensor: Prepared data tensor [Days, Context, Stocks, Features]
+                     (typically validation data to avoid holdout leakage)
         context_window_days: Context window for filepath lookup
 
     Returns:
@@ -557,7 +558,7 @@ def calculate_coefficient_correlations(entries: list, holdout_tensor: torch.Tens
 
         with torch.no_grad():
             # Get coefficient predictions [Days, Stocks, 2]
-            actions = agent.actor(holdout_tensor).cpu().numpy()
+            actions = agent.actor(data_tensor).cpu().numpy()
 
         # Extract coefficients (first output dimension)
         # Flatten to 1D for correlation: [Days * Stocks]
