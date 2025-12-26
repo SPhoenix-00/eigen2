@@ -1,3 +1,16 @@
+# Project Eigen 2 Requirements
+# =============================
+#
+# GPU Support: This project supports both NVIDIA (CUDA) and AMD (ROCm) GPUs.
+#
+# For NVIDIA GPUs (CUDA):
+#   pip install -r requirements.txt
+#
+# For AMD GPUs (ROCm):
+#   pip install -r requirements_rocm.txt
+#
+# The codebase automatically detects your GPU backend and configures itself.
+
 torch>=2.0.0
 numpy>=1.24.0
 pandas>=2.0.0

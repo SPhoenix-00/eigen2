@@ -54,8 +54,8 @@ class DDPGAgent:
             weight_decay=Config.WEIGHT_DECAY
         )
 
-        self.actor_scaler = GradScaler('cuda')
-        self.critic_scaler = GradScaler('cuda')
+        self.actor_scaler = GradScaler(Config.DEVICE_TYPE)
+        self.critic_scaler = GradScaler(Config.DEVICE_TYPE)
         
         # Exploration noise
         self.noise_scale = Config.NOISE_SCALE
@@ -182,7 +182,7 @@ class DDPGAgent:
             # Compute target: r + gamma * Q_target(s', a')
             target_q = rewards + (1 - dones) * Config.GAMMA * target_q
         
-        with autocast(device_type='cuda'):
+        with autocast(device_type=Config.DEVICE_TYPE):
             current_q = self.critic(states, actions)
             critic_loss = nn.MSELoss()(current_q, target_q)
         
@@ -205,7 +205,7 @@ class DDPGAgent:
         for param in self.critic.parameters():
             param.requires_grad = False
         
-        with autocast(device_type='cuda'):
+        with autocast(device_type=Config.DEVICE_TYPE):
             actor_actions = self.actor(states)
             actor_loss = -self.critic(states, actor_actions).mean()
         

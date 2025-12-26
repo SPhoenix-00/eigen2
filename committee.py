@@ -2477,8 +2477,8 @@ if __name__ == "__main__":
         exit(0)
 
     print("Initializing Committee Engine...")
-    Config.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  Device: {Config.DEVICE}")
+    # Device is already set by Config using device abstraction
+    print(f"  Device: {Config.DEVICE} ({Config.GPU_BACKEND})")
 
     context_window_days = Config.CONTEXT_WINDOW_DAYS
     manager = CommitteeManager(context_window_days)

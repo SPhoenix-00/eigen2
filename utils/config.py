@@ -6,6 +6,8 @@ All hyperparameters and settings in one place
 import torch
 from pathlib import Path
 
+from utils.device import get_device, get_device_type, get_gpu_backend
+
 class Config:
     # ============ Data Parameters ============
     DATA_PATH = Path(__file__).parent.parent / "Eigen2_Master_PY_OUTPUT.pkl"
@@ -178,10 +180,15 @@ class Config:
     GRADIENT_ACCUMULATION_STEPS = 1
     
     # ============ Training Parameters ============
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device configuration - supports both NVIDIA (CUDA) and AMD (ROCm) GPUs
+    DEVICE = get_device()  # Auto-detects GPU backend
+    DEVICE_TYPE = get_device_type()  # For autocast/GradScaler ("cuda" or "cpu")
+    GPU_BACKEND = get_gpu_backend()  # "CUDA", "ROCm", or "CPU"
+
     NUM_WORKERS = 6  # For data loading (deprecated, kept for compatibility)
     NUM_DATALOADER_WORKERS = 6  # Number of background workers for async batch loading
-    # With 4 workers, batches are prepared in parallel while GPU trains
+    PREFETCH_FACTOR = 2  # Batches to prefetch per worker
+    # With 6 workers and prefetch=2, up to 12 batches prepared ahead
     # Higher = more CPU usage but better GPU utilization
     # NOTE: Random seed is now set dynamically per wandb run in ERLTrainer
     # This ensures parallel runs have unique, independent behavior
@@ -279,9 +286,11 @@ class Config:
         cls.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         cls.LOG_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Check GPU availability
+        # Check GPU availability and display backend info
         if not torch.cuda.is_available():
-            print("WARNING: CUDA not available. Training will be slow on CPU.")
+            print("WARNING: No GPU detected. Training will be slow on CPU.")
+        else:
+            print(f"GPU Backend: {cls.GPU_BACKEND} ({torch.cuda.get_device_name(0)})")
         
         if errors:
             print("\n".join(errors))

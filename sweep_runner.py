@@ -17,11 +17,14 @@ from data.loader import StockDataLoader
 def set_seed(seed: int = 42):
     """Set random seeds for reproducibility."""
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # cuDNN settings (works for both CUDA and ROCm)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def train_with_config():

@@ -4,8 +4,10 @@ Evolutionary Reinforcement Learning for Stock Trading
 """
 
 import os
-# Fix PyTorch memory fragmentation (must be set before importing torch)
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+# GPU environment setup must happen before importing torch
+# This sets PYTORCH_CUDA_ALLOC_CONF (NVIDIA) or PYTORCH_HIP_ALLOC_CONF (AMD)
+from utils.device import setup_gpu_environment
+setup_gpu_environment()
 
 import argparse
 import torch
@@ -65,11 +67,14 @@ class TeeLogger:
 def set_seed(seed: int = 42):
     """Set random seeds for reproducibility."""
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # cuDNN settings (works for both CUDA and ROCm)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def main():

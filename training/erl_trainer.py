@@ -1210,7 +1210,7 @@ class ERLTrainer:
             batch_size=None,  # Already batched by __iter__
             num_workers=Config.NUM_DATALOADER_WORKERS,
             pin_memory=True,  # Faster GPU transfer
-            prefetch_factor=2,  # Each worker prefetches 2 batches ahead
+            prefetch_factor=Config.PREFETCH_FACTOR,  # Each worker prefetches batches ahead
             persistent_workers=True  # Keep workers alive between epochs
         )
         # Reset iterator when creating new DataLoader
