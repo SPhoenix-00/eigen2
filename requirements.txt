@@ -1,17 +1,13 @@
 # Project Eigen 2 Requirements
 # =============================
 #
-# GPU Support: This project supports both NVIDIA (CUDA) and AMD (ROCm) GPUs.
+# For Runpod ROCm deployments (runpod/pytorch:2.4.0-py3.10-rocm6.1.0-ubuntu22.04):
+#   - PyTorch is pre-installed with ROCm support, DO NOT reinstall
+#   - Just run: pip install -r requirements.txt
 #
-# For NVIDIA GPUs (CUDA):
-#   pip install -r requirements.txt
-#
-# For AMD GPUs (ROCm):
-#   pip install -r requirements_rocm.txt
-#
-# The codebase automatically detects your GPU backend and configures itself.
+# The codebase automatically detects CUDA or ROCm backends.
 
-torch>=2.0.0
+# NOTE: torch is NOT listed here - use the pre-installed ROCm PyTorch from the base image
 numpy>=1.24.0
 pandas>=2.0.0
 gymnasium>=0.29.0

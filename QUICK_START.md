@@ -3,7 +3,7 @@
 ## Prerequisites
 - GCS Bucket: `eigen2-checkpoints-ase0`
 - Credentials: `gcs-credentials.json`
-- RunPod account with RTX 4090 instance
+- RunPod account with AMD MI300X instance (ROCm)
 
 ---
 
@@ -11,8 +11,8 @@
 
 ### 1. Create RunPod Instance
 - Go to: https://www.runpod.io/console/gpu-cloud
-- GPU: RTX 4090 (24GB+ VRAM)
-- Template: PyTorch 2.1
+- GPU: AMD MI300X (192GB VRAM) or similar ROCm GPU
+- Template: `runpod/pytorch:2.4.0-py3.10-rocm6.1.0-ubuntu22.04`
 - Disk: 250 GB
 
 ### 2. SSH and Install
@@ -21,9 +21,12 @@ ssh root@YOUR_RUNPOD_HOST -p YOUR_PORT
 
 mkdir -p /workspace && cd /workspace
 rm -rf * .??*
-git clone https://github.com/SPhoenix-00/eigen2.git .
-python3 -m pip install --no-cache-dir -r requirements.txt google-cloud-storage
+git clone -b eigen_rocm https://github.com/SPhoenix-00/eigen2.git .
+pip install -r requirements.txt google-cloud-storage
 ```
+
+> **Note:** PyTorch with ROCm support is pre-installed in the base image.
+> The requirements.txt does NOT include torch to avoid overwriting it.
 
 ### 3. Upload Credentials (from local machine)
 ```bash
@@ -118,16 +121,13 @@ Ctrl+B, then [
 ```bash
 # Check if running (without attaching)
 ps aux | grep python
-nvidia-smi
+rocm-smi              # AMD GPU status (replaces nvidia-smi)
 
 # View logs
 tail -f /workspace/logs/training.log
 
 # W&B Dashboard
 https://wandb.ai/your-username/eigen2-self
-
-# Download metrics to CSV
-python download_metrics.py
 ```
 
 ---
