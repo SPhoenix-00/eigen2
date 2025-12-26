@@ -1997,6 +1997,420 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
     return roster_data
 
 
+# --- Simulation ---
+
+def parse_date_input(date_str: str) -> datetime:
+    """
+    Parse user input date string in DD-MM-YY format.
+
+    Args:
+        date_str: Date string like '29-07-22'
+
+    Returns:
+        datetime object
+
+    Raises:
+        ValueError if format is invalid
+    """
+    try:
+        return datetime.strptime(date_str, "%d-%m-%y")
+    except ValueError:
+        raise ValueError(f"Invalid date format '{date_str}'. Expected DD-MM-YY (e.g., 29-07-22)")
+
+
+def find_date_index(loader, target_date: datetime) -> int:
+    """
+    Find the index in loader.dates that matches or is closest to target_date.
+
+    Args:
+        loader: StockDataLoader with dates array
+        target_date: Target datetime to find
+
+    Returns:
+        Index of matching or nearest date
+
+    Raises:
+        ValueError if date is out of range
+    """
+    # Convert loader dates to datetime objects for comparison
+    loader_dates = []
+    for d in loader.dates:
+        if isinstance(d, str):
+            loader_dates.append(datetime.strptime(d, "%d-%m-%y"))
+        else:
+            # numpy datetime64 or pandas Timestamp
+            loader_dates.append(pd.Timestamp(d).to_pydatetime())
+
+    # Check bounds
+    if target_date < loader_dates[0]:
+        raise ValueError(f"Date {target_date.strftime('%d-%m-%y')} is before dataset start ({loader_dates[0].strftime('%d-%m-%y')})")
+    if target_date > loader_dates[-1]:
+        raise ValueError(f"Date {target_date.strftime('%d-%m-%y')} is after dataset end ({loader_dates[-1].strftime('%d-%m-%y')})")
+
+    # Find exact match or nearest
+    for i, d in enumerate(loader_dates):
+        if d >= target_date:
+            return i
+
+    return len(loader_dates) - 1
+
+
+def simulate_committee_continuous(members: list, loader, stats,
+                                   context_window_days: int,
+                                   start_idx: int,
+                                   trading_end_idx: int,
+                                   settlement_end_idx: int) -> dict:
+    """
+    Run committee simulation continuously over an arbitrary time period.
+
+    Unlike evaluate_committee_on_slice (which uses fixed TRADING_PERIOD_DAYS),
+    this function allows continuous trading for any period length.
+
+    Args:
+        members: List of committee member dicts with agent metadata and stats
+        loader: StockDataLoader instance
+        stats: Normalization statistics
+        context_window_days: Context window for loading agent files
+        start_idx: First trading day index
+        trading_end_idx: Last day to open new positions (user's "last trading day")
+        settlement_end_idx: End of settlement period (exclusive)
+
+    Returns:
+        Dict with comprehensive metrics
+    """
+    from environment.trading_env import TradingEnvironment
+
+    # Create committee agent with consensus tracking
+    committee = CommitteeAgent(members, context_window_days, track_consensus=True)
+
+    # Create trading environment
+    # trading_end_idx controls when new positions stop being opened
+    env = TradingEnvironment(
+        data_array=loader.data_array,
+        dates=loader.dates,
+        normalization_stats=stats,
+        start_idx=start_idx,
+        end_idx=settlement_end_idx,
+        trading_end_idx=trading_end_idx + 1,  # +1 because env uses exclusive end for trading
+        data_array_full=loader.data_array_full,
+        is_training=False,
+        gauntlet_mode=True
+    )
+
+    # Run simulation
+    obs, info = env.reset()
+    terminated = False
+
+    committee.reset_episode()
+
+    while not terminated:
+        held_ids = list(env.open_positions.keys())
+        action = committee.predict_action(obs, held_stock_ids=held_ids)
+        obs, reward, terminated, truncated, info = env.step(action)
+
+    # Get results
+    summary = env.get_episode_summary()
+    consensus_stats = committee.get_consensus_summary()
+
+    # Enrich closed trades
+    closed_trades = summary.get('closed_trades', [])
+    for trade in closed_trades:
+        stock_id = trade.get('stock_id')
+        if stock_id is not None and loader.column_names:
+            actual_col_idx = Config.INVESTABLE_START_COL + stock_id
+            if actual_col_idx < len(loader.column_names):
+                trade['stock_name'] = loader.column_names[actual_col_idx]
+            else:
+                trade['stock_name'] = f"UNKNOWN_{stock_id}"
+        else:
+            trade['stock_name'] = f"UNKNOWN_{stock_id}"
+        trade['exit_date'] = trade.get('day', '')
+
+    # Cleanup
+    committee.cleanup()
+    del env
+    torch.cuda.empty_cache()
+
+    return {
+        'num_trades': summary['num_trades'],
+        'win_rate': summary['win_rate'],
+        'quality_ratio': (summary['num_wins'] / summary['num_losses']) if summary['num_losses'] > 0 else float('inf'),
+        'expectancy': summary['avg_reward_per_trade'],
+        'roi': summary['roi'],
+        'fitness': summary['total_reward'],
+        'consensus_stats': consensus_stats,
+        'closed_trades': closed_trades,
+        'raw_pnl': summary.get('raw_pnl', 0.0),
+        'peak_capital_employed': summary.get('peak_capital_employed', 0.0),
+        'trading_days': trading_end_idx - start_idx + 1,
+        'settlement_days': settlement_end_idx - trading_end_idx - 1,
+    }
+
+
+def run_simulation(manager: CommitteeManager, loader, stats, context_window_days: int):
+    """
+    Interactive simulation mode: Run committee over a user-specified date range.
+
+    This replicates how the committee would actually be deployed:
+    1. User specifies first and last TRADING day
+    2. System automatically adds settlement period after last trading day
+    3. Committee can open new positions continuously until last trading day
+    4. Outputs results and generates .xlsx position tracking file
+
+    Unlike validation mode (which uses fixed 125-day trading periods), simulation
+    mode allows continuous trading for any period length.
+    """
+    print("\n" + "="*60)
+    print("COMMITTEE SIMULATION MODE")
+    print("="*60)
+
+    # Load roster
+    roster = manager.load_roster()
+    if roster is None:
+        print("❌ No committee roster found. Run --draft first.")
+        return None
+
+    members = roster['members']
+    print(f"\n✓ Loaded committee with {len(members)} members")
+
+    # Show available date range
+    first_date = loader.dates[0]
+    last_date = loader.dates[-1]
+
+    # Convert to display format
+    if isinstance(first_date, str):
+        first_date_display = first_date
+    else:
+        first_date_display = pd.Timestamp(first_date).strftime('%d-%m-%y')
+
+    if isinstance(last_date, str):
+        last_date_display = last_date
+    else:
+        last_date_display = pd.Timestamp(last_date).strftime('%d-%m-%y')
+
+    print(f"\n  Dataset date range: {first_date_display} to {last_date_display}")
+    print(f"  Total days in dataset: {len(loader.dates)}")
+    print(f"\n  Simulation structure:")
+    print(f"    Context window: {Config.CONTEXT_WINDOW_DAYS} days (required before first trade)")
+    print(f"    Settlement period: {Config.SETTLEMENT_PERIOD_DAYS} days (auto-added after last trading day)")
+    print(f"\n  NOTE: Unlike validation mode, simulation allows CONTINUOUS trading")
+    print(f"        for any period length (not limited to {Config.TRADING_PERIOD_DAYS}-day episodes).")
+
+    # Get first trading day from user
+    print(f"\n" + "-"*60)
+    print("Enter simulation date range (format: DD-MM-YY)")
+    print("-"*60)
+
+    # Calculate earliest valid first trading day (need context window before it)
+    earliest_first_idx = Config.CONTEXT_WINDOW_DAYS
+    earliest_first_date = loader.dates[earliest_first_idx]
+    if isinstance(earliest_first_date, str):
+        earliest_display = earliest_first_date
+    else:
+        earliest_display = pd.Timestamp(earliest_first_date).strftime('%d-%m-%y')
+
+    print(f"\n  Earliest valid first trading day: {earliest_display}")
+    print(f"    (Requires {Config.CONTEXT_WINDOW_DAYS} days of context before this)")
+
+    while True:
+        first_day_input = input("\n  First trading day: ").strip()
+        try:
+            first_day_dt = parse_date_input(first_day_input)
+            first_day_idx = find_date_index(loader, first_day_dt)
+
+            # Validate we have enough context
+            if first_day_idx < Config.CONTEXT_WINDOW_DAYS:
+                print(f"  ❌ Need at least {Config.CONTEXT_WINDOW_DAYS} days of context before first trading day.")
+                print(f"     Earliest valid: {earliest_display}")
+                continue
+
+            break
+        except ValueError as e:
+            print(f"  ❌ {e}")
+            continue
+
+    # Calculate latest valid last trading day (need room for settlement after)
+    latest_last_idx = len(loader.dates) - Config.SETTLEMENT_PERIOD_DAYS - 1
+    if latest_last_idx <= first_day_idx:
+        print(f"\n❌ Not enough data after {first_day_input} for trading + settlement.")
+        return None
+
+    latest_last_date = loader.dates[latest_last_idx]
+    if isinstance(latest_last_date, str):
+        latest_last_display = latest_last_date
+    else:
+        latest_last_display = pd.Timestamp(latest_last_date).strftime('%d-%m-%y')
+
+    print(f"\n  Latest valid last trading day: {latest_last_display}")
+    print(f"    (Need {Config.SETTLEMENT_PERIOD_DAYS} days after for settlement)")
+
+    while True:
+        last_day_input = input("\n  Last trading day: ").strip()
+        try:
+            last_day_dt = parse_date_input(last_day_input)
+            last_day_idx = find_date_index(loader, last_day_dt)
+
+            # Validate it's after first day
+            if last_day_idx <= first_day_idx:
+                print(f"  ❌ Last trading day must be after first trading day.")
+                continue
+
+            # Validate we have room for settlement
+            settlement_end_idx = last_day_idx + Config.SETTLEMENT_PERIOD_DAYS + 1
+            if settlement_end_idx > len(loader.dates):
+                print(f"  ❌ Not enough data for settlement period after {last_day_input}.")
+                print(f"     Latest valid: {latest_last_display}")
+                continue
+
+            break
+        except ValueError as e:
+            print(f"  ❌ {e}")
+            continue
+
+    # Display simulation parameters
+    actual_first_date = loader.dates[first_day_idx]
+    actual_last_trading_date = loader.dates[last_day_idx]
+    actual_settlement_end_date = loader.dates[settlement_end_idx - 1]
+
+    if isinstance(actual_first_date, str):
+        actual_first_display = actual_first_date
+    else:
+        actual_first_display = pd.Timestamp(actual_first_date).strftime('%d-%m-%y')
+
+    if isinstance(actual_last_trading_date, str):
+        actual_last_trading_display = actual_last_trading_date
+    else:
+        actual_last_trading_display = pd.Timestamp(actual_last_trading_date).strftime('%d-%m-%y')
+
+    if isinstance(actual_settlement_end_date, str):
+        actual_settlement_end_display = actual_settlement_end_date
+    else:
+        actual_settlement_end_display = pd.Timestamp(actual_settlement_end_date).strftime('%d-%m-%y')
+
+    trading_days = last_day_idx - first_day_idx + 1
+    settlement_days = Config.SETTLEMENT_PERIOD_DAYS
+    total_days = trading_days + settlement_days
+
+    print(f"\n" + "="*60)
+    print("SIMULATION PARAMETERS")
+    print("="*60)
+    print(f"  First trading day:  {actual_first_display} (index {first_day_idx})")
+    print(f"  Last trading day:   {actual_last_trading_display} (index {last_day_idx})")
+    print(f"  Settlement ends:    {actual_settlement_end_display} (index {settlement_end_idx - 1})")
+    print(f"  Trading period:     {trading_days} days")
+    print(f"  Settlement period:  {settlement_days} days")
+    print(f"  Total simulation:   {total_days} days")
+    print(f"  Committee size:     {len(members)} members")
+
+    # Confirm before running
+    confirm = input("\n  Proceed with simulation? [Y/n]: ").strip().lower()
+    if confirm in ('n', 'no'):
+        print("  Simulation cancelled.")
+        return None
+
+    # Run the simulation
+    print(f"\n" + "="*60)
+    print("RUNNING SIMULATION")
+    print("="*60)
+
+    # Use continuous simulation
+    metrics = simulate_committee_continuous(
+        members, loader, stats, context_window_days,
+        start_idx=first_day_idx,
+        trading_end_idx=last_day_idx,
+        settlement_end_idx=settlement_end_idx
+    )
+
+    # Display results
+    print(f"\n" + "="*60)
+    print("SIMULATION RESULTS")
+    print("="*60)
+    print(f"\n  Period: {actual_first_display} to {actual_settlement_end_display}")
+    print(f"    Trading: {actual_first_display} to {actual_last_trading_display} ({metrics.get('trading_days', trading_days)} days)")
+    print(f"    Settlement: {metrics.get('settlement_days', settlement_days)} days")
+    print(f"\n  Performance Metrics:")
+    print(f"    Fitness:       {metrics.get('fitness', 0.0):.2f}")
+    print(f"    Win Rate:      {metrics.get('win_rate', 0.0):.2%}")
+    print(f"    Quality Ratio: {metrics.get('quality_ratio', 0.0):.3f}")
+    print(f"    Expectancy:    {metrics.get('expectancy', 0.0):.6f}")
+    print(f"    ROI:           {metrics.get('roi', 0.0):.2f}%")
+    print(f"    Raw P&L:       ${metrics.get('raw_pnl', 0.0):.2f}")
+    print(f"    Peak Capital:  ${metrics.get('peak_capital_employed', 0.0):.2f}")
+    print(f"    Total Trades:  {metrics.get('num_trades', 0)}")
+
+    # Display consensus stats
+    cs = metrics.get('consensus_stats', {})
+    if 'avg_consensus_votes' in cs:
+        print(f"\n  Consensus Statistics:")
+        print(f"    Unanimity Rate:    {cs.get('unanimity_pct', 0):.1f}%")
+        print(f"    Min Consensus:     {cs.get('min_consensus_pct', 0):.1f}%")
+        print(f"    Avg Votes/Trade:   {cs.get('avg_consensus_votes', 0):.2f}")
+        print(f"    Trades by Quorum:  {cs.get('trades_by_quorum', 0)}")
+        print(f"    Trades by Conviction: {cs.get('trades_by_conviction', 0)}")
+        print(f"    Trades Vetoed:     {cs.get('trades_vetoed', 0)}")
+
+    # Save trades to CSV
+    closed_trades = metrics.get('closed_trades', [])
+    if closed_trades:
+        # Generate unique filename with simulation date range (trading period)
+        csv_filename = f"simulation_{actual_first_display.replace('-', '')}_to_{actual_last_trading_display.replace('-', '')}.csv"
+        csv_path = manager.local_committee_dir / csv_filename
+
+        import csv
+        preferred_columns = [
+            'stock_id', 'stock_name', 'entry_date', 'exit_date', 'days_held',
+            'entry_price', 'exit_price', 'gain_pct', 'coefficient', 'reason',
+            'base_reward', 'forced_exit_penalty', 'reward', 'day', 'action'
+        ]
+        actual_columns = list(closed_trades[0].keys())
+        fieldnames = [c for c in preferred_columns if c in actual_columns]
+        fieldnames += [c for c in actual_columns if c not in fieldnames]
+
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(closed_trades)
+
+        print(f"\n  Trades CSV saved: {csv_path}")
+
+        # Generate .xlsx position tracking file using transform_trades_to_positions
+        from transform_trades_to_positions import transform_trades_to_positions
+
+        xlsx_path = csv_path.parent / f"{csv_path.stem}_positions.xlsx"
+
+        print(f"\n  Generating position tracking Excel file...")
+        try:
+            transform_trades_to_positions(str(csv_path), str(xlsx_path))
+            print(f"  ✓ Position tracking saved: {xlsx_path}")
+        except Exception as e:
+            print(f"  ⚠ Failed to generate Excel file: {e}")
+
+        # Upload to cloud
+        if manager.cloud_sync.provider != "local":
+            print(f"\n  Syncing to cloud...")
+            cloud_csv_path = f"{manager.cloud_committee_base}/{csv_filename}"
+            if manager.cloud_sync.upload_file_verified(str(csv_path), cloud_csv_path):
+                print(f"    ✓ Uploaded: {csv_filename}")
+            else:
+                print(f"    ✗ Failed to upload: {csv_filename}")
+
+            xlsx_filename = f"{csv_path.stem}_positions.xlsx"
+            cloud_xlsx_path = f"{manager.cloud_committee_base}/{xlsx_filename}"
+            if xlsx_path.exists():
+                if manager.cloud_sync.upload_file_verified(str(xlsx_path), cloud_xlsx_path):
+                    print(f"    ✓ Uploaded: {xlsx_filename}")
+                else:
+                    print(f"    ✗ Failed to upload: {xlsx_filename}")
+    else:
+        print(f"\n  ⚠ No trades were executed during this simulation period.")
+
+    print(f"\n" + "="*60)
+    print("SIMULATION COMPLETE")
+    print("="*60)
+
+    return metrics
+
+
 # --- Main ---
 
 if __name__ == "__main__":
@@ -2009,15 +2423,18 @@ if __name__ == "__main__":
                         help='Only verify data split')
     parser.add_argument('--mirror', action='store_true',
                         help='Check cloud sync status, download missing files')
+    parser.add_argument('--simulate', action='store_true',
+                        help='Simulate committee deployment over a custom date range')
     args = parser.parse_args()
 
-    if not args.draft and not args.validate and not args.verify_only and not args.mirror:
-        print("Usage: python committee.py [--draft] [--validate] [--verify-only] [--mirror]")
+    if not args.draft and not args.validate and not args.verify_only and not args.mirror and not args.simulate:
+        print("Usage: python committee.py [--draft] [--validate] [--verify-only] [--mirror] [--simulate]")
         print("\nOptions:")
         print("  --draft        Run Phase 1: Draft committee from Global50")
         print("  --validate     Run Phase 2: Validate committee on holdout slices")
         print("  --verify-only  Verify data split without running")
         print("  --mirror       Check cloud sync status, download missing files")
+        print("  --simulate     Simulate committee deployment over a custom date range")
         exit(0)
 
     print("Initializing Committee Engine...")
@@ -2077,3 +2494,6 @@ if __name__ == "__main__":
                 roster['validation'] = validation_results
                 manager.save_roster(roster)
                 print(f"\n✓ Validation results added and synced to cloud")
+
+    if args.simulate:
+        run_simulation(manager, loader, stats, context_window_days)

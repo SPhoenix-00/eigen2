@@ -37,3 +37,6 @@ wandb/
 .gcloud/
 .azure/
 nul
+
+# Results
+committee_results/

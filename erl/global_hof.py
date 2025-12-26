@@ -466,25 +466,32 @@ class GlobalHallOfFame:
         if self.league_rules.context_window_days != 504:
             old_cloud_json_path = f"{self.cloud_sync.project_name}/global50/global50.json"
             import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=True) as tmp:
-                try:
-                    success = self.cloud_sync.download_file(old_cloud_json_path, tmp.name, silent=True)
-                    if success:
-                        # Load to get entry count
-                        with open(tmp.name, 'r') as f:
-                            data = json.load(f)
-                        entry_count = len(data.get('entries', []))
+            # Use delete=False to avoid FileNotFoundError when download fails on new instances
+            # (download_file may remove the temp file if the source doesn't exist in GCS)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                    tmp_path = tmp.name
+                success = self.cloud_sync.download_file(old_cloud_json_path, tmp_path, silent=True)
+                if success:
+                    # Load to get entry count
+                    with open(tmp_path, 'r') as f:
+                        data = json.load(f)
+                    entry_count = len(data.get('entries', []))
 
-                        self.fallback_leagues.append({
-                            'context_window_days': 504,
-                            'context_window_id': 'legacy',  # Special ID for old structure
-                            'entry_count': entry_count,
-                            'cloud_base': f"{self.cloud_sync.project_name}/global50",  # No subdirectory
-                            'is_legacy': True
-                        })
-                        print(f"  ✓ Found legacy fallback: 504 days (legacy structure, {entry_count} agents)")
-                except Exception:
-                    pass  # Doesn't exist, skip
+                    self.fallback_leagues.append({
+                        'context_window_days': 504,
+                        'context_window_id': 'legacy',  # Special ID for old structure
+                        'entry_count': entry_count,
+                        'cloud_base': f"{self.cloud_sync.project_name}/global50",  # No subdirectory
+                        'is_legacy': True
+                    })
+                    print(f"  ✓ Found legacy fallback: 504 days (legacy structure, {entry_count} agents)")
+            except Exception:
+                pass  # Doesn't exist or download failed, skip
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
         # Dynamically discover available context window leagues from GCS
         available_windows = []
