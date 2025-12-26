@@ -1696,6 +1696,27 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
                     writer.writeheader()
                     writer.writerows(closed_trades)
 
+            # Generate xlsx position tracking file
+            xlsx_path = csv_path.parent / f"{csv_path.stem}_positions.xlsx"
+            try:
+                from transform_trades_to_positions import transform_trades_to_positions
+
+                # Parse slice dates for the full range
+                slice_start_dt = datetime.strptime(start_date, "%d-%m-%y")
+                slice_end_dt = datetime.strptime(end_date, "%d-%m-%y")
+
+                transform_trades_to_positions(
+                    str(csv_path), str(xlsx_path),
+                    start_date=slice_start_dt, end_date=slice_end_dt
+                )
+                print(f"  ✓ Generated xlsx: {xlsx_path.name}")
+            except ImportError:
+                print(f"  ⚠ openpyxl not installed - skipping xlsx generation")
+                xlsx_path = None
+            except Exception as e:
+                print(f"  ⚠ Failed to generate xlsx: {e}")
+                xlsx_path = None
+
             # Upload to cloud
             cloud_csv_path = f"{manager.cloud_committee_base}/{csv_filename}"
             if manager.cloud_sync.provider != "local":
@@ -1703,6 +1724,15 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
                     print(f"  ✓ Uploaded CSV: {csv_filename}")
                 else:
                     print(f"  ✗ Failed to upload CSV: {csv_filename}")
+
+                # Upload xlsx if it exists
+                if xlsx_path and xlsx_path.exists():
+                    xlsx_filename = xlsx_path.name
+                    cloud_xlsx_path = f"{manager.cloud_committee_base}/{xlsx_filename}"
+                    if manager.cloud_sync.upload_file_verified(str(xlsx_path), cloud_xlsx_path):
+                        print(f"  ✓ Uploaded xlsx: {xlsx_filename}")
+                    else:
+                        print(f"  ✗ Failed to upload xlsx: {xlsx_filename}")
 
         slice_result = {
             'slice': s,
@@ -2374,14 +2404,23 @@ def run_simulation(manager: CommitteeManager, loader, stats, context_window_days
         print(f"\n  Trades CSV saved: {csv_path}")
 
         # Generate .xlsx position tracking file using transform_trades_to_positions
-        from transform_trades_to_positions import transform_trades_to_positions
-
         xlsx_path = csv_path.parent / f"{csv_path.stem}_positions.xlsx"
 
         print(f"\n  Generating position tracking Excel file...")
         try:
-            transform_trades_to_positions(str(csv_path), str(xlsx_path))
+            from transform_trades_to_positions import transform_trades_to_positions
+
+            # Parse simulation dates for the full range (trading + settlement)
+            sim_start = datetime.strptime(actual_first_display, "%d-%m-%y")
+            sim_end = datetime.strptime(actual_settlement_end_display, "%d-%m-%y")
+
+            transform_trades_to_positions(
+                str(csv_path), str(xlsx_path),
+                start_date=sim_start, end_date=sim_end
+            )
             print(f"  ✓ Position tracking saved: {xlsx_path}")
+        except ImportError:
+            print(f"  ⚠ openpyxl not installed. Install with: pip install openpyxl")
         except Exception as e:
             print(f"  ⚠ Failed to generate Excel file: {e}")
 

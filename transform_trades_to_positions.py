@@ -19,30 +19,71 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 
 def parse_date(date_str: str) -> datetime:
-    """Parse date string in DD-MM-YY format."""
-    return datetime.strptime(date_str, "%d-%m-%y")
+    """Parse date string in various formats."""
+    # Handle various date formats
+    formats = [
+        "%d-%m-%y",      # 02-01-24
+        "%Y-%m-%d",      # 2024-01-02
+        "%d/%m/%y",      # 02/01/24
+        "%d/%m/%Y",      # 02/01/2024
+        "%Y-%m-%d %H:%M:%S",  # 2024-01-02 00:00:00
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(str(date_str).split()[0] if ' ' in str(date_str) else str(date_str), fmt)
+        except ValueError:
+            continue
+
+    raise ValueError(f"Cannot parse date: {date_str}")
 
 
 def extract_date_range_from_filename(filename: str) -> tuple:
     """
     Extract start and end dates from filename pattern like:
-    '..._29-07-22_to_10-03-23.csv'
+    '..._29-07-22_to_10-03-23.csv' (with hyphens)
+    or
+    '..._290722_to_100323.csv' (without hyphens)
 
     Returns:
         (start_date, end_date) as datetime objects, or (None, None) if not found
     """
     import re
-    pattern = r'(\d{2}-\d{2}-\d{2})_to_(\d{2}-\d{2}-\d{2})'
-    match = re.search(pattern, filename)
+
+    # Pattern 1: DD-MM-YY_to_DD-MM-YY (with hyphens)
+    pattern1 = r'(\d{2}-\d{2}-\d{2})_to_(\d{2}-\d{2}-\d{2})'
+    match = re.search(pattern1, filename)
     if match:
         start_str, end_str = match.groups()
         return parse_date(start_str), parse_date(end_str)
+
+    # Pattern 2: DDMMYY_to_DDMMYY (without hyphens)
+    pattern2 = r'(\d{6})_to_(\d{6})'
+    match = re.search(pattern2, filename)
+    if match:
+        start_str, end_str = match.groups()
+        # Convert DDMMYY to DD-MM-YY
+        start_formatted = f"{start_str[:2]}-{start_str[2:4]}-{start_str[4:]}"
+        end_formatted = f"{end_str[:2]}-{end_str[2:4]}-{end_str[4:]}"
+        return parse_date(start_formatted), parse_date(end_formatted)
+
     return None, None
 
 
-def transform_trades_to_positions(csv_path: str, output_path: str = None) -> pd.DataFrame:
+def transform_trades_to_positions(csv_path: str, output_path: str = None,
+                                   start_date: datetime = None,
+                                   end_date: datetime = None) -> pd.DataFrame:
     """
     Transform trading CSV to multi-sheet Excel workbook.
+
+    Args:
+        csv_path: Path to trades CSV file
+        output_path: Optional path for output Excel file
+        start_date: Optional explicit start date for the date range
+        end_date: Optional explicit end date for the date range
+
+    If start_date/end_date are not provided, attempts to extract from filename,
+    then falls back to the actual trade dates in the CSV.
     """
     # Read the trading data
     df = pd.read_csv(csv_path)
@@ -51,13 +92,18 @@ def transform_trades_to_positions(csv_path: str, output_path: str = None) -> pd.
     df['entry_date_parsed'] = df['entry_date'].apply(parse_date)
     df['exit_date_parsed'] = df['exit_date'].apply(parse_date)
 
-    # Get the full date range from filename
-    input_path = Path(csv_path)
-    min_date, max_date = extract_date_range_from_filename(input_path.name)
+    # Determine date range (priority: explicit params > filename > trade dates)
+    if start_date is not None and end_date is not None:
+        min_date, max_date = start_date, end_date
+    else:
+        # Try to get from filename
+        input_path = Path(csv_path)
+        min_date, max_date = extract_date_range_from_filename(input_path.name)
 
-    if min_date is None or max_date is None:
-        min_date = df['entry_date_parsed'].min()
-        max_date = df['exit_date_parsed'].max()
+        if min_date is None or max_date is None:
+            # Fall back to trade dates
+            min_date = df['entry_date_parsed'].min()
+            max_date = df['exit_date_parsed'].max()
 
     # Create all calendar days in the range
     all_dates = pd.date_range(start=min_date, end=max_date, freq='D')
