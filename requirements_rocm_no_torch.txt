@@ -1,0 +1,29 @@
+# ROCm Requirements (No PyTorch) for Runpod/Docker Deployments
+# =============================================================
+#
+# USE THIS FILE when deploying to environments with pre-installed ROCm PyTorch:
+#   - Runpod: runpod/pytorch:2.4.0-py3.10-rocm6.1.0-ubuntu22.04
+#   - Docker images with ROCm PyTorch pre-installed
+#
+# This file does NOT include torch to avoid overwriting the optimized
+# ROCm-compiled PyTorch that comes with the base image.
+#
+# Installation:
+#   pip install -r requirements_rocm_no_torch.txt
+#
+# For bare-metal installations where you need to install PyTorch:
+#   pip install -r requirements_rocm.txt
+
+# Core dependencies (PyTorch excluded - use pre-installed version)
+numpy>=1.24.0
+pandas>=2.0.0
+gymnasium>=0.29.0
+tensorboard>=2.14.0
+wandb>=0.16.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tqdm>=4.65.0
+pyyaml>=6.0
+psutil>=5.9.0
+pydantic>=2.0.0
+openpyxl>=3.1.0

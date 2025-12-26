@@ -3,10 +3,16 @@
 #
 # This file contains dependencies for AMD GPU (ROCm) support.
 #
-# Installation instructions:
+# IMPORTANT: For Runpod/Docker deployments with pre-installed ROCm PyTorch:
+#   - The base image (e.g., runpod/pytorch:2.4.0-py3.10-rocm6.1.0-ubuntu22.04)
+#     already has PyTorch with ROCm support installed.
+#   - DO NOT run: pip install -r requirements_rocm.txt (it will overwrite PyTorch!)
+#   - Instead run: pip install -r requirements_rocm_no_torch.txt
+#
+# For bare-metal installations:
 #   1. Install ROCm drivers from: https://rocm.docs.amd.com/
 #   2. Upgrade pip: python -m pip install --upgrade pip
-#   3. Install PyTorch with ROCm support:
+#   3. Install all dependencies including PyTorch:
 #      python -m pip install -r requirements_rocm.txt
 #
 # Supported AMD GPUs:
