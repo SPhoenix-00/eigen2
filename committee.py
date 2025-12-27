@@ -1291,52 +1291,104 @@ class CommitteeAgent:
         torch.cuda.empty_cache()
 
 
-def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray) -> np.ndarray:
+def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray,
+                                      percentile: int = 95) -> np.ndarray:
     """
-    Calculates the 95th percentile conviction threshold for each stock.
+    Calculates the Nth percentile conviction threshold for each stock.
 
     CRITICAL: Only considers coefficients that would actually trigger a trade
     (>= Config.COEFFICIENT_THRESHOLD). Including non-trading noise (< 1.0) drags
-    the P95 down, allowing sub-threshold signals to masquerade as 'high conviction'.
+    the percentile down, allowing sub-threshold signals to masquerade as 'high conviction'.
 
     Args:
         agent_coeff_history_2d: Numpy array [Days, Stocks] for a single agent
+        percentile: Percentile to use for conviction threshold (default: 95)
 
     Returns:
-        p95_vector: Numpy array [Stocks] of 95th percentile conviction thresholds
+        threshold_vector: Numpy array [Stocks] of Nth percentile conviction thresholds
     """
     days, num_stocks = agent_coeff_history_2d.shape
-    p95_vector = np.zeros(num_stocks, dtype=np.float32)
+    threshold_vector = np.zeros(num_stocks, dtype=np.float32)
 
     # Filter: Only look at coefficients that are actual trades
     # We use Config.COEFFICIENT_THRESHOLD (1.0) as the floor
     valid_trades_mask = agent_coeff_history_2d >= Config.COEFFICIENT_THRESHOLD
     all_active = agent_coeff_history_2d[valid_trades_mask]
 
-    # Calculate Global P95 fallback
+    # Calculate Global percentile fallback
     # If the agent has NEVER traded (or very rarely), we set a high fallback
     # so it cannot easily trigger conviction on noise.
     if len(all_active) > 0:
-        global_p95 = np.percentile(all_active, 95)
+        global_threshold = np.percentile(all_active, percentile)
     else:
-        # Agent is a ghost (no trades > 1.0). Set P95 to infinity to disable conviction.
-        global_p95 = 100.0
+        # Agent is a ghost (no trades > 1.0). Set threshold to infinity to disable conviction.
+        global_threshold = 100.0
 
     for i in range(num_stocks):
         # Extract history for this specific stock
         stock_coeffs = agent_coeff_history_2d[:, i]
 
-        # Only calculate P95 based on actual trades for this stock
+        # Only calculate percentile based on actual trades for this stock
         active_coeffs = stock_coeffs[stock_coeffs >= Config.COEFFICIENT_THRESHOLD]
 
         if len(active_coeffs) >= 20:
             # Sufficient history for this stock
-            p95_vector[i] = np.percentile(active_coeffs, 95)
+            threshold_vector[i] = np.percentile(active_coeffs, percentile)
         else:
-            # Insufficient history, fallback to global P95
-            p95_vector[i] = global_p95
+            # Insufficient history, fallback to global threshold
+            threshold_vector[i] = global_threshold
 
-    return p95_vector
+    return threshold_vector
+
+
+def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info,
+                                       context_window_days: int, percentile: int) -> list:
+    """
+    Recalculate conviction thresholds for all committee members at a given percentile.
+
+    This creates a deep copy of members with updated conviction_threshold_vector values,
+    avoiding pollution of the original roster data.
+
+    Args:
+        members: Original list of member dicts from roster
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        percentile: Percentile to use for conviction threshold (e.g., 90, 95, 99)
+
+    Returns:
+        New list of member dicts with recalculated conviction thresholds
+    """
+    import copy
+
+    # Deep copy to avoid modifying original
+    new_members = copy.deepcopy(members)
+
+    # Get coefficient history range (validation period only, before holdout)
+    val_start = holdout_info['val_start']
+    val_end = holdout_info['val_end']
+    num_days = val_end - val_start + 1
+    num_stocks = loader.data_array.shape[1]
+
+    for member in new_members:
+        filepath = get_agent_filepath(member, context_window_days)
+        agent = load_agent_actor_only(filepath, 0)
+
+        if agent is not None:
+            # Generate coefficient history on validation data
+            agent_coeffs_1d = generate_coefficient_history(
+                agent, loader, stats, val_start, val_end + 1
+            )
+            agent_coeffs_2d = agent_coeffs_1d.reshape(num_days, num_stocks)
+
+            # Recalculate with new percentile
+            conviction_threshold_vector = calculate_agent_stats_vectorized(
+                agent_coeffs_2d, percentile=percentile
+            )
+            member['stats']['conviction_threshold_vector'] = conviction_threshold_vector.tolist()
+
+    return new_members
 
 
 # --- Validation ---
@@ -1510,9 +1562,19 @@ def evaluate_committee_on_slice(members: list, loader, stats,
 
 
 def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
-                   context_window_days: int) -> dict:
+                   context_window_days: int, members_override: list = None,
+                   conviction_percentile: int = None) -> dict:
     """
     Run 5-slice validation on the committee: 3 slices on validation data, 2 slices on holdout data.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        members_override: Optional pre-computed members list (for A/B testing)
+        conviction_percentile: Optional percentile override (recalculates thresholds if provided)
 
     Returns validation results dict with comprehensive metrics.
     """
@@ -1525,7 +1587,19 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         print(f"❌ No roster found. Run --draft first.")
         return None
 
-    members = roster['members']
+    # Use override members if provided, otherwise use roster members
+    if members_override is not None:
+        members = members_override
+        print(f"  Using custom members (A/B test mode)")
+    elif conviction_percentile is not None:
+        # Recalculate conviction thresholds with custom percentile
+        print(f"  Recalculating conviction thresholds at P{conviction_percentile}...")
+        members = recalculate_conviction_thresholds(
+            roster['members'], loader, stats, holdout_info,
+            context_window_days, conviction_percentile
+        )
+    else:
+        members = roster['members']
     num_slices = Config.COMMITTEE_VALIDATION_SLICES
 
     # Episode structure (matching training):
@@ -1975,6 +2049,109 @@ def run_quorum_sweep(manager: CommitteeManager, loader, stats, holdout_info,
 
     print(f"\n{'='*60}")
     print(f"RECOMMENDATION: Quorum {best_quorum} achieved highest mean fitness ({best_fitness:.2f})")
+    print(f"{'='*60}")
+
+    return all_results
+
+
+def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
+                         context_window_days: int, percentile_values: list) -> dict:
+    """
+    Run validation with multiple conviction percentile values for A/B testing.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        percentile_values: List of percentile values to test (e.g., [90, 95, 99])
+
+    Returns:
+        Dict mapping percentile value to validation results
+    """
+    print("\n" + "="*60)
+    print("CONVICTION SWEEP: A/B Testing Multiple Percentiles")
+    print("="*60)
+    print(f"  Percentile values to test: {percentile_values}")
+    print(f"  Committee size: {Config.COMMITTEE_SIZE}")
+    print(f"  Current quorum: {Config.COMMITTEE_QUORUM}")
+
+    roster = manager.load_roster()
+    if roster is None:
+        print(f"❌ No roster found. Run --draft first.")
+        return None
+
+    all_results = {}
+
+    for percentile in percentile_values:
+        print(f"\n{'='*60}")
+        print(f"TESTING CONVICTION PERCENTILE = P{percentile}")
+        print(f"{'='*60}")
+
+        # Recalculate conviction thresholds with this percentile
+        print(f"  Recalculating thresholds for {len(roster['members'])} members...")
+        members_with_new_thresholds = recalculate_conviction_thresholds(
+            roster['members'], loader, stats, holdout_info,
+            context_window_days, percentile
+        )
+
+        # Run validation with recalculated members
+        results = run_validation(
+            manager, loader, stats, holdout_info, context_window_days,
+            members_override=members_with_new_thresholds
+        )
+
+        if results:
+            all_results[percentile] = {
+                'aggregate': results['committee_aggregate'],
+                'consensus': results['consensus_summary'],
+            }
+
+        # Clean up between runs
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Print comparison summary
+    print("\n" + "="*60)
+    print("CONVICTION SWEEP COMPARISON SUMMARY")
+    print("="*60)
+
+    # Header
+    print(f"\n{'Percentile':<12} {'Fitness':<10} {'Win Rate':<10} {'Quality':<10} {'Expectancy':<12} {'ROI':<10} {'Trades':<8}")
+    print("-" * 82)
+
+    for percentile in sorted(all_results.keys()):
+        agg = all_results[percentile]['aggregate']
+        print(f"P{percentile:<11} {agg['mean_fitness']:<10.2f} {agg['mean_win_rate']*100:<10.1f}% "
+              f"{agg['mean_quality_ratio']:<10.3f} {agg['mean_expectancy']:<12.6f} "
+              f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
+
+    # Consensus breakdown (conviction trades are the key metric here)
+    print(f"\n{'Percentile':<12} {'By Quorum':<12} {'By Conviction':<14} {'Vetoed':<10} {'Unanimity':<12}")
+    print("-" * 70)
+
+    for percentile in sorted(all_results.keys()):
+        cs = all_results[percentile]['consensus']
+        if 'note' not in cs:
+            print(f"P{percentile:<11} {cs.get('total_trades_by_quorum', 0):<12} "
+                  f"{cs.get('total_trades_by_conviction', 0):<14} "
+                  f"{cs.get('total_trades_vetoed', 0):<10} "
+                  f"{cs.get('avg_unanimity_pct', 0):<12.1f}%")
+        else:
+            print(f"P{percentile:<11} {cs['note']}")
+
+    # Find best percentile by fitness
+    best_percentile = max(all_results.keys(), key=lambda p: all_results[p]['aggregate']['mean_fitness'])
+    best_fitness = all_results[best_percentile]['aggregate']['mean_fitness']
+
+    # Also show conviction trade counts for context
+    best_conviction_trades = all_results[best_percentile]['consensus'].get('total_trades_by_conviction', 'N/A')
+
+    print(f"\n{'='*60}")
+    print(f"RECOMMENDATION: P{best_percentile} achieved highest mean fitness ({best_fitness:.2f})")
+    print(f"  Conviction trades at P{best_percentile}: {best_conviction_trades}")
     print(f"{'='*60}")
 
     return all_results
@@ -2559,9 +2736,13 @@ if __name__ == "__main__":
                         help=f'Override quorum threshold (default: {Config.COMMITTEE_QUORUM})')
     parser.add_argument('--sweep-quorum', type=str, default=None,
                         help='Sweep multiple quorum values, comma-separated (e.g., "2,3,4,5")')
+    parser.add_argument('--conviction-percentile', type=int, default=None,
+                        help='Override conviction percentile threshold (default: 95)')
+    parser.add_argument('--sweep-conviction', type=str, default=None,
+                        help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99")')
     args = parser.parse_args()
 
-    if not args.draft and not args.validate and not args.verify_only and not args.mirror and not args.simulate and not args.sweep_quorum:
+    if not args.draft and not args.validate and not args.verify_only and not args.mirror and not args.simulate and not args.sweep_quorum and not args.sweep_conviction:
         print("Usage: python committee.py [--draft] [--validate] [--verify-only] [--mirror] [--simulate]")
         print("\nOptions:")
         print("  --draft          Run Phase 1: Draft committee from Global50")
@@ -2571,6 +2752,8 @@ if __name__ == "__main__":
         print("  --simulate       Simulate committee deployment over a custom date range")
         print("  --quorum N       Override quorum threshold for validation (default: 3)")
         print("  --sweep-quorum   Sweep multiple quorum values (e.g., '2,3,4,5')")
+        print("  --conviction-percentile N  Override conviction percentile (default: 95)")
+        print("  --sweep-conviction  Sweep multiple conviction percentiles (e.g., '90,95,99')")
         exit(0)
 
     print("Initializing Committee Engine...")
@@ -2624,27 +2807,44 @@ if __name__ == "__main__":
         run_quorum_sweep(manager, loader, stats, holdout_info, context_window_days, quorum_values)
         exit(0)
 
+    # Handle --sweep-conviction (runs validation multiple times with different percentiles)
+    if args.sweep_conviction:
+        percentile_values = [int(p.strip()) for p in args.sweep_conviction.split(',')]
+        run_conviction_sweep(manager, loader, stats, holdout_info, context_window_days, percentile_values)
+        exit(0)
+
     # Handle --quorum override
     if args.quorum is not None:
         original_quorum = Config.COMMITTEE_QUORUM
         Config.COMMITTEE_QUORUM = args.quorum
         print(f"\n⚙ Quorum override: {original_quorum} → {args.quorum}")
 
+    # Handle --conviction-percentile override
+    conviction_percentile = args.conviction_percentile
+    if conviction_percentile is not None:
+        print(f"\n⚙ Conviction percentile override: 95 → P{conviction_percentile}")
+
     if args.validate:
         validation_results = run_validation(
-            manager, loader, stats, holdout_info, context_window_days
+            manager, loader, stats, holdout_info, context_window_days,
+            conviction_percentile=conviction_percentile
         )
 
         if validation_results:
-            # Update roster with validation results (only if not using custom quorum)
-            if args.quorum is None:
+            # Update roster with validation results (only if not using custom overrides)
+            if args.quorum is None and conviction_percentile is None:
                 roster = manager.load_roster()
                 if roster:
                     roster['validation'] = validation_results
                     manager.save_roster(roster)
                     print(f"\n✓ Validation results added and synced to cloud")
             else:
-                print(f"\n⚠ Skipping roster update (custom quorum={args.quorum} used for A/B testing)")
+                overrides = []
+                if args.quorum is not None:
+                    overrides.append(f"quorum={args.quorum}")
+                if conviction_percentile is not None:
+                    overrides.append(f"conviction=P{conviction_percentile}")
+                print(f"\n⚠ Skipping roster update ({', '.join(overrides)} used for A/B testing)")
 
     if args.simulate:
         run_simulation(manager, loader, stats, context_window_days)

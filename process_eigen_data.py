@@ -475,6 +475,11 @@ def main():
     # Assume first column is the index (e.g., Date)
     df = pd.read_csv(INPUT_FILE, index_col=0)
 
+    # Remove TRANSFER column if present (artifact from Excel, not needed for training)
+    if 'TRANSFER' in df.columns:
+        df = df.drop(columns=['TRANSFER'])
+        print("Dropped TRANSFER column")
+
     # Calculate row count from the data (column A is now the index)
     DATA_ROW_COUNT = len(df)
     print(f"Detected {DATA_ROW_COUNT} rows of data from CSV.")
