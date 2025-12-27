@@ -49,7 +49,15 @@
       "Bash(grep:*)",
       "Bash(gsutil cat:*)",
       "Bash(git diff:*)",
-      "Bash(gcloud storage ls:*)"
+      "Bash(gcloud storage ls:*)",
+      "Bash(if [ -f ./venv/bin/python ])",
+      "Bash(then ./venv/bin/python utils/device.py)",
+      "Bash(else echo \"No venv found, syntax check passed instead\")",
+      "Bash(git stash push:*)",
+      "Bash(git checkout:*)",
+      "Bash(git stash:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)"
     ],
     "deny": [],
     "ask": []

@@ -1889,6 +1889,97 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     return results
 
 
+def run_quorum_sweep(manager: CommitteeManager, loader, stats, holdout_info,
+                     context_window_days: int, quorum_values: list) -> dict:
+    """
+    Run validation with multiple quorum values for A/B testing.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        quorum_values: List of quorum values to test (e.g., [2, 3, 4, 5])
+
+    Returns:
+        Dict mapping quorum value to validation results
+    """
+    print("\n" + "="*60)
+    print("QUORUM SWEEP: A/B Testing Multiple Quorum Values")
+    print("="*60)
+    print(f"  Quorum values to test: {quorum_values}")
+    print(f"  Committee size: {Config.COMMITTEE_SIZE}")
+
+    original_quorum = Config.COMMITTEE_QUORUM
+    all_results = {}
+
+    for quorum in quorum_values:
+        print(f"\n{'='*60}")
+        print(f"TESTING QUORUM = {quorum}")
+        print(f"{'='*60}")
+
+        # Override quorum
+        Config.COMMITTEE_QUORUM = quorum
+
+        # Run validation
+        results = run_validation(manager, loader, stats, holdout_info, context_window_days)
+
+        if results:
+            all_results[quorum] = {
+                'aggregate': results['committee_aggregate'],
+                'consensus': results['consensus_summary'],
+            }
+
+        # Clean up between runs
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Restore original quorum
+    Config.COMMITTEE_QUORUM = original_quorum
+
+    # Print comparison summary
+    print("\n" + "="*60)
+    print("QUORUM SWEEP COMPARISON SUMMARY")
+    print("="*60)
+
+    # Header
+    print(f"\n{'Quorum':<8} {'Fitness':<10} {'Win Rate':<10} {'Quality':<10} {'Expectancy':<12} {'ROI':<10} {'Trades':<8}")
+    print("-" * 78)
+
+    for quorum in sorted(all_results.keys()):
+        agg = all_results[quorum]['aggregate']
+        print(f"{quorum:<8} {agg['mean_fitness']:<10.2f} {agg['mean_win_rate']*100:<10.1f}% "
+              f"{agg['mean_quality_ratio']:<10.3f} {agg['mean_expectancy']:<12.6f} "
+              f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
+
+    # Consensus breakdown
+    print(f"\n{'Quorum':<8} {'By Quorum':<12} {'By Conviction':<14} {'Vetoed':<10} {'Unanimity':<12} {'Avg Votes':<10}")
+    print("-" * 78)
+
+    for quorum in sorted(all_results.keys()):
+        cs = all_results[quorum]['consensus']
+        if 'note' not in cs:
+            print(f"{quorum:<8} {cs.get('total_trades_by_quorum', 0):<12} "
+                  f"{cs.get('total_trades_by_conviction', 0):<14} "
+                  f"{cs.get('total_trades_vetoed', 0):<10} "
+                  f"{cs.get('avg_unanimity_pct', 0):<12.1f}% "
+                  f"{cs.get('avg_consensus_votes', 0):<10.2f}")
+        else:
+            print(f"{quorum:<8} {cs['note']}")
+
+    # Find best quorum by fitness
+    best_quorum = max(all_results.keys(), key=lambda q: all_results[q]['aggregate']['mean_fitness'])
+    best_fitness = all_results[best_quorum]['aggregate']['mean_fitness']
+
+    print(f"\n{'='*60}")
+    print(f"RECOMMENDATION: Quorum {best_quorum} achieved highest mean fitness ({best_fitness:.2f})")
+    print(f"{'='*60}")
+
+    return all_results
+
+
 # --- Phase 1: Draft Day ---
 
 def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
@@ -2464,16 +2555,22 @@ if __name__ == "__main__":
                         help='Check cloud sync status, download missing files')
     parser.add_argument('--simulate', action='store_true',
                         help='Simulate committee deployment over a custom date range')
+    parser.add_argument('--quorum', type=int, default=None,
+                        help=f'Override quorum threshold (default: {Config.COMMITTEE_QUORUM})')
+    parser.add_argument('--sweep-quorum', type=str, default=None,
+                        help='Sweep multiple quorum values, comma-separated (e.g., "2,3,4,5")')
     args = parser.parse_args()
 
-    if not args.draft and not args.validate and not args.verify_only and not args.mirror and not args.simulate:
+    if not args.draft and not args.validate and not args.verify_only and not args.mirror and not args.simulate and not args.sweep_quorum:
         print("Usage: python committee.py [--draft] [--validate] [--verify-only] [--mirror] [--simulate]")
         print("\nOptions:")
-        print("  --draft        Run Phase 1: Draft committee from Global50")
-        print("  --validate     Run Phase 2: Validate committee on holdout slices")
-        print("  --verify-only  Verify data split without running")
-        print("  --mirror       Check cloud sync status, download missing files")
-        print("  --simulate     Simulate committee deployment over a custom date range")
+        print("  --draft          Run Phase 1: Draft committee from Global50")
+        print("  --validate       Run Phase 2: Validate committee on holdout slices")
+        print("  --verify-only    Verify data split without running")
+        print("  --mirror         Check cloud sync status, download missing files")
+        print("  --simulate       Simulate committee deployment over a custom date range")
+        print("  --quorum N       Override quorum threshold for validation (default: 3)")
+        print("  --sweep-quorum   Sweep multiple quorum values (e.g., '2,3,4,5')")
         exit(0)
 
     print("Initializing Committee Engine...")
@@ -2521,18 +2618,33 @@ if __name__ == "__main__":
             gc.collect()
             torch.cuda.empty_cache()
 
+    # Handle --sweep-quorum (runs validation multiple times with different quorums)
+    if args.sweep_quorum:
+        quorum_values = [int(q.strip()) for q in args.sweep_quorum.split(',')]
+        run_quorum_sweep(manager, loader, stats, holdout_info, context_window_days, quorum_values)
+        exit(0)
+
+    # Handle --quorum override
+    if args.quorum is not None:
+        original_quorum = Config.COMMITTEE_QUORUM
+        Config.COMMITTEE_QUORUM = args.quorum
+        print(f"\n⚙ Quorum override: {original_quorum} → {args.quorum}")
+
     if args.validate:
         validation_results = run_validation(
             manager, loader, stats, holdout_info, context_window_days
         )
 
         if validation_results:
-            # Update roster with validation results
-            roster = manager.load_roster()
-            if roster:
-                roster['validation'] = validation_results
-                manager.save_roster(roster)
-                print(f"\n✓ Validation results added and synced to cloud")
+            # Update roster with validation results (only if not using custom quorum)
+            if args.quorum is None:
+                roster = manager.load_roster()
+                if roster:
+                    roster['validation'] = validation_results
+                    manager.save_roster(roster)
+                    print(f"\n✓ Validation results added and synced to cloud")
+            else:
+                print(f"\n⚠ Skipping roster update (custom quorum={args.quorum} used for A/B testing)")
 
     if args.simulate:
         run_simulation(manager, loader, stats, context_window_days)

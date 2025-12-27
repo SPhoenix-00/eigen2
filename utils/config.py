@@ -6,9 +6,12 @@ All hyperparameters and settings in one place
 import torch
 from pathlib import Path
 
+# Import the output filename from process_eigen_data.py
+from process_eigen_data import OUTPUT_FILE_PKL
+
 class Config:
     # ============ Data Parameters ============
-    DATA_PATH = Path(__file__).parent.parent / "Eigen2_Master_PY_OUTPUT.pkl"
+    DATA_PATH = Path(__file__).parent.parent / OUTPUT_FILE_PKL
     DATE_COLUMN = 0  # Column A (0-indexed)
     INVESTABLE_START_COL = 9  # Column J (0-indexed) - First investable stock: DFAC
     INVESTABLE_END_COL = 116  # Column DO (0-indexed, inclusive) - Last investable stock: VXX

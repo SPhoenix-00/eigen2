@@ -5,9 +5,9 @@ import sys
 import os
 
 # --- Configuration ---
-INPUT_FILE = 'Eigen2_Master(GFIN)_04_OutputOnly2_shiftup.csv'
-OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT.pkl'
-OUTPUT_FILE_CSV = 'Eigen2_Master_PY_OUTPUT_FOR_COMPARE.csv'
+INPUT_FILE = 'Eigen2_Master(GFIN)_05_skinny - MASTER.csv'
+OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_151025.pkl'
+OUTPUT_FILE_CSV = 'Eigen2_Master_PY_OUTPUT_151025_FOR_COMPARE.csv'
 
 # --- Index Map for Slicing (Step 2: ManipulateArrayString) ---
 # Your VBA keeps indices: 0, 1, 2, 3, 6, 9, 10, 13, 15
@@ -361,12 +361,55 @@ def process_dataframe(df):
     sys.stdout.write('\n') # Move to next line after progress bar
     return df
 
+# --- NEW STEP 0: Shift data UP (top-align) before processing ---
+def shift_data_up(df):
+    """
+    Shifts all column data to the top of the DataFrame.
+    This ensures processing starts from row 0 for each column,
+    avoiding None values in the history lookback.
+    Returns the shifted DataFrame and a dict of original offsets per column.
+    """
+    print("Shifting data to top-align for processing...")
+
+    num_rows = df.shape[0]
+    offsets = {}  # Store how many empty rows were at the top of each column
+    result_data = {}  # Build column data as lists
+
+    for col_name in df.columns:
+        col_data = df[col_name].tolist()
+
+        # Find first non-None value
+        first_valid_idx = None
+        for i, val in enumerate(col_data):
+            if val is not None:
+                first_valid_idx = i
+                break
+
+        if first_valid_idx is None:
+            # Column is all None
+            offsets[col_name] = num_rows
+            result_data[col_name] = [None] * num_rows
+            continue
+
+        offsets[col_name] = first_valid_idx
+
+        # Extract valid data and pad with None at the end
+        valid_data = col_data[first_valid_idx:]
+        padding = [None] * first_valid_idx
+        result_data[col_name] = valid_data + padding
+
+    # Create DataFrame from dict (preserves list objects in cells)
+    new_df = pd.DataFrame(result_data, index=df.index)
+
+    return new_df, offsets
+
+
 # --- NEW STEP 1: Replicates ShiftDataDown Sub ---
-def shift_data_down(df):
+def shift_data_down(df, offsets=None):
     """
     Replicates the VBA ShiftDataDown logic.
     Aligns all data to the bottom of the DataFrame, column by column.
-    This version is "future-proof" and silences pandas warnings.
+    If offsets dict is provided, uses those to restore original positions.
     """
     print("Shifting data to bottom-align (replicating ShiftDataDown)...")
     
@@ -423,8 +466,6 @@ def manipulate_list(cell_list):
 # --- Main Execution Function ---
 def main():
     """Main execution function."""
-    
-    VBA_DATA_ROW_COUNT = 3922 # (This is Excel row 2 to 3923)
 
     if not os.path.exists(INPUT_FILE):
         print(f"Error: Input file not found: {INPUT_FILE}")
@@ -433,48 +474,55 @@ def main():
     print(f"Loading {INPUT_FILE}...")
     # Assume first column is the index (e.g., Date)
     df = pd.read_csv(INPUT_FILE, index_col=0)
-    
+
+    # Calculate row count from the data (column A is now the index)
+    DATA_ROW_COUNT = len(df)
+    print(f"Detected {DATA_ROW_COUNT} rows of data from CSV.")
+
     # --- NEW, BETTER CLEANING STEPS ---
-    
+
     # 1. Convert all empty strings ("") or whitespace-only strings to NaN
     #    (This is the "missing link" that makes dropna work)
     df = df.replace(r'^\s*$', np.nan, regex=True)
-    
+
     # 2. NOW, drop all columns that are "all" NaN
     df = df.dropna(axis=1, how='all')
-    
-    # Force the DataFrame to match the VBA's hard-coded 3922 row-count
-    if len(df) > VBA_DATA_ROW_COUNT:
-        print(f"File is {len(df)} rows. Slicing to VBA limit of {VBA_DATA_ROW_COUNT} rows.")
-        df = df.iloc[:VBA_DATA_ROW_COUNT]
 
     # --- Replicates 'SingleIntoArray' sub ---
     print("Formatting data from single values to lists...")
     def format_cell(x):
-        # x is a string like "[43.77,43.23,43.8,43.2]" or ""
-        
+        # x is a string like "[43.77,43.23,43.8,43.2]" or a plain number like "1.4422"
+
         # Check for empty/invalid strings first
-        if not isinstance(x, str) or x == "" or x == "[]" or not x.startswith('['):
+        if not isinstance(x, str) or x == "" or x == "[]":
             return None
-        
+
         try:
-            # Remove brackets: "[1,2,3]" -> "1,2,3"
-            list_string = x[1:-1]
-            
-            # Split by comma and convert each part to a float
-            return [float(part) for part in list_string.split(',')]
-        
+            if x.startswith('['):
+                # It's a bracketed array: "[1,2,3,4]" -> [1.0, 2.0, 3.0, 4.0]
+                list_string = x[1:-1]
+                return [float(part) for part in list_string.split(',')]
+            else:
+                # It's a plain number: "1.4422" -> [1.4422, 1.4422, 1.4422, 1.4422]
+                val = float(x)
+                return [val, val, val, val]
+
         except (ValueError, TypeError):
             # Catches errors if a part isn't a valid number
             return None
-            
+
     df_lists = df.map(format_cell)
-    
+
+    # --- NEW STEP 0: Shift data UP (top-align) before processing ---
+    # This handles columns where data doesn't start at row 1
+    df_shifted_up, col_offsets = shift_data_up(df_lists)
+
     # --- Replicates 'DataRun' sub ---
-    print(f"Processing {len(df_lists.columns)} columns...")
-    df_processed = process_dataframe(df_lists)
+    print(f"Processing {len(df_shifted_up.columns)} columns...")
+    df_processed = process_dataframe(df_shifted_up)
 
     # --- NEW STEP 1: Replicates 'ShiftDataDown' sub ---
+    # Shift data back down to bottom-align (original positions)
     df_shifted = shift_data_down(df_processed)
 
     # --- NEW STEP 2: Replicates 'ManipulateArrayString' ---
