@@ -1365,28 +1365,40 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
     # Deep copy to avoid modifying original
     new_members = copy.deepcopy(members)
 
-    # Get coefficient history range (validation period only, before holdout)
-    val_start = holdout_info['val_start']
-    val_end = holdout_info['val_end']
-    num_days = val_end - val_start + 1
-    num_stocks = loader.data_array.shape[1]
+    # Get validation data tensor (same as used during draft)
+    val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+    num_days = len(valid_indices)
+    num_stocks = Config.NUM_INVESTABLE_STOCKS
 
-    for member in new_members:
+    for member in tqdm(new_members, desc=f"Recalculating P{percentile} thresholds"):
         filepath = get_agent_filepath(member, context_window_days)
         agent = load_agent_actor_only(filepath, 0)
 
         if agent is not None:
-            # Generate coefficient history on validation data
-            agent_coeffs_1d = generate_coefficient_history(
-                agent, loader, stats, val_start, val_end + 1
-            )
-            agent_coeffs_2d = agent_coeffs_1d.reshape(num_days, num_stocks)
+            # Generate coefficients using same method as calculate_coefficient_correlations
+            with torch.no_grad():
+                batch_size = 32
+                num_samples = val_tensor.shape[0]
+                all_coefs = []
+
+                for start_idx in range(0, num_samples, batch_size):
+                    end_idx = min(start_idx + batch_size, num_samples)
+                    batch = val_tensor[start_idx:end_idx]
+                    batch_actions = agent.actor(batch).cpu().numpy()
+                    # Extract coefficients (first output dimension)
+                    all_coefs.append(batch_actions[:, :, 0])
+
+                # Concatenate to [Days, Stocks]
+                agent_coeffs_2d = np.concatenate(all_coefs, axis=0)
 
             # Recalculate with new percentile
             conviction_threshold_vector = calculate_agent_stats_vectorized(
                 agent_coeffs_2d, percentile=percentile
             )
             member['stats']['conviction_threshold_vector'] = conviction_threshold_vector.tolist()
+
+            del agent
+            torch.cuda.empty_cache()
 
     return new_members
 
