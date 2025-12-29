@@ -325,14 +325,16 @@ def _run_validation_worker(args):
     Similar to _run_episode_worker but focused on validation-only tasks.
 
     Args:
-        args: Tuple of (agent_state, validation_slices, quality_threshold, seed)
+        args: Tuple of (agent_state, validation_slices, quality_threshold, seed, use_penalized_median)
               Note: env_config, env, and agent_cache are accessed from globals
+              use_penalized_median: If True, use Penalized Median (median - 0.5*std) instead of
+                                    pessimistic (0.4*mean + 0.6*min) aggregation
 
     Returns:
         Dict with validation results (fitness, metrics, etc.)
     """
     global _worker_env_config, _worker_env, _worker_agent_cache
-    agent_state, validation_slices, quality_threshold, seed = args
+    agent_state, validation_slices, quality_threshold, seed, use_penalized_median = args
 
     # Set worker-specific seed for reproducibility
     np.random.seed(seed)
@@ -426,11 +428,20 @@ def _run_validation_worker(args):
         if 'closed_trades' in episode_info and episode_info['closed_trades']:
             all_closed_trades.extend(episode_info['closed_trades'])
 
-    # Calculate aggregated validation fitness (0.4*mean + 0.6*min)
+    # Calculate aggregated validation fitness
     fitness_scores = [result['fitness'] for result in slice_results]
     mean_score = np.mean(fitness_scores)
     min_score = np.min(fitness_scores)
-    validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
+
+    if use_penalized_median:
+        # Penalized Median: median - (0.5 * std)
+        # Rewards consistent performance, penalizes volatility
+        median_score = np.median(fitness_scores)
+        std_score = np.std(fitness_scores)
+        validation_fitness = float(median_score - (0.5 * std_score))
+    else:
+        # Pessimistic: 0.4*mean + 0.6*min
+        validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
 
     # Aggregate metrics
     total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -1909,11 +1920,18 @@ class ERLTrainer:
                     print(f"\n  ! Worker failed: {e}")
                     slice_fitness_scores.append(-10000.0)
 
-        # Calculate pessimistic fitness (0.4*mean + 0.6*min)
-        final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+        # Calculate fitness using appropriate aggregator
+        if self.multi_mode:
+            # Penalized Median for multi-mode (consistent with Gauntlet/committee.py)
+            final_fitness = self._calculate_penalized_median_fitness(slice_fitness_scores)
+            aggregation_method = "Penalized Median"
+        else:
+            # Pessimistic for single/heroes mode
+            final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+            aggregation_method = "Pessimistic"
 
         print(f"  Slice scores: {[f'{s:.2f}' for s in slice_fitness_scores]}")
-        print(f"  Pessimistic aggregation: {final_fitness:.2f}")
+        print(f"  {aggregation_method} aggregation: {final_fitness:.2f}")
 
         return final_fitness
 
@@ -2387,6 +2405,25 @@ class ERLTrainer:
         min_score = np.min(slice_fitness_scores)
         return (0.4 * mean_score) + (0.6 * min_score)
 
+    def _calculate_penalized_median_fitness(self, slice_fitness_scores: List[float]) -> float:
+        """
+        Calculate fitness using Penalized Median scoring: Median - (0.5 * StdDev).
+
+        This rewards agents that reliably perform well while penalizing volatility.
+        Used by Gauntlet validation and --multi mode to ensure consistent performance
+        across diverse market conditions.
+
+        Args:
+            slice_fitness_scores: List of fitness scores from multiple evaluation slices
+
+        Returns:
+            Penalized median fitness score
+        """
+        scores_np = np.array(slice_fitness_scores)
+        median_score = float(np.median(scores_np))
+        std_score = float(np.std(scores_np))
+        return median_score - (0.5 * std_score)
+
     def _aggregate_agent_stats(self, slice_episode_stats: List[Dict]) -> Dict:
         """
         Aggregate episode statistics across all training slices for a single agent.
@@ -2454,9 +2491,13 @@ class ERLTrainer:
         all_episode_stats = []
 
         # Use same number of episodes and scoring method for both modes
-        # ALWAYS use pessimistic aggregator (0.4*mean + 0.6*min) to align with validation gatekeeper
         num_episodes = 5 if self.consistency_mode else 3
-        scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
+
+        # Use Penalized Median for multi-mode, pessimistic otherwise
+        if self.multi_mode:
+            scoring_method = "median - 0.5*std (Penalized Median, matches Gauntlet)"
+        else:
+            scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
@@ -2501,8 +2542,11 @@ class ERLTrainer:
                 slice_fitness_scores.append(triad_fitness)
                 slice_episode_stats.append(episode_info)
 
-            # Calculate fitness using pessimistic aggregator (same as validation gatekeeper)
-            final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+            # Calculate fitness using appropriate aggregator
+            if self.multi_mode:
+                final_fitness = self._calculate_penalized_median_fitness(slice_fitness_scores)
+            else:
+                final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
             fitness_scores.append(final_fitness)
 
             # Aggregate episode stats across all training slices for this agent
@@ -2534,9 +2578,13 @@ class ERLTrainer:
             Tuple of (fitness_scores, aggregate_stats)
         """
         # Use same number of episodes and scoring method for both modes
-        # ALWAYS use pessimistic aggregator (0.4*mean + 0.6*min) to align with validation gatekeeper
         num_episodes = 5 if self.consistency_mode else 3
-        scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
+
+        # Use Penalized Median for multi-mode, pessimistic otherwise
+        if self.multi_mode:
+            scoring_method = "median - 0.5*std (Penalized Median, matches Gauntlet)"
+        else:
+            scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population (Parallel) ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
@@ -2677,8 +2725,11 @@ class ERLTrainer:
                 slice_fitness = [f for f, _ in agent_slices]
                 slice_stats = [info for _, info in agent_slices]
 
-                # Calculate fitness using pessimistic aggregator (same as validation gatekeeper)
-                final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
+                # Calculate fitness using appropriate aggregator
+                if self.multi_mode:
+                    final_fitness = self._calculate_penalized_median_fitness(slice_fitness)
+                else:
+                    final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
                 fitness_scores.append(final_fitness)
 
                 # Aggregate stats for this agent
@@ -3548,7 +3599,10 @@ class ERLTrainer:
                 # Create unique seed for this validation task
                 task_seed = self.seed + self.generation * 10000 + idx * 100
 
-                tasks.append((agent_state, validation_slices, quality_threshold, task_seed))
+                # Use Penalized Median for multi-mode (consistent with Gauntlet/committee.py)
+                use_penalized_median = self.multi_mode
+
+                tasks.append((agent_state, validation_slices, quality_threshold, task_seed, use_penalized_median))
                 agent_indices_to_validate.append((idx, agent_hash, cache_key))
 
         # If all agents were cached, return early

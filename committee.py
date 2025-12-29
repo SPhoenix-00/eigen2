@@ -1035,6 +1035,139 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
     return current_indices
 
 
+def automatic_correlation_refinement(committee_indices: tuple, entries: list,
+                                      corr_matrix: np.ndarray,
+                                      max_iterations: int = 50) -> tuple:
+    """
+    Automated refinement: iteratively swap to improve both objective and max_corr.
+
+    Selection logic per iteration:
+    1. Find highest correlation pair, identify swap candidate (lower fitness)
+    2. Test all valid replacements
+    3. Among candidates that IMPROVE objective, select the one with LOWEST max_corr
+    4. Only apply if that candidate also LOWERS max_corr
+    5. Stop when no candidate improves BOTH
+
+    Args:
+        committee_indices: Initial committee indices from optimization
+        entries: Full list of Global50 entries
+        corr_matrix: Full NxN correlation matrix
+        max_iterations: Safety limit on number of swap iterations
+
+    Returns:
+        Final committee indices after all swaps
+    """
+    current_indices = committee_indices
+    swap_count = 0
+
+    # Calculate starting metrics
+    start_obj, start_score_sum, start_avg_corr, start_max_corr = committee_objective(
+        current_indices, entries, corr_matrix
+    )
+
+    print(f"\n{'='*60}")
+    print("PHASE 1b: CORRELATION REFINEMENT (Automatic Deep)")
+    print(f"{'='*60}")
+    print(f"Starting: obj={start_obj:.2f}, max_corr={start_max_corr:.4f}")
+
+    # Valid entries for candidate search
+    valid_entries = [i for i in range(len(entries))
+                     if corr_matrix[i, i] == 1.0]
+
+    for iteration in range(1, max_iterations + 1):
+        # Calculate current metrics
+        curr_obj, curr_score_sum, curr_avg_corr, curr_max_corr = committee_objective(
+            current_indices, entries, corr_matrix
+        )
+
+        # Find highest correlation pair
+        drop_idx, keep_idx, max_corr, drop_entry, keep_entry = find_highest_correlation_pair(
+            current_indices, entries, corr_matrix
+        )
+
+        if drop_idx is None:
+            print(f"\n  No valid pairs found in committee.")
+            break
+
+        print(f"\n  Iteration {iteration}:")
+        print(f"    Highest pair: {drop_entry['run_name']}_{drop_entry['agent_id']} <-> "
+              f"{keep_entry['run_name']}_{keep_entry['agent_id']} (corr={max_corr:.4f})")
+
+        # Build remaining committee (without the dropped agent)
+        remaining = [idx for idx in current_indices if idx != drop_idx]
+
+        # Test all valid candidates
+        improving_candidates = []
+
+        for candidate_idx in valid_entries:
+            # Skip if already in committee
+            if candidate_idx in current_indices:
+                continue
+
+            # Create new committee with swap
+            new_indices = tuple(sorted(remaining + [candidate_idx]))
+
+            # Calculate metrics for this swap
+            new_obj, new_score_sum, new_avg_corr, new_max_corr = committee_objective(
+                new_indices, entries, corr_matrix
+            )
+
+            # Only consider if objective IMPROVES
+            if new_obj > curr_obj:
+                improving_candidates.append({
+                    'idx': candidate_idx,
+                    'new_indices': new_indices,
+                    'obj': new_obj,
+                    'max_corr': new_max_corr,
+                    'entry': entries[candidate_idx]
+                })
+
+        print(f"    Testing {len(valid_entries) - len(current_indices)} candidates...")
+        print(f"    Candidates improving objective: {len(improving_candidates)}")
+
+        if not improving_candidates:
+            print(f"    No candidate improves objective")
+            print(f"    Stopping")
+            break
+
+        # Among those that improve objective, pick the one with lowest max_corr
+        improving_candidates.sort(key=lambda x: x['max_corr'])
+        best = improving_candidates[0]
+
+        # Only apply if max_corr also improves
+        if best['max_corr'] >= curr_max_corr:
+            print(f"    Best objective-improving candidate has max_corr={best['max_corr']:.4f} "
+                  f"(not better than {curr_max_corr:.4f})")
+            print(f"    Stopping")
+            break
+
+        # Apply the swap
+        print(f"    Best among those (lowest max_corr): "
+              f"{best['entry']['run_name']}_{best['entry']['agent_id']}")
+        print(f"      obj: {curr_obj:.2f} -> {best['obj']:.2f} ({best['obj'] - curr_obj:+.2f})")
+        print(f"      max_corr: {curr_max_corr:.4f} -> {best['max_corr']:.4f} "
+              f"({best['max_corr'] - curr_max_corr:+.4f})")
+        print(f"    Swap applied")
+
+        current_indices = best['new_indices']
+        swap_count += 1
+
+    # Final summary
+    final_obj, final_score_sum, final_avg_corr, final_max_corr = committee_objective(
+        current_indices, entries, corr_matrix
+    )
+
+    print(f"\n{'='*60}")
+    print(f"REFINEMENT COMPLETE: {swap_count} swap(s) made")
+    print(f"{'='*60}")
+    print(f"  Final: obj={final_obj:.2f}, max_corr={final_max_corr:.4f}")
+    if swap_count > 0:
+        print(f"  Delta: obj {final_obj - start_obj:+.2f}, "
+              f"max_corr {final_max_corr - start_max_corr:+.4f}")
+
+    return current_indices
+
+
 # --- Committee Agent Class ---
 
 class CommitteeAgent:
@@ -2171,12 +2304,19 @@ def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
 
 # --- Phase 1: Draft Day ---
 
-def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
+def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool = False):
     """
     Phase 1: Select committee from Global50 using coefficient correlation optimization.
 
     IMPORTANT: Correlation is calculated on VALIDATION data (not holdout) to prevent
     data leakage. The holdout period remains unseen until Phase 2 validation.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization statistics
+        holdout_info: Holdout period information
+        deep: If True, use automatic deep refinement instead of interactive refinement
     """
     print("\n" + "="*60)
     print("PHASE 1: DRAFT DAY (Global50 Selection)")
@@ -2212,10 +2352,15 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
         print("❌ Optimization failed")
         return None
 
-    # 4b. Interactive correlation refinement pass
-    refined_indices = interactive_correlation_refinement(
-        result['committee_indices'], entries, corr_matrix
-    )
+    # 4b. Correlation refinement pass
+    if deep:
+        refined_indices = automatic_correlation_refinement(
+            result['committee_indices'], entries, corr_matrix
+        )
+    else:
+        refined_indices = interactive_correlation_refinement(
+            result['committee_indices'], entries, corr_matrix
+        )
 
     # Recalculate metrics after refinement
     final_obj, final_score_sum, final_avg_corr, final_max_corr = committee_objective(
@@ -2736,6 +2881,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Committee Selection from Global50")
     parser.add_argument('--draft', action='store_true',
                         help='Run Phase 1: Draft committee from Global50')
+    parser.add_argument('--draft-deep', action='store_true',
+                        help='Run Phase 1 with automatic deep refinement (no manual swaps)')
     parser.add_argument('--validate', action='store_true',
                         help='Run Phase 2: Validate on holdout slices')
     parser.add_argument('--verify-only', action='store_true',
@@ -2754,10 +2901,11 @@ if __name__ == "__main__":
                         help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99")')
     args = parser.parse_args()
 
-    if not args.draft and not args.validate and not args.verify_only and not args.mirror and not args.simulate and not args.sweep_quorum and not args.sweep_conviction:
-        print("Usage: python committee.py [--draft] [--validate] [--verify-only] [--mirror] [--simulate]")
+    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.simulate and not args.sweep_quorum and not args.sweep_conviction:
+        print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--simulate]")
         print("\nOptions:")
-        print("  --draft          Run Phase 1: Draft committee from Global50")
+        print("  --draft          Run Phase 1: Draft committee from Global50 (interactive refinement)")
+        print("  --draft-deep     Run Phase 1 with automatic deep refinement (no manual swaps)")
         print("  --validate       Run Phase 2: Validate committee on holdout slices")
         print("  --verify-only    Verify data split without running")
         print("  --mirror         Check cloud sync status, download missing files")
@@ -2805,8 +2953,8 @@ if __name__ == "__main__":
         print("\n✓ Verification complete.")
         exit(0)
 
-    if args.draft:
-        roster = run_draft(manager, loader, stats, holdout_info)
+    if args.draft or args.draft_deep:
+        roster = run_draft(manager, loader, stats, holdout_info, deep=args.draft_deep)
 
         # Auto-run validation after draft if requested
         if roster and args.validate:
