@@ -32,7 +32,7 @@ class TeeLogger:
             filepath: Path to the log file
         """
         self.terminal = sys.stdout
-        self.log_file = open(filepath, 'w', buffering=1)  # Line buffered
+        self.log_file = open(filepath, 'w', encoding='utf-8', buffering=1)  # Line buffered
 
     def write(self, message):
         """Write message to both terminal and file."""
