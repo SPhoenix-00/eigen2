@@ -3042,7 +3042,10 @@ class ERLTrainer:
 
         Args:
             improved_agent: The agent that achieved the improvement
-            score: The validation score achieved (base_combined_fitness)
+            score: The BASE validation score (base_combined_fitness, WITHOUT ROI adjustment).
+                   This is critical for fair comparison since baseline is also stored without
+                   ROI adjustment. Using combined_fitness would cause score inflation when
+                   the ROI hurdle changes.
             val_result: Full validation result dict with metrics
             is_breakthrough: If True, this improvement also qualifies as a breakthrough (5%+)
         """
@@ -3133,12 +3136,10 @@ class ERLTrainer:
         total_decisions = num_wins + num_losses
         win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
 
-        # Calculate fresh conviction_threshold_vector for the improved agent
-        # This is required because the agent may have evolved different trading patterns
-        # The 95th percentile thresholds determine when conviction trades trigger
-        print(f"  Calculating conviction thresholds for improved agent...")
-        conviction_threshold_vector = self.calculate_conviction_threshold_vector(improved_agent)
-        print(f"  ✓ Conviction thresholds calculated (mean p95: {np.mean(conviction_threshold_vector):.3f})")
+        # Skip conviction threshold calculation during training - it's only needed for committee inference
+        # The thresholds will be recalculated when the committee is loaded for production use
+        # This saves ~10-30 seconds per improvement
+        conviction_threshold_vector = member.get('stats', {}).get('conviction_threshold_vector', [0.0] * Config.NUM_INVESTABLE_STOCKS)
 
         self.multi_roster['members'][member_idx] = {
             'filename': new_filename,
@@ -6197,6 +6198,12 @@ class ERLTrainer:
             # Extract combined scores for elite selection (sorted by agent index)
             validation_scores = [result['combined_fitness'] for result in sorted(validation_results, key=lambda x: x['idx'])]
 
+            # MULTI-MODE: Also extract base_combined_fitness for baseline comparisons
+            # This is critical because ROI adjustment varies with hurdle, making combined_fitness
+            # incomparable across different hurdle values. Base fitness is consistent.
+            if self.multi_mode:
+                base_validation_scores = [result['base_combined_fitness'] for result in sorted(validation_results, key=lambda x: x['idx'])]
+
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
             if self.consistency_mode and not self.multi_mode:
@@ -6270,15 +6277,18 @@ class ERLTrainer:
                         print(f"  ⏳ Member {self.current_member_idx} warmup completes next generation")
                 else:
                     # Check for breakthrough on current committee member
-                    breakthrough_result = self._check_multi_breakthrough(validation_scores)
+                    # CRITICAL: Use base_validation_scores (no ROI adjustment) for fair comparison
+                    # Baseline was set using base_combined_fitness, so we compare apples to apples
+                    breakthrough_result = self._check_multi_breakthrough(base_validation_scores)
 
                 if breakthrough_result is not None:
-                    improved_agent, score = breakthrough_result
+                    improved_agent, base_score = breakthrough_result
                     # Get full validation result for this agent to extract metrics
                     agent_idx = self.population.index(improved_agent)
                     agent_val_result = [r for r in validation_results if r['idx'] == agent_idx][0]
                     # Process the breakthrough and advance to next member
-                    self._process_multi_breakthrough(improved_agent, score, agent_val_result)
+                    # Pass base_score (base_combined_fitness) as the score
+                    self._process_multi_breakthrough(improved_agent, base_score, agent_val_result)
                     self._advance_to_next_multi_member()
 
                     # CRITICAL: Skip evolution for this generation
@@ -6293,24 +6303,28 @@ class ERLTrainer:
                 # Check for ANY improvement over baseline (save immediately to Global50/committee)
                 # Also track stuck generations for local optima detection
                 if generations_trained >= warmup_generations:
-                    best_idx = np.argmax(validation_scores)
-                    best_score_this_gen = validation_scores[best_idx]
+                    # CRITICAL: Use base_validation_scores for baseline comparison
+                    # This ensures consistency since baseline is stored as base_combined_fitness
+                    best_idx = np.argmax(base_validation_scores)
+                    best_base_score_this_gen = base_validation_scores[best_idx]
                     current_baseline = self.member_baselines[self.current_member_idx]
 
                     # Check for improvement over baseline (any amount, not just 5%)
-                    if best_score_this_gen > current_baseline:
+                    if best_base_score_this_gen > current_baseline:
                         improved_agent = self.population[best_idx]
                         agent_val_result = [r for r in validation_results if r['idx'] == best_idx][0]
 
                         # Save improvement immediately (updates Global50, committee, baseline)
                         # Note: This is NOT a breakthrough (no advance to next member)
-                        self._process_multi_improvement(improved_agent, best_score_this_gen, agent_val_result, is_breakthrough=False)
+                        # Pass base_score (base_combined_fitness) as the score
+                        self._process_multi_improvement(improved_agent, best_base_score_this_gen, agent_val_result, is_breakthrough=False)
 
                         # _process_multi_improvement already resets stuck counter and updates best score
                     else:
                         # No improvement over baseline - check if we at least improved over previous best
-                        if best_score_this_gen > self.multi_best_score_for_member:
-                            self.multi_best_score_for_member = best_score_this_gen
+                        # Use base_score for consistency with baseline comparison
+                        if best_base_score_this_gen > self.multi_best_score_for_member:
+                            self.multi_best_score_for_member = best_base_score_this_gen
                             self.multi_gens_since_improvement = 0
                         else:
                             self.multi_gens_since_improvement += 1
