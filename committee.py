@@ -2332,7 +2332,8 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
 
     print(f"\n  Top 5 agents by gauntlet score:")
     for i, e in enumerate(entries[:5]):
-        print(f"    {i+1}. {e['run_name']}_{e['agent_id']}: "
+        maverick_tag = " [M]" if e.get('is_maverick', False) else ""
+        print(f"    {i+1}. {e['run_name']}_{e['agent_id']}{maverick_tag}: "
               f"score={e['gauntlet_score']:.2f}, roi={e.get('roi', 0):.2f}%")
 
     # 2. Prepare VALIDATION data for correlation calculation (NOT holdout - prevents data leakage)
@@ -2403,6 +2404,7 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
                 'expectancy': e.get('expectancy', 0.0),
                 'quality_ratio': e.get('quality_ratio', 0.0),
                 'win_ratio': e.get('win_ratio', 0.0),
+                'is_maverick': e.get('is_maverick', False),
                 'stats': {
                     'conviction_threshold_vector': conviction_threshold_vector.tolist()
                 }
@@ -2441,7 +2443,8 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
     print(f"{'='*60}")
 
     for i, m in enumerate(roster_data['members']):
-        print(f"  {i+1}. {m['run_name']}_{m['agent_id']}: "
+        maverick_tag = " [M]" if m.get('is_maverick', False) else ""
+        print(f"  {i+1}. {m['run_name']}_{m['agent_id']}{maverick_tag}: "
               f"score={m['gauntlet_score']:.2f}, roi={m['roi']:.2f}%")
 
     print(f"\n  Aggregate Score: {final_score_sum:.2f}")

@@ -1363,7 +1363,8 @@ class AgentEvaluator:
         print(f"{'='*70}")
 
         for i, entry in enumerate(self.global_hof.entries, 1):
-            print(f"\n[{i}/{len(self.global_hof.entries)}] {entry.run_name} (Agent {entry.agent_id})")
+            maverick_tag = " [M]" if entry.is_maverick else ""
+            print(f"\n[{i}/{len(self.global_hof.entries)}] {entry.run_name} (Agent {entry.agent_id}){maverick_tag}")
             print(f"  Current Score: {entry.gauntlet_score:.2f}")
 
             try:
@@ -1864,8 +1865,8 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print(f"⚠ WARNING: {len(agents_to_remove)} agents will be REMOVED from Global 50:")
         print(f"{'='*70}")
-        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'CV':<8} {'Trades':<8} {'Run Name':<25} {'Agent':<8} {'Reason'}")
-        print(f"{'-'*110}")
+        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'CV':<8} {'Trades':<8} {'Run Name':<25} {'Agent':<8} {'M':<3} {'Reason'}")
+        print(f"{'-'*115}")
 
         for entry in sorted(agents_to_remove, key=lambda e: e.gauntlet_score):
             # Determine why agent fails
@@ -1888,7 +1889,8 @@ class AgentEvaluator:
                 reasons.append("trades")
             reason_str = ", ".join(reasons) if reasons else "filter"
 
-            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.cv:<8.3f} {entry.total_trades:<8} {entry.run_name:<25} {entry.agent_id:<8} {reason_str}")
+            maverick_flag = "Y" if entry.is_maverick else ""
+            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.cv:<8.3f} {entry.total_trades:<8} {entry.run_name:<25} {entry.agent_id:<8} {maverick_flag:<3} {reason_str}")
 
         print(f"\n{len(agents_to_keep)} agents will remain in Global 50.")
 

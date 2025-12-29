@@ -11,6 +11,13 @@ Usage:
     python fix_global50.py                    # Fix cw151 (default)
     python fix_global50.py --context-window 504   # Fix cw504
     python fix_global50.py --dry-run          # Show what would happen without making changes
+    python fix_global50.py --set-maverick <pattern>    # Mark agent(s) as maverick
+    python fix_global50.py --unset-maverick <pattern>  # Remove maverick flag
+
+Maverick Management:
+    Mavericks are aggressive agents trained with FOMO/ROI-First reward functions.
+    The Global 50 allows up to MAVERICK_CAP (default: 5) mavericks at any time.
+    Use --set-maverick and --unset-maverick to manage the maverick flag.
 """
 
 import argparse
@@ -1056,6 +1063,114 @@ class Global50Fixer:
         print(f"  Cloud:  gs://{self.cloud_sync.bucket_name}/{self.cloud_base}/")
 
 
+def set_maverick_flag(context_window_days: int, agent_pattern: str, is_maverick: bool):
+    """
+    Set or unset the maverick flag for agents matching a pattern.
+
+    Args:
+        context_window_days: Context window (e.g., 151)
+        agent_pattern: Pattern to match agent filenames (e.g., 'azure-thunder-123_5' or 'azure-thunder')
+        is_maverick: True to set as maverick, False to unset
+    """
+    from utils.cloud_sync import get_cloud_sync_from_env
+
+    context_window_id = f"cw{context_window_days}"
+    cloud_sync = get_cloud_sync_from_env()
+
+    # Paths
+    local_dir = Path("global50") / context_window_id
+    local_json_path = local_dir / "global50.json"
+    cloud_base = f"{cloud_sync.project_name}/global50/{context_window_id}"
+    cloud_json_path = f"{cloud_base}/global50.json"
+
+    print(f"\n{'='*70}")
+    print(f"{'Setting' if is_maverick else 'Unsetting'} Maverick Flag")
+    print(f"{'='*70}")
+    print(f"Context Window: {context_window_id}")
+    print(f"Pattern: '{agent_pattern}'")
+
+    # Download current global50.json
+    print("\n1. Loading global50.json from cloud...")
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    if not cloud_sync.download_file(cloud_json_path, str(local_json_path)):
+        print("   ✗ Failed to download global50.json")
+        return
+
+    with open(local_json_path, 'r') as f:
+        data = json.load(f)
+
+    entries = data.get('entries', [])
+    print(f"   Found {len(entries)} entries")
+
+    # Count current mavericks
+    current_maverick_count = sum(1 for e in entries if e.get('is_maverick', False))
+    print(f"   Current maverick count: {current_maverick_count}/{Config.MAVERICK_CAP}")
+
+    # Find matching entries
+    matched = []
+    for entry in entries:
+        filename = f"{entry['run_name']}_{entry['agent_id']}"
+        if agent_pattern in filename or agent_pattern == entry['run_name']:
+            matched.append(entry)
+
+    if not matched:
+        print(f"\n   ⚠ No agents found matching pattern '{agent_pattern}'")
+        return
+
+    print(f"\n2. Found {len(matched)} matching agent(s):")
+    for entry in matched:
+        current_status = "[M]" if entry.get('is_maverick', False) else ""
+        print(f"   - {entry['run_name']}_{entry['agent_id']} {current_status}")
+
+    # Check maverick cap if setting flag
+    if is_maverick:
+        new_mavericks = sum(1 for e in matched if not e.get('is_maverick', False))
+        if current_maverick_count + new_mavericks > Config.MAVERICK_CAP:
+            print(f"\n   ✗ Cannot set maverick: Would exceed cap of {Config.MAVERICK_CAP}")
+            print(f"      Current: {current_maverick_count}, Adding: {new_mavericks}, Cap: {Config.MAVERICK_CAP}")
+            return
+
+    # Apply changes
+    print(f"\n3. Applying changes...")
+    changes_made = 0
+    for entry in entries:
+        filename = f"{entry['run_name']}_{entry['agent_id']}"
+        if agent_pattern in filename or agent_pattern == entry['run_name']:
+            old_value = entry.get('is_maverick', False)
+            if old_value != is_maverick:
+                entry['is_maverick'] = is_maverick
+                changes_made += 1
+                action = "SET" if is_maverick else "UNSET"
+                print(f"   {action}: {entry['run_name']}_{entry['agent_id']}")
+
+    if changes_made == 0:
+        print(f"   No changes needed (already {'maverick' if is_maverick else 'not maverick'})")
+        return
+
+    # Update timestamp
+    data['last_updated'] = datetime.utcnow().isoformat() + 'Z'
+
+    # Save locally
+    with open(local_json_path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"\n4. Saved local: {local_json_path}")
+
+    # Upload to cloud
+    if cloud_sync.upload_file_verified(str(local_json_path), cloud_json_path):
+        print(f"   ✓ Uploaded to cloud: {cloud_json_path}")
+    else:
+        print(f"   ✗ Failed to upload to cloud")
+        return
+
+    # Final count
+    final_maverick_count = sum(1 for e in entries if e.get('is_maverick', False))
+    print(f"\n{'='*70}")
+    print(f"✓ Updated {changes_made} agent(s)")
+    print(f"  Maverick count: {final_maverick_count}/{Config.MAVERICK_CAP}")
+    print(f"{'='*70}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Fix Global 50 by re-evaluating all agents from cloud",
@@ -1066,6 +1181,8 @@ Examples:
   python fix_global50.py --context-window 504   # Fix cw504
   python fix_global50.py --dry-run          # Preview without changes
   python fix_global50.py --cleanup          # Sync state without re-evaluating
+  python fix_global50.py --set-maverick azure-thunder-123_5    # Mark agent as maverick
+  python fix_global50.py --unset-maverick azure-thunder-123_5  # Remove maverick flag
         """
     )
 
@@ -1088,7 +1205,30 @@ Examples:
         help='Sync local/cloud state without re-evaluating. Ensures global50.json matches actual files.'
     )
 
+    parser.add_argument(
+        '--set-maverick',
+        type=str,
+        metavar='PATTERN',
+        help='Set maverick flag for agents matching pattern (e.g., run_name or run_name_agentid)'
+    )
+
+    parser.add_argument(
+        '--unset-maverick',
+        type=str,
+        metavar='PATTERN',
+        help='Remove maverick flag from agents matching pattern'
+    )
+
     args = parser.parse_args()
+
+    # Handle maverick flag operations
+    if args.set_maverick:
+        set_maverick_flag(args.context_window, args.set_maverick, is_maverick=True)
+        return
+
+    if args.unset_maverick:
+        set_maverick_flag(args.context_window, args.unset_maverick, is_maverick=False)
+        return
 
     fixer = Global50Fixer(context_window_days=args.context_window)
 

@@ -49,7 +49,8 @@ class TradingEnvironment(gym.Env):
                  data_array_full: np.ndarray = None,
                  is_training: bool = True,
                  consistency_mode: bool = False,
-                 gauntlet_mode: bool = False):
+                 gauntlet_mode: bool = False,
+                 maverick_mode: bool = False):
         """
         Initialize trading environment.
 
@@ -65,6 +66,9 @@ class TradingEnvironment(gym.Env):
             is_training: If True, applies observation noise for regularization
             consistency_mode: If True, applies loss magnification for consistency training (see Config.CONSISTENCY_LOSS_MULTIPLIER)
             gauntlet_mode: If True, uses soft penalty for zero trades (tactical no-trade is acceptable)
+            maverick_mode: If True, applies aggressive reward function (FOMO/ROI-First):
+                          - Lower hurdle rate (50% of normal)
+                          - No forced exit penalty
         """
         super().__init__()
 
@@ -82,6 +86,7 @@ class TradingEnvironment(gym.Env):
         self.is_training = is_training  # Flag to control observation noise
         self.consistency_mode = consistency_mode  # Flag to enable loss magnification
         self.gauntlet_mode = gauntlet_mode  # Flag for soft zero-trades penalty during gauntlet/stabilization
+        self.maverick_mode = maverick_mode  # Flag for aggressive FOMO/ROI-First reward function
 
         # Trading end is when model stops opening new positions
         # Settlement period allows existing positions to close
@@ -533,7 +538,9 @@ class TradingEnvironment(gym.Env):
                 # 3. SNIPER LOGIC: Apply Hurdle FIRST
                 # A trade making 0.5% when hurdle is 0.6% is a LOSS of -0.1%
                 # Convert HURDLE_RATE from decimal (0.006) to percentage (0.6%)
-                hurdle_pct = Config.HURDLE_RATE * 100.0
+                # MAVERICK MODE: Lower hurdle (50% of normal) to encourage more trading
+                hurdle_rate = Config.HURDLE_RATE * 0.5 if self.maverick_mode else Config.HURDLE_RATE
+                hurdle_pct = hurdle_rate * 100.0
                 net_gain_pct = gain_pct - hurdle_pct
 
                 # 4. Conviction Scaling (Keep convex surface)
@@ -546,14 +553,15 @@ class TradingEnvironment(gym.Env):
                     self.num_wins += 1
                 else:
                     # LOSS: Apply magnification only in consistency mode
-                    # Consistency mode: Magnify losses to focus training on reducing drawdowns
-                    # Normal mode: Treat losses equally to gains (1.0x)
+                    # Consistency mode: 1.5x magnification (focus on reducing drawdowns)
+                    # Normal/Maverick mode: 1.0x (treat losses equally to gains)
                     loss_multiplier = Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0
                     base_reward = scaled_coefficient * net_gain_pct * loss_multiplier
                     self.num_losses += 1
 
                 # 6. Forced Exit Penalty (Lack of decisiveness)
-                if reason == 'max_holding_period':
+                # MAVERICK MODE: No forced exit penalty (encourages holding for bigger gains)
+                if reason == 'max_holding_period' and not self.maverick_mode:
                     forced_exit_penalty = position.entry_price * position.coefficient * Config.FORCED_EXIT_PENALTY_PCT
                 else:
                     forced_exit_penalty = 0.0
@@ -630,6 +638,20 @@ class TradingEnvironment(gym.Env):
             if action.get('action') == 'close'
         ]
 
+        # Calculate market return for FOMO penalty (Maverick mode)
+        # Uses the market benchmark column (e.g., S&P 500 proxy)
+        market_return_pct = 0.0
+        if self.maverick_mode:
+            try:
+                benchmark_col = Config.MAVERICK_MARKET_BENCHMARK_COL
+                # Get close prices at start and end of episode (index 1 = close in full dataset)
+                start_price = self.data_array_full[self.start_idx, benchmark_col, 1]
+                end_price = self.data_array_full[self.current_idx - 1, benchmark_col, 1]
+                if not np.isnan(start_price) and not np.isnan(end_price) and start_price > 0:
+                    market_return_pct = ((end_price - start_price) / start_price) * 100.0
+            except (IndexError, KeyError):
+                market_return_pct = 0.0
+
         summary = {
             'total_reward': self.cumulative_reward,
             'num_trades': self.num_trades,
@@ -651,6 +673,7 @@ class TradingEnvironment(gym.Env):
             # ROI now uses peak capital employed (true capital efficiency)
             # This rewards high-turnover strategies that recycle the same capital multiple times
             'roi': (self.raw_pnl / self.peak_capital_employed * 100) if self.peak_capital_employed > 0 else 0.0,
+            'market_return_pct': market_return_pct,  # Market benchmark return for FOMO calculation
         }
 
         # CRITICAL FIX: Clear episode history to prevent memory leak (~15-20GB per generation)

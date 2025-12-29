@@ -115,7 +115,8 @@ def _init_worker(env_config):
             'trading_end_idx': env_config['trading_end_idx'],
             'is_training': env_config.get('is_training', True),
             'consistency_mode': env_config.get('consistency_mode', False),
-            'gauntlet_mode': env_config.get('gauntlet_mode', False)
+            'gauntlet_mode': env_config.get('gauntlet_mode', False),
+            'maverick_mode': env_config.get('maverick_mode', False)
         }
         _worker_env_config = actual_env_config
     else:
@@ -1030,7 +1031,8 @@ class ERLTrainer:
             end_idx=self.train_end_idx,
             trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
             data_array_full=self.data_loader.data_array_full,
-            consistency_mode=self.consistency_mode
+            consistency_mode=self.consistency_mode,
+            maverick_mode=self.maverick_mode
         )
 
         # Initialize shared memory for parallel worker data (eliminates serialization overhead)
@@ -1198,7 +1200,8 @@ class ERLTrainer:
             'trading_end_idx': trading_end_idx,
             'is_training': is_training,
             'consistency_mode': self.consistency_mode,
-            'gauntlet_mode': gauntlet_mode
+            'gauntlet_mode': gauntlet_mode,
+            'maverick_mode': self.maverick_mode
         }
 
     def _create_dataloader(self):
@@ -2330,12 +2333,21 @@ class ERLTrainer:
         Base = Signed ROI * Log(Volume)
         If Positive: Boosted by WR and QR
         If Negative: Penalized by Inconsistency
+
+        MAVERICK MODE: FOMO/ROI-First scoring designed to break committee deadlock.
+        Formula: Base Score - FOMO Penalty - Fear Factor
+        - Base Score: (Raw PnL / Peak Capital) * log10(Peak Capital + 10)
+        - FOMO Penalty: max(0, Market Return - Agent ROI) * 10.0
+        - Fear Factor: 2.0 * (num_losses ^ 1.2) - gentle drag on losing streaks
         """
         total_trades = stats.get('num_trades', 0)
 
         # 1. Handle Inactivity
-        # Keep your existing gradient logic for zero trades
         if total_trades == 0:
+            # MAVERICK MODE: Massive penalty for inaction - forces market engagement
+            if self.maverick_mode:
+                return -5000.0 + stats.get('max_coefficient_during_episode', 0)
+
             # In consistency mode during stabilization/gauntlet, use soft penalty
             # (tactical no-trade in a slice is acceptable, not a ghost indicator)
             if self.consistency_mode and self.breakthrough_state in (BreakthroughState.STABILIZATION, BreakthroughState.GAUNTLET):
@@ -2348,6 +2360,7 @@ class ERLTrainer:
 
         # 2. Calculate Core Metrics
         win_rate = stats.get('win_rate', 0.0) # 0.0 to 1.0
+        num_losses = stats.get('num_losses', 0)
 
         # Calculate Quality Ratio (QR): ratio of trades beating the HoF median ROI threshold
         # This is dynamically updated each generation to reflect the rising bar of excellence
@@ -2362,6 +2375,36 @@ class ERLTrainer:
         total_inv = stats.get('total_investment', 0.0)
         roi_pct = (raw_pnl / total_inv * 100) if total_inv > 0 else 0.0
 
+        # MAVERICK MODE: FOMO/ROI-First scoring
+        if self.maverick_mode:
+            # Get peak capital employed (more accurate than total_investment for efficiency)
+            peak_capital = stats.get('peak_capital_employed', total_inv)
+            if peak_capital <= 0:
+                peak_capital = total_inv if total_inv > 0 else 1.0
+
+            # 1. Base Score: ROI Efficiency
+            # (Raw PnL / Peak Capital Employed) * log10(Peak Capital + 10)
+            roi_efficiency = (raw_pnl / peak_capital) * 100.0 if peak_capital > 0 else 0.0
+            volume_scalar = math.log10(peak_capital + 10)
+            base_score = roi_efficiency * volume_scalar
+
+            # 2. FOMO Penalty (Relative Performance)
+            # Get market return from stats (Col 44 = S&P 500 proxy)
+            market_return = stats.get('market_return_pct', 0.0)
+            alpha_gap = market_return - roi_pct
+            fomo_penalty = max(0.0, alpha_gap) * 10.0
+
+            # 3. Fear Factor (Limited Ratchet)
+            # Gentle non-linear drag on losses: 2.0 * (num_losses ^ 1.2)
+            # A few losses are acceptable, but streaks become expensive
+            fear_factor = 2.0 * (num_losses ** 1.2) if num_losses > 0 else 0.0
+
+            # Final Maverick Fitness
+            fitness = base_score - fomo_penalty - fear_factor
+
+            return float(fitness)
+
+        # NORMAL/CONSISTENCY MODE: Standard Triad scoring
         # ROI Expansion Mode: Uncap ROI and apply super-linear scaling
         # Power law (** 1.1) makes high ROI disproportionately valuable
         # Sign preservation: apply power to absolute value, then restore sign
