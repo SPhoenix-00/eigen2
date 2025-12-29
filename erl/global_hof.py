@@ -61,6 +61,7 @@ class GlobalHoFEntry(BaseModel):
     quality_ratio: float = 0.0
     win_ratio: float = 0.0
     total_trades: int = 0
+    is_maverick: bool = False  # Maverick agents use aggressive reward functions (FOMO, ROI-First)
 
     model_config = {"extra": "ignore"}
 
@@ -620,16 +621,25 @@ class GlobalHallOfFame:
 
         return True
 
+    # Maximum number of Maverick agents allowed in Global 50 (The "Highlander" Rule)
+    MAVERICK_CAP = 5
+
     def check_and_promote(self, agent: DDPGAgent, gauntlet_score: float, generation: int,
                           roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0,
                           quality_ratio: float = 0.0, win_ratio: float = 0.0,
                           total_trades: int = 0, run_name: Optional[str] = None,
-                          suppress_threshold_output: bool = False) -> bool:
+                          suppress_threshold_output: bool = False,
+                          is_maverick: bool = False) -> Tuple[bool, int]:
         """
         Phase C: The Promotion Routine (Atomic Update)
 
         Promotes an agent to the Global 50 if they qualify.
         Handles concurrency by re-downloading the ledger before writing.
+
+        Maverick Governance (The "Highlander" Rule):
+        - Maximum 5 Maverick agents allowed in Global 50
+        - To enter when quota is full, a Maverick must outperform an existing Maverick
+        - This prevents the committee from becoming too volatile
 
         Args:
             agent: The DDPGAgent instance to promote
@@ -641,18 +651,24 @@ class GlobalHallOfFame:
             quality_ratio: Ratio of quality trades to total trades
             win_ratio: Ratio of winning trades to total trades
             total_trades: Total trades
+            run_name: Optional run name override (e.g., for archive fill)
+            suppress_threshold_output: If True, suppress threshold output
+            is_maverick: If True, this agent is a Maverick (aggressive reward function)
 
         Returns:
-            True if agent was promoted, False otherwise
+            Tuple of (promoted: bool, rank: int)
+            - promoted: True if agent was promoted, False otherwise
+            - rank: 1-based rank of agent in Global 50 (-1 if not promoted)
         """
         if not self.should_promote(gauntlet_score, roi, expectancy, cv):
-            return False
+            return False, -1
 
         with self._lock:
             print(f"\n{'='*60}")
             print("Global Hall of Fame - Promotion Routine")
             print(f"{'='*60}")
-            print(f"🏆 Agent qualified with Gauntlet Score: {gauntlet_score:.2f}, ROI: {roi:.2f}%, Expectancy: {expectancy:.4f}")
+            maverick_indicator = " [MAVERICK]" if is_maverick else ""
+            print(f"🏆 Agent qualified with Gauntlet Score: {gauntlet_score:.2f}, ROI: {roi:.2f}%, Expectancy: {expectancy:.4f}{maverick_indicator}")
 
             # ATOMIC UPDATE: Re-download to get latest state
             print("⏳ Re-downloading global50.json for atomic update...")
@@ -660,7 +676,7 @@ class GlobalHallOfFame:
             if not success:
                 print("⚠ Failed to download latest global50.json. Aborting promotion.")
                 print(f"{'='*60}\n")
-                return False
+                return False, -1
 
             # Reload entries
             self._load_local_ledger()
@@ -678,31 +694,66 @@ class GlobalHallOfFame:
                 cv=cv,
                 quality_ratio=quality_ratio,
                 win_ratio=win_ratio,
-                total_trades=total_trades
+                total_trades=total_trades,
+                is_maverick=is_maverick
             )
 
-            # Merge: Add new agent
-            self.entries.append(new_entry)
+            # Merge: Add new agent to candidate pool
+            candidates = self.entries + [new_entry]
 
             # Sort: Rank by Gauntlet Score (descending)
-            self.entries.sort(key=lambda e: e.gauntlet_score, reverse=True)
+            candidates.sort(key=lambda e: e.gauntlet_score, reverse=True)
 
-            # Cut: Identify dropouts
+            # Apply Maverick Cap Enforcement (The "Highlander" Logic)
+            # Iterate from top to bottom: Accept all "Normal" agents, accept "Maverick"
+            # agents only if maverick_count < MAVERICK_CAP
+            final_list = []
+            maverick_count = 0
             dropouts = []
-            if len(self.entries) > self.CAPACITY:
-                dropouts = self.entries[self.CAPACITY:]
-                self.entries = self.entries[:self.CAPACITY]
+
+            for entry in candidates:
+                if len(final_list) >= self.CAPACITY:
+                    # Capacity reached, remaining entries are dropouts
+                    dropouts.append(entry)
+                    continue
+
+                if entry.is_maverick:
+                    if maverick_count < self.MAVERICK_CAP:
+                        final_list.append(entry)
+                        maverick_count += 1
+                    else:
+                        # Maverick cap hit: This Maverick is rejected
+                        # Check if this is the new entry
+                        if entry == new_entry:
+                            print(f"  ⚠ Agent qualified by score but rejected by Maverick Cap (Max {self.MAVERICK_CAP}).")
+                            print(f"{'='*60}\n")
+                            return False, -1
+                        # Otherwise skip this Maverick (it's an existing one being displaced)
+                        dropouts.append(entry)
+                else:
+                    # Normal agents are always accepted (subject to capacity)
+                    final_list.append(entry)
+
+            # Check if our new entry survived the cut
+            if new_entry not in final_list:
+                print(f"  ⚠ Agent did not make the final cut (score too low or capacity reached).")
+                print(f"{'='*60}\n")
+                return False, -1
+
+            # Identify dropouts from original entries (not including the new entry if it failed)
+            # dropouts are entries in self.entries that are not in final_list
+            dropouts = [e for e in self.entries if e not in final_list]
+
+            # Apply the new list
+            self.entries = final_list
 
             # Sync Files - MUST succeed before updating ledger
             if not self._sync_agent_files(new_entry, agent, dropouts):
-                # Rollback: Remove the new entry from the list
-                self.entries = [e for e in self.entries if e != new_entry]
-                # Re-add dropouts if any were removed
-                self.entries.extend(dropouts)
-                self.entries.sort(key=lambda e: e.gauntlet_score, reverse=True)
+                # Rollback: Restore from cloud ledger
+                self._load_local_ledger()
                 print(f"✗ Promotion aborted: Agent file upload failed")
                 print(f"{'='*60}\n")
-                return False
+                return False, -1
 
             # Update Ledger
             self._save_local_ledger()
@@ -726,16 +777,19 @@ class GlobalHallOfFame:
             print(f"  Rank: #{new_rank}")
             print(f"  Score: {gauntlet_score:.2f}")
             print(f"  Run: {self.run_name}")
+            if is_maverick:
+                print(f"  Type: Maverick (Count: {maverick_count}/{self.MAVERICK_CAP})")
             if not suppress_threshold_output:
                 print(f"  New Threshold: {self.entry_threshold:.2f}")
 
             if dropouts:
                 for dropout in dropouts:
-                    print(f"  ⤵ Retired: {dropout.run_name} (Score: {dropout.gauntlet_score:.2f})")
+                    dropout_type = " [M]" if dropout.is_maverick else ""
+                    print(f"  ⤵ Retired: {dropout.run_name}{dropout_type} (Score: {dropout.gauntlet_score:.2f})")
 
             print(f"{'='*60}\n")
 
-            return True
+            return True, new_rank
 
     def _sync_agent_files(self, new_entry: GlobalHoFEntry, agent: DDPGAgent,
                           dropouts: List[GlobalHoFEntry]) -> bool:
