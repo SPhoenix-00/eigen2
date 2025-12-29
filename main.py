@@ -178,6 +178,15 @@ def main():
                  'Limited to 5 mavericks in Global 50 (Highlander Rule). Training stops when '
                  'maverick reaches rank 20 or higher.'
         )
+        parser.add_argument(
+            '--local',
+            action='store_true',
+            help='Enable local mode optimizations for running on local machines. '
+                 'Uses sequential evaluation/validation instead of parallel processing to '
+                 'eliminate process spawning overhead and IPC serialization. Also serializes '
+                 'disk writes to avoid I/O thrashing on local NVMe drives. Recommended for '
+                 'Windows or when parallel workers cause slowdowns.'
+        )
         args = parser.parse_args()
         # --------------------------------
 
@@ -373,7 +382,8 @@ def main():
             original_stderr=tee_logger.terminal,
             multi_mode=args.multi,
             multi_roster=getattr(args, 'multi_roster', None),
-            maverick_mode=args.maverick
+            maverick_mode=args.maverick,
+            local_mode=args.local
         )
 
         # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---

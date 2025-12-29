@@ -54,8 +54,10 @@ class DDPGAgent:
             weight_decay=Config.WEIGHT_DECAY
         )
 
-        self.actor_scaler = GradScaler('cuda')
-        self.critic_scaler = GradScaler('cuda')
+        # GradScaler for mixed precision - only enabled on CUDA
+        scaler_device = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        self.actor_scaler = GradScaler(scaler_device, enabled=(self.device.type == 'cuda'))
+        self.critic_scaler = GradScaler(scaler_device, enabled=(self.device.type == 'cuda'))
         
         # Exploration noise
         self.noise_scale = Config.NOISE_SCALE

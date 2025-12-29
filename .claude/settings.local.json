@@ -57,7 +57,10 @@
       "Bash(git checkout:*)",
       "Bash(git stash:*)",
       "Bash(head:*)",
-      "Bash(tail:*)"
+      "Bash(tail:*)",
+      "Bash(d:)",
+      "Bash(.venvScriptspip install psutil)",
+      "Bash(\"d:\\\\GitHub\\\\eigen2\\\\.venv\\\\Scripts\\\\pip\" install psutil)"
     ],
     "deny": [],
     "ask": []

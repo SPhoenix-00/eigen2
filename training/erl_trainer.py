@@ -566,7 +566,8 @@ class ERLTrainer:
     def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
                  consistency_mode: bool = False, heroes_hof_dir: str = None, single_agent_path: str = None,
                  buffer_storage_path: str = None, reset_limit: bool = False, original_stdout=None, original_stderr=None,
-                 multi_mode: bool = False, multi_roster: dict = None, maverick_mode: bool = False):
+                 multi_mode: bool = False, multi_roster: dict = None, maverick_mode: bool = False,
+                 local_mode: bool = False):
         """
         Initialize ERL trainer.
 
@@ -584,6 +585,7 @@ class ERLTrainer:
             multi_mode: If True, enable multi-agent committee training mode
             multi_roster: Committee roster dict with 9 members (required if multi_mode=True)
             maverick_mode: If True, enable Maverick training mode (aggressive reward functions)
+            local_mode: If True, use sequential evaluation/validation and serialize disk writes
         """
         self.data_loader = data_loader
         self.resume_run_name = resume_run_name
@@ -595,6 +597,7 @@ class ERLTrainer:
         self.external_buffer_storage_path = buffer_storage_path  # Optional path to reuse existing buffer
         self.reset_limit = reset_limit  # Reset fallback counter on resume
         self.maverick_mode = maverick_mode  # Maverick training mode (aggressive reward functions)
+        self.local_mode = local_mode  # Local mode: sequential execution and serialized disk writes
 
         # Multi-agent committee mode (sequential training of each member)
         self.multi_mode = multi_mode
@@ -1656,7 +1659,13 @@ class ERLTrainer:
 
         # Run full validation to establish self-referential baselines
         # Note: validate_population_parallel returns raw validation metrics
-        validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
+        if self.local_mode:
+            print(f"\n--- Initial Validation (Sequential) ---")
+            validation_results = []
+            for agent in tqdm(self.population, desc="Validating agents"):
+                validation_results.append(self.validate_agent_cached(agent, quality_threshold=Config.ROI_QUALITY_THRESHOLD))
+        else:
+            validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
 
         # Initialize storage for each member's specific starting ROI
         # This allows each member to compete against THEMSELVES, not a global median
@@ -1955,7 +1964,8 @@ class ERLTrainer:
 
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
-                   training: bool = True) -> Tuple[float, Dict]:
+                   training: bool = True,
+                   transition_collector: list = None) -> Tuple[float, Dict]:
         """
         Run one episode with an agent using a persistent environment.
 
@@ -1965,6 +1975,9 @@ class ERLTrainer:
             start_idx: Starting day index (first day of trading period)
             end_idx: Ending day index (includes settlement period)
             training: Whether this is training (adds to replay buffer)
+            transition_collector: Optional list to collect transitions instead of writing to disk.
+                                  When provided, transitions are appended here for batch writing later.
+                                  Used in local mode to serialize disk I/O.
 
         Returns:
             Tuple of (cumulative_reward, episode_info)
@@ -1984,24 +1997,30 @@ class ERLTrainer:
         )
         cumulative_reward = 0.0
         steps = 0
-        
+
         # Run episode
         while True:
             # Select action
             action = agent.select_action(state, add_noise=training)
-            
+
             # Take step
             next_state, reward, terminated, truncated, info = env.step(action)
-            
-            # Store transition in replay buffer (Off-Policy Buffer: all agents contribute)
-            # Note: training flag controls noise (line 776), not buffer saving
-            self.replay_buffer.add(
-                state=state.astype(np.float32),
-                action=action.astype(np.float32),
-                reward=reward,
-                next_state=next_state.astype(np.float32),
-                done=float(terminated or truncated)
-            )
+
+            # Store transition - either in collector for batch writing or directly to buffer
+            transition = {
+                'state': state.astype(np.float32),
+                'action': action.astype(np.float32),
+                'reward': reward,
+                'next_state': next_state.astype(np.float32),
+                'done': float(terminated or truncated)
+            }
+
+            if transition_collector is not None:
+                # Collect for batch writing (local mode)
+                transition_collector.append(transition)
+            else:
+                # Write directly to buffer (parallel mode writes in workers)
+                self.replay_buffer.add(**transition)
             
             cumulative_reward += reward
             steps += 1
@@ -2542,6 +2561,9 @@ class ERLTrainer:
         - Final fitness = average of the LOWEST 2 scores (conservative, robust estimate)
         - This prevents "lucky" agents from advancing and selects for consistency
 
+        In local mode, transitions are collected in memory and batch-written to disk
+        at the end to avoid I/O thrashing from many small writes.
+
         Returns:
             Tuple of (fitness_scores, aggregate_stats)
         """
@@ -2564,6 +2586,11 @@ class ERLTrainer:
         num_elites = sum(1 for a in self.population if a.is_elite)
         num_exploratory = len(self.population) - num_elites
         print(f"Elite Demonstration: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
+
+        # In local mode, collect transitions for batch writing to avoid I/O thrashing
+        transition_collector = [] if self.local_mode else None
+        if self.local_mode:
+            print(f"Local mode: Collecting transitions for batch write")
 
         for agent_idx, agent in enumerate(tqdm(self.population, desc="Evaluating agents")):
             # Evaluate agent on multiple random training slices
@@ -2591,7 +2618,8 @@ class ERLTrainer:
                     env=self.eval_env,  # Reuse persistent environment instead of creating new ones
                     start_idx=start_idx,
                     end_idx=end_idx,
-                    training=(not agent.is_elite)  # Only exploratory agents contribute to buffer
+                    training=(not agent.is_elite),  # Only exploratory agents contribute to buffer
+                    transition_collector=transition_collector  # Collect transitions in local mode
                 )
 
                 # Calculate Structural Fitness for Evolution
@@ -2615,6 +2643,12 @@ class ERLTrainer:
 
         # Aggregate statistics across all agents
         aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
+
+        # In local mode, batch-write all collected transitions to disk
+        if self.local_mode and transition_collector:
+            print(f"\n--- Batch writing {len(transition_collector)} transitions to replay buffer ---")
+            self.replay_buffer.add_batch(transition_collector)
+            del transition_collector  # Free memory
 
         # CRITICAL FIX: Delete large all_episode_stats list and force aggressive GC
         del all_episode_stats
@@ -3120,11 +3154,10 @@ class ERLTrainer:
         print(f"  Baseline: {self.member_baselines[member_idx]:.2f} -> New: {score:.2f}")
         print(f"  Improvement: {improvement_pct:.1f}%")
 
-        # Archive original member agent (locally and in cloud Global50)
+        # Archive original member agent locally (cloud archiving is handled by check_and_promote)
         original_path = get_agent_filepath(member, context_window)
-        old_filename = f"{member['run_name']}_{member['agent_id']}.pth"
 
-        # Archive locally
+        # Archive locally (for local backup)
         if original_path.exists():
             archive_dir = original_path.parent / "archive"
             archive_dir.mkdir(exist_ok=True)
@@ -3133,28 +3166,10 @@ class ERLTrainer:
             shutil.copy(original_path, archive_path)
             print(f"  Archived original to: {archive_path.name}")
 
-        # Archive in cloud Global50 (move from agents/ to archive/)
-        # This prevents orphan agents from accumulating in cloud storage
-        cloud_agents_path = f"{self.global_hof.cloud_base}/agents/{old_filename}"
-        cloud_archive_path = f"{self.global_hof.cloud_base}/archive/{old_filename}"
-
-        if self.global_hof.enabled and self.cloud_sync.file_exists(cloud_agents_path):
-            # Download to local archive if we don't have it
-            local_archive_path = self.global_hof.local_archive_dir / old_filename
-            if not local_archive_path.exists():
-                self.cloud_sync.download_file(cloud_agents_path, str(local_archive_path))
-
-            # Upload to cloud archive
-            if local_archive_path.exists():
-                upload_success = self.cloud_sync.upload_file_verified(str(local_archive_path), cloud_archive_path)
-                if upload_success:
-                    # Delete from cloud agents/ only after verified archive
-                    if self.cloud_sync.delete_file(cloud_agents_path):
-                        print(f"  Archived parent in cloud: {old_filename} (agents/ -> archive/)")
-                    else:
-                        print(f"  ⚠ Parent archived but failed to delete from cloud agents/: {old_filename}")
-                else:
-                    print(f"  ⚠ Failed to archive parent in cloud: {old_filename}")
+        # NOTE: Cloud archiving (move from agents/ to archive/) is now handled by
+        # check_and_promote via the replacing_entry parameter. This ensures atomic
+        # operations where the parent entry is removed from the JSON and its file
+        # is archived in a single transaction, preventing race conditions in --multi mode.
 
         # Save improved agent with new filename
         new_filename = f"{self.run_name}_{improved_agent.agent_id}.pth"
@@ -3316,6 +3331,12 @@ class ERLTrainer:
         self.global_hof.expectancy_p75 = float('-inf')
 
         # Upload to Global50 on every improvement
+        # Pass the parent entry to be replaced so check_and_promote can:
+        # 1. Remove it from the candidate pool before merging
+        # 2. Archive its file as part of normal dropout handling
+        # This prevents race conditions where the parent's entry persists in JSON
+        # after its file has been archived by a concurrent run.
+        parent_entry = (member['run_name'], member['agent_id'])
         promoted, rank = self.global_hof.check_and_promote(
             agent=agent,
             gauntlet_score=score,
@@ -3326,7 +3347,8 @@ class ERLTrainer:
             quality_ratio=quality_ratio,
             win_ratio=win_ratio,
             total_trades=total_trades,
-            is_maverick=self.maverick_mode
+            is_maverick=self.maverick_mode,
+            replacing_entry=parent_entry
         )
 
         # Restore original thresholds (check_and_promote may have updated them via _update_entry_threshold)
@@ -5548,9 +5570,12 @@ class ERLTrainer:
             self.current_generation_val_slices = self.generate_validation_slices()
             self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
 
-            # Re-evaluate population on training data (using parallel evaluation for speed)
+            # Re-evaluate population on training data
             print("\nRe-evaluating population on training data...")
-            fitness_scores, _ = self.evaluate_population_parallel()
+            if self.local_mode:
+                fitness_scores, _ = self.evaluate_population()
+            else:
+                fitness_scores, _ = self.evaluate_population_parallel()
 
             # Re-evaluate population on validation data
             print("\nRe-evaluating population on validation data...")
@@ -5894,6 +5919,17 @@ class ERLTrainer:
         print("Starting ERL Training")
         print("="*60)
 
+        # Print local mode notice if enabled
+        if self.local_mode:
+            print("\n" + "-"*60)
+            print("LOCAL MODE ENABLED")
+            print("-"*60)
+            print("  - Sequential evaluation (no process spawning)")
+            print("  - Sequential validation (no worker pool)")
+            print("  - Batch disk writes (no I/O thrashing)")
+            print("  - Optimized for local machines (Windows/WSL)")
+            print("-"*60 + "\n")
+
         # Initialize leverage mode if requested
         if self.enable_leverage and not self.leverage_mode_active:
             hof_size = len(self.hall_of_fame)
@@ -6087,8 +6123,11 @@ class ERLTrainer:
             print(f"{'='*60}")
 
             # 1. Evaluate population (collect experiences)
-            # Use parallel evaluation for significant speedup
-            fitness_scores, pop_stats = self.evaluate_population_parallel()
+            # Use sequential evaluation in local mode to eliminate process spawning overhead
+            if self.local_mode:
+                fitness_scores, pop_stats = self.evaluate_population()
+            else:
+                fitness_scores, pop_stats = self.evaluate_population_parallel()
 
             # Update resource tracker after evaluation
             self.resource_tracker.update()
@@ -6168,8 +6207,15 @@ class ERLTrainer:
             # Update instance variable for use in fitness calculation
             self.quality_threshold = quality_threshold
 
-            # Validate entire population in parallel
-            all_val_results = self.validate_population_parallel(quality_threshold=quality_threshold)
+            # Validate entire population
+            # Use sequential validation in local mode to eliminate process spawning overhead
+            if self.local_mode:
+                print(f"\n--- Walk-Forward Validation (Sequential) ---")
+                all_val_results = []
+                for agent in tqdm(self.population, desc="Validating agents"):
+                    all_val_results.append(self.validate_agent_cached(agent, quality_threshold=quality_threshold))
+            else:
+                all_val_results = self.validate_population_parallel(quality_threshold=quality_threshold)
 
             # Process validation results and calculate combined fitness
             for idx, val_results in enumerate(all_val_results):

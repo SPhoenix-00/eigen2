@@ -629,7 +629,8 @@ class GlobalHallOfFame:
                           quality_ratio: float = 0.0, win_ratio: float = 0.0,
                           total_trades: int = 0, run_name: Optional[str] = None,
                           suppress_threshold_output: bool = False,
-                          is_maverick: bool = False) -> Tuple[bool, int]:
+                          is_maverick: bool = False,
+                          replacing_entry: Optional[Tuple[str, int]] = None) -> Tuple[bool, int]:
         """
         Phase C: The Promotion Routine (Atomic Update)
 
@@ -654,6 +655,11 @@ class GlobalHallOfFame:
             run_name: Optional run name override (e.g., for archive fill)
             suppress_threshold_output: If True, suppress threshold output
             is_maverick: If True, this agent is a Maverick (aggressive reward function)
+            replacing_entry: Optional (run_name, agent_id) tuple of entry being replaced.
+                           When specified, this entry is explicitly removed from the candidate
+                           pool before merging. This is used in --multi mode where a child
+                           agent replaces its parent to prevent the parent's entry from
+                           persisting in the JSON after its file has been archived.
 
         Returns:
             Tuple of (promoted: bool, rank: int)
@@ -680,6 +686,19 @@ class GlobalHallOfFame:
 
             # Reload entries
             self._load_local_ledger()
+
+            # If replacing an existing entry (--multi mode parent replacement),
+            # remove it from the pool before merging to prevent orphaned references
+            replaced_entry = None
+            if replacing_entry is not None:
+                parent_run_name, parent_agent_id = replacing_entry
+                for entry in self.entries:
+                    if entry.run_name == parent_run_name and entry.agent_id == parent_agent_id:
+                        replaced_entry = entry
+                        break
+                if replaced_entry:
+                    self.entries = [e for e in self.entries if e != replaced_entry]
+                    print(f"  Replacing parent: {parent_run_name}_{parent_agent_id}")
 
             # Create new entry
             # Use provided run_name if given (e.g., for archive fill), otherwise use self.run_name
@@ -743,6 +762,10 @@ class GlobalHallOfFame:
             # Identify dropouts from original entries (not including the new entry if it failed)
             # dropouts are entries in self.entries that are not in final_list
             dropouts = [e for e in self.entries if e not in final_list]
+
+            # Also add the explicitly replaced entry to dropouts for proper archiving
+            if replaced_entry is not None:
+                dropouts.append(replaced_entry)
 
             # Apply the new list
             self.entries = final_list
