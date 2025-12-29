@@ -48,6 +48,9 @@ from utils.cleanup_orphans import cleanup_orphans
 from torch.utils.data import DataLoader
 # from utils.memory_profiler import get_profiler, log_memory  # Memory profiling disabled
 
+# Local mode evaluator (CPU-optimized, no I/O during evaluation)
+from training.local_evaluator import LocalEvaluator
+
 
 class NumpyEncoder(json.JSONEncoder):
     """Custom encoder for NumPy data types."""
@@ -1042,8 +1045,19 @@ class ERLTrainer:
 
         # Initialize shared memory for parallel worker data (eliminates serialization overhead)
         # This creates shared memory blocks for data arrays that workers can access directly
-        print("Initializing shared memory for parallel workers...")
-        self._init_shared_memory()
+        if not self.local_mode:
+            print("Initializing shared memory for parallel workers...")
+            self._init_shared_memory()
+        else:
+            print("Local mode: Skipping shared memory (CPU-optimized evaluation)")
+            self._shared_memory_names = {}  # Empty dict for compatibility
+
+        # Initialize LocalEvaluator for CPU-optimized local mode
+        # This must be initialized after eval_env but before checkpoint loading
+        self.local_evaluator = None
+        if self.local_mode:
+            print("Initializing LocalEvaluator for CPU-optimized execution...")
+            self.local_evaluator = LocalEvaluator(self)
 
         # Load heroes from Hall of Fame if specified (must happen after env creation, before checkpoint load)
         if self.heroes_hof_dir:
@@ -1660,10 +1674,7 @@ class ERLTrainer:
         # Run full validation to establish self-referential baselines
         # Note: validate_population_parallel returns raw validation metrics
         if self.local_mode:
-            print(f"\n--- Initial Validation (Sequential) ---")
-            validation_results = []
-            for agent in tqdm(self.population, desc="Validating agents"):
-                validation_results.append(self.validate_agent_cached(agent, quality_threshold=Config.ROI_QUALITY_THRESHOLD))
+            validation_results = self.local_evaluator.validate_population(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
         else:
             validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
 
@@ -5573,7 +5584,7 @@ class ERLTrainer:
             # Re-evaluate population on training data
             print("\nRe-evaluating population on training data...")
             if self.local_mode:
-                fitness_scores, _ = self.evaluate_population()
+                fitness_scores, _ = self.local_evaluator.evaluate_population()
             else:
                 fitness_scores, _ = self.evaluate_population_parallel()
 
@@ -6123,9 +6134,9 @@ class ERLTrainer:
             print(f"{'='*60}")
 
             # 1. Evaluate population (collect experiences)
-            # Use sequential evaluation in local mode to eliminate process spawning overhead
+            # Use LocalEvaluator in local mode for CPU-optimized execution with in-memory transitions
             if self.local_mode:
-                fitness_scores, pop_stats = self.evaluate_population()
+                fitness_scores, pop_stats = self.local_evaluator.evaluate_population()
             else:
                 fitness_scores, pop_stats = self.evaluate_population_parallel()
 
@@ -6208,12 +6219,9 @@ class ERLTrainer:
             self.quality_threshold = quality_threshold
 
             # Validate entire population
-            # Use sequential validation in local mode to eliminate process spawning overhead
+            # Use LocalEvaluator in local mode for CPU-optimized validation
             if self.local_mode:
-                print(f"\n--- Walk-Forward Validation (Sequential) ---")
-                all_val_results = []
-                for agent in tqdm(self.population, desc="Validating agents"):
-                    all_val_results.append(self.validate_agent_cached(agent, quality_threshold=quality_threshold))
+                all_val_results = self.local_evaluator.validate_population(quality_threshold=quality_threshold)
             else:
                 all_val_results = self.validate_population_parallel(quality_threshold=quality_threshold)
 

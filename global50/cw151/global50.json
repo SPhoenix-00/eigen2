@@ -4,6 +4,19 @@
   },
   "entries": [
     {
+      "agent_id": 55,
+      "run_name": "pleasant-water-209",
+      "gauntlet_score": 344.70656904298465,
+      "generation": 32,
+      "roi": 7.720576763153076,
+      "expectancy": 6.815585613250732,
+      "cv": 100.0,
+      "quality_ratio": 0.29056603773584905,
+      "win_ratio": 0.0,
+      "total_trades": 265,
+      "is_maverick": false
+    },
+    {
       "agent_id": 83,
       "run_name": "pleasant-water-209",
       "gauntlet_score": 181.8024637593477,
@@ -639,22 +652,9 @@
       "win_ratio": 0.9178082191780822,
       "total_trades": 146,
       "is_maverick": false
-    },
-    {
-      "agent_id": 54,
-      "run_name": "breezy-glade-175",
-      "gauntlet_score": -116.59604090285725,
-      "generation": 0,
-      "roi": 7.376284122467041,
-      "expectancy": 5.422657012939453,
-      "cv": 2.4372233660666143,
-      "quality_ratio": 0.2669039145907473,
-      "win_ratio": 0.7313167259786477,
-      "total_trades": 562,
-      "is_maverick": false
     }
   ],
   "capacity": 50,
   "version": "1.0",
-  "last_updated": "2025-12-29T14:49:01.806829Z"
+  "last_updated": "2025-12-29T16:05:12.298853Z"
 }
