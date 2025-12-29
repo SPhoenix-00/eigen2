@@ -49,7 +49,15 @@
       "Bash(grep:*)",
       "Bash(gsutil cat:*)",
       "Bash(git diff:*)",
-      "Bash(gcloud storage ls:*)"
+      "Bash(gcloud storage ls:*)",
+      "Bash(git checkout:*)",
+      "Bash(git -C /Users/asellam/Documents/GitHub/eigen2 branch --show-current)",
+      "Bash(git -C /Users/asellam/Documents/GitHub/eigen2 status)",
+      "Bash(git -C /Users/asellam/Documents/GitHub/eigen2 diff --stat)",
+      "Bash(git -C /Users/asellam/Documents/GitHub/eigen2 add environment/trading_env.py training/erl_trainer.py utils/config.py)",
+      "Bash(git -C /Users/asellam/Documents/GitHub/eigen2 commit -m \"$(cat <<''EOF''\nImplement Maverick aggressive reward function (FOMO/ROI-First)\n\n- Add maverick_mode parameter to TradingEnvironment\n- Implement aggressive reward logic:\n  - 50% reduced hurdle rate to encourage more trading\n  - 0.5x loss penalty (vs 1.0x normal, 1.5x consistency)\n  - No forced exit penalty (encourages holding for bigger gains)\n- Update calculate_triad_fitness with FOMO/ROI-First scoring:\n  - Base Score: (Raw PnL / Peak Capital) * log10(Peak Capital + 10)\n  - FOMO Penalty: max(0, Market Return - Agent ROI) * 10.0\n  - Fear Factor: 2.0 * (num_losses ^ 1.2) - gentle drag on losses\n  - -5000 penalty for zero trades (forces market engagement)\n- Add MAVERICK_MARKET_BENCHMARK_COL config for S&P 500 proxy\n- Pass maverick_mode through worker functions and env creation\n- Add market_return_pct to episode summary for FOMO calculation\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git -C /Users/asellam/Documents/GitHub/eigen2 log --oneline -3)",
+      "Bash(git -C /Users/asellam/Documents/GitHub/eigen2 push origin eigen_rocm)"
     ],
     "deny": [],
     "ask": []
