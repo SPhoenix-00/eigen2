@@ -19,7 +19,9 @@ import math
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-from multiprocessing import shared_memory, resource_tracker
+from multiprocessing import shared_memory
+if sys.platform != 'win32':
+    from multiprocessing import resource_tracker
 from enum import Enum
 from dataclasses import dataclass
 from collections import OrderedDict
@@ -1114,7 +1116,9 @@ class ERLTrainer:
         shm_data_view[:] = data_array[:]
         self._shm_blocks.append(self._shm_data_array)
         # Register with resource tracker for crash-safe cleanup (prevents zombie segments)
-        resource_tracker.register(self._shm_data_array.name, "shared_memory")
+        # Note: resource_tracker is POSIX-only, not available on Windows
+        if sys.platform != 'win32':
+            resource_tracker.register(self._shm_data_array.name, "shared_memory")
 
         # Create shared memory for data_array_full (full features for environment)
         data_array_full = self.data_loader.data_array_full
@@ -1131,7 +1135,9 @@ class ERLTrainer:
         shm_full_view[:] = data_array_full[:]
         self._shm_blocks.append(self._shm_data_array_full)
         # Register with resource tracker for crash-safe cleanup (prevents zombie segments)
-        resource_tracker.register(self._shm_data_array_full.name, "shared_memory")
+        # Note: resource_tracker is POSIX-only, not available on Windows
+        if sys.platform != 'win32':
+            resource_tracker.register(self._shm_data_array_full.name, "shared_memory")
 
         # Store metadata for workers
         self._shm_metadata = {
