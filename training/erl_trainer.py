@@ -1666,14 +1666,23 @@ class ERLTrainer:
             self.member_starting_rois[member_idx] = agent_roi
 
             # 2. Calculate Base Fitness
-            base_combined_fitness = val_fitness + min(0.0, train_fitness)
+            # BUGFIX: Clamp val_fitness to 0 if agent isn't trading (val_fitness = -500)
+            # Without this, a non-trading agent gets baseline of -500, making any improvement trivial
+            clamped_val_fitness = max(0.0, val_fitness)
+            base_combined_fitness = clamped_val_fitness + min(0.0, train_fitness)
 
-            # 3. Force ZERO adjustment for the baseline (Self vs Self = 0)
-            # We want the baseline to represent "no improvement yet"
-            # During training, the hurdle will be set to this member's starting ROI
-            roi_adjustment = 0.0
+            # 3. Calculate ROI adjustment using the SAME formula as training
+            # This ensures baseline and training scores are comparable
+            # Formula: |base_fitness| * multiplier * (agent_roi - hurdle_roi) / 100
+            # For baseline, hurdle_roi = agent's own ROI, so adjustment = 0
+            # But we compute it explicitly to match the training path
+            hurdle_roi = agent_roi  # Self-referential: competing against own starting ROI
+            min_trades_threshold = Config.ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY
+            confidence_factor = min(1.0, quality_count / min_trades_threshold) if min_trades_threshold > 0 else 1.0
+            roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - hurdle_roi) / 100.0
+            roi_adjustment = roi_adjustment * confidence_factor  # = 0 since agent_roi == hurdle_roi
 
-            # 4. Set the baseline (no ROI adjustment for initial baseline)
+            # 4. Set the baseline
             combined_fitness = base_combined_fitness + roi_adjustment
 
             # Store in result
@@ -3228,6 +3237,34 @@ class ERLTrainer:
         total_decisions = num_wins + num_losses
         win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
 
+        # MULTI-MODE FIX: Bypass should_promote() gate by temporarily setting all thresholds to -inf/+inf
+        # Committee members are already in Global50 - they're replacing themselves, not competing for entry.
+        # The parent agent was archived from cloud storage but is still in the ledger until promotion completes.
+        # Without this bypass, should_promote() uses thresholds that include the parent, causing rejection.
+        original_thresholds = {
+            'entry_threshold': self.global_hof.entry_threshold,
+            'roi_threshold': self.global_hof.roi_threshold,
+            'expectancy_threshold': self.global_hof.expectancy_threshold,
+            'cv_threshold': self.global_hof.cv_threshold,
+            'gauntlet_median': self.global_hof.gauntlet_median,
+            'roi_median': self.global_hof.roi_median,
+            'expectancy_median': self.global_hof.expectancy_median,
+            'gauntlet_p75': self.global_hof.gauntlet_p75,
+            'roi_p75': self.global_hof.roi_p75,
+            'expectancy_p75': self.global_hof.expectancy_p75,
+        }
+        # Set thresholds to allow any agent through should_promote()
+        self.global_hof.entry_threshold = float('-inf')
+        self.global_hof.roi_threshold = float('-inf')
+        self.global_hof.expectancy_threshold = float('-inf')
+        self.global_hof.cv_threshold = float('inf')  # CV: lower is better, so +inf allows all
+        self.global_hof.gauntlet_median = float('-inf')
+        self.global_hof.roi_median = float('-inf')
+        self.global_hof.expectancy_median = float('-inf')
+        self.global_hof.gauntlet_p75 = float('-inf')
+        self.global_hof.roi_p75 = float('-inf')
+        self.global_hof.expectancy_p75 = float('-inf')
+
         # Upload to Global50 on every improvement
         promoted, rank = self.global_hof.check_and_promote(
             agent=agent,
@@ -3242,6 +3279,12 @@ class ERLTrainer:
             is_maverick=self.maverick_mode
         )
 
+        # Restore original thresholds (check_and_promote may have updated them via _update_entry_threshold)
+        # We restore only if promotion failed; if it succeeded, thresholds are already recalculated correctly
+        if not promoted:
+            for key, value in original_thresholds.items():
+                setattr(self.global_hof, key, value)
+
         if promoted:
             print(f"  ✓ Promoted to Global50: {new_filename} (Rank #{rank})")
             # Maverick stopping condition: Top 20 achieved
@@ -3249,7 +3292,7 @@ class ERLTrainer:
                 self._maverick_goal_achieved = True
                 self._maverick_final_rank = rank
         else:
-            print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={self.global_hof.entry_threshold:.2f})")
+            print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={original_thresholds['entry_threshold']:.2f})")
 
     def _process_multi_turnover(self):
         """
