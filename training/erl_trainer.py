@@ -552,7 +552,7 @@ class ERLTrainer:
     def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
                  consistency_mode: bool = False, heroes_hof_dir: str = None, single_agent_path: str = None,
                  buffer_storage_path: str = None, reset_limit: bool = False, original_stdout=None, original_stderr=None,
-                 multi_mode: bool = False, multi_roster: dict = None):
+                 multi_mode: bool = False, multi_roster: dict = None, maverick_mode: bool = False):
         """
         Initialize ERL trainer.
 
@@ -569,6 +569,7 @@ class ERLTrainer:
             original_stderr: Original stderr before any redirection (for wandb console capture)
             multi_mode: If True, enable multi-agent committee training mode
             multi_roster: Committee roster dict with 9 members (required if multi_mode=True)
+            maverick_mode: If True, enable Maverick training mode (aggressive reward functions)
         """
         self.data_loader = data_loader
         self.resume_run_name = resume_run_name
@@ -579,6 +580,7 @@ class ERLTrainer:
         self.single_agent_mode = single_agent_path is not None
         self.external_buffer_storage_path = buffer_storage_path  # Optional path to reuse existing buffer
         self.reset_limit = reset_limit  # Reset fallback counter on resume
+        self.maverick_mode = maverick_mode  # Maverick training mode (aggressive reward functions)
 
         # Multi-agent committee mode (sequential training of each member)
         self.multi_mode = multi_mode
@@ -975,6 +977,10 @@ class ERLTrainer:
         self.target_hof_turnovers = Config.TARGET_HOF_TURNOVERS  # Target number of turnovers
         self.generation_at_last_turnover = 0  # Reset fallback counter on each turnover (consistency mode)
 
+        # Maverick mode tracking (aggressive training for committee diversity)
+        self._maverick_goal_achieved = False  # Set True when Maverick reaches target rank
+        self._maverick_final_rank = -1  # Rank achieved when goal was met
+
         if self.gauntlet_mode_enabled:
             print(f"\n🎯 Gauntlet Mode ENABLED")
             print(f"  Breakthrough threshold: {self.breakthrough_threshold*100:.0f}% improvement")
@@ -983,6 +989,13 @@ class ERLTrainer:
             print(f"  Gauntlet slices: {Config.GAUNTLET_NUM_SLICES} (vs 7 normal)")
             print(f"  Target breakthroughs: {self.target_breakthroughs}")
             print(f"  Mode: {'Consistency' if self.consistency_mode else 'Normal'}")
+
+        if self.maverick_mode:
+            print(f"\n🔥 Maverick Mode ENABLED")
+            print(f"  Agent type: Maverick (aggressive reward functions)")
+            print(f"  Maverick cap: {Config.MAVERICK_CAP} max in Global 50")
+            print(f"  Target rank: #{Config.MAVERICK_TARGET_RANK} or higher")
+            print(f"  Training continues until target rank achieved")
 
         # Initialize resource tracker
         self.resource_tracker = ResourceTracker(disk_path="/workspace")
@@ -3165,7 +3178,7 @@ class ERLTrainer:
         win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
 
         # Upload to Global50 on every improvement
-        promoted = self.global_hof.check_and_promote(
+        promoted, rank = self.global_hof.check_and_promote(
             agent=agent,
             gauntlet_score=score,
             generation=self.generation,
@@ -3174,11 +3187,16 @@ class ERLTrainer:
             cv=cv,
             quality_ratio=quality_ratio,
             win_ratio=win_ratio,
-            total_trades=total_trades
+            total_trades=total_trades,
+            is_maverick=self.maverick_mode
         )
 
         if promoted:
-            print(f"  ✓ Promoted to Global50: {new_filename}")
+            print(f"  ✓ Promoted to Global50: {new_filename} (Rank #{rank})")
+            # Maverick stopping condition: Top 20 achieved
+            if self.maverick_mode and rank <= Config.MAVERICK_TARGET_RANK:
+                self._maverick_goal_achieved = True
+                self._maverick_final_rank = rank
         else:
             print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={self.global_hof.entry_threshold:.2f})")
 
@@ -4600,7 +4618,7 @@ class ERLTrainer:
                         quality_ratio = quality_count / total_trades if total_trades > 0 else 0.0
 
                         # Try to promote to Global 50
-                        promoted = self.global_hof.check_and_promote(
+                        promoted, rank = self.global_hof.check_and_promote(
                             agent=agent_to_admit,
                             gauntlet_score=g50_gauntlet_score,
                             generation=self.generation,
@@ -4609,11 +4627,15 @@ class ERLTrainer:
                             cv=agent_cv,
                             quality_ratio=quality_ratio,
                             win_ratio=win_rate,
-                            total_trades=total_trades
+                            total_trades=total_trades,
+                            is_maverick=self.maverick_mode
                         )
 
                         if promoted:
-                            pass  # Global 50 promotion succeeded
+                            # Maverick stopping condition: Top 20 achieved
+                            if self.maverick_mode and rank <= Config.MAVERICK_TARGET_RANK:
+                                self._maverick_goal_achieved = True
+                                self._maverick_final_rank = rank
 
                     # Log to wandb
                     wandb.log({
@@ -5843,6 +5865,19 @@ class ERLTrainer:
 
             # Multi-agent mode: NO fallback timeout - train until target turnovers achieved
             # (fallback timeout disabled for --multi mode)
+
+            # Maverick mode success: Target rank achieved in Global 50
+            if self.maverick_mode and self._maverick_goal_achieved:
+                print(f"\n{'='*60}")
+                print(f"🎯 MAVERICK GOAL ACHIEVED!")
+                print(f"{'='*60}")
+                print(f"  Maverick Agent promoted to Rank #{self._maverick_final_rank} (Target: <= #{Config.MAVERICK_TARGET_RANK})")
+                print(f"  Agent type: Maverick (aggressive reward functions)")
+                print(f"  Confirmed baseline: {self.confirmed_baseline:.2f}")
+                print(f"  Breakthroughs: {self.confirmed_breakthroughs}")
+                print(f"  Generation: {gen + 1}")
+                print(f"{'='*60}")
+                break
 
             if self.consistency_mode and self.hof_turnover_count >= self.target_hof_turnovers:
                 print(f"\n{'='*60}")

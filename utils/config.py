@@ -161,6 +161,12 @@ class Config:
     MULTI_BREAKTHROUGH_THRESHOLD = 0.05  # 5% improvement over member's baseline score
     MULTI_TARGET_TURNOVERS = 3           # End after 3 complete turnovers (all 9 members get 3 breakthroughs each)
 
+    # Maverick mode - aggressive training mode with FOMO/ROI-First reward functions
+    # Used to produce aggressive signal generators that break committee inaction
+    MAVERICK_MODE = False  # Set via --maverick flag
+    MAVERICK_CAP = 5       # Maximum Mavericks allowed in Global 50 (The "Highlander" Rule)
+    MAVERICK_TARGET_RANK = 20  # Training stops when Maverick reaches this rank or higher
+
     # Consistency mode - loss magnification for training on consistency
     # Applied ONLY when --consistency flag is used. Normal mode uses 1.0 (no magnification)
     CONSISTENCY_LOSS_MULTIPLIER = 1.5  # Magnify losses by 1.5x to focus training on reducing drawdowns
