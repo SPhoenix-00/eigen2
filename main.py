@@ -170,6 +170,14 @@ def main():
                  'In consistency mode, this resets the "generations since last turnover" counter, '
                  'giving the run a fresh runway of MAX_GENERATIONS_GAUNTLET generations.'
         )
+        parser.add_argument(
+            '--maverick',
+            action='store_true',
+            help='Enable Maverick mode: aggressive training with FOMO/ROI-First reward functions. '
+                 'Produces aggressive signal generators designed to break committee inaction. '
+                 'Limited to 5 mavericks in Global 50 (Highlander Rule). Training stops when '
+                 'maverick reaches rank 20 or higher.'
+        )
         args = parser.parse_args()
         # --------------------------------
 
@@ -364,7 +372,8 @@ def main():
             original_stdout=tee_logger.terminal,
             original_stderr=tee_logger.terminal,
             multi_mode=args.multi,
-            multi_roster=getattr(args, 'multi_roster', None)
+            multi_roster=getattr(args, 'multi_roster', None),
+            maverick_mode=args.maverick
         )
 
         # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---

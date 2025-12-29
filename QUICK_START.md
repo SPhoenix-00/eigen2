@@ -39,8 +39,8 @@ python3 << 'EOF'
 from google.cloud import storage
 client = storage.Client()
 bucket = client.bucket('eigen2-checkpoints-ase0')
-blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT.pkl')
-blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT.pkl')
+blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_151025.pkl')
+blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT_151025.pkl')
 print("✓ Training data downloaded")
 EOF
 ```
