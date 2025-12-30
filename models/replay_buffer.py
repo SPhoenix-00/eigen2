@@ -758,81 +758,75 @@ class OnDiskReplayBuffer(IterableDataset):
 
     def __iter__(self):
         """
-        High-Performance Iterator for OnDiskReplayBuffer.
+        Memory-Safe Cache & Drain Iterator.
 
-        Optimized for "Chunked" storage using Cache & Drain pattern:
-        1. Loads a large pool of transitions into RAM (e.g., 4000 items).
-        2. Shuffles them to ensure randomness.
-        3. Drains the entire pool into batches before reading from disk again.
+        1. Loads ~16 chunk files (approx 1000 items) into RAM.
+        2. Shuffles them.
+        3. Yields ~15 batches instantly from RAM.
+        4. Refills only when cache drops below batch_size.
 
-        This reduces CPU decompression overhead by ~50x compared to stateless sampling.
-        Each disk read now produces ~60 batches instead of 1.
+        This reduces Disk I/O by 15x and eliminates decompression CPU spikes.
+        Memory usage: 1000 items * 350KB = ~350MB RAM (completely safe).
         """
         import random
 
-        # Configuration for local caching
-        # 350KB per state * 4000 items ~= 1.4GB RAM per worker.
-        # With 4 workers, this uses ~5.6GB system RAM. Safe for most machines.
-        TARGET_CACHE_SIZE = 4000
-        MIN_CACHE_SIZE = 500  # Refill when cache drops below this
+        # 1000 items * 350KB = ~350MB RAM. Completely safe.
+        TARGET_CACHE_SIZE = 1000
 
         local_cache = []
 
         while True:
-            # 1. REFILL PHASE: If cache is low, load files until we hit target
-            if len(local_cache) < MIN_CACHE_SIZE:
+            # 1. REFILL PHASE
+            if len(local_cache) < self.training_batch_size:
+                # Calculate how many files we need to reach target
+                current_size = len(local_cache)
+                needed_items = TARGET_CACHE_SIZE - current_size
 
-                # Wait if buffer is not ready
-                if len(self.buffer) == 0:
-                    time.sleep(1.0)
+                # Assume 64 items per chunk file
+                files_needed = max(1, needed_items // 64)
+
+                # Cap at available files in buffer
+                files_needed = min(files_needed, len(self.buffer))
+
+                if files_needed > 0 and len(self.buffer) > 0:
+                    # Pick random files
+                    indices = np.random.choice(len(self.buffer), files_needed, replace=True)
+
+                    for i in indices:
+                        path = self.buffer[i]
+                        try:
+                            with gzip.open(path, 'rb') as f:
+                                data = pickle.load(f)
+
+                            # Handle both chunks (list) and legacy (dict)
+                            if isinstance(data, list):
+                                local_cache.extend(data)
+                            else:
+                                local_cache.append(data)
+                        except Exception:
+                            continue
+
+                    # Shuffle to ensure IID data for training
+                    random.shuffle(local_cache)
+                else:
+                    # Buffer is empty, wait for data
+                    time.sleep(0.5)
                     continue
 
-                # Calculate how many chunks we need to load
-                # Each chunk file contains ~64 transitions
-                needed_items = TARGET_CACHE_SIZE - len(local_cache)
-                chunks_to_load = max(1, needed_items // 64)
-
-                # Cap at available files
-                chunks_to_load = min(chunks_to_load, len(self.buffer))
-
-                # Select random file indices
-                indices = np.random.choice(len(self.buffer), chunks_to_load, replace=True)
-
-                for i in indices:
-                    path = self.buffer[i]
-                    try:
-                        with gzip.open(path, 'rb') as f:
-                            data = pickle.load(f)
-
-                        if isinstance(data, list):
-                            local_cache.extend(data)  # Chunk file (fast)
-                        else:
-                            local_cache.append(data)  # Legacy file (slow)
-                    except Exception:
-                        # Ignore corrupt files, they will be cleaned up later
-                        continue
-
-                # Shuffle the newly filled cache to ensure IID data
-                random.shuffle(local_cache)
-
-            # 2. YIELD PHASE: Drain the cache into batches
-            # We yield as long as we have enough data for a batch
+            # 2. YIELD PHASE
             if len(local_cache) >= self.training_batch_size:
+                # Pop batch from cache (Fast RAM operation)
+                batch_data = [local_cache.pop() for _ in range(self.training_batch_size)]
 
-                # Pop batch_size items from the end of the list (O(1) operation)
-                batch_transitions = []
-                for _ in range(self.training_batch_size):
-                    batch_transitions.append(local_cache.pop())
-
-                # Collate into tensors
                 try:
-                    # Fast numpy stacking
-                    states = np.stack([t['state'] for t in batch_transitions])
-                    actions = np.stack([t['action'] for t in batch_transitions])
-                    rewards = np.array([t['reward'] for t in batch_transitions]).reshape(-1, 1)
-                    next_states = np.stack([t['next_state'] for t in batch_transitions])
-                    dones = np.array([t['done'] for t in batch_transitions]).reshape(-1, 1)
+                    # Stack into Numpy (CPU)
+                    states = np.stack([t['state'] for t in batch_data])
+                    actions = np.stack([t['action'] for t in batch_data])
+                    rewards = np.array([t['reward'] for t in batch_data]).reshape(-1, 1)
+                    next_states = np.stack([t['next_state'] for t in batch_data])
+                    dones = np.array([t['done'] for t in batch_data]).reshape(-1, 1)
 
+                    # Yield Tensors (DataLoader will move to GPU)
                     yield {
                         'states': torch.FloatTensor(states),
                         'actions': torch.FloatTensor(actions),
@@ -844,7 +838,7 @@ class OnDiskReplayBuffer(IterableDataset):
                     print(f"Error collating batch: {e}")
                     continue
             else:
-                # Edge case: If we couldn't load enough data (buffer empty?), wait a bit
+                # Buffer is empty or waiting for data
                 time.sleep(0.1)
 
     def __len__(self) -> int:

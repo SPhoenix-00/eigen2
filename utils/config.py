@@ -123,6 +123,7 @@ class Config:
     BATCH_SIZE = 160
     LOCAL_BATCH_SIZE = 64  # Batch size for local mode training
     LOCAL_GRADIENT_ACCUMULATION_STEPS = 1  # No accumulation in local mode - each step = 1 disk read (vs 16x with accumulation)
+    LOCAL_NUM_DATALOADER_WORKERS = 0  # Run in main process - Windows/WSL multiprocessing overhead is massive for 64-item batches
     MIN_BUFFER_SIZE = 23200  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     

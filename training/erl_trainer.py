@@ -1254,23 +1254,34 @@ class ERLTrainer:
         # Force garbage collection to ensure workers are cleaned up
         gc.collect()
 
-        # Set batch size based on mode
-        # Local mode uses smaller batches to fit in 24GB VRAM with batched agent training
+        # Set batch size and workers based on mode
+        # Local mode: smaller batches + no workers (main process is faster on Windows)
         if self.local_mode:
             self.replay_buffer.training_batch_size = Config.LOCAL_BATCH_SIZE
-            print(f"Creating DataLoader with {Config.NUM_DATALOADER_WORKERS} workers (batch_size={Config.LOCAL_BATCH_SIZE} for local mode)...")
+            num_workers = Config.LOCAL_NUM_DATALOADER_WORKERS
+            print(f"Creating DataLoader with {num_workers} workers (batch_size={Config.LOCAL_BATCH_SIZE} for local mode)...")
         else:
             self.replay_buffer.training_batch_size = Config.BATCH_SIZE
-            print(f"Creating DataLoader with {Config.NUM_DATALOADER_WORKERS} background workers...")
+            num_workers = Config.NUM_DATALOADER_WORKERS
+            print(f"Creating DataLoader with {num_workers} background workers...")
 
-        self.replay_dataloader = DataLoader(
-            self.replay_buffer,
-            batch_size=None,  # Already batched by __iter__
-            num_workers=Config.NUM_DATALOADER_WORKERS,
-            pin_memory=True,  # Faster GPU transfer
-            prefetch_factor=2,  # Each worker prefetches 2 batches ahead
-            persistent_workers=True  # Keep workers alive between epochs
-        )
+        # num_workers=0 runs in main process - different options required
+        if num_workers == 0:
+            self.replay_dataloader = DataLoader(
+                self.replay_buffer,
+                batch_size=None,  # Already batched by __iter__
+                num_workers=0,
+                pin_memory=True  # Faster GPU transfer
+            )
+        else:
+            self.replay_dataloader = DataLoader(
+                self.replay_buffer,
+                batch_size=None,  # Already batched by __iter__
+                num_workers=num_workers,
+                pin_memory=True,  # Faster GPU transfer
+                prefetch_factor=2,  # Each worker prefetches 2 batches ahead
+                persistent_workers=True  # Keep workers alive between epochs
+            )
         # Reset iterator when creating new DataLoader
         self.batch_iterator = None
 
