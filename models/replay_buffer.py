@@ -503,13 +503,17 @@ class OnDiskReplayBuffer(IterableDataset):
         except Exception as e:
             print(f"❌ ERROR saving on-disk transition {file_path}: {e}")
 
-    def add_batch(self, transitions: list):
+    def add_batch(self, transitions: list, chunk_size: int = 64):
         """
-        Efficiently add multiple transitions at once using parallel writes.
-        Much faster than calling add() sequentially for large batches.
+        Efficiently add multiple transitions by grouping them into chunks.
+
+        Instead of writing 1 file per transition (slow), this writes 1 file per
+        64 transitions (fast). The __iter__ method expects chunks for efficient
+        Cache & Drain iteration.
 
         Args:
             transitions: List of transition dicts with keys: state, action, reward, next_state, done
+            chunk_size: Number of transitions per file (default: 64)
         """
         from concurrent.futures import ThreadPoolExecutor
         import threading
@@ -518,50 +522,57 @@ class OnDiskReplayBuffer(IterableDataset):
             return
 
         num_transitions = len(transitions)
-        print(f"  Adding {num_transitions} transitions to on-disk buffer...")
 
-        # Thread-safe counter for file IDs
+        # 1. Group transitions into chunks (The Critical Fix)
+        # Instead of writing 1 file per item, we write 1 file per 64 items
+        chunks = [transitions[i:i + chunk_size] for i in range(0, num_transitions, chunk_size)]
+
+        print(f"  Batching {num_transitions} transitions into {len(chunks)} chunk files...")
+
         lock = threading.Lock()
 
-        def write_transition(transition):
-            """Write a single transition to disk (runs in thread pool)"""
+        def write_chunk(chunk_data):
+            """Write a list of transitions to a single chunk file"""
             with lock:
                 file_id = self.total_added
                 self.total_added += 1
-                file_path = self.storage_path / f"transition_{file_id}.pkl.gz"
+                # Use 'chunk_' prefix to identify these are lists, not single dicts
+                file_path = self.storage_path / f"chunk_{file_id}.pkl.gz"
 
             try:
-                # Write to disk (this is the slow I/O operation)
+                # Write list of transitions to one file
                 with gzip.open(file_path, 'wb', compresslevel=1) as f:
-                    pickle.dump(transition, f, protocol=pickle.HIGHEST_PROTOCOL)
-                return str(file_path), True
+                    pickle.dump(chunk_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                return str(file_path), len(chunk_data), True
             except Exception as e:
-                print(f"❌ ERROR saving transition {file_path}: {e}")
-                return None, False
+                print(f"❌ ERROR saving chunk {file_path}: {e}")
+                return None, 0, False
 
-        # Write all transitions in parallel using thread pool
+        # 2. Write chunks in parallel
         start_time = time.time()
         with ThreadPoolExecutor(max_workers=8) as executor:
-            results = list(executor.map(write_transition, transitions))
+            results = list(executor.map(write_chunk, chunks))
 
-        # Add successful paths to buffer and track failed writes
+        # 3. Process results
         successful_paths = []
-        for path, success in results:
+        total_saved = 0
+        for path, count, success in results:
             if success and path:
                 successful_paths.append(path)
+                total_saved += count
 
-        # Add all paths to buffer (this is fast - just appending to deque)
-        # Determine how many old files to remove
+        # Add to buffer deque
         num_to_remove = max(0, len(self.buffer) + len(successful_paths) - self.capacity)
         old_paths_to_remove = []
-
         if num_to_remove > 0:
-            # Collect paths to remove before modifying buffer
             old_paths_to_remove = [self.buffer[i] for i in range(num_to_remove)]
 
         # Add new paths
         for path in successful_paths:
             self.buffer.append(path)
+
+        # Update statistics
+        self.total_transitions += total_saved
 
         # Delete old files from disk in parallel
         if old_paths_to_remove:
@@ -587,7 +598,7 @@ class OnDiskReplayBuffer(IterableDataset):
 
         elapsed = time.time() - start_time
         rate = num_transitions / elapsed if elapsed > 0 else 0
-        print(f"  ✓ Added {len(successful_paths)}/{num_transitions} transitions in {elapsed:.2f}s ({rate:.0f} trans/s)")
+        print(f"  ✓ Added {len(successful_paths)} chunks ({total_saved} transitions) in {elapsed:.2f}s ({rate:.0f} trans/s)")
 
     def add_batch_columnar(self, transitions: Dict[str, np.ndarray], count: int, chunk_size: int = 64):
         """
