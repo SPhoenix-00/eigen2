@@ -2992,9 +2992,9 @@ class ERLTrainer:
         # Agents were moved to CPU after inference; we move them to GPU in batches
         LOCAL_TRAINING_BATCH_SIZE = 16
 
-        # Local mode: Use smaller sample batches to fit in 24GB VRAM
+        # Local mode: Use larger batches to saturate GPU and minimize disk I/O
         # The LSTM processes batch_size × 117 sequences
-        # Config.LOCAL_BATCH_SIZE (64) × 117 = 7,488 sequences - fits comfortably in VRAM
+        # Config.LOCAL_BATCH_SIZE (256) × 117 = 29,952 sequences - saturates GPU compute
 
         if self.local_mode and torch.cuda.is_available():
             # Batched GPU training for local mode
@@ -3002,9 +3002,13 @@ class ERLTrainer:
             num_batches = (len(self.population) + LOCAL_TRAINING_BATCH_SIZE - 1) // LOCAL_TRAINING_BATCH_SIZE
             cpu_device = torch.device('cpu')
 
-            # Use fewer gradient steps in local mode (LSTM compute is the bottleneck)
-            local_gradient_steps = min(gradient_steps, 16)  # Cap at 16 for reasonable training time
-            print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {local_gradient_steps} steps/agent")
+            # Local mode optimizations to reduce disk I/O (the bottleneck)
+            # - Larger batch size set via Config.LOCAL_BATCH_SIZE
+            # - Accumulation steps set via Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
+            # - Capped gradient steps (16 max)
+            local_gradient_steps = min(gradient_steps, 16)
+            local_accumulation_steps = Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
+            print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {local_gradient_steps} steps/agent (batch_size={Config.LOCAL_BATCH_SIZE}, accum={local_accumulation_steps})")
 
             for batch_idx in range(num_batches):
                 batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
@@ -3021,12 +3025,12 @@ class ERLTrainer:
                     critic_losses = []
 
                     for step in range(local_gradient_steps):
-                        for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                        for accum_step in range(local_accumulation_steps):
                             # Use DataLoader iterator (has async prefetching)
                             batch_cpu = next(self.batch_iterator)
                             batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
 
-                            is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
+                            is_last_accum = (accum_step == local_accumulation_steps - 1)
                             critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
 
                             if agent.agent_id == 0:

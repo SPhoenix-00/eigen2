@@ -121,7 +121,8 @@ class Config:
     # Replay buffer
     BUFFER_SIZE = 1500000  # Maximum buffer size
     BATCH_SIZE = 160
-    LOCAL_BATCH_SIZE = 64  # Smaller batch for --local mode to fit in 24GB VRAM (64×117=7,488 LSTM sequences)
+    LOCAL_BATCH_SIZE = 64  # Batch size for local mode training
+    LOCAL_GRADIENT_ACCUMULATION_STEPS = 1  # No accumulation in local mode - each step = 1 disk read (vs 16x with accumulation)
     MIN_BUFFER_SIZE = 23200  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     
