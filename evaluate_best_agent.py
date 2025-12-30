@@ -66,7 +66,7 @@ class AgentEvaluator:
         # Get stock column names
         self._load_stock_names()
 
-        print(f"✓ Data loaded: {len(self.data_array)} days")
+        print(f"[OK] Data loaded: {len(self.data_array)} days")
         print(f"  Training: days 0-{self.train_end}")
         print(f"  Validation: days {self.val_start}-{self.val_end}")
 
@@ -100,7 +100,7 @@ class AgentEvaluator:
         # Also store non-investable column names for reference
         self.non_investable_names = all_columns[:Config.INVESTABLE_START_COL]
 
-        print(f"✓ Loaded {len(self.stock_names)} investable stock tickers")
+        print(f"[OK] Loaded {len(self.stock_names)} investable stock tickers")
 
     def _load_best_agent(self) -> DDPGAgent:
         """Download and load best agent from GCP."""
@@ -120,7 +120,7 @@ class AgentEvaluator:
         # Load agent
         agent = DDPGAgent(agent_id='best')
         agent.load(str(best_agent_path))
-        print(f"✓ Best agent loaded from {best_agent_path}")
+        print(f"[OK] Best agent loaded from {best_agent_path}")
 
         return agent
 
@@ -449,7 +449,7 @@ class AgentEvaluator:
                 f.write(f"  Result: {'WIN' if trade['is_win'] else 'LOSS'}\n")
                 f.write("\n")
 
-        print(f"✓ Text report saved to {filepath}")
+        print(f"[OK] Text report saved to {filepath}")
 
     def _export_trades_csv(self, filepath: Path):
         """Export trades to CSV."""
@@ -472,13 +472,13 @@ class AgentEvaluator:
 
         df = df[column_order]
         df.to_csv(filepath, index=False)
-        print(f"✓ Trades CSV saved to {filepath}")
+        print(f"[OK] Trades CSV saved to {filepath}")
 
     def _export_summary_csv(self, filepath: Path):
         """Export summary statistics to CSV."""
         df = pd.DataFrame(self.slice_summaries)
         df.to_csv(filepath, index=False)
-        print(f"✓ Summary CSV saved to {filepath}")
+        print(f"[OK] Summary CSV saved to {filepath}")
 
 
 def main():
@@ -510,7 +510,7 @@ def main():
         print("="*80 + "\n")
 
     except Exception as e:
-        print(f"\n❌ Error during evaluation: {e}")
+        print(f"\n[ERROR] Error during evaluation: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)

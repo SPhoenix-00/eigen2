@@ -1254,7 +1254,15 @@ class ERLTrainer:
         # Force garbage collection to ensure workers are cleaned up
         gc.collect()
 
-        print(f"Creating DataLoader with {Config.NUM_DATALOADER_WORKERS} background workers...")
+        # Set batch size based on mode
+        # Local mode uses smaller batches to fit in 24GB VRAM with batched agent training
+        if self.local_mode:
+            self.replay_buffer.training_batch_size = Config.LOCAL_BATCH_SIZE
+            print(f"Creating DataLoader with {Config.NUM_DATALOADER_WORKERS} workers (batch_size={Config.LOCAL_BATCH_SIZE} for local mode)...")
+        else:
+            self.replay_buffer.training_batch_size = Config.BATCH_SIZE
+            print(f"Creating DataLoader with {Config.NUM_DATALOADER_WORKERS} background workers...")
+
         self.replay_dataloader = DataLoader(
             self.replay_buffer,
             batch_size=None,  # Already batched by __iter__
@@ -2963,6 +2971,12 @@ class ERLTrainer:
 
         print(f"\n--- Training Population (Buffer: {len(self.replay_buffer)}) ---")
 
+        # Debug: Check GPU memory at start of training
+        if torch.cuda.is_available():
+            gpu_mem = torch.cuda.memory_allocated() / 1024**3
+            gpu_reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"  [GPU] Memory at training start: {gpu_mem:.2f} GB allocated, {gpu_reserved:.2f} GB reserved")
+
         # Use reduced gradient steps during stabilization phase or multi-mode for faster iteration
         # Normal: 32 steps × 192 batch = 6,144 samples (full exploration)
         # Stabilization/Multi: 10 steps × 192 batch = 1,920 samples (maintenance training)
@@ -2974,53 +2988,122 @@ class ERLTrainer:
             gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION
 
         # Train each agent
-        for agent in tqdm(self.population, desc="Training agents"):
-            actor_losses = []
-            critic_losses = []
+        # Local mode with GPU: Process in batches of 16 to manage GPU memory
+        # Agents were moved to CPU after inference; we move them to GPU in batches
+        LOCAL_TRAINING_BATCH_SIZE = 16
 
-            # Multiple gradient steps per agent
-            for step in range(gradient_steps):
-                # Gradient accumulation loop
-                for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
-                    # Get next batch from DataLoader (already prefetched by workers)
-                    # This is FAST - batch is already in RAM, loaded asynchronously
-                    batch_cpu = next(self.batch_iterator)
+        # Local mode: Use smaller sample batches to fit in 24GB VRAM
+        # The LSTM processes batch_size × 117 sequences
+        # Config.LOCAL_BATCH_SIZE (64) × 117 = 7,488 sequences - fits comfortably in VRAM
 
-                    # Move batch to GPU (fast transfer thanks to pin_memory)
-                    batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+        if self.local_mode and torch.cuda.is_available():
+            # Batched GPU training for local mode
+            # Uses move_to_device() to properly handle optimizer references and free GPU memory
+            num_batches = (len(self.population) + LOCAL_TRAINING_BATCH_SIZE - 1) // LOCAL_TRAINING_BATCH_SIZE
+            cpu_device = torch.device('cpu')
 
-                    # Update with gradient accumulation
-                    is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
-                    critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+            # Use fewer gradient steps in local mode (LSTM compute is the bottleneck)
+            local_gradient_steps = min(gradient_steps, 16)  # Cap at 16 for reasonable training time
+            print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {local_gradient_steps} steps/agent")
 
-                    # Capture attention weights from actor (after forward pass in update)
-                    # Only capture from first agent to avoid redundant logging
+            for batch_idx in range(num_batches):
+                batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
+                batch_end = min(batch_start + LOCAL_TRAINING_BATCH_SIZE, len(self.population))
+                batch_agents = self.population[batch_start:batch_end]
+
+                # Move batch of agents to GPU (with optimizer recreation)
+                for agent in batch_agents:
+                    agent.move_to_device(Config.DEVICE, recreate_optimizers=True)
+
+                # Train agents in this batch using DataLoader iterator
+                for agent in tqdm(batch_agents, desc=f"Training batch {batch_idx + 1}/{num_batches}"):
+                    actor_losses = []
+                    critic_losses = []
+
+                    for step in range(local_gradient_steps):
+                        for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                            # Use DataLoader iterator (has async prefetching)
+                            batch_cpu = next(self.batch_iterator)
+                            batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+
+                            is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
+                            critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+
+                            if agent.agent_id == 0:
+                                attention_weights = agent.actor.get_attention_weights()
+                                if attention_weights is not None:
+                                    self.update_feature_importance(attention_weights)
+
+                            actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
+                            critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+                            del batch
+
                     if agent.agent_id == 0:
-                        attention_weights = agent.actor.get_attention_weights()
-                        if attention_weights is not None:
-                            self.update_feature_importance(attention_weights)
+                        self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
+                        self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
+                        wandb.log({
+                            "train/actor_loss": np.mean(actor_losses),
+                            "train/critic_loss": np.mean(critic_losses),
+                        }, step=self.generation)
 
-                    # Detach from computation graph to prevent memory leak
-                    actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
-                    critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+                    del actor_losses
+                    del critic_losses
 
-                    # Explicitly delete batch tensors to free GPU memory
-                    del batch
+                # Move batch of agents back to CPU (with optimizer recreation to free GPU memory)
+                for agent in batch_agents:
+                    agent.move_to_device(cpu_device, recreate_optimizers=True)
 
-            # Log agent stats
-            if agent.agent_id == 0:  # Log first agent as representative
-                self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
-                self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
+                torch.cuda.empty_cache()
 
-                # Log to wandb
-                wandb.log({
-                    "train/actor_loss": np.mean(actor_losses),
-                    "train/critic_loss": np.mean(critic_losses),
-                }, step=self.generation)
+        else:
+            # Original code path for distributed mode or CPU-only
+            for agent in tqdm(self.population, desc="Training agents"):
+                actor_losses = []
+                critic_losses = []
 
-            # Explicitly clear loss lists to free memory
-            del actor_losses
-            del critic_losses
+                # Multiple gradient steps per agent
+                for step in range(gradient_steps):
+                    # Gradient accumulation loop
+                    for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                        # Get next batch from DataLoader (already prefetched by workers)
+                        # This is FAST - batch is already in RAM, loaded asynchronously
+                        batch_cpu = next(self.batch_iterator)
+
+                        # Move batch to GPU (fast transfer thanks to pin_memory)
+                        batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+
+                        # Update with gradient accumulation
+                        is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
+                        critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+
+                        # Capture attention weights from actor (after forward pass in update)
+                        # Only capture from first agent to avoid redundant logging
+                        if agent.agent_id == 0:
+                            attention_weights = agent.actor.get_attention_weights()
+                            if attention_weights is not None:
+                                self.update_feature_importance(attention_weights)
+
+                        # Detach from computation graph to prevent memory leak
+                        actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
+                        critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+
+                        # Explicitly delete batch tensors to free GPU memory
+                        del batch
+
+                # Log agent stats
+                if agent.agent_id == 0:  # Log first agent as representative
+                    self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
+                    self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
+
+                    # Log to wandb
+                    wandb.log({
+                        "train/actor_loss": np.mean(actor_losses),
+                        "train/critic_loss": np.mean(critic_losses),
+                    }, step=self.generation)
+
+                # Explicitly clear loss lists to free memory
+                del actor_losses
+                del critic_losses
 
         # Clear GPU cache once after training all agents
         # Note: With expandable_segments=True, CUDA handles fragmentation efficiently
@@ -4984,8 +5067,20 @@ class ERLTrainer:
                 print("  ✓ Evaluation complete - results saved to evaluation_summary.txt and evaluation_trades.csv")
             else:
                 print(f"  ⚠ Evaluation script failed with code {result.returncode}")
+                # Show stdout first (actual error messages usually go here)
+                if result.stdout:
+                    # Filter out tqdm progress bars, show last 500 chars
+                    stdout_lines = [l for l in result.stdout.split('\n') if not l.strip().startswith('Processing')]
+                    filtered_stdout = '\n'.join(stdout_lines[-10:])  # Last 10 lines
+                    if filtered_stdout.strip():
+                        print(f"  Output: {filtered_stdout}")
+                # Show stderr (often contains traceback)
                 if result.stderr:
-                    print(f"  Error: {result.stderr[:200]}")  # Print first 200 chars of error
+                    # Filter out tqdm progress bars
+                    stderr_lines = [l for l in result.stderr.split('\n') if not ('|' in l and '%' in l)]
+                    filtered_stderr = '\n'.join(stderr_lines[-15:])  # Last 15 lines
+                    if filtered_stderr.strip():
+                        print(f"  Error:\n{filtered_stderr}")
         except subprocess.TimeoutExpired:
             print("  ⚠ Evaluation script timed out after 5 minutes")
         except Exception as e:
@@ -5999,8 +6094,12 @@ class ERLTrainer:
         # Use start_generation for the loop
         # Stopping condition: Gauntlet Mode uses breakthroughs, fallback to generation limit
         # In consistency mode, fallback resets with each turnover (checked inside loop)
+        # Maverick mode: no generation limit - train until target rank achieved
         if self.consistency_mode and self.gauntlet_mode_enabled:
             # Use a high ceiling - actual stopping is controlled by turnover-based fallback inside loop
+            max_generations = 10000
+        elif self.maverick_mode:
+            # Maverick mode: no timeout - train until target rank (default: 20) is achieved in Global 50
             max_generations = 10000
         else:
             max_generations = Config.MAX_GENERATIONS_GAUNTLET if self.gauntlet_mode_enabled else Config.NUM_GENERATIONS
@@ -6627,6 +6726,12 @@ class ERLTrainer:
             wandb.log(log_data, step=gen)
 
             # 2. Train agents using replay buffer
+            # First, wait for background transfer to complete (if running in local mode)
+            if self.local_mode:
+                self.local_evaluator.wait_for_transfer()
+                # Move agents to CPU before training (frees GPU memory)
+                # Training will move agents to GPU in batches of 16
+                self.local_evaluator.restore_agents_to_cpu()
             self.train_population()
 
             # Update resource tracker after training

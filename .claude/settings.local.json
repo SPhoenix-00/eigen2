@@ -60,7 +60,20 @@
       "Bash(tail:*)",
       "Bash(d:)",
       "Bash(.venvScriptspip install psutil)",
-      "Bash(\"d:\\\\GitHub\\\\eigen2\\\\.venv\\\\Scripts\\\\pip\" install psutil)"
+      "Bash(\"d:\\\\GitHub\\\\eigen2\\\\.venv\\\\Scripts\\\\pip\" install psutil)",
+      "Bash(nvidia-smi:*)",
+      "Bash(./venv/Scripts/python:*)",
+      "Bash(./venv/Scripts/pip:*)",
+      "Bash(./venv/Scripts/pip install:*)",
+      "Bash(cd:*)",
+      "Bash(.venvScriptspython -m py_compile traininglocal_evaluator.py)",
+      "Bash(.venvScriptspython -c \"import torch; print\\(f''PyTorch version: {torch.__version__}''\\); print\\(f''CUDA available: {torch.cuda.is_available\\(\\)}''\\); print\\(f''CUDA version: {torch.version.cuda}'' if torch.cuda.is_available\\(\\) else ''''\\); print\\(f''GPU: {torch.cuda.get_device_name\\(0\\)}'' if torch.cuda.is_available\\(\\) else ''''\\)\")",
+      "Bash(d:\\\\GitHub\\\\eigen2\\\\venv\\\\Scripts\\\\python.exe:*)",
+      "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\":*)",
+      "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -c:*)",
+      "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -c \"\nimport torch\ntorch.backends.cudnn.enabled = False\nprint\\(''cuDNN disabled''\\)\nx = torch.randn\\(10, 10\\).cuda\\(\\)\nprint\\(''Tensor created''\\)\nprint\\(''Testing mm without cuDNN...''\\)\ny = torch.mm\\(x, x.T\\)\nprint\\(f''mm result: {y.sum\\(\\)}''\\)\n\")",
+      "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -c \"\nimport torch\nx = torch.randn\\(10, 10\\).cuda\\(\\)\nprint\\(''Tensor created''\\)\nprint\\(''Testing einsum \\(alternative to mm\\)...''\\)\ny = torch.einsum\\(''ij,kj->ik'', x, x\\)  # Same as mm\\(x, x.T\\)\nprint\\(f''einsum result: {y.sum\\(\\)}''\\)\n\")",
+      "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -m py_compile:*)"
     ],
     "deny": [],
     "ask": []

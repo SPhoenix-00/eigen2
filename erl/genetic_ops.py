@@ -80,24 +80,31 @@ def crossover(parent1: DDPGAgent, parent2: DDPGAgent,
     if alpha is None:
         alpha = np.random.uniform(Config.CROSSOVER_ALPHA_MIN, Config.CROSSOVER_ALPHA_MAX)
     
-    # Create new agent
+    # Create new agent (uses Config.DEVICE - GPU if available)
     offspring = DDPGAgent(agent_id=-1)  # Will be assigned proper ID later
-    
+    target_device = offspring.device
+
     # Blend actor networks: child = alpha * parent1 + (1-alpha) * parent2
+    # Ensure computation happens on offspring's device for correct placement
     for child_param, p1_param, p2_param in zip(
         offspring.actor.parameters(),
         parent1.actor.parameters(),
         parent2.actor.parameters()
     ):
-        child_param.data.copy_(alpha * p1_param.data + (1 - alpha) * p2_param.data)
-    
+        # Move parent params to target device for blending, then copy
+        p1_data = p1_param.data.to(target_device)
+        p2_data = p2_param.data.to(target_device)
+        child_param.data.copy_(alpha * p1_data + (1 - alpha) * p2_data)
+
     # Blend critic networks
     for child_param, p1_param, p2_param in zip(
         offspring.critic.parameters(),
         parent1.critic.parameters(),
         parent2.critic.parameters()
     ):
-        child_param.data.copy_(alpha * p1_param.data + (1 - alpha) * p2_param.data)
+        p1_data = p1_param.data.to(target_device)
+        p2_data = p2_param.data.to(target_device)
+        child_param.data.copy_(alpha * p1_data + (1 - alpha) * p2_data)
     
     # Copy target networks from blended networks
     offspring.actor_target.load_state_dict(offspring.actor.state_dict())

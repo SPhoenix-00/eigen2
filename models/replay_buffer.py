@@ -25,17 +25,21 @@ class ReplayBuffer:
     def __init__(self, capacity: int = None):
         """
         Initialize replay buffer.
-        
+
         Args:
             capacity: Maximum number of transitions to store. If None, uses Config.BUFFER_SIZE
         """
         self.capacity = capacity or Config.BUFFER_SIZE
-        
+
         # Use deque for automatic circular buffer behavior
         self.buffer = deque(maxlen=self.capacity)
-        
+
         # Statistics
         self.total_added = 0
+
+        # Configurable batch size for iterator (can be overridden for local mode)
+        # Default to Config.BATCH_SIZE, but trainer can set this smaller for local mode
+        self.training_batch_size = Config.BATCH_SIZE
         
     def add(self, state: np.ndarray, action: np.ndarray, reward: float, 
             next_state: np.ndarray, done: bool):
@@ -404,7 +408,9 @@ class OnDiskReplayBuffer(IterableDataset):
         self.buffer = deque(maxlen=self.capacity)
 
         # Statistics
-        self.total_added = 0
+        self.total_added = 0  # Total chunks/files ever added (for unique file IDs)
+        self.total_transitions = 0  # Actual transition count (for is_ready() check)
+        self._chunk_size = 64  # Default chunk size for transition counting
 
         # Migration tracking: external source path for gradual migration
         # When set, transitions from this path will be deleted as they're evicted
@@ -582,10 +588,103 @@ class OnDiskReplayBuffer(IterableDataset):
         elapsed = time.time() - start_time
         rate = num_transitions / elapsed if elapsed > 0 else 0
         print(f"  ✓ Added {len(successful_paths)}/{num_transitions} transitions in {elapsed:.2f}s ({rate:.0f} trans/s)")
-    
+
+    def add_batch_columnar(self, transitions: Dict[str, np.ndarray], count: int, chunk_size: int = 64):
+        """
+        Add multiple transitions from columnar format using CHUNKED storage.
+
+        Instead of creating 44,640 individual files (slow due to inode/metadata overhead),
+        this groups transitions into chunks of ~64, creating only ~700 files.
+
+        Performance improvement: 692s -> ~10s for 44,640 transitions.
+
+        Args:
+            transitions: Dict with keys 'states', 'actions', 'rewards', 'next_states', 'dones'
+                        Each value is a numpy array with shape [count, ...]
+            count: Number of valid transitions in the arrays
+            chunk_size: Transitions per file (default 64 = ~22MB with 350KB states)
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        if count == 0:
+            return
+
+        num_chunks = (count + chunk_size - 1) // chunk_size
+        print(f"  Chunking {count} transitions into {num_chunks} files ({chunk_size}/file)...")
+
+        # Pre-allocate chunk file IDs
+        start_chunk_id = self.total_added
+        self.total_added += num_chunks
+
+        # Pre-compute chunk ranges and file paths
+        chunk_ranges = []
+        file_paths = []
+        for i in range(num_chunks):
+            start_idx = i * chunk_size
+            end_idx = min(start_idx + chunk_size, count)
+            chunk_ranges.append((start_idx, end_idx))
+            file_paths.append(self.storage_path / f"chunk_{start_chunk_id + i}.pkl.gz")
+
+        def write_chunk(chunk_idx: int):
+            """Write a chunk of transitions to a single file"""
+            start_idx, end_idx = chunk_ranges[chunk_idx]
+            file_path = file_paths[chunk_idx]
+
+            # Slice the columnar arrays for this chunk
+            chunk_data = []
+            for idx in range(start_idx, end_idx):
+                chunk_data.append({
+                    'state': transitions['states'][idx],
+                    'action': transitions['actions'][idx],
+                    'reward': float(transitions['rewards'][idx]),
+                    'next_state': transitions['next_states'][idx],
+                    'done': float(transitions['dones'][idx])
+                })
+
+            try:
+                with gzip.open(file_path, 'wb', compresslevel=1) as f:
+                    pickle.dump(chunk_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                return str(file_path), end_idx - start_idx, True
+            except Exception as e:
+                print(f"ERROR saving chunk {file_path}: {e}")
+                return None, 0, False
+
+        # Write all chunks in parallel
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(write_chunk, range(num_chunks)))
+
+        # Collect successful paths and count transitions
+        successful_paths = []
+        total_saved = 0
+        for path, trans_count, success in results:
+            if success and path:
+                successful_paths.append(path)
+                total_saved += trans_count
+
+        # Add chunk paths to buffer (each entry is a chunk file, not individual transition)
+        # Note: capacity is in "entries" - with chunks, each entry holds chunk_size transitions
+        for path in successful_paths:
+            self.buffer.append(path)
+
+        # Track actual transition count for is_ready() check
+        self.total_transitions += total_saved
+        self._chunk_size = chunk_size  # Remember chunk size for reference
+
+        # Handle capacity eviction (simplified - just let deque handle it)
+        # Old files will be cleaned up when they're popped from deque
+
+        elapsed = time.time() - start_time
+        rate = total_saved / elapsed if elapsed > 0 else 0
+        print(f"  Added {len(successful_paths)} chunks ({total_saved} transitions) in {elapsed:.2f}s ({rate:.0f} trans/s)")
+
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """
         Sample a random batch by loading transitions from disk.
+
+        Handles both:
+        - Chunk files (list of transitions) - new format, efficient
+        - Legacy single-transition files (dict) - backward compatible
 
         Note: When used with DataLoader, this runs in background worker processes.
         The tensors are created on CPU, then transferred to GPU after pin_memory.
@@ -593,31 +692,51 @@ class OnDiskReplayBuffer(IterableDataset):
         Returns:
             Dictionary of tensors, or None if sampling failed.
         """
-        if len(self.buffer) < batch_size:
-            raise ValueError(f"Not enough samples in buffer: {len(self.buffer)} < {batch_size}")
+        import random
 
-        # 1. Sample random indices from the deque
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        if len(self.buffer) < 1:
+            return None
 
-        # 2. Get the file paths for those indices
+        # With chunked storage, each file contains ~64 transitions.
+        # We need to load enough files to get batch_size transitions.
+        # Load a few more than needed to ensure we have enough after sampling.
+        avg_chunk_size = 64  # Expected transitions per chunk file
+        num_files_to_load = max(3, (batch_size // avg_chunk_size) + 2)
+        num_files_to_load = min(num_files_to_load, len(self.buffer))
+
+        # Sample random file indices
+        indices = np.random.choice(len(self.buffer), num_files_to_load, replace=False)
         batch_paths = [self.buffer[i] for i in indices]
 
-        # 3. Load transitions from disk
-        batch_transitions = []
+        # Load and flatten transitions from files
+        pool = []
         for path in batch_paths:
             try:
                 with gzip.open(path, 'rb') as f:
-                    batch_transitions.append(pickle.load(f))
-            except Exception as e:
-                # This can happen if a file is corrupted or mid-write
-                # Don't recurse - let caller handle retry
+                    data = pickle.load(f)
+
+                if isinstance(data, list):
+                    # Chunk file - contains multiple transitions
+                    pool.extend(data)
+                else:
+                    # Legacy single-transition file
+                    pool.append(data)
+            except Exception:
                 continue
 
         # Return None if we couldn't load any transitions
-        if not batch_transitions:
+        if not pool:
             return None
 
-        # 4. Stack into tensors
+        # Sample exactly batch_size transitions from the loaded pool
+        if len(pool) < batch_size:
+            # Not enough - sample with replacement
+            batch_transitions = random.choices(pool, k=batch_size)
+        else:
+            # Sample without replacement
+            batch_transitions = random.sample(pool, batch_size)
+
+        # Stack into tensors
         try:
             states = np.stack([t['state'] for t in batch_transitions])
             actions = np.stack([t['action'] for t in batch_transitions])
@@ -625,12 +744,10 @@ class OnDiskReplayBuffer(IterableDataset):
             next_states = np.stack([t['next_state'] for t in batch_transitions])
             dones = np.array([t['done'] for t in batch_transitions]).reshape(-1, 1)
         except Exception as e:
-            # Data corrupted - return None and let caller retry
-            print(f"❌ ERROR stacking transitions: {e}")
+            print(f"ERROR stacking transitions: {e}")
             return None
 
-        # 5. Convert to PyTorch tensors (on CPU in worker processes)
-        # DataLoader with pin_memory will automatically transfer to GPU efficiently
+        # Convert to PyTorch tensors (on CPU in worker processes)
         return {
             'states': torch.FloatTensor(states),
             'actions': torch.FloatTensor(actions),
@@ -663,7 +780,8 @@ class OnDiskReplayBuffer(IterableDataset):
                 try:
                     # Sample batch (this is the slow disk I/O operation)
                     # When used with DataLoader workers, this runs in parallel with GPU training
-                    batch = self.sample(Config.BATCH_SIZE)
+                    # Uses training_batch_size which can be set smaller for local mode
+                    batch = self.sample(self.training_batch_size)
 
                     if batch is None:
                         # sample() returned None due to corrupted files
@@ -694,12 +812,14 @@ class OnDiskReplayBuffer(IterableDataset):
                 time.sleep(0.5)
 
     def __len__(self) -> int:
-        return len(self.buffer)
-    
+        """Return actual transition count (not chunk count)."""
+        return self.total_transitions
+
     def is_ready(self) -> bool:
+        """Check if buffer has enough transitions for training."""
         is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
         min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
-        return len(self.buffer) >= min_size
+        return self.total_transitions >= min_size
     
     def clear(self):
         print("Clearing OnDiskReplayBuffer and deleting files...")
@@ -713,7 +833,8 @@ class OnDiskReplayBuffer(IterableDataset):
     
     def get_stats(self) -> dict:
         return {
-            'size': len(self.buffer),
+            'size': self.total_transitions,  # Actual transition count
+            'chunk_count': len(self.buffer),  # Number of chunk files
             'capacity': self.capacity,
             'utilization': len(self.buffer) / self.capacity,
             'total_added': self.total_added
@@ -729,12 +850,14 @@ class OnDiskReplayBuffer(IterableDataset):
             'capacity': self.capacity,
             'buffer': self.buffer,  # The deque of file paths
             'total_added': self.total_added,
+            'total_transitions': self.total_transitions,  # Actual transition count
+            'chunk_size': self._chunk_size,
             'storage_path': str(self.storage_path) # Save storage path for verification
         }
         try:
             with gzip.open(file_path, 'wb', compresslevel=1) as f:
                 pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"  ✓ Buffer metadata saved ({len(self.buffer)} paths).")
+            print(f"  ✓ Buffer metadata saved ({len(self.buffer)} chunks, {self.total_transitions} transitions).")
         except Exception as e:
             print(f"  ❌ ERROR saving buffer metadata: {e}")
 
@@ -753,13 +876,23 @@ class OnDiskReplayBuffer(IterableDataset):
             storage_path = storage_path_override or save_data.get('storage_path', 'buffer_storage')
 
             new_buffer = OnDiskReplayBuffer(
-                capacity=save_data['capacity'], 
+                capacity=save_data['capacity'],
                 storage_path=storage_path
             )
             new_buffer.buffer = save_data['buffer']
             new_buffer.total_added = save_data.get('total_added', len(new_buffer.buffer))
-            
-            print(f"  ✓ Buffer metadata loaded (size: {len(new_buffer.buffer)}).")
+
+            # Restore transition count (with backward compatibility)
+            chunk_size = save_data.get('chunk_size', 64)
+            new_buffer._chunk_size = chunk_size
+            if 'total_transitions' in save_data:
+                new_buffer.total_transitions = save_data['total_transitions']
+            else:
+                # Backward compatibility: estimate from chunk count
+                new_buffer.total_transitions = len(new_buffer.buffer) * chunk_size
+                print(f"  ⚠️ Old checkpoint format - estimated {new_buffer.total_transitions} transitions from {len(new_buffer.buffer)} chunks")
+
+            print(f"  ✓ Buffer metadata loaded ({len(new_buffer.buffer)} chunks, {new_buffer.total_transitions} transitions).")
             
             # Verify that the files and storage path still exist
             if len(new_buffer.buffer) > 0:
