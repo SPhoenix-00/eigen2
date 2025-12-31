@@ -710,6 +710,11 @@ def append_mode(production_file, new_data_file):
     
     print(f"Combined dataset: {len(df_combined)} rows × {len(df_combined.columns)} columns")
     
+    # WARNING: shift_data_down will align data to the bottom of the DataFrame.
+    # If a stock stopped trading (delisted/missing data), its old historical prices
+    # will be shifted forward to fill empty new rows, causing data corruption.
+    # Ensure your input CSV does not contain columns for stocks that are no longer trading.
+    
     # --- Step 5: Process Combined Dataset ---
     print(f"\nStep 5: Processing combined dataset...")
     
@@ -728,37 +733,25 @@ def append_mode(production_file, new_data_file):
     df_combined_final = df_combined_shifted.map(manipulate_list)
     
     # Extract only the new rows
-    # After processing, the combined dataset has history_rows + new_data_rows
-    # We need to extract only rows that correspond to new_data, skipping the ramp-up period
-    # The ramp-up period affects the first VBA_CALC_RAMP_UP_ROWS of new_data
+    # FIX: We have HISTORY_ROWS (100) which serves as the warm-up period.
+    # Therefore, the indicators are stable by the time we hit the first new row.
+    # We do NOT need to discard the first 34 rows of the new data.
     
     new_data_indices = list(df_new_lists.index)
-    skip_rows = HISTORY_ROWS + VBA_CALC_RAMP_UP_ROWS
     
-    if len(df_combined_final) > skip_rows:
-        # After skip_rows, we should have valid new data rows
-        # But we need to match by index to ensure we get the right rows
-        # (shift operations preserve indices, so we can match by index)
-        
-        # Get indices of new data that are valid (after ramp-up)
-        valid_new_indices = new_data_indices[VBA_CALC_RAMP_UP_ROWS:]
-        
-        # Extract rows from combined_final that match valid_new_indices
-        # Use intersection to get only rows that exist in both
-        available_indices = df_combined_final.index.intersection(valid_new_indices)
+    # Use intersection to find valid rows that exist in the processed output
+    # (This handles the alignment safely without slicing off valid data)
+    available_indices = df_combined_final.index.intersection(new_data_indices)
+    
+    if len(available_indices) > 0:
         df_new_processed = df_combined_final.loc[available_indices].copy()
-        
         print(f"Extracted {len(df_new_processed)} new processed rows")
-        print(f"  (Skipped {HISTORY_ROWS} history rows + {VBA_CALC_RAMP_UP_ROWS} ramp-up rows)")
-        
-        if len(df_new_processed) == 0:
-            print(f"⚠️  Error: No valid new rows extracted.")
-            print(f"  Available indices in combined: {len(df_combined_final.index)}")
-            print(f"  Valid new indices: {len(valid_new_indices)}")
-            print(f"  Intersection: {len(available_indices)}")
-            return
+        print(f"  (Used {HISTORY_ROWS} history rows as warm-up period)")
     else:
-        print(f"⚠️  Warning: Combined dataset has only {len(df_combined_final)} rows, cannot extract new rows after skipping {skip_rows} rows")
+        print(f"⚠️  Error: No valid new rows extracted.")
+        print(f"  Available indices in combined: {len(df_combined_final.index)}")
+        print(f"  New data indices: {len(new_data_indices)}")
+        print(f"  Intersection: {len(available_indices)}")
         return
     
     # --- Step 6: Validation Check ---
