@@ -176,6 +176,93 @@ class CommitteeManager:
 
         with open(self.local_roster_path, 'r') as f:
             return json.load(f)
+    
+    def update_maverick_flags(self) -> bool:
+        """
+        Update is_maverick flags in existing committee roster by syncing from Global50.
+        
+        This is useful when:
+        - Global50 entries have been updated with maverick flags
+        - Committee roster was created before maverick flags were set
+        - Need to align committee roster with current Global50 state
+        
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        print("\n" + "="*60)
+        print(f"UPDATING MAVERICK FLAGS IN COMMITTEE ROSTER ({self.context_window_id})")
+        print("="*60)
+        
+        # Load current roster
+        roster = self.load_roster()
+        if not roster:
+            print("❌ No committee roster found. Run --draft first.")
+            return False
+        
+        # Load Global50 entries
+        entries = load_global50_candidates(self.context_window_days)
+        if not entries:
+            print("❌ No agents in Global50")
+            return False
+        
+        # Create lookup dict: (run_name, agent_id) -> is_maverick
+        global50_maverick_map = {}
+        for entry in entries:
+            key = (entry['run_name'], entry['agent_id'])
+            global50_maverick_map[key] = entry.get('is_maverick', False)
+        
+        # Update roster members
+        updated_count = 0
+        members = roster.get('members', [])
+        
+        print(f"\nChecking {len(members)} committee members...")
+        for member in members:
+            run_name = member.get('run_name')
+            agent_id = member.get('agent_id')
+            key = (run_name, agent_id)
+            
+            if key in global50_maverick_map:
+                new_maverick_flag = global50_maverick_map[key]
+                old_maverick_flag = member.get('is_maverick', False)
+                
+                if new_maverick_flag != old_maverick_flag:
+                    member['is_maverick'] = new_maverick_flag
+                    updated_count += 1
+                    action = "SET" if new_maverick_flag else "UNSET"
+                    print(f"  {action}: {run_name}_{agent_id} -> is_maverick={new_maverick_flag}")
+            else:
+                print(f"  ⚠ {run_name}_{agent_id}: Not found in Global50 (may have been removed)")
+        
+        if updated_count == 0:
+            print(f"\n✓ No updates needed - all maverick flags are already in sync")
+            return True
+        
+        # Update timestamp
+        roster['last_updated'] = datetime.now().isoformat() + 'Z'
+        roster['maverick_flags_updated_at'] = datetime.now().isoformat() + 'Z'
+        
+        # Save updated roster
+        print(f"\nSaving updated roster...")
+        if self.save_roster(roster):
+            print(f"✓ Updated {updated_count} member(s) and synced to cloud")
+            
+            # Print summary
+            maverick_count = sum(1 for m in members if m.get('is_maverick', False))
+            print(f"\n  Committee Summary:")
+            print(f"    Total members: {len(members)}")
+            print(f"    Maverick members: {maverick_count}")
+            print(f"    Non-maverick members: {len(members) - maverick_count}")
+            
+            if maverick_count == 0:
+                print(f"\n  ⚠ WARNING: No maverick agents in committee!")
+                print(f"    --multi mode requires at least one maverick agent.")
+                print(f"    Use fix_global50.py --set-maverick to mark agents as mavericks in Global50,")
+                print(f"    then run --draft to create a new committee with mavericks.")
+            
+            return True
+        else:
+            print(f"✗ Failed to save updated roster")
+            return False
 
     def check_mirror_status(self) -> bool:
         """
@@ -2442,10 +2529,30 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
     print("FINAL COMMITTEE")
     print(f"{'='*60}")
 
+    maverick_count = 0
     for i, m in enumerate(roster_data['members']):
         maverick_tag = " [M]" if m.get('is_maverick', False) else ""
+        if m.get('is_maverick', False):
+            maverick_count += 1
         print(f"  {i+1}. {m['run_name']}_{m['agent_id']}{maverick_tag}: "
               f"score={m['gauntlet_score']:.2f}, roi={m['roi']:.2f}%")
+    
+    # Warn if no mavericks selected (required for --multi mode)
+    print(f"\n  Committee Summary:")
+    print(f"    Total members: {len(roster_data['members'])}")
+    print(f"    Maverick members: {maverick_count}")
+    print(f"    Non-maverick members: {len(roster_data['members']) - maverick_count}")
+    
+    if maverick_count == 0:
+        print(f"\n  ⚠ WARNING: No maverick agents selected in committee!")
+        print(f"    --multi mode requires at least one maverick agent.")
+        print(f"    Options:")
+        print(f"      1. Use fix_global50.py --set-maverick to mark agents as mavericks in Global50")
+        print(f"      2. Re-run --draft to select a committee with mavericks")
+        print(f"      3. Use committee.py --update-maverick-flags after setting flags in Global50")
+    elif maverick_count > Config.MAVERICK_CAP:
+        print(f"\n  ⚠ WARNING: {maverick_count} mavericks selected (exceeds cap of {Config.MAVERICK_CAP})")
+        print(f"    This may cause issues with Global50 promotion (Highlander Rule)")
 
     print(f"\n  Aggregate Score: {final_score_sum:.2f}")
     print(f"  Objective Value: {final_obj:.2f}")
@@ -2892,6 +2999,8 @@ if __name__ == "__main__":
                         help='Only verify data split')
     parser.add_argument('--mirror', action='store_true',
                         help='Check cloud sync status, download missing files')
+    parser.add_argument('--update-maverick-flags', action='store_true',
+                        help='Update is_maverick flags in committee roster from Global50')
     parser.add_argument('--simulate', action='store_true',
                         help='Simulate committee deployment over a custom date range')
     parser.add_argument('--quorum', type=int, default=None,
@@ -2904,15 +3013,16 @@ if __name__ == "__main__":
                         help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99")')
     args = parser.parse_args()
 
-    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.simulate and not args.sweep_quorum and not args.sweep_conviction:
-        print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--simulate]")
+    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.update_maverick_flags and not args.simulate and not args.sweep_quorum and not args.sweep_conviction:
+        print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--update-maverick-flags] [--simulate]")
         print("\nOptions:")
-        print("  --draft          Run Phase 1: Draft committee from Global50 (interactive refinement)")
-        print("  --draft-deep     Run Phase 1 with automatic deep refinement (no manual swaps)")
-        print("  --validate       Run Phase 2: Validate committee on holdout slices")
-        print("  --verify-only    Verify data split without running")
-        print("  --mirror         Check cloud sync status, download missing files")
-        print("  --simulate       Simulate committee deployment over a custom date range")
+        print("  --draft              Run Phase 1: Draft committee from Global50 (interactive refinement)")
+        print("  --draft-deep         Run Phase 1 with automatic deep refinement (no manual swaps)")
+        print("  --validate           Run Phase 2: Validate committee on holdout slices")
+        print("  --verify-only        Verify data split without running")
+        print("  --mirror             Check cloud sync status, download missing files")
+        print("  --update-maverick-flags  Update is_maverick flags in committee roster from Global50")
+        print("  --simulate           Simulate committee deployment over a custom date range")
         print("  --quorum N       Override quorum threshold for validation (default: 3)")
         print("  --sweep-quorum   Sweep multiple quorum values (e.g., '2,3,4,5')")
         print("  --conviction-percentile N  Override conviction percentile (default: 95)")
@@ -2935,6 +3045,11 @@ if __name__ == "__main__":
     # Handle --mirror mode
     if args.mirror:
         manager.check_mirror_status()
+        exit(0)
+    
+    # Handle --update-maverick-flags mode
+    if args.update_maverick_flags:
+        manager.update_maverick_flags()
         exit(0)
 
     # Load data for other operations

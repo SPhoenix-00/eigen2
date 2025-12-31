@@ -617,6 +617,14 @@ class ERLTrainer:
             self.multi_parent_agent = None  # Reference to the parent agent for parent mutant injection
             self.multi_gens_since_improvement = 0  # Generations since last improvement (post-warmup)
             self.multi_best_score_for_member = float('-inf')  # Best score seen for current member
+            # Phase tracking for maverick/non-maverick separation
+            self.multi_phase = 'non_maverick'  # 'non_maverick' or 'maverick'
+            self.non_maverick_members = []  # List of member indices that are non-maverick
+            self.maverick_members = []  # List of member indices that are maverick
+            self.current_non_maverick_idx = 0  # Index into non_maverick_members list
+            self.current_maverick_idx = 0  # Index into maverick_members list
+            self.non_maverick_turnovers_per_agent = []  # Track turnovers per non-maverick agent
+            self.maverick_turnovers_per_agent = []  # Track turnovers per maverick agent
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -1762,10 +1770,52 @@ class ERLTrainer:
         print(f"\n✓ All {len(members)} members evaluated")
         print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
         print(f"  Breakthrough threshold: {Config.MULTI_BREAKTHROUGH_THRESHOLD * 100:.0f}%")
-        print(f"  Training sequence: One breakthrough per member, then rotate")
-
+        
+        # Separate members into non-maverick and maverick lists
+        self.non_maverick_members = []
+        self.maverick_members = []
+        
+        for member_idx, member in enumerate(members):
+            is_maverick = member.get('is_maverick', False)
+            if is_maverick:
+                self.maverick_members.append(member_idx)
+            else:
+                self.non_maverick_members.append(member_idx)
+        
+        # Validate: at least one maverick in committee (user requirement)
+        if len(self.maverick_members) == 0:
+            raise ValueError(
+                "ERROR: No maverick agents found in committee. "
+                "At least one maverick agent is required in the committee."
+            )
+        
+        # If all members are mavericks, skip non-maverick phase
+        if len(self.non_maverick_members) == 0:
+            print(f"\n⚠ All {len(members)} members are mavericks - skipping non-maverick phase")
+            self.multi_phase = 'maverick'
+            self.maverick_mode = True
+            # Initialize maverick turnovers tracking
+            self.maverick_turnovers_per_agent = [0] * len(self.maverick_members)
+            self.current_maverick_idx = 0
+            print(f"  Training sequence: 3 turnovers per maverick agent, sequentially")
+        else:
+            # Start with non-maverick phase
+            self.multi_phase = 'non_maverick'
+            self.maverick_mode = False
+            # Initialize non-maverick turnovers tracking
+            self.non_maverick_turnovers_per_agent = [0] * len(self.non_maverick_members)
+            self.current_non_maverick_idx = 0
+            print(f"  Non-maverick members: {len(self.non_maverick_members)}")
+            print(f"  Maverick members: {len(self.maverick_members)}")
+            print(f"  Training sequence: 3 turnovers per non-maverick agent, sequentially")
+            print(f"  Then: Clear buffer/population and train maverick agents")
+        
         # Now load the first member for training
-        self._load_multi_member(0)
+        if self.multi_phase == 'maverick':
+            first_member_idx = self.maverick_members[0]
+        else:
+            first_member_idx = self.non_maverick_members[0]
+        self._load_multi_member(first_member_idx)
 
     def _load_multi_member(self, member_idx: int):
         """
@@ -1780,6 +1830,27 @@ class ERLTrainer:
         self.current_member_idx = member_idx
         member = self.multi_roster['members'][member_idx]
         context_window = self.multi_roster['context_window_days']
+        
+        # Ensure maverick_mode is set correctly based on phase
+        if self.multi_phase == 'maverick':
+            self.maverick_mode = True
+            # Recreate environment with maverick_mode=True if not already set
+            if not hasattr(self.eval_env, 'maverick_mode') or not self.eval_env.maverick_mode:
+                print(f"  Recreating environment with maverick_mode=True...")
+                self.eval_env = TradingEnvironment(
+                    data_array=self.data_loader.data_array,
+                    dates=self.data_loader.dates,
+                    normalization_stats=self.normalization_stats,
+                    start_idx=self.train_start_idx,
+                    end_idx=self.train_end_idx,
+                    trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+                    data_array_full=self.data_loader.data_array_full,
+                    consistency_mode=self.consistency_mode,
+                    maverick_mode=True
+                )
+                print(f"  ✓ Environment updated for maverick mode")
+        else:
+            self.maverick_mode = False
 
         # Record when this member started training for warmup enforcement
         self.member_training_start_gen = self.generation
@@ -1793,12 +1864,21 @@ class ERLTrainer:
         print(f"\n{'='*60}")
         print(f"🎯 MULTI-MODE: Loading Member {member_idx} for Training")
         print(f"{'='*60}")
+        print(f"  Phase: {self.multi_phase}")
         print(f"  Member: {member['run_name']}_{member['agent_id']}")
+        print(f"  Maverick mode: {self.maverick_mode}")
         print(f"  Member Starting ROI: {target_roi:.2f}%")
         print(f"  Training Hurdle set to: {self.roi_hurdle_ema:.2f}%")
         print(f"  Baseline: {self.member_baselines[member_idx]:.2f}")
         print(f"  Current breakthroughs: {self.member_breakthroughs[member_idx]}")
-        print(f"  Target for this round: {self.turnovers_completed + 1}")
+        if self.multi_phase == 'non_maverick':
+            list_idx = self.non_maverick_members.index(member_idx) if member_idx in self.non_maverick_members else -1
+            if list_idx >= 0:
+                print(f"  Turnovers for this agent: {self.non_maverick_turnovers_per_agent[list_idx]}/{Config.MULTI_TARGET_TURNOVERS}")
+        elif self.multi_phase == 'maverick':
+            list_idx = self.maverick_members.index(member_idx) if member_idx in self.maverick_members else -1
+            if list_idx >= 0:
+                print(f"  Turnovers for this agent: {self.maverick_turnovers_per_agent[list_idx]}/{Config.MULTI_TARGET_TURNOVERS}")
 
         agent_path = get_agent_filepath(member, context_window)
         source_agent = DDPGAgent(agent_id=0)
@@ -1879,38 +1959,172 @@ class ERLTrainer:
 
     def _advance_to_next_multi_member(self) -> bool:
         """
-        Advance to the next committee member that needs a breakthrough for current turnover.
+        Advance to the next committee member based on phase.
+        
+        Non-maverick phase: Train each non-maverick agent for 3 turnovers sequentially.
+        Maverick phase: Train each maverick agent for 3 turnovers sequentially.
 
         Returns:
-            True if advanced to next member, False if turnover complete or all done
+            True if advanced to next member, False if all done or phase transition needed
         """
-        target_breakthroughs = self.turnovers_completed + 1
-
-        # Find next member that hasn't achieved current target
-        start_idx = self.current_member_idx
-        for offset in range(1, self.num_committee_members + 1):
-            next_idx = (start_idx + offset) % self.num_committee_members
-            if self.member_breakthroughs[next_idx] < target_breakthroughs:
-                self._load_multi_member(next_idx)
+        if self.multi_phase == 'non_maverick':
+            # Non-maverick phase: sequential 3 turnovers per agent
+            if len(self.non_maverick_members) == 0:
+                # No non-maverick members - transition to maverick phase
+                return self._transition_to_maverick_phase()
+            
+            current_list_idx = self.current_non_maverick_idx
+            current_member_idx = self.non_maverick_members[current_list_idx]
+            # Check breakthroughs (turnovers) for current agent
+            current_breakthroughs = self.member_breakthroughs[current_member_idx]
+            
+            # Check if current non-maverick agent has completed 3 turnovers (breakthroughs)
+            if current_breakthroughs >= Config.MULTI_TARGET_TURNOVERS:
+                # Move to next non-maverick agent
+                self.current_non_maverick_idx += 1
+                
+                # Check if all non-maverick agents are done
+                if self.current_non_maverick_idx >= len(self.non_maverick_members):
+                    # All non-maverick agents complete - transition to maverick phase
+                    print(f"\n{'='*60}")
+                    print(f"✓ NON-MAVERICK PHASE COMPLETE")
+                    print(f"  All {len(self.non_maverick_members)} non-maverick agents completed {Config.MULTI_TARGET_TURNOVERS} turnovers each")
+                    print(f"{'='*60}")
+                    return self._transition_to_maverick_phase()
+                
+                # Load next non-maverick agent
+                next_member_idx = self.non_maverick_members[self.current_non_maverick_idx]
+                self._load_multi_member(next_member_idx)
                 return True
-
-        # All members have achieved target - check for turnover
-        min_breakthroughs = min(self.member_breakthroughs)
-        if min_breakthroughs > self.turnovers_completed:
-            self.turnovers_completed = min_breakthroughs
-            self._process_multi_turnover()
-
-            # Check if we've reached final target
-            if self.turnovers_completed >= Config.MULTI_TARGET_TURNOVERS:
-                return False  # All done!
-
-            # Start next round with first member that needs breakthrough
-            for idx in range(self.num_committee_members):
-                if self.member_breakthroughs[idx] < self.turnovers_completed + 1:
-                    self._load_multi_member(idx)
-                    return True
-
+            else:
+                # Current agent needs more turnovers - continue training same agent
+                return True
+        
+        elif self.multi_phase == 'maverick':
+            # Maverick phase: sequential 3 turnovers per agent
+            if len(self.maverick_members) == 0:
+                return False  # No maverick members (shouldn't happen due to validation)
+            
+            current_list_idx = self.current_maverick_idx
+            current_member_idx = self.maverick_members[current_list_idx]
+            # Check breakthroughs (turnovers) for current agent
+            current_breakthroughs = self.member_breakthroughs[current_member_idx]
+            
+            # Check if current maverick agent has completed 3 turnovers (breakthroughs)
+            if current_breakthroughs >= Config.MULTI_TARGET_TURNOVERS:
+                # Move to next maverick agent
+                self.current_maverick_idx += 1
+                
+                # Check if all maverick agents are done
+                if self.current_maverick_idx >= len(self.maverick_members):
+                    # All maverick agents complete - training done!
+                    print(f"\n{'='*60}")
+                    print(f"✓ MAVERICK PHASE COMPLETE")
+                    print(f"  All {len(self.maverick_members)} maverick agents completed {Config.MULTI_TARGET_TURNOVERS} turnovers each")
+                    print(f"{'='*60}")
+                    return False
+                
+                # Load next maverick agent
+                next_member_idx = self.maverick_members[self.current_maverick_idx]
+                self._load_multi_member(next_member_idx)
+                return True
+            else:
+                # Current agent needs more turnovers - continue training same agent
+                return True
+        
         return False  # Should not reach here
+    
+    def _transition_to_maverick_phase(self) -> bool:
+        """
+        Transition from non-maverick phase to maverick phase.
+        Clears buffer, resets population, and enables maverick mode.
+        
+        Returns:
+            True if transition successful and first maverick loaded, False otherwise
+        """
+        print(f"\n{'='*60}")
+        print(f"🔄 TRANSITIONING TO MAVERICK PHASE")
+        print(f"{'='*60}")
+        
+        # Reset buffer and population
+        self._reset_for_maverick_phase()
+        
+        # Load first maverick agent
+        if len(self.maverick_members) > 0:
+            first_maverick_idx = self.maverick_members[0]
+            self.current_maverick_idx = 0
+            self._load_multi_member(first_maverick_idx)
+            return True
+        
+        return False
+    
+    def _reset_for_maverick_phase(self):
+        """
+        Reset buffer, population, and environment for maverick phase.
+        Called when transitioning from non-maverick to maverick phase.
+        """
+        print(f"\n  Clearing replay buffer and resetting population...")
+        
+        # Clear replay buffer
+        if hasattr(self.replay_buffer, 'clear'):
+            self.replay_buffer.clear()
+            print(f"  ✓ Replay buffer cleared")
+        else:
+            print(f"  ⚠ Replay buffer does not support clear() - manual cleanup may be needed")
+        
+        # Reset population - create fresh population
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+        print(f"  Creating fresh population of {pop_size} agents...")
+        self.population = [DDPGAgent(agent_id=i) for i in range(pop_size)]
+        print(f"  ✓ Population reset")
+        
+        # Set phase and enable maverick mode
+        self.multi_phase = 'maverick'
+        self.maverick_mode = True
+        
+        # Initialize maverick turnovers tracking
+        self.maverick_turnovers_per_agent = [0] * len(self.maverick_members)
+        self.current_maverick_idx = 0
+        
+        # Reset breakthrough tracking for maverick phase (keep member_breakthroughs for all members)
+        # But reset member-specific tracking
+        self.multi_gens_since_improvement = 0
+        self.multi_best_score_for_member = float('-inf')
+        self.multi_parent_agent = None
+        
+        # CRITICAL: Reset baselines for maverick phase
+        # Mavericks use a different reward function (FOMO/ROI-First) with different fitness scale
+        # Comparing maverick performance against non-maverick baselines would be incorrect
+        self.confirmed_baseline = 0.0
+        self.initial_single_baseline = 0.0
+        print(f"  ✓ Baselines reset for maverick phase (different fitness scale)")
+        
+        # Recreate environment with maverick_mode=True
+        print(f"  Recreating environment with maverick_mode=True...")
+        self.eval_env = TradingEnvironment(
+            data_array=self.data_loader.data_array,
+            dates=self.data_loader.dates,
+            normalization_stats=self.normalization_stats,
+            start_idx=self.train_start_idx,
+            end_idx=self.train_end_idx,
+            trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+            data_array_full=self.data_loader.data_array_full,
+            consistency_mode=self.consistency_mode,
+            maverick_mode=True  # Enable maverick mode
+        )
+        print(f"  ✓ Environment recreated with maverick_mode=True")
+        
+        # Update shared memory config for workers (if not in local mode)
+        # CRITICAL: Recreate shared memory with maverick_mode=True to prevent global state leaks
+        # Workers cache _worker_env_config globally, so we must recreate shared memory
+        # to ensure they get the updated maverick_mode flag
+        if not self.local_mode:
+            print(f"  Recreating shared memory with maverick_mode=True for workers...")
+            # Reinitialize shared memory with updated maverick_mode
+            self._init_shared_memory()
+            print(f"  ✓ Shared memory recreated - workers will use maverick_mode=True on next ProcessPoolExecutor")
+        
+        print(f"  ✓ Reset complete - ready for maverick phase")
 
     def _evaluate_single_agent_for_baseline(self, agent: DDPGAgent) -> float:
         """
@@ -3370,10 +3584,38 @@ class ERLTrainer:
         if is_breakthrough:
             # Update breakthrough count for this member
             self.member_breakthroughs[member_idx] += 1
+            
+            # Track turnovers per agent based on phase
+            # Note: In this context, "turnover" = "breakthrough", so 3 turnovers = 3 breakthroughs
+            if self.multi_phase == 'non_maverick':
+                # Find which non-maverick agent this is
+                if member_idx in self.non_maverick_members:
+                    list_idx = self.non_maverick_members.index(member_idx)
+                    # Turnovers = breakthroughs (each breakthrough is a turnover)
+                    breakthroughs_for_agent = self.member_breakthroughs[member_idx]
+                    self.non_maverick_turnovers_per_agent[list_idx] = breakthroughs_for_agent
+                    
+                    if breakthroughs_for_agent >= Config.MULTI_TARGET_TURNOVERS:
+                        print(f"\n  ✓ Non-Maverick Agent {list_idx} completed {Config.MULTI_TARGET_TURNOVERS} turnovers!")
+            elif self.multi_phase == 'maverick':
+                # Find which maverick agent this is
+                if member_idx in self.maverick_members:
+                    list_idx = self.maverick_members.index(member_idx)
+                    breakthroughs_for_agent = self.member_breakthroughs[member_idx]
+                    self.maverick_turnovers_per_agent[list_idx] = breakthroughs_for_agent
+                    
+                    if breakthroughs_for_agent >= Config.MULTI_TARGET_TURNOVERS:
+                        print(f"\n  ✓ Maverick Agent {list_idx} completed {Config.MULTI_TARGET_TURNOVERS} turnovers!")
 
             # Print overall progress
             print(f"\n  Multi-Mode Progress:")
-            print(f"    Turnovers: {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
+            print(f"    Phase: {self.multi_phase}")
+            if self.multi_phase == 'non_maverick':
+                print(f"    Current non-maverick agent: {self.current_non_maverick_idx}/{len(self.non_maverick_members)}")
+                print(f"    Non-maverick turnovers: {self.non_maverick_turnovers_per_agent}")
+            elif self.multi_phase == 'maverick':
+                print(f"    Current maverick agent: {self.current_maverick_idx}/{len(self.maverick_members)}")
+                print(f"    Maverick turnovers: {self.maverick_turnovers_per_agent}")
             print(f"    Breakthroughs: {self.member_breakthroughs}")
 
         print("="*60)
@@ -5363,6 +5605,14 @@ class ERLTrainer:
                 # Stuck detection state
                 'multi_gens_since_improvement': getattr(self, 'multi_gens_since_improvement', 0),
                 'multi_best_score_for_member': getattr(self, 'multi_best_score_for_member', float('-inf')),
+                # Phase tracking for maverick/non-maverick separation
+                'multi_phase': getattr(self, 'multi_phase', 'non_maverick'),
+                'non_maverick_members': getattr(self, 'non_maverick_members', []),
+                'maverick_members': getattr(self, 'maverick_members', []),
+                'current_non_maverick_idx': getattr(self, 'current_non_maverick_idx', 0),
+                'current_maverick_idx': getattr(self, 'current_maverick_idx', 0),
+                'non_maverick_turnovers_per_agent': getattr(self, 'non_maverick_turnovers_per_agent', []),
+                'maverick_turnovers_per_agent': getattr(self, 'maverick_turnovers_per_agent', []),
             } if self.multi_mode else None,
 
             # Gauntlet Mode state
@@ -5564,6 +5814,21 @@ class ERLTrainer:
                     # Restore stuck detection state
                     self.multi_gens_since_improvement = multi_state.get('multi_gens_since_improvement', 0)
                     self.multi_best_score_for_member = multi_state.get('multi_best_score_for_member', float('-inf'))
+                    
+                    # Restore phase tracking state
+                    self.multi_phase = multi_state.get('multi_phase', 'non_maverick')
+                    self.non_maverick_members = multi_state.get('non_maverick_members', [])
+                    self.maverick_members = multi_state.get('maverick_members', [])
+                    self.current_non_maverick_idx = multi_state.get('current_non_maverick_idx', 0)
+                    self.current_maverick_idx = multi_state.get('current_maverick_idx', 0)
+                    self.non_maverick_turnovers_per_agent = multi_state.get('non_maverick_turnovers_per_agent', [])
+                    self.maverick_turnovers_per_agent = multi_state.get('maverick_turnovers_per_agent', [])
+                    
+                    # Ensure maverick_mode is set correctly based on phase
+                    if self.multi_phase == 'maverick':
+                        self.maverick_mode = True
+                    else:
+                        self.maverick_mode = False
 
                     # Reload the parent agent for the current member (needed for stuck recovery)
                     # The population was restored from checkpoint, but multi_parent_agent is separate

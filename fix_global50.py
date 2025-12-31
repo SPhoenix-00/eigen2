@@ -1183,6 +1183,9 @@ Examples:
   python fix_global50.py --cleanup          # Sync state without re-evaluating
   python fix_global50.py --set-maverick azure-thunder-123_5    # Mark agent as maverick
   python fix_global50.py --unset-maverick azure-thunder-123_5  # Remove maverick flag
+  
+Note: After setting maverick flags in Global50, update committee roster with:
+  python committee.py --update-maverick-flags
         """
     )
 

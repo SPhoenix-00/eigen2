@@ -145,9 +145,10 @@ def main():
         parser.add_argument(
             '--multi',
             action='store_true',
-            help='Multi-agent mode: Train all 9 committee members sequentially. '
-                 'Trains one member at a time until breakthrough (5%% improvement), then rotates to next. '
-                 'Ends after 3 turnovers (all 9 members achieve 3 breakthroughs each).'
+            help='Multi-agent mode: Two-phase training of committee members. '
+                 'Phase 1 (Non-Maverick): Train each non-maverick agent sequentially for 3 turnovers each, '
+                 'then clear buffer/population. Phase 2 (Maverick): Train each maverick agent sequentially '
+                 'for 3 turnovers each using maverick reward function. Requires at least one maverick in committee.'
         )
         parser.add_argument(
             '--cleanup',

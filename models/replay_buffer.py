@@ -864,14 +864,37 @@ class OnDiskReplayBuffer(IterableDataset):
         return self.total_transitions >= min_size
     
     def clear(self):
+        """
+        Clear OnDiskReplayBuffer and delete ALL files from storage directory.
+        
+        This ensures no "zombie" files remain that could be loaded by a new phase
+        (e.g., when transitioning from non-maverick to maverick training).
+        """
         print("Clearing OnDiskReplayBuffer and deleting files...")
+        
+        # Delete all files in the buffer list
         for path in list(self.buffer): # Iterate copy
             try:
                 os.remove(path)
             except OSError:
                 pass
+        
+        # CRITICAL: Also delete ALL files in storage_path directory to prevent zombie files
+        # Files might exist that were written but not yet added to buffer list
+        if self.storage_path.exists():
+            import glob
+            # Delete all transition and chunk files
+            for pattern in ['transition_*.pkl.gz', 'chunk_*.pkl.gz']:
+                for file_path in glob.glob(str(self.storage_path / pattern)):
+                    try:
+                        os.remove(file_path)
+                    except OSError:
+                        pass
+        
         self.buffer.clear()
-        print("Buffer cleared.")
+        self.total_added = 0  # Reset counter when clearing
+        self.total_transitions = 0  # Reset transition count
+        print("Buffer cleared (including all files in storage directory).")
     
     def get_stats(self) -> dict:
         return {
