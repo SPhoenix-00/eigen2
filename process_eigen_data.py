@@ -412,19 +412,50 @@ def shift_data_down(df, offsets=None):
     """
     Replicates the VBA ShiftDataDown logic.
     Aligns all data to the bottom of the DataFrame, column by column.
-    If offsets dict is provided, uses those to restore original positions.
+    If offsets dict is provided, uses those to restore original positions (RECOMMENDED).
     """
-    print("Shifting data to bottom-align (replicating ShiftDataDown)...")
-    
-    # --- FIX 1: Start from the beginning (index 0) ---
-    pandas_start_index = 0
-    num_rows = df.shape[0]
+    print("Shifting data to restore alignment (ShiftDataDown)...")
     
     # Create a new, empty DataFrame to hold the shifted data
     new_df = pd.DataFrame(None, index=df.index, columns=df.columns)
     
-    # --- FIX 2: DELETED the 'new_df.iloc[0] = df.iloc[0]' line ---
-    # We no longer "preserve" any rows. All data is shifted.
+    # If offsets are provided, use them to restore original alignment EXACTLY
+    if offsets is not None:
+        print("  Using captured offsets to restore exact data alignment...")
+        for col_name in df.columns:
+            if col_name not in offsets:
+                continue
+                
+            offset = offsets[col_name]
+            col_data = df[col_name].tolist()
+            
+            # The data currently starts at index 0 (shifted up)
+            # We want to move it down by 'offset'
+            
+            # 1. Take the data that was shifted up (excluding the padding we added at the end)
+            #    The valid data length is (total_rows - offset)
+            num_rows = len(col_data)
+            valid_len = num_rows - offset
+            
+            # 2. Extract valid data from top
+            valid_data = col_data[:valid_len]
+            
+            # 3. Create new column: [None]*offset + valid_data
+            #    This pushes the data back to its original start index
+            new_col_data = [None] * offset + valid_data
+            
+            # Assign to DataFrame
+            new_df[col_name] = new_col_data
+            
+        return new_df
+
+    # --- FALLBACK: OLD BEHAVIOR (Bottom Align) ---
+    # Only used if offsets are not provided
+    print("  WARNING: No offsets provided. Forcing bottom alignment (Risk of time-shift).")
+    
+    # --- FIX 1: Start from the beginning (index 0) ---
+    pandas_start_index = 0
+    num_rows = df.shape[0]
     
     # Length of the data section
     data_section_len = num_rows - pandas_start_index
@@ -454,11 +485,21 @@ def format_cell(x):
     Converts a cell value to a list format.
     x is a string like "[43.77,43.23,43.8,43.2]" or a plain number like "1.4422"
     """
-    # Check for empty/invalid strings first
-    if not isinstance(x, str) or x == "" or x == "[]":
+    # Already parsed list (e.g., when working with in-memory data)
+    if isinstance(x, list):
+        return x
+
+    # Handle numeric input (pandas often reads CSV numeric cells as float/int, not str)
+    if isinstance(x, (int, float, np.integer, np.floating)) and not pd.isna(x):
+        val = float(x)
+        return [val, val, val, val]
+
+    # Check for empty/invalid strings
+    if not isinstance(x, str) or x.strip() == "" or x.strip() == "[]":
         return None
 
     try:
+        x = x.strip()
         if x.startswith('['):
             # It's a bracketed array: "[1,2,3,4]" -> [1.0, 2.0, 3.0, 4.0]
             list_string = x[1:-1]
@@ -588,7 +629,7 @@ def generate_output_filename(base_filename):
     return output_filename
 
 # --- Append Mode Function ---
-def append_mode(production_file, new_data_file):
+def append_mode(production_file, new_data_file, *, update_config=False, allow_overlap=False):
     """
     Append mode: Process new raw data and append to existing production dataset.
     Uses last 100 rows from production as history for proper indicator calculation.
@@ -652,13 +693,16 @@ def append_mode(production_file, new_data_file):
         return
     
     print(f"✓ Column validation passed: {len(production_cols)} columns match")
+
+    # Align new data column order to production (prevents accidental order drift)
+    df_new_raw = df_new_raw.loc[:, df_production.columns]
     
     # Clean and convert new data using format_cell function
     print("Formatting new data from single values to lists...")
     df_new_raw = df_new_raw.replace(r'^\s*$', np.nan, regex=True)
     df_new_lists = df_new_raw.map(format_cell)
     
-    # --- Step 3: Date Continuity Check ---
+    # --- Step 3: Date Continuity Check / Overlap Guard ---
     print(f"\nStep 3: Checking date continuity...")
     production_last_date = df_production.index[-1]
     new_data_first_date = df_new_lists.index[0]
@@ -666,38 +710,46 @@ def append_mode(production_file, new_data_file):
     print(f"Production last date: {production_last_date}")
     print(f"New data first date: {new_data_first_date}")
     
-    # Convert to pandas Timestamp for comparison if needed
-    try:
-        prod_date = pd.Timestamp(production_last_date)
-        new_date = pd.Timestamp(new_data_first_date)
-        
-        # Check if new data starts after production (allowing for trading day gaps)
-        # We allow new data to start on the same day or after (trading days may have gaps)
-        if new_date < prod_date:
-            print(f"\n⚠️  WARNING: Date mismatch detected!")
-            print(f"   New data starts before production ends.")
-            print(f"   Production ends: {production_last_date}")
-            print(f"   New data starts: {new_data_first_date}")
-            
-            response = input("\nDate mismatch detected. Continue anyway? (y/n): ").strip().lower()
-            if response != 'y':
-                print("Aborted by user.")
-                return
-            print("Continuing with user override...")
-        elif new_date == prod_date:
-            print(f"⚠️  Note: New data starts on the same day as production ends (overlap possible)")
-            response = input("Continue anyway? (y/n): ").strip().lower()
-            if response != 'y':
-                print("Aborted by user.")
-                return
-        else:
-            print(f"✓ Date continuity check passed (new data starts after production)")
-    except Exception as e:
-        print(f"⚠️  Warning: Could not parse dates for comparison: {e}")
-        response = input("Continue anyway? (y/n): ").strip().lower()
-        if response != 'y':
-            print("Aborted by user.")
+    # Convert index to timestamps for robust comparisons
+    prod_index_ts = pd.to_datetime(df_production.index, errors='coerce')
+    new_index_ts = pd.to_datetime(df_new_lists.index, errors='coerce')
+
+    if prod_index_ts.isna().any():
+        print("Error: Could not parse one or more production index values as dates.")
+        print("Append mode requires a date-like index.")
+        return
+    if new_index_ts.isna().any():
+        bad = df_new_lists.index[pd.isna(new_index_ts)]
+        print("Error: Could not parse one or more new-data index values as dates:")
+        print(f"  {list(bad[:10])}" + (" ..." if len(bad) > 10 else ""))
+        print("Append mode requires a date-like index.")
+        return
+
+    prod_last_ts = prod_index_ts.iloc[-1]
+    new_first_ts = new_index_ts.iloc[0]
+
+    if new_first_ts <= prod_last_ts:
+        print(f"\n⚠️  WARNING: New data does not start strictly after production.")
+        print(f"   Production ends (ts): {prod_last_ts}  | raw: {production_last_date}")
+        print(f"   New starts      (ts): {new_first_ts}  | raw: {new_data_first_date}")
+        if not allow_overlap:
+            print("\nError: Overlap/rewind detected. For safety, append mode refuses to proceed.")
+            print("If you intentionally included overlapping rows, re-run with --allow-overlap to drop them.")
             return
+        print("Continuing because --allow-overlap was provided; overlapping/older rows will be dropped.")
+    else:
+        print(f"✓ Date continuity check passed (new data starts after production)")
+
+    # Drop any new rows that are <= production last date to prevent duplicates/corruption
+    keep_mask = new_index_ts > prod_last_ts
+    dropped = int((~keep_mask).sum())
+    if dropped:
+        print(f"Dropping {dropped} overlapping/old rows from new data (<= production last date).")
+        df_new_lists = df_new_lists.loc[keep_mask].copy()
+
+    if df_new_lists.empty:
+        print("Error: After dropping overlap/old rows, there is nothing left to append.")
+        return
     
     # --- Step 4: Combine History and New Data ---
     print(f"\nStep 4: Combining history ({HISTORY_ROWS} rows) with new data ({len(df_new_lists)} rows)...")
@@ -717,9 +769,13 @@ def append_mode(production_file, new_data_file):
     df_history_raw = df_history.map(to_raw)
     
     # Combine: history (now raw) + new raw data
-    combined_index = list(df_history.index) + list(df_new_lists.index)
     df_combined = pd.concat([df_history_raw, df_new_lists], axis=0)
-    df_combined.index = combined_index
+    # Safety: combined dataset must not contain duplicate indices
+    if df_combined.index.duplicated().any():
+        dupes = df_combined.index[df_combined.index.duplicated()].unique()
+        print("Error: Duplicate dates detected after overlap filtering (this should not happen).")
+        print(f"  Examples: {list(dupes[:10])}" + (" ..." if len(dupes) > 10 else ""))
+        return
     
     print(f"Combined dataset: {len(df_combined)} rows × {len(df_combined.columns)} columns")
     print("  (History converted to raw OHLC to allow indicator warm-up)")
@@ -733,14 +789,15 @@ def append_mode(production_file, new_data_file):
     print(f"\nStep 5: Processing combined dataset...")
     
     # Apply shift_data_up
-    df_combined_shifted_up, _ = shift_data_up(df_combined)
+    df_combined_shifted_up, offsets = shift_data_up(df_combined)
     
     # Apply process_dataframe
     print(f"Processing {len(df_combined_shifted_up.columns)} columns...")
     df_combined_processed = process_dataframe(df_combined_shifted_up)
     
     # Apply shift_data_down
-    df_combined_shifted = shift_data_down(df_combined_processed)
+    # Pass offsets to ensure we restore data to correct time slots
+    df_combined_shifted = shift_data_down(df_combined_processed, offsets=offsets)
     
     # Apply manipulate_list to filter to 9 indices
     print("Filtering lists to final 9 elements...")
@@ -766,6 +823,13 @@ def append_mode(production_file, new_data_file):
         print(f"  Available indices in combined: {len(df_combined_final.index)}")
         print(f"  New data indices: {len(new_data_indices)}")
         print(f"  Intersection: {len(available_indices)}")
+        return
+
+    # Final safety: do not allow overlapping indices to be appended
+    overlap_with_prod = df_production_full.index.intersection(df_new_processed.index)
+    if len(overlap_with_prod) > 0:
+        print("Error: Processed new rows overlap production indices (refusing to append).")
+        print(f"  Examples: {list(overlap_with_prod[:10])}" + (" ..." if len(overlap_with_prod) > 10 else ""))
         return
     
     # --- Step 6: Validation Check ---
@@ -853,7 +917,9 @@ def append_mode(production_file, new_data_file):
     
     # Save pickle
     print(f"\nSaving final dataset to {output_filename}...")
-    df_final.to_pickle(output_filename)
+    tmp_pkl = output_filename + ".tmp"
+    df_final.to_pickle(tmp_pkl)
+    os.replace(tmp_pkl, output_filename)
     
     # Save CSV for comparison
     print(f"Converting to strings for CSV export...")
@@ -861,7 +927,9 @@ def append_mode(production_file, new_data_file):
         lambda x: str(x) if x is not None else ""
     )
     print(f"Saving comparison CSV to {output_csv_filename}...")
-    df_string_output.to_csv(output_csv_filename)
+    tmp_csv = output_csv_filename + ".tmp"
+    df_string_output.to_csv(tmp_csv)
+    os.replace(tmp_csv, output_csv_filename)
     
     # --- Step 8: Validate Overlapping Data ---
     print(f"\nStep 8: Validating overlapping data between old and new production files...")
@@ -941,15 +1009,16 @@ def append_mode(production_file, new_data_file):
         print("✓ No overlapping rows found (new data starts after old data ends)")
     
     # --- Step 9: Update Configuration Files ---
-    print(f"\nStep 9: Updating configuration files to point to new production file...")
-    
-    # Update OUTPUT_FILE_PKL in process_eigen_data.py
-    try:
-        update_config_files(output_filename)
-        print(f"✓ Configuration files updated")
-    except Exception as e:
-        print(f"⚠️  Warning: Failed to update configuration files: {e}")
-        print(f"   Please manually update OUTPUT_FILE_PKL in process_eigen_data.py to: {output_filename}")
+    if update_config:
+        print(f"\nStep 9: Updating configuration files to point to new production file...")
+        try:
+            update_config_files(output_filename)
+            print(f"✓ Configuration files updated")
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to update configuration files: {e}")
+            print(f"   Please manually update OUTPUT_FILE_PKL in process_eigen_data.py to: {output_filename}")
+    else:
+        print(f"\nStep 9: Skipping configuration file updates (run with --update-config to enable).")
     
     print(f"\n✅ Success! Append mode complete.")
     print(f"   Production dataset: {production_file}")
@@ -982,6 +1051,10 @@ Examples:
                         help='Production pickle file (required for --append mode)')
     parser.add_argument('--new-data-file', type=str,
                         help='New raw CSV data file (required for --append mode)')
+    parser.add_argument('--update-config', action='store_true',
+                        help='(Append mode) Update OUTPUT_FILE_PKL references in repo to point at the newly written pickle')
+    parser.add_argument('--allow-overlap', action='store_true',
+                        help='(Append mode) Allow new-data CSV to include rows on/before the last production date; those rows will be dropped for safety')
     
     args = parser.parse_args()
     
@@ -996,7 +1069,12 @@ Examples:
             parser.print_help()
             return
         
-        append_mode(args.production_file, args.new_data_file)
+        append_mode(
+            args.production_file,
+            args.new_data_file,
+            update_config=args.update_config,
+            allow_overlap=args.allow_overlap,
+        )
         return
     
     # Normal mode (existing functionality)
@@ -1040,7 +1118,7 @@ Examples:
 
     # --- NEW STEP 1: Replicates 'ShiftDataDown' sub ---
     # Shift data back down to bottom-align (original positions)
-    df_shifted = shift_data_down(df_processed)
+    df_shifted = shift_data_down(df_processed, offsets=col_offsets)
 
     # --- NEW STEP 2: Replicates 'ManipulateArrayString' ---
     print("Filtering lists to final 9 elements...")
