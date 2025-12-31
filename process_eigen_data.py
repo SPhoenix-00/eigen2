@@ -3,6 +3,9 @@ import numpy as np
 import time
 import sys
 import os
+import argparse
+from datetime import datetime
+import re
 
 # --- Configuration ---
 INPUT_FILE = 'Eigen2_Master(GFIN)_05_skinny - MASTER.csv'
@@ -445,6 +448,30 @@ def shift_data_down(df, offsets=None):
 
     return new_df
 
+# --- Cell Formatting Function (used in both normal and append modes) ---
+def format_cell(x):
+    """
+    Converts a cell value to a list format.
+    x is a string like "[43.77,43.23,43.8,43.2]" or a plain number like "1.4422"
+    """
+    # Check for empty/invalid strings first
+    if not isinstance(x, str) or x == "" or x == "[]":
+        return None
+
+    try:
+        if x.startswith('['):
+            # It's a bracketed array: "[1,2,3,4]" -> [1.0, 2.0, 3.0, 4.0]
+            list_string = x[1:-1]
+            return [float(part) for part in list_string.split(',')]
+        else:
+            # It's a plain number: "1.4422" -> [1.4422, 1.4422, 1.4422, 1.4422]
+            val = float(x)
+            return [val, val, val, val]
+
+    except (ValueError, TypeError):
+        # Catches errors if a part isn't a valid number
+        return None
+
 # --- NEW STEP 2: Replicates ManipulateArrayString Function ---
 def manipulate_list(cell_list):
     """
@@ -463,10 +490,509 @@ def manipulate_list(cell_list):
         # Handle case where an element might be missing (e.g., None)
         return None
 
+# --- Helper function to update configuration files ---
+def update_config_files(new_filename):
+    """
+    Update configuration files to point to the new production pickle file.
+    Updates:
+    - process_eigen_data.py: OUTPUT_FILE_PKL
+    - QUICK_START.md: References to the pickle filename
+    """
+    # Extract just the filename (not full path)
+    new_basename = os.path.basename(new_filename)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    updated_files = []
+    
+    # Update process_eigen_data.py (the current script)
+    script_path = os.path.abspath(__file__)
+    try:
+        with open(script_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Update OUTPUT_FILE_PKL
+        pattern = r"OUTPUT_FILE_PKL = '[^']+'"
+        replacement = f"OUTPUT_FILE_PKL = '{new_basename}'"
+        new_content = re.sub(pattern, replacement, content)
+        
+        if new_content != content:
+            # Write to a temporary file first, then rename (safer)
+            temp_path = script_path + '.tmp'
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            os.replace(temp_path, script_path)
+            updated_files.append('process_eigen_data.py')
+    except Exception as e:
+        print(f"  Warning: Could not update process_eigen_data.py: {e}")
+    
+    # Update QUICK_START.md
+    quick_start_path = os.path.join(base_dir, 'QUICK_START.md')
+    if os.path.exists(quick_start_path):
+        try:
+            with open(quick_start_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Update references to Eigen2_Master_PY_OUTPUT_*.pkl
+            # Pattern matches: Eigen2_Master_PY_OUTPUT_151025.pkl or Eigen2_Master_PY_OUTPUT.pkl
+            old_pattern = r"Eigen2_Master_PY_OUTPUT(?:_\d{6})?\.pkl"
+            new_content = re.sub(old_pattern, new_basename, content)
+            
+            if new_content != content:
+                with open(quick_start_path, 'w', encoding='utf-8') as f:
+                    f.write(new_content)
+                updated_files.append('QUICK_START.md')
+        except Exception as e:
+            print(f"  Warning: Could not update QUICK_START.md: {e}")
+    
+    if updated_files:
+        print(f"  Updated: {', '.join(updated_files)}")
+    else:
+        print(f"  No files needed updating (or update failed)")
+
+# --- Helper function for date suffix generation ---
+def generate_output_filename(base_filename):
+    """
+    Generate output filename with date suffix in format _ddmmyy.{ext}
+    Removes existing date suffix if present.
+    Supports both .pkl and .csv files.
+    """
+    # Extract extension
+    if base_filename.endswith('.pkl'):
+        ext = '.pkl'
+        pattern = r'_(\d{6})\.pkl$'
+    elif base_filename.endswith('.csv'):
+        ext = '.csv'
+        pattern = r'_(\d{6})_FOR_COMPARE\.csv$'
+    else:
+        # Default to .pkl if no extension found
+        ext = '.pkl'
+        pattern = r'_(\d{6})\.pkl$'
+        if not base_filename.endswith('.pkl'):
+            base_filename = base_filename + '.pkl'
+    
+    # Remove existing date suffix pattern if present
+    base_name = re.sub(pattern, '', base_filename)
+    # Also handle case where extension was added
+    if base_name.endswith(ext):
+        base_name = base_name[:-len(ext)]
+    
+    # Add new date suffix
+    today = datetime.now()
+    date_suffix = today.strftime('%d%m%y')
+    
+    # Handle special case for CSV (add _FOR_COMPARE)
+    if ext == '.csv' and '_FOR_COMPARE' not in base_name:
+        output_filename = f"{base_name}_{date_suffix}_FOR_COMPARE.csv"
+    else:
+        output_filename = f"{base_name}_{date_suffix}{ext}"
+    
+    return output_filename
+
+# --- Append Mode Function ---
+def append_mode(production_file, new_data_file):
+    """
+    Append mode: Process new raw data and append to existing production dataset.
+    Uses last 100 rows from production as history for proper indicator calculation.
+    """
+    HISTORY_ROWS = 100  # Hardcoded history rows
+    VBA_CALC_RAMP_UP_ROWS = 34  # Ramp-up rows to skip
+    
+    print("="*60)
+    print("APPEND MODE")
+    print("="*60)
+    
+    # --- Step 1: Load Production Dataset ---
+    print(f"\nStep 1: Loading production dataset from {production_file}...")
+    if not os.path.exists(production_file):
+        print(f"Error: Production file not found: {production_file}")
+        return
+    
+    df_production = pd.read_pickle(production_file)
+    print(f"Loaded production dataset: {df_production.shape[0]} rows × {df_production.shape[1]} columns")
+    
+    if len(df_production) < HISTORY_ROWS:
+        print(f"Error: Production dataset has only {len(df_production)} rows, but {HISTORY_ROWS} rows are required for history.")
+        return
+    
+    # Extract last 100 rows for history
+    df_history = df_production.iloc[-HISTORY_ROWS:].copy()
+    print(f"Extracted last {HISTORY_ROWS} rows for history")
+    
+    # Store full production for later appending
+    df_production_full = df_production.copy()
+    
+    # --- Step 2: Load and Validate New Data ---
+    print(f"\nStep 2: Loading new data from {new_data_file}...")
+    if not os.path.exists(new_data_file):
+        print(f"Error: New data file not found: {new_data_file}")
+        return
+    
+    df_new_raw = pd.read_csv(new_data_file, index_col=0)
+    print(f"Loaded new data: {df_new_raw.shape[0]} rows × {df_new_raw.shape[1]} columns")
+    
+    # Remove TRANSFER column if present
+    if 'TRANSFER' in df_new_raw.columns:
+        df_new_raw = df_new_raw.drop(columns=['TRANSFER'])
+        print("Dropped TRANSFER column from new data")
+    
+    # Validate column matching
+    production_cols = set(df_production.columns)
+    new_data_cols = set(df_new_raw.columns)
+    
+    if production_cols != new_data_cols:
+        missing_in_new = production_cols - new_data_cols
+        extra_in_new = new_data_cols - production_cols
+        
+        print(f"\nError: Column mismatch detected!")
+        if missing_in_new:
+            print(f"  Columns in production but missing in new data: {sorted(missing_in_new)}")
+        if extra_in_new:
+            print(f"  Columns in new data but not in production: {sorted(extra_in_new)}")
+        print(f"\nProduction columns ({len(production_cols)}): {sorted(production_cols)}")
+        print(f"New data columns ({len(new_data_cols)}): {sorted(new_data_cols)}")
+        return
+    
+    print(f"✓ Column validation passed: {len(production_cols)} columns match")
+    
+    # Clean and convert new data using format_cell function
+    print("Formatting new data from single values to lists...")
+    df_new_raw = df_new_raw.replace(r'^\s*$', np.nan, regex=True)
+    df_new_lists = df_new_raw.map(format_cell)
+    
+    # --- Step 3: Date Continuity Check ---
+    print(f"\nStep 3: Checking date continuity...")
+    production_last_date = df_production.index[-1]
+    new_data_first_date = df_new_lists.index[0]
+    
+    print(f"Production last date: {production_last_date}")
+    print(f"New data first date: {new_data_first_date}")
+    
+    # Convert to pandas Timestamp for comparison if needed
+    try:
+        prod_date = pd.Timestamp(production_last_date)
+        new_date = pd.Timestamp(new_data_first_date)
+        
+        # Check if new data starts after production (allowing for trading day gaps)
+        # We allow new data to start on the same day or after (trading days may have gaps)
+        if new_date < prod_date:
+            print(f"\n⚠️  WARNING: Date mismatch detected!")
+            print(f"   New data starts before production ends.")
+            print(f"   Production ends: {production_last_date}")
+            print(f"   New data starts: {new_data_first_date}")
+            
+            response = input("\nDate mismatch detected. Continue anyway? (y/n): ").strip().lower()
+            if response != 'y':
+                print("Aborted by user.")
+                return
+            print("Continuing with user override...")
+        elif new_date == prod_date:
+            print(f"⚠️  Note: New data starts on the same day as production ends (overlap possible)")
+            response = input("Continue anyway? (y/n): ").strip().lower()
+            if response != 'y':
+                print("Aborted by user.")
+                return
+        else:
+            print(f"✓ Date continuity check passed (new data starts after production)")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not parse dates for comparison: {e}")
+        response = input("Continue anyway? (y/n): ").strip().lower()
+        if response != 'y':
+            print("Aborted by user.")
+            return
+    
+    # --- Step 4: Combine History and New Data ---
+    print(f"\nStep 4: Combining history ({HISTORY_ROWS} rows) with new data ({len(df_new_lists)} rows)...")
+    
+    # Combine: history (already processed, 9-element lists) + new raw data (4-element lists)
+    # We need to align indices properly
+    combined_index = list(df_history.index) + list(df_new_lists.index)
+    df_combined = pd.concat([df_history, df_new_lists], axis=0)
+    df_combined.index = combined_index
+    
+    print(f"Combined dataset: {len(df_combined)} rows × {len(df_combined.columns)} columns")
+    
+    # --- Step 5: Process Combined Dataset ---
+    print(f"\nStep 5: Processing combined dataset...")
+    
+    # Apply shift_data_up
+    df_combined_shifted_up, _ = shift_data_up(df_combined)
+    
+    # Apply process_dataframe
+    print(f"Processing {len(df_combined_shifted_up.columns)} columns...")
+    df_combined_processed = process_dataframe(df_combined_shifted_up)
+    
+    # Apply shift_data_down
+    df_combined_shifted = shift_data_down(df_combined_processed)
+    
+    # Apply manipulate_list to filter to 9 indices
+    print("Filtering lists to final 9 elements...")
+    df_combined_final = df_combined_shifted.map(manipulate_list)
+    
+    # Extract only the new rows
+    # After processing, the combined dataset has history_rows + new_data_rows
+    # We need to extract only rows that correspond to new_data, skipping the ramp-up period
+    # The ramp-up period affects the first VBA_CALC_RAMP_UP_ROWS of new_data
+    
+    new_data_indices = list(df_new_lists.index)
+    skip_rows = HISTORY_ROWS + VBA_CALC_RAMP_UP_ROWS
+    
+    if len(df_combined_final) > skip_rows:
+        # After skip_rows, we should have valid new data rows
+        # But we need to match by index to ensure we get the right rows
+        # (shift operations preserve indices, so we can match by index)
+        
+        # Get indices of new data that are valid (after ramp-up)
+        valid_new_indices = new_data_indices[VBA_CALC_RAMP_UP_ROWS:]
+        
+        # Extract rows from combined_final that match valid_new_indices
+        # Use intersection to get only rows that exist in both
+        available_indices = df_combined_final.index.intersection(valid_new_indices)
+        df_new_processed = df_combined_final.loc[available_indices].copy()
+        
+        print(f"Extracted {len(df_new_processed)} new processed rows")
+        print(f"  (Skipped {HISTORY_ROWS} history rows + {VBA_CALC_RAMP_UP_ROWS} ramp-up rows)")
+        
+        if len(df_new_processed) == 0:
+            print(f"⚠️  Error: No valid new rows extracted.")
+            print(f"  Available indices in combined: {len(df_combined_final.index)}")
+            print(f"  Valid new indices: {len(valid_new_indices)}")
+            print(f"  Intersection: {len(available_indices)}")
+            return
+    else:
+        print(f"⚠️  Warning: Combined dataset has only {len(df_combined_final)} rows, cannot extract new rows after skipping {skip_rows} rows")
+        return
+    
+    # --- Step 6: Validation Check ---
+    print(f"\nStep 6: Validating calculations...")
+    
+    # The last row of the history section in the combined dataset (at index HISTORY_ROWS - 1)
+    # should match the last row of production (index -1)
+    # Note: After shift operations, the indices might have changed, so we need to find
+    # the row that corresponds to the last production row by matching the date/index
+    if len(df_combined_final) > HISTORY_ROWS - 1:
+        # Find the row in combined_final that has the same index as production's last row
+        production_last_index = df_production.index[-1]
+        
+        if production_last_index in df_combined_final.index:
+            recalculated_last_row = df_combined_final.loc[production_last_index]
+            production_last_row = df_production.iloc[-1]
+            
+            # Compare row by row (cell by cell)
+            mismatches = []
+            for col in df_production.columns:
+                recalc_val = recalculated_last_row[col]
+                prod_val = production_last_row[col]
+                
+                # Handle None values
+                if recalc_val is None and prod_val is None:
+                    continue
+                if recalc_val is None or prod_val is None:
+                    mismatches.append(f"{col}: recalculated={recalc_val}, production={prod_val}")
+                    continue
+                
+                # Compare lists
+                if isinstance(recalc_val, list) and isinstance(prod_val, list):
+                    if len(recalc_val) != len(prod_val):
+                        mismatches.append(f"{col}: length mismatch (recalc={len(recalc_val)}, prod={len(prod_val)})")
+                    else:
+                        for i, (r, p) in enumerate(zip(recalc_val, prod_val)):
+                            if r != p and not (pd.isna(r) and pd.isna(p)):
+                                # Allow small floating point differences
+                                if isinstance(r, (int, float)) and isinstance(p, (int, float)):
+                                    if abs(r - p) > 1e-6:
+                                        mismatches.append(f"{col}[{i}]: recalc={r}, prod={p} (diff={abs(r-p)})")
+                                else:
+                                    mismatches.append(f"{col}[{i}]: recalc={r}, prod={p}")
+                elif recalc_val != prod_val:
+                    # Allow small floating point differences for numeric values
+                    if isinstance(recalc_val, (int, float)) and isinstance(prod_val, (int, float)):
+                        if abs(recalc_val - prod_val) > 1e-6:
+                            mismatches.append(f"{col}: recalc={recalc_val}, prod={prod_val} (diff={abs(recalc_val-prod_val)})")
+                    else:
+                        mismatches.append(f"{col}: recalc={recalc_val}, prod={prod_val}")
+            
+            if mismatches:
+                print(f"⚠️  Warning: {len(mismatches)} mismatches detected in validation check:")
+                for mismatch in mismatches[:10]:  # Show first 10
+                    print(f"  {mismatch}")
+                if len(mismatches) > 10:
+                    print(f"  ... and {len(mismatches) - 10} more")
+                response = input("\nValidation check failed. Continue anyway? (y/n): ").strip().lower()
+                if response != 'y':
+                    print("Aborted by user.")
+                    return
+            else:
+                print("✓ Validation check passed: Recalculated last row matches production")
+        else:
+            print(f"⚠️  Warning: Cannot find production last index {production_last_index} in combined dataset for validation")
+            response = input("Continue anyway? (y/n): ").strip().lower()
+            if response != 'y':
+                print("Aborted by user.")
+                return
+    else:
+        print("⚠️  Warning: Cannot perform validation check (insufficient rows)")
+    
+    # --- Step 7: Append and Save ---
+    print(f"\nStep 7: Appending new rows to production dataset...")
+    
+    # Append processed new rows to production
+    df_final = pd.concat([df_production_full, df_new_processed], axis=0)
+    print(f"Final dataset: {df_final.shape[0]} rows × {df_final.shape[1]} columns")
+    print(f"  (Original: {len(df_production_full)} rows, Added: {len(df_new_processed)} rows)")
+    
+    # Generate output filename
+    output_filename = generate_output_filename(production_file)
+    # For CSV, replace .pkl with _FOR_COMPARE.csv in the output filename
+    output_csv_filename = output_filename.replace('.pkl', '_FOR_COMPARE.csv')
+    
+    # Save pickle
+    print(f"\nSaving final dataset to {output_filename}...")
+    df_final.to_pickle(output_filename)
+    
+    # Save CSV for comparison
+    print(f"Converting to strings for CSV export...")
+    df_string_output = df_final.map(
+        lambda x: str(x) if x is not None else ""
+    )
+    print(f"Saving comparison CSV to {output_csv_filename}...")
+    df_string_output.to_csv(output_csv_filename)
+    
+    # --- Step 8: Validate Overlapping Data ---
+    print(f"\nStep 8: Validating overlapping data between old and new production files...")
+    
+    # Load the newly saved file
+    df_new_production = pd.read_pickle(output_filename)
+    
+    # Find overlapping indices (dates that exist in both)
+    overlapping_indices = df_production_full.index.intersection(df_new_production.index)
+    
+    if len(overlapping_indices) > 0:
+        print(f"Found {len(overlapping_indices)} overlapping rows to validate...")
+        
+        # Compare overlapping rows
+        df_old_overlap = df_production_full.loc[overlapping_indices]
+        df_new_overlap = df_new_production.loc[overlapping_indices]
+        
+        mismatches = []
+        for idx in overlapping_indices:
+            old_row = df_old_overlap.loc[idx]
+            new_row = df_new_overlap.loc[idx]
+            
+            for col in df_production_full.columns:
+                old_val = old_row[col]
+                new_val = new_row[col]
+                
+                # Handle None values
+                if old_val is None and new_val is None:
+                    continue
+                if old_val is None or new_val is None:
+                    mismatches.append(f"Row {idx}, Column {col}: old={old_val}, new={new_val}")
+                    continue
+                
+                # Compare lists
+                if isinstance(old_val, list) and isinstance(new_val, list):
+                    if len(old_val) != len(new_val):
+                        mismatches.append(f"Row {idx}, Column {col}: length mismatch (old={len(old_val)}, new={len(new_val)})")
+                    else:
+                        for i, (o, n) in enumerate(zip(old_val, new_val)):
+                            if o != n and not (pd.isna(o) and pd.isna(n)):
+                                # Allow small floating point differences
+                                if isinstance(o, (int, float)) and isinstance(n, (int, float)):
+                                    if abs(o - n) > 1e-6:
+                                        mismatches.append(f"Row {idx}, Column {col}[{i}]: old={o}, new={n} (diff={abs(o-n)})")
+                                else:
+                                    mismatches.append(f"Row {idx}, Column {col}[{i}]: old={o}, new={n}")
+                elif old_val != new_val:
+                    # Allow small floating point differences for numeric values
+                    if isinstance(old_val, (int, float)) and isinstance(new_val, (int, float)):
+                        if abs(old_val - new_val) > 1e-6:
+                            mismatches.append(f"Row {idx}, Column {col}: old={old_val}, new={new_val} (diff={abs(old_val-new_val)})")
+                    else:
+                        mismatches.append(f"Row {idx}, Column {col}: old={old_val}, new={new_val}")
+        
+        if mismatches:
+            print(f"⚠️  ERROR: {len(mismatches)} mismatches found in overlapping data!")
+            print("This indicates the new production file has different values than the old one for overlapping rows.")
+            for mismatch in mismatches[:20]:  # Show first 20
+                print(f"  {mismatch}")
+            if len(mismatches) > 20:
+                print(f"  ... and {len(mismatches) - 20} more mismatches")
+            print(f"\n⚠️  CRITICAL: Overlapping data validation failed!")
+            print(f"   The new production file does not match the old one for {len(overlapping_indices)} overlapping rows.")
+            response = input("\nValidation failed. Continue anyway? (y/n): ").strip().lower()
+            if response != 'y':
+                print("Aborted. Please investigate the issue.")
+                # Optionally remove the new file
+                if os.path.exists(output_filename):
+                    print(f"Removing {output_filename}...")
+                    os.remove(output_filename)
+                if os.path.exists(output_csv_filename):
+                    os.remove(output_csv_filename)
+                return
+        else:
+            print(f"✓ Overlapping data validation passed: All {len(overlapping_indices)} overlapping rows match")
+    else:
+        print("✓ No overlapping rows found (new data starts after old data ends)")
+    
+    # --- Step 9: Update Configuration Files ---
+    print(f"\nStep 9: Updating configuration files to point to new production file...")
+    
+    # Update OUTPUT_FILE_PKL in process_eigen_data.py
+    try:
+        update_config_files(output_filename)
+        print(f"✓ Configuration files updated")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to update configuration files: {e}")
+        print(f"   Please manually update OUTPUT_FILE_PKL in process_eigen_data.py to: {output_filename}")
+    
+    print(f"\n✅ Success! Append mode complete.")
+    print(f"   Production dataset: {production_file}")
+    print(f"   New data added: {len(df_new_processed)} rows")
+    print(f"   Output saved to: {output_filename}")
+    print(f"   CSV saved to: {output_csv_filename}")
+    print(f"   Configuration updated to use: {output_filename}")
+
 # --- Main Execution Function ---
 def main():
     """Main execution function."""
-
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description='Process Eigen data: convert raw CSV to processed pickle file',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Normal mode:
+    python process_eigen_data.py
+  
+  Append mode:
+    python process_eigen_data.py --append --production-file Eigen2_Master_PY_OUTPUT_151025.pkl --new-data-file new_data.csv
+        """
+    )
+    
+    parser.add_argument('--append', action='store_true',
+                        help='Enable append mode: append new data to existing production dataset')
+    parser.add_argument('--production-file', type=str,
+                        help='Production pickle file (required for --append mode)')
+    parser.add_argument('--new-data-file', type=str,
+                        help='New raw CSV data file (required for --append mode)')
+    
+    args = parser.parse_args()
+    
+    # Branch to append mode if requested
+    if args.append:
+        if not args.production_file:
+            print("Error: --production-file is required when using --append mode")
+            parser.print_help()
+            return
+        if not args.new_data_file:
+            print("Error: --new-data-file is required when using --append mode")
+            parser.print_help()
+            return
+        
+        append_mode(args.production_file, args.new_data_file)
+        return
+    
+    # Normal mode (existing functionality)
     if not os.path.exists(INPUT_FILE):
         print(f"Error: Input file not found: {INPUT_FILE}")
         return
@@ -495,27 +1021,6 @@ def main():
 
     # --- Replicates 'SingleIntoArray' sub ---
     print("Formatting data from single values to lists...")
-    def format_cell(x):
-        # x is a string like "[43.77,43.23,43.8,43.2]" or a plain number like "1.4422"
-
-        # Check for empty/invalid strings first
-        if not isinstance(x, str) or x == "" or x == "[]":
-            return None
-
-        try:
-            if x.startswith('['):
-                # It's a bracketed array: "[1,2,3,4]" -> [1.0, 2.0, 3.0, 4.0]
-                list_string = x[1:-1]
-                return [float(part) for part in list_string.split(',')]
-            else:
-                # It's a plain number: "1.4422" -> [1.4422, 1.4422, 1.4422, 1.4422]
-                val = float(x)
-                return [val, val, val, val]
-
-        except (ValueError, TypeError):
-            # Catches errors if a part isn't a valid number
-            return None
-
     df_lists = df.map(format_cell)
 
     # --- NEW STEP 0: Shift data UP (top-align) before processing ---
