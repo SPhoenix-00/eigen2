@@ -702,13 +702,27 @@ def append_mode(production_file, new_data_file):
     # --- Step 4: Combine History and New Data ---
     print(f"\nStep 4: Combining history ({HISTORY_ROWS} rows) with new data ({len(df_new_lists)} rows)...")
     
-    # Combine: history (already processed, 9-element lists) + new raw data (4-element lists)
-    # We need to align indices properly
+    # FIX: Convert history to raw format (Indices 0-3 only: Open, Close, High, Low)
+    # The processed history (Skinny) does not contain the intermediate EMA states 
+    # (indices 4, 5, 7, 8, etc.) required to continue calculations directly.
+    # We must treat the history as raw data and let the model "warm up" again.
+    def to_raw(cell_list):
+        """Convert processed cell (9 elements) back to raw OHLC (4 elements)."""
+        if isinstance(cell_list, list) and len(cell_list) >= 4:
+            return cell_list[:4]  # Keep only [Open, Close, High, Low]
+        return None
+    
+    # Strip history down to raw OHLC
+    print("  Converting history from processed (9 elements) to raw (4 elements)...")
+    df_history_raw = df_history.map(to_raw)
+    
+    # Combine: history (now raw) + new raw data
     combined_index = list(df_history.index) + list(df_new_lists.index)
-    df_combined = pd.concat([df_history, df_new_lists], axis=0)
+    df_combined = pd.concat([df_history_raw, df_new_lists], axis=0)
     df_combined.index = combined_index
     
     print(f"Combined dataset: {len(df_combined)} rows × {len(df_combined.columns)} columns")
+    print("  (History converted to raw OHLC to allow indicator warm-up)")
     
     # WARNING: shift_data_down will align data to the bottom of the DataFrame.
     # If a stock stopped trading (delisted/missing data), its old historical prices
