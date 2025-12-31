@@ -171,7 +171,7 @@ def create_next_generation(population: List[DDPGAgent],
                           injection_count: int = 0) -> List[DDPGAgent]:
     """
     Create next generation using selection, crossover, and mutation.
-    Calculates population segments dynamically using Config.POPULATION_SIZE.
+    Maintains the same population size as the input (supports local mode's smaller population).
 
     Args:
         population: Current population of agents
@@ -190,7 +190,8 @@ def create_next_generation(population: List[DDPGAgent],
         - injection_pool/injection_count: Used in heroes+consistency mode to inject mutated
           Global50 agents until first breakthrough (prevents HoF poisoning)
     """
-    pop_size = Config.POPULATION_SIZE
+    # Use actual population size (supports local mode's smaller population)
+    pop_size = len(population)
 
     # Use validation scores (elite_scores) for elitism, or fall back to training fitness
     scores_for_elites = elite_scores if elite_scores is not None else fitness_scores
@@ -317,8 +318,8 @@ def create_next_generation(population: List[DDPGAgent],
         agent.agent_id = i
     
     # This assertion will now pass for ANY population size
-    assert len(next_gen) == Config.POPULATION_SIZE, \
-        f"Population size mismatch: {len(next_gen)} != {Config.POPULATION_SIZE}"
+    assert len(next_gen) == pop_size, \
+        f"Population size mismatch: {len(next_gen)} != {pop_size}"
     
     return next_gen
 

@@ -108,6 +108,19 @@
       "is_maverick": false
     },
     {
+      "agent_id": 53,
+      "run_name": "pleasant-water-209",
+      "gauntlet_score": 32.93621017940386,
+      "generation": 144,
+      "roi": 6.730440139770508,
+      "expectancy": 4.437005996704102,
+      "cv": 100.0,
+      "quality_ratio": 0.2010221465076661,
+      "win_ratio": 0.0,
+      "total_trades": 587,
+      "is_maverick": false
+    },
+    {
       "agent_id": 81,
       "run_name": "pleasant-water-209",
       "gauntlet_score": 26.33055995542668,
@@ -639,22 +652,9 @@
       "win_ratio": 0.7724867724867724,
       "total_trades": 189,
       "is_maverick": false
-    },
-    {
-      "agent_id": 71,
-      "run_name": "happy-dream-203",
-      "gauntlet_score": -105.81046736091619,
-      "generation": 32,
-      "roi": 8.374120712280273,
-      "expectancy": 6.506375312805176,
-      "cv": 2.264652059375213,
-      "quality_ratio": 0.25914634146341464,
-      "win_ratio": 0.8201219512195121,
-      "total_trades": 328,
-      "is_maverick": false
     }
   ],
   "capacity": 50,
   "version": "1.0",
-  "last_updated": "2025-12-30T03:41:22.706200Z"
+  "last_updated": "2025-12-31T07:31:38.463393Z"
 }

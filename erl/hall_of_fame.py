@@ -4,10 +4,44 @@ Stores and manages the best agents based on validation scores across all generat
 """
 
 import json
+import time
 import numpy as np
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from models.ddpg_agent import DDPGAgent
+
+
+def _safe_unlink(path: Path, max_retries: int = 5, base_delay: float = 0.1) -> bool:
+    """
+    Safely delete a file with retry logic for Windows file locking.
+
+    On Windows, background upload processes may hold locks on files.
+    This function retries with exponential backoff to handle transient locks.
+
+    Args:
+        path: Path to the file to delete
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds (doubles each retry)
+
+    Returns:
+        True if file was deleted or doesn't exist, False if deletion failed after all retries
+    """
+    if not path.exists():
+        return True
+
+    for attempt in range(max_retries):
+        try:
+            path.unlink()
+            return True
+        except PermissionError:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff
+                time.sleep(delay)
+            else:
+                # Final attempt failed - log warning but don't crash
+                print(f"  ⚠ Could not delete {path.name} (file locked by another process)")
+                return False
+    return False
 
 
 class HallOfFameEntry:
@@ -163,8 +197,7 @@ class HallOfFame:
             # Delete the old agent file
             if self.checkpoint_dir:
                 old_path = self.hof_dir / f"hof_agent_{worst_entry.agent_id}.pth"
-                if old_path.exists():
-                    old_path.unlink()
+                _safe_unlink(old_path)
 
         # Create new entry with unique ID
         new_id = self._get_next_id()
@@ -273,8 +306,7 @@ class HallOfFame:
                     # Delete old agent file
                     if self.checkpoint_dir:
                         old_path = self.hof_dir / f"hof_agent_{old_id}.pth"
-                        if old_path.exists():
-                            old_path.unlink()
+                        _safe_unlink(old_path)
 
                     # Add new entry
                     new_id = self._get_next_id()

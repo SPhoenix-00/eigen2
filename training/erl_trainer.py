@@ -706,7 +706,7 @@ class ERLTrainer:
                             id=wandb_run_id,
                             resume="must",  # Must resume this specific run
                             config={
-                                "population_size": Config.POPULATION_SIZE,
+                                "population_size": Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE,
                                 "num_generations": Config.NUM_GENERATIONS,
                                 "buffer_size": Config.BUFFER_SIZE,
                                 "batch_size": Config.BATCH_SIZE,
@@ -727,7 +727,7 @@ class ERLTrainer:
                             name=self.resume_run_name,  # Try to use same name
                             resume="allow",
                             config={
-                                "population_size": Config.POPULATION_SIZE,
+                                "population_size": Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE,
                                 "num_generations": Config.NUM_GENERATIONS,
                                 "buffer_size": Config.BUFFER_SIZE,
                                 "batch_size": Config.BATCH_SIZE,
@@ -753,7 +753,7 @@ class ERLTrainer:
                         project="eigen2-self",
                         #name=f"erl-{Config.NUM_GENERATIONS}gen",
                         config={
-                            "population_size": Config.POPULATION_SIZE,
+                            "population_size": Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE,
                             "num_generations": Config.NUM_GENERATIONS,
                             "buffer_size": Config.BUFFER_SIZE,
                             "batch_size": Config.BATCH_SIZE,
@@ -1448,9 +1448,11 @@ class ERLTrainer:
                 final_fitness = np.mean(sorted_fitness[:2])
             hero_fitness.append((final_fitness, loaded_agents[agent_idx]))
 
-        # Sort by fitness (descending) and select top 32
+        # Sort by fitness (descending) and select top agents
+        # Respect local mode's smaller population size
         hero_fitness.sort(key=lambda x: x[0], reverse=True)
-        num_to_select = min(Config.POPULATION_SIZE, len(hero_fitness))
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+        num_to_select = min(pop_size, len(hero_fitness))
 
         print(f"\n--- Selecting top {num_to_select} heroes ---")
         print("Top 5 heroes:")
@@ -1465,7 +1467,7 @@ class ERLTrainer:
             selected_heroes.append(agent)
 
         # Fill remaining slots with random agents if needed (NOT clones)
-        num_random_needed = Config.POPULATION_SIZE - len(selected_heroes)
+        num_random_needed = pop_size - len(selected_heroes)
         if num_random_needed > 0:
             print(f"\n  Filling {num_random_needed} remaining slots with random agents")
             for i in range(num_random_needed):
@@ -1549,10 +1551,10 @@ class ERLTrainer:
             print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
 
         print(f"\nUsing heroes mode elite/offspring fractions:")
-        print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_ELITE_FRAC)} agents)")
-        print(f"  Offspring: {Config.HEROES_OFFSPRING_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_OFFSPRING_FRAC)} agents)")
+        print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(pop_size * Config.HEROES_ELITE_FRAC)} agents)")
+        print(f"  Offspring: {Config.HEROES_OFFSPRING_FRAC * 100:.1f}% ({int(pop_size * Config.HEROES_OFFSPRING_FRAC)} agents)")
         mutant_frac = 1.0 - Config.HEROES_ELITE_FRAC - Config.HEROES_OFFSPRING_FRAC
-        print(f"  Mutants: {mutant_frac * 100:.1f}% ({int(Config.POPULATION_SIZE * mutant_frac)} agents)")
+        print(f"  Mutants: {mutant_frac * 100:.1f}% ({int(pop_size * mutant_frac)} agents)")
         print("="*60 + "\n")
 
     def load_single_agent(self, agent_path: str, stored_gauntlet_score: float = None):
@@ -1596,7 +1598,8 @@ class ERLTrainer:
         self.initial_single_baseline = baseline  # Store original for final summary
 
         # 4. Initialize population with clones + mutations
-        pop_size = Config.POPULATION_SIZE
+        # Respect local mode's smaller population size
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
         num_clones = int(pop_size * Config.SINGLE_CLONE_FRAC)
         num_normal_mutants = int(pop_size * Config.SINGLE_NORMAL_MUTATION_FRAC)
         num_plateau_mutants = pop_size - num_clones - num_normal_mutants
@@ -1814,7 +1817,8 @@ class ERLTrainer:
         self.initial_single_baseline = self.member_baselines[member_idx]
 
         # Initialize population with clones + mutations (same as single mode)
-        pop_size = Config.POPULATION_SIZE
+        # Respect local mode's smaller population size
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
         num_clones = int(pop_size * Config.SINGLE_CLONE_FRAC)
         num_normal_mutants = int(pop_size * Config.SINGLE_NORMAL_MUTATION_FRAC)
         num_plateau_mutants = pop_size - num_clones - num_normal_mutants
@@ -3170,7 +3174,8 @@ class ERLTrainer:
         # This helps the evolution "find its way back" if it drifted too far from the parent
         if self.multi_mode and self.multi_gens_since_improvement >= 5 and self.multi_parent_agent is not None:
             # Calculate how many mutant slots to use for parent mutants (half of total mutants)
-            pop_size = Config.POPULATION_SIZE
+            # Respect local mode's smaller population size
+            pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
             num_elites = int(pop_size * Config.HEROES_ELITE_FRAC)
             num_offspring = int(pop_size * Config.HEROES_OFFSPRING_FRAC)
             num_mutants = pop_size - num_elites - num_offspring
@@ -4461,7 +4466,9 @@ class ERLTrainer:
             stabilization_mutation_std = self.current_mutation_std * 0.5  # Half the normal noise
 
             # Fill the rest of the population with mutants of the candidate
-            for i in range(1, Config.POPULATION_SIZE):
+            # Respect local mode's smaller population size
+            pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+            for i in range(1, pop_size):
                 mutant = mutate(
                     self.breakthrough_candidate.agent,
                     mutation_rate=stabilization_mutation_rate,
@@ -4474,7 +4481,7 @@ class ERLTrainer:
             # Replace the trainer's population
             self.population = new_population
 
-            print(f"  ✓ Population locked: 1 elite + {Config.POPULATION_SIZE - 1} mutants")
+            print(f"  ✓ Population locked: 1 elite + {pop_size - 1} mutants")
             print(f"  ✓ Stabilization mutation: rate={stabilization_mutation_rate}, std={stabilization_mutation_std:.4f}")
 
             # Cleanup old population to free memory

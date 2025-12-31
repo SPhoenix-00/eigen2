@@ -806,17 +806,9 @@ class OnDiskReplayBuffer(IterableDataset):
                             else:
                                 local_cache.append(data)
                             loaded_count += 1
-                        except Exception as e:
+                        except Exception:
                             error_count += 1
-                            # Print first few errors to debug (this is the key fix to find the issue)
-                            if error_count <= 3:
-                                print(f"DEBUG: Error loading {path}: {e}")
                             continue
-
-                    # Diagnostics for slow loading
-                    elapsed = time_module.time() - start_time
-                    if elapsed > 2.0 or error_count > 0:
-                        print(f"DEBUG: Buffer Refill: Loaded {loaded_count}/{len(indices)} files in {elapsed:.2f}s. Errors: {error_count}")
 
                     # Shuffle to ensure IID data for training
                     if loaded_count > 0:

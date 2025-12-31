@@ -295,7 +295,8 @@ def main():
 
             print(f"\n🎯 MULTI-AGENT MODE")
             print(f"  Committee members: {len(roster['members'])}")
-            print(f"  Population size: {Config.POPULATION_SIZE} (standard)")
+            pop_size = Config.LOCAL_POPULATION_SIZE if args.local else Config.POPULATION_SIZE
+            print(f"  Population size: {pop_size}{' (local mode)' if args.local else ' (standard)'}")
             print(f"  Training mode: Sequential (one member at a time)")
             print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
             print(f"  Consistency mode: AUTO-ENABLED")

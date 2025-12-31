@@ -9,14 +9,14 @@ and GCP cloud storage. Use --mirror to check sync status across ALL context
 windows (cw151, cw504, etc.) and automatically download any missing agent files.
 
 Usage:
-    python evaluate_for_global50.py --init                              # Initialize Global 50
-    python evaluate_for_global50.py --mirror                            # Check sync status
-    python evaluate_for_global50.py --eval                              # Re-evaluate all agents
-    python evaluate_for_global50.py --trim                              # Interactive trim (prompts for thresholds)
-    python evaluate_for_global50.py --archive-fill                      # Fill Global 50 from archive
-    python evaluate_for_global50.py --cleanup                           # Archive orphan agents
-    python evaluate_for_global50.py --cleanup-dry-run                   # Report orphans (no changes)
-    python evaluate_for_global50.py --agent-dir <path> [--run-name <name>]
+    python global50.py --init                              # Initialize Global 50
+    python global50.py --mirror                            # Check sync status
+    python global50.py --eval                              # Re-evaluate all agents
+    python global50.py --trim                              # Interactive trim (prompts for thresholds)
+    python global50.py --archive-fill                      # Fill Global 50 from archive
+    python global50.py --cleanup                           # Archive orphan agents
+    python global50.py --cleanup-dry-run                   # Report orphans (no changes)
+    python global50.py --agent-dir <path> [--run-name <name>]
 
 Options:
     --init              First-time setup. Creates empty global50.json and validates cloud sync.
@@ -31,12 +31,12 @@ Options:
     --run-name NAME     Run name for evaluation batch (default: batch-evaluation).
 
 Examples:
-    python evaluate_for_global50.py --eval                              # Update all metrics
-    python evaluate_for_global50.py --trim                              # Interactive trim
-    python evaluate_for_global50.py --cleanup-dry-run                   # Preview orphan cleanup
-    python evaluate_for_global50.py --cleanup                           # Archive orphan agents
-    python evaluate_for_global50.py --agent-dir checkpoints/run-123/hall_of_fame
-    python evaluate_for_global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
+    python global50.py --eval                              # Update all metrics
+    python global50.py --trim                              # Interactive trim
+    python global50.py --cleanup-dry-run                   # Preview orphan cleanup
+    python global50.py --cleanup                           # Archive orphan agents
+    python global50.py --agent-dir checkpoints/run-123/hall_of_fame
+    python global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
 """
 
 import argparse
@@ -761,7 +761,7 @@ class AgentEvaluator:
                 if choice == 'd':
                     break
                 elif choice == 'i':
-                    print(f"    → Please run: python evaluate_for_global50.py --init")
+                    print(f"    → Please run: python global50.py --init")
                     if temp_cloud_path and os.path.exists(temp_cloud_path):
                         os.unlink(temp_cloud_path)
                     return False
@@ -1232,7 +1232,7 @@ class AgentEvaluator:
             print(f"{'='*70}")
             print(f"Found {len(orphan_files)} orphan agent(s) that would be archived.")
             print(f"\nTo actually archive these orphans, run:")
-            print(f"  python evaluate_for_global50.py --cleanup")
+            print(f"  python global50.py --cleanup")
             return {
                 'success': True,
                 'valid_count': len(valid_filenames),
@@ -2618,40 +2618,40 @@ def main():
         epilog="""
 Examples:
   # First-time setup (initialize Global 50 structure)
-  python evaluate_for_global50.py --init
+  python global50.py --init
 
   # Check mirror status between local and GCP
-  python evaluate_for_global50.py --mirror
+  python global50.py --mirror
 
   # Re-evaluate all agents with current logic (updates metrics)
-  python evaluate_for_global50.py --eval
+  python global50.py --eval
 
   # Re-evaluate agents in a specific context window (e.g., cw504)
-  python evaluate_for_global50.py --eval --cw 504
+  python global50.py --eval --cw 504
 
   # Interactive trim - prompts for gauntlet, ROI, expectancy, and total trades thresholds
-  python evaluate_for_global50.py --trim
+  python global50.py --trim
 
   # Evaluate agents from Hall of Fame directory
-  python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
+  python global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
 
   # Evaluate with custom run name
-  python evaluate_for_global50.py --agent-dir workspace/elite_agents --run-name backfill-2025
+  python global50.py --agent-dir workspace/elite_agents --run-name backfill-2025
 
   # Evaluate specific run's champions
-  python evaluate_for_global50.py --agent-dir checkpoints/crimson-wave-456/hall_of_fame
+  python global50.py --agent-dir checkpoints/crimson-wave-456/hall_of_fame
 
   # Find orphan agents (dry run - report only)
-  python evaluate_for_global50.py --cleanup-dry-run
+  python global50.py --cleanup-dry-run
 
   # Archive orphan agents (move from agents/ to archive/)
-  python evaluate_for_global50.py --cleanup
+  python global50.py --cleanup
 
   # Fill Global 50 from archive (after trimming)
-  python evaluate_for_global50.py --archive-fill
+  python global50.py --archive-fill
 
   # Fill Global 50 from archive for a specific context window
-  python evaluate_for_global50.py --archive-fill --cw 504
+  python global50.py --archive-fill --cw 504
         """
     )
 
@@ -2756,7 +2756,7 @@ Examples:
 
             print("\n✓ Setup complete! You can now run evaluations.")
             print("\nNext step:")
-            print(f"  python evaluate_for_global50.py --agent-dir <path>")
+            print(f"  python global50.py --agent-dir <path>")
         else:
             print("\n✗ Initialization FAILED")
             print(f"  Cloud Provider: {evaluator.cloud_sync.provider}")

@@ -54,7 +54,7 @@ def clean_global50():
     print(f"\n{'='*70}")
     print("NEXT STEPS:")
     print(f"{'='*70}")
-    print("1. Run: python evaluate_for_global50.py --eval")
+    print("1. Run: python global50.py --eval")
     print("2. This will re-download agents from cloud with OLD names")
     print("3. Re-evaluate them and save with NEW names")
     print("4. Upload to cloud with NEW names")

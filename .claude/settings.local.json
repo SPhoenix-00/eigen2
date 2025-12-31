@@ -33,7 +33,7 @@
       "Bash(awk:*)",
       "Bash(if [ -d \"workspace/global50\" ])",
       "Bash(then echo \"G50 directory exists\")",
-      "Bash(else echo \"G50 directory does not exist - create with: python evaluate_for_global50.py --init\")",
+      "Bash(else echo \"G50 directory does not exist - create with: python global50.py --init\")",
       "Bash(fi)",
       "Bash(if exist .env type .env)",
       "Bash(echo:*)",
@@ -73,7 +73,9 @@
       "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -c:*)",
       "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -c \"\nimport torch\ntorch.backends.cudnn.enabled = False\nprint\\(''cuDNN disabled''\\)\nx = torch.randn\\(10, 10\\).cuda\\(\\)\nprint\\(''Tensor created''\\)\nprint\\(''Testing mm without cuDNN...''\\)\ny = torch.mm\\(x, x.T\\)\nprint\\(f''mm result: {y.sum\\(\\)}''\\)\n\")",
       "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -c \"\nimport torch\nx = torch.randn\\(10, 10\\).cuda\\(\\)\nprint\\(''Tensor created''\\)\nprint\\(''Testing einsum \\(alternative to mm\\)...''\\)\ny = torch.einsum\\(''ij,kj->ik'', x, x\\)  # Same as mm\\(x, x.T\\)\nprint\\(f''einsum result: {y.sum\\(\\)}''\\)\n\")",
-      "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -m py_compile:*)"
+      "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -m py_compile:*)",
+      "Bash(\"d:/GitHub/eigen2/venv/Scripts/python.exe\" -m py_compile d:/GitHub/eigen2/erl/genetic_ops.py)",
+      "Bash(git mv:*)"
     ],
     "deny": [],
     "ask": []
