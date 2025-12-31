@@ -527,8 +527,6 @@ class OnDiskReplayBuffer(IterableDataset):
         # Instead of writing 1 file per item, we write 1 file per 64 items
         chunks = [transitions[i:i + chunk_size] for i in range(0, num_transitions, chunk_size)]
 
-        print(f"  Batching {num_transitions} transitions into {len(chunks)} chunk files...")
-
         lock = threading.Lock()
 
         def write_chunk(chunk_data):
@@ -596,10 +594,6 @@ class OnDiskReplayBuffer(IterableDataset):
                 if self.migrated_count % 10000 < len(external_paths):
                     print(f"  Migration progress: {self.migrated_count} external files cleaned up")
 
-        elapsed = time.time() - start_time
-        rate = num_transitions / elapsed if elapsed > 0 else 0
-        print(f"  ✓ Added {len(successful_paths)} chunks ({total_saved} transitions) in {elapsed:.2f}s ({rate:.0f} trans/s)")
-
     def add_batch_columnar(self, transitions: Dict[str, np.ndarray], count: int, chunk_size: int = 64):
         """
         Add multiple transitions from columnar format using CHUNKED storage.
@@ -621,7 +615,6 @@ class OnDiskReplayBuffer(IterableDataset):
             return
 
         num_chunks = (count + chunk_size - 1) // chunk_size
-        print(f"  Chunking {count} transitions into {num_chunks} files ({chunk_size}/file)...")
 
         # Pre-allocate chunk file IDs
         start_chunk_id = self.total_added
@@ -684,10 +677,6 @@ class OnDiskReplayBuffer(IterableDataset):
 
         # Handle capacity eviction (simplified - just let deque handle it)
         # Old files will be cleaned up when they're popped from deque
-
-        elapsed = time.time() - start_time
-        rate = total_saved / elapsed if elapsed > 0 else 0
-        print(f"  Added {len(successful_paths)} chunks ({total_saved} transitions) in {elapsed:.2f}s ({rate:.0f} trans/s)")
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """
@@ -769,22 +758,19 @@ class OnDiskReplayBuffer(IterableDataset):
 
     def __iter__(self):
         """
-        Memory-Safe Cache & Drain Iterator.
-
-        1. Loads ~16 chunk files (approx 1000 items) into RAM.
-        2. Shuffles them.
-        3. Yields ~15 batches instantly from RAM.
-        4. Refills only when cache drops below batch_size.
-
-        This reduces Disk I/O by 15x and eliminates decompression CPU spikes.
-        Memory usage: 1000 items * 350KB = ~350MB RAM (completely safe).
+        Memory-Safe Cache & Drain Iterator (Diagnostic Mode).
         """
         import random
+        import time as time_module
 
-        # 1000 items * 350KB = ~350MB RAM. Completely safe.
-        TARGET_CACHE_SIZE = 1000
+        # INCREASED: 5000 items * 350KB = ~1.7GB RAM.
+        # Larger cache = fewer disk hits = less overhead.
+        TARGET_CACHE_SIZE = 5000
 
         local_cache = []
+
+        # Track Consecutive Failures
+        consecutive_failures = 0
 
         while True:
             # 1. REFILL PHASE
@@ -793,8 +779,9 @@ class OnDiskReplayBuffer(IterableDataset):
                 current_size = len(local_cache)
                 needed_items = TARGET_CACHE_SIZE - current_size
 
-                # Assume 64 items per chunk file
-                files_needed = max(1, needed_items // 64)
+                # Use actual chunk size estimate
+                chunk_size = getattr(self, '_chunk_size', 64)
+                files_needed = max(1, needed_items // chunk_size)
 
                 # Cap at available files in buffer
                 files_needed = min(files_needed, len(self.buffer))
@@ -802,6 +789,10 @@ class OnDiskReplayBuffer(IterableDataset):
                 if files_needed > 0 and len(self.buffer) > 0:
                     # Pick random files
                     indices = np.random.choice(len(self.buffer), files_needed, replace=True)
+
+                    loaded_count = 0
+                    error_count = 0
+                    start_time = time_module.time()
 
                     for i in indices:
                         path = self.buffer[i]
@@ -814,14 +805,32 @@ class OnDiskReplayBuffer(IterableDataset):
                                 local_cache.extend(data)
                             else:
                                 local_cache.append(data)
-                        except Exception:
+                            loaded_count += 1
+                        except Exception as e:
+                            error_count += 1
+                            # Print first few errors to debug (this is the key fix to find the issue)
+                            if error_count <= 3:
+                                print(f"DEBUG: Error loading {path}: {e}")
                             continue
 
+                    # Diagnostics for slow loading
+                    elapsed = time_module.time() - start_time
+                    if elapsed > 2.0 or error_count > 0:
+                        print(f"DEBUG: Buffer Refill: Loaded {loaded_count}/{len(indices)} files in {elapsed:.2f}s. Errors: {error_count}")
+
                     # Shuffle to ensure IID data for training
-                    random.shuffle(local_cache)
+                    if loaded_count > 0:
+                        random.shuffle(local_cache)
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures % 10 == 0:
+                            print(f"Warning: Buffer refill failed {consecutive_failures} times in a row. Buffer size: {len(self.buffer)}")
+                        time_module.sleep(0.1)
+
                 else:
                     # Buffer is empty, wait for data
-                    time.sleep(0.5)
+                    time_module.sleep(0.5)
                     continue
 
             # 2. YIELD PHASE

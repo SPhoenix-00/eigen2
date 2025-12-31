@@ -634,8 +634,9 @@ class ERLTrainer:
         self.normalization_stats = data_loader.compute_normalization_stats()
 
         # Initialize population (multi-mode uses standard size, trains one member at a time)
-        pop_size = Config.POPULATION_SIZE  # 96 for all modes
-        print(f"Initializing population of {pop_size} agents...")
+        # Local mode uses smaller population (32 vs 96) for faster iteration
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+        print(f"Initializing population of {pop_size} agents{'  (local mode)' if self.local_mode else ''}...")
         self.population = [DDPGAgent(agent_id=i) for i in range(pop_size)]
 
         # Training range (excludes validation set)
@@ -1255,10 +1256,13 @@ class ERLTrainer:
         gc.collect()
 
         # Set batch size and workers based on mode
-        # Local mode: smaller batches + no workers (main process is faster on Windows)
+        # Local mode: FORCE num_workers=0 to prevent "Stale Buffer" issue on Windows
+        # With workers > 0, worker processes get a COPY of self.buffer at iter() time.
+        # They never see new files added in Generation 2+, causing infinite sleep/starvation.
+        # With num_workers=0, main process runs __iter__ directly and always sees updates.
         if self.local_mode:
             self.replay_buffer.training_batch_size = Config.LOCAL_BATCH_SIZE
-            num_workers = Config.LOCAL_NUM_DATALOADER_WORKERS
+            num_workers = Config.LOCAL_NUM_DATALOADER_WORKERS  # Should be 0 for local mode
             print(f"Creating DataLoader with {num_workers} workers (batch_size={Config.LOCAL_BATCH_SIZE} for local mode)...")
         else:
             self.replay_buffer.training_batch_size = Config.BATCH_SIZE
@@ -2991,7 +2995,11 @@ class ERLTrainer:
         # Use reduced gradient steps during stabilization phase or multi-mode for faster iteration
         # Normal: 32 steps × 192 batch = 6,144 samples (full exploration)
         # Stabilization/Multi: 10 steps × 192 batch = 1,920 samples (maintenance training)
-        if self.breakthrough_state == BreakthroughState.STABILIZATION or self.multi_mode:
+        # Local: 8 steps for faster iteration on single GPU
+        if self.local_mode:
+            gradient_steps = Config.LOCAL_GRADIENT_STEPS_PER_GENERATION
+            print(f"  [Local Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} distributed)]")
+        elif self.breakthrough_state == BreakthroughState.STABILIZATION or self.multi_mode:
             gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION_STABILIZATION
             mode_name = "Multi-Agent" if self.multi_mode else "Stabilization"
             print(f"  [{mode_name} Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} normal)]")
@@ -2999,9 +3007,10 @@ class ERLTrainer:
             gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION
 
         # Train each agent
-        # Local mode with GPU: Process in batches of 16 to manage GPU memory
+        # Local mode with GPU: Process agents in batches to manage GPU memory
         # Agents were moved to CPU after inference; we move them to GPU in batches
-        LOCAL_TRAINING_BATCH_SIZE = 16
+        # 32 agents / 8 per batch = 4 batches
+        LOCAL_TRAINING_BATCH_SIZE = Config.LOCAL_TRAINING_AGENT_BATCH_SIZE
 
         # Local mode: Use larger batches to saturate GPU and minimize disk I/O
         # The LSTM processes batch_size × 117 sequences
@@ -3014,12 +3023,11 @@ class ERLTrainer:
             cpu_device = torch.device('cpu')
 
             # Local mode optimizations to reduce disk I/O (the bottleneck)
-            # - Larger batch size set via Config.LOCAL_BATCH_SIZE
+            # - Smaller population (32 vs 96)
+            # - Fewer gradient steps (8 vs 32)
             # - Accumulation steps set via Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
-            # - Capped gradient steps (16 max)
-            local_gradient_steps = min(gradient_steps, 16)
             local_accumulation_steps = Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
-            print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {local_gradient_steps} steps/agent (batch_size={Config.LOCAL_BATCH_SIZE}, accum={local_accumulation_steps})")
+            print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {gradient_steps} steps/agent (batch_size={Config.LOCAL_BATCH_SIZE}, accum={local_accumulation_steps})")
 
             for batch_idx in range(num_batches):
                 batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
@@ -3035,7 +3043,7 @@ class ERLTrainer:
                     actor_losses = []
                     critic_losses = []
 
-                    for step in range(local_gradient_steps):
+                    for step in range(gradient_steps):
                         for accum_step in range(local_accumulation_steps):
                             # Use DataLoader iterator (has async prefetching)
                             batch_cpu = next(self.batch_iterator)

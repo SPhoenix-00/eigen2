@@ -140,11 +140,12 @@ class LocalEvaluator:
         self._compiled_actors = {}  # Cache of compiled actors by agent_id
         self._use_compiled = (self.target_device.type == 'cpu')
 
-        # Pre-allocate transition buffer for one generation's worth of data
-        # Estimate: 96 agents × 3 slices × ~125 steps = ~36,000 transitions max
-        # Use 50,000 for safety margin
+        # Pre-allocate transition buffer with REDUCED capacity to avoid RAM exhaustion
+        # Old: 50,000 × 151 days × 117 cols × 5 features × 4 bytes × 2 = ~35GB (causes swapping!)
+        # New: 12,000 × same = ~8.5GB (fits comfortably in 32GB with headroom)
+        # Buffer is flushed incrementally during evaluation when it hits 80% capacity
         state_shape = (Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL)
-        self.transition_buffer = TransitionBatch.create(50000, state_shape)
+        self.transition_buffer = TransitionBatch.create(12000, state_shape)
 
         # Background transfer thread for async disk I/O
         # Transfer runs in parallel with validation to hide disk latency
@@ -358,10 +359,17 @@ except Exception as e:
             fitness_scores.append(float(final_fitness))
             all_episode_stats.append(self._aggregate_stats(slice_stats))
 
-        # Start background transfer of transitions to replay buffer
-        # This runs in parallel with validation to hide disk I/O latency
+            # Incremental flush: If buffer is > 80% full, flush to disk to prevent RAM exhaustion
+            # This prevents the 35GB allocation that causes OS swapping (268s/it stall)
+            buffer_capacity = self.transition_buffer.states.shape[0]
+            if self.transition_buffer.count >= buffer_capacity * 0.8:
+                self._start_background_transfer()
+                # Wait for transfer to complete before continuing to ensure RAM is freed
+                self.wait_for_transfer()
+
+        # Final flush for any remaining transitions
         if self.transition_buffer.count > 0:
-            print(f"\n--- Transferring {self.transition_buffer.count} transitions to replay buffer (background) ---")
+            print(f"\n--- Transferring final {self.transition_buffer.count} transitions to replay buffer ---")
             self._start_background_transfer()
 
         # Aggregate population stats
@@ -531,7 +539,6 @@ except Exception as e:
             daemon=True
         )
         self._transfer_thread.start()
-        print(f"  [Background] Started transfer of {self._pending_count} transitions...")
 
     def wait_for_transfer(self):
         """
@@ -542,8 +549,6 @@ except Exception as e:
         """
         if self._transfer_thread is not None and self._transfer_thread.is_alive():
             self._transfer_thread.join()
-            elapsed = time.time() - self._transfer_start_time
-            print(f"  [Background] Transfer complete in {elapsed:.1f}s (ran in parallel with validation)")
         self._transfer_thread = None
 
     def restore_agents_to_cpu(self):
