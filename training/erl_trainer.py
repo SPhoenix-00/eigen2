@@ -1884,6 +1884,20 @@ class ERLTrainer:
         source_agent = DDPGAgent(agent_id=0)
         source_agent.load(str(agent_path))
 
+        # FIX 2: Re-evaluate baseline if in Maverick phase (or if maverick_mode changed)
+        # The stored baseline might be from a different reward function (Standard vs Maverick)
+        # Maverick reward function uses completely different scale (e.g., -5000 penalties, different volume scalars)
+        # Comparing Maverick scores against Standard baselines is mathematically invalid
+        if self.maverick_mode:
+            print(f"  Re-evaluating baseline for Maverick scoring...")
+            # Use the helper to evaluate with current reward function (maverick_mode=True)
+            # This ensures the baseline matches the CURRENT reward function's scale
+            fresh_baseline = self._evaluate_single_agent_for_baseline(source_agent)
+            self.member_baselines[member_idx] = fresh_baseline
+            print(f"  Updated Baseline (Maverick Scale): {fresh_baseline:.2f}")
+        # Note: For non-maverick phase, we keep the original baseline from initialization
+        # which was calculated with the standard reward function
+
         # Store the parent agent for potential stuck recovery (parent mutant injection)
         self.multi_parent_agent = source_agent.clone()
         self.multi_parent_agent.agent_id = -1  # Mark as parent template
@@ -2068,7 +2082,31 @@ class ERLTrainer:
         # Clear replay buffer
         if hasattr(self.replay_buffer, 'clear'):
             self.replay_buffer.clear()
-            print(f"  ✓ Replay buffer cleared")
+            
+            # FIX 3: Physically delete buffer files to prevent "zombie" files
+            # The clear() method clears the deque but doesn't delete physical files
+            import shutil
+            if hasattr(self.replay_buffer, 'storage_path'):
+                storage_path = Path(self.replay_buffer.storage_path)
+                if storage_path.exists():
+                    print(f"  Physically deleting buffer files in {storage_path}...")
+                    try:
+                        # Delete entire directory and recreate to ensure clean slate
+                        shutil.rmtree(storage_path)
+                        storage_path.mkdir(parents=True, exist_ok=True)
+                        print(f"  ✓ Buffer directory cleaned (deleted and recreated)")
+                    except Exception as e:
+                        print(f"  ⚠ Failed to clean buffer directory: {e}")
+                    
+                    # Reset file ID counter if buffer uses one
+                    if hasattr(self.replay_buffer, 'file_id_counter'):
+                        self.replay_buffer.file_id_counter = 0
+                    if hasattr(self.replay_buffer, 'total_added'):
+                        self.replay_buffer.total_added = 0
+                    if hasattr(self.replay_buffer, 'total_transitions'):
+                        self.replay_buffer.total_transitions = 0
+            
+            print(f"  ✓ Replay buffer cleared (memory + disk)")
         else:
             print(f"  ⚠ Replay buffer does not support clear() - manual cleanup may be needed")
         
@@ -2120,6 +2158,9 @@ class ERLTrainer:
         # to ensure they get the updated maverick_mode flag
         if not self.local_mode:
             print(f"  Recreating shared memory with maverick_mode=True for workers...")
+            # FIX 1: Clean up OLD shared memory before creating new blocks
+            # This prevents memory leaks (2-3GB of old shared memory staying locked)
+            self._cleanup_shared_memory()
             # Reinitialize shared memory with updated maverick_mode
             self._init_shared_memory()
             print(f"  ✓ Shared memory recreated - workers will use maverick_mode=True on next ProcessPoolExecutor")
