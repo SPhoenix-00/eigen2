@@ -4,6 +4,19 @@
   },
   "entries": [
     {
+      "agent_id": 78,
+      "run_name": "pleasant-water-209",
+      "gauntlet_score": 356.4206615843773,
+      "generation": 175,
+      "roi": 6.072122097015381,
+      "expectancy": 6.205150127410889,
+      "cv": 100.0,
+      "quality_ratio": 0.2361111111111111,
+      "win_ratio": 0.0,
+      "total_trades": 216,
+      "is_maverick": false
+    },
+    {
       "agent_id": 55,
       "run_name": "pleasant-water-209",
       "gauntlet_score": 344.70656904298465,
@@ -43,6 +56,19 @@
       "is_maverick": false
     },
     {
+      "agent_id": 67,
+      "run_name": "pleasant-water-209",
+      "gauntlet_score": 102.63430325627166,
+      "generation": 232,
+      "roi": 8.129058837890625,
+      "expectancy": 3.401106119155884,
+      "cv": 100.0,
+      "quality_ratio": 0.15246338215712382,
+      "win_ratio": 0.0,
+      "total_trades": 1502,
+      "is_maverick": false
+    },
+    {
       "agent_id": 62,
       "run_name": "pleasant-water-209",
       "gauntlet_score": 101.4852069720354,
@@ -66,6 +92,19 @@
       "quality_ratio": 0.07388137356919876,
       "win_ratio": 0.0,
       "total_trades": 961,
+      "is_maverick": false
+    },
+    {
+      "agent_id": 51,
+      "run_name": "pleasant-water-209",
+      "gauntlet_score": 68.30326654862178,
+      "generation": 172,
+      "roi": 1.5269166231155396,
+      "expectancy": 3.0264434814453125,
+      "cv": 100.0,
+      "quality_ratio": 0.17326732673267325,
+      "win_ratio": 0.0,
+      "total_trades": 202,
       "is_maverick": false
     },
     {
@@ -613,48 +652,9 @@
       "win_ratio": 0.7694524495677233,
       "total_trades": 347,
       "is_maverick": false
-    },
-    {
-      "agent_id": 3,
-      "run_name": "royal-armadillo-204",
-      "gauntlet_score": -96.72745122495552,
-      "generation": 232,
-      "roi": 8.478340148925781,
-      "expectancy": 5.942519664764404,
-      "cv": 2.7332768710517845,
-      "quality_ratio": 0.36023054755043227,
-      "win_ratio": 0.7694524495677233,
-      "total_trades": 347,
-      "is_maverick": false
-    },
-    {
-      "agent_id": 3,
-      "run_name": "royal-armadillo-204",
-      "gauntlet_score": -96.72745122495552,
-      "generation": 232,
-      "roi": 8.478340148925781,
-      "expectancy": 5.942519664764404,
-      "cv": 2.7332768710517845,
-      "quality_ratio": 0.36023054755043227,
-      "win_ratio": 0.7694524495677233,
-      "total_trades": 347,
-      "is_maverick": false
-    },
-    {
-      "agent_id": 58,
-      "run_name": "royal-armadillo-204",
-      "gauntlet_score": -99.34364213525654,
-      "generation": 8,
-      "roi": 8.644070625305176,
-      "expectancy": 7.6882123947143555,
-      "cv": 3.701755867663362,
-      "quality_ratio": 0.43386243386243384,
-      "win_ratio": 0.7724867724867724,
-      "total_trades": 189,
-      "is_maverick": false
     }
   ],
   "capacity": 50,
   "version": "1.0",
-  "last_updated": "2025-12-31T07:31:38.463393Z"
+  "last_updated": "2026-01-01T14:33:47.969126Z"
 }

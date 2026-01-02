@@ -632,9 +632,10 @@ def generate_output_filename(base_filename):
 def append_mode(production_file, new_data_file, *, update_config=False, allow_overlap=False):
     """
     Append mode: Process new raw data and append to existing production dataset.
-    Uses last 100 rows from production as history for proper indicator calculation.
+    Uses last 50 rows from production as history for proper indicator calculation.
+    History provides warm-up for EMAs (need 34 minimum) plus overlap for validation.
     """
-    HISTORY_ROWS = 100  # Hardcoded history rows
+    HISTORY_ROWS = 50  # History rows: 34 minimum + 16 overlap for validation
     VBA_CALC_RAMP_UP_ROWS = 34  # Ramp-up rows to skip
     
     print("="*60)
@@ -1025,7 +1026,10 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     print(f"   New data added: {len(df_new_processed)} rows")
     print(f"   Output saved to: {output_filename}")
     print(f"   CSV saved to: {output_csv_filename}")
-    print(f"   Configuration updated to use: {output_filename}")
+    if update_config:
+        print(f"   Configuration updated to use: {output_filename}")
+    else:
+        print(f"   ⚠️  Remember to manually update OUTPUT_FILE_PKL to: {output_filename}")
 
 # --- Main Execution Function ---
 def main():

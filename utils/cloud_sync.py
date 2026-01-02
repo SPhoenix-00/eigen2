@@ -110,6 +110,10 @@ class CloudSync:
             timeout: Upload timeout in seconds (default: 60)
         """
         try:
+            # Check if file still exists (may have been deleted after being queued)
+            if not os.path.exists(local_path):
+                return  # File was deleted, skip silently
+
             if self.provider == "s3":
                 self.client.upload_file(local_path, self.bucket_name, cloud_path)
 

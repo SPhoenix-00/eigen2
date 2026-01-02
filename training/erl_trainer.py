@@ -754,6 +754,15 @@ class ERLTrainer:
 
                     # Update last_run.json with the resumed run info
                     self._write_last_run_file()
+
+                    # Suppress W&B step order warnings when resuming
+                    # (W&B's internal step counter may be ahead of our resume point)
+                    import warnings
+                    warnings.filterwarnings(
+                        'ignore',
+                        message='.*step.*less than the current step.*',
+                        module='wandb.*'
+                    )
                 else:
                     # New training run
                     print("--- Initializing new W&B run (main.py mode) ---")
@@ -5176,12 +5185,16 @@ class ERLTrainer:
                                 print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p75: {self.global_hof.gauntlet_p75:.2f}")
 
                     # Attempt promotion if we have a consistency-aligned score
-                    if g50_gauntlet_score is not None and self.global_hof.should_promote(
-                        g50_gauntlet_score,
-                        g50_gauntlet_results.get('roi', 0.0),
-                        g50_gauntlet_results.get('expectancy', 0.0),
-                        g50_gauntlet_results.get('cv', 100.0)
-                    ):
+                    should_promote_result = False
+                    if g50_gauntlet_score is not None:
+                        should_promote_result = self.global_hof.should_promote(
+                            g50_gauntlet_score,
+                            g50_gauntlet_results.get('roi', 0.0),
+                            g50_gauntlet_results.get('expectancy', 0.0),
+                            g50_gauntlet_results.get('cv', 100.0)
+                        )
+                    
+                    if g50_gauntlet_score is not None and should_promote_result:
                         agent_to_admit = self.breakthrough_candidate.agent
                         agent_roi = g50_gauntlet_results['roi']
                         agent_expectancy = g50_gauntlet_results['expectancy']
@@ -5208,10 +5221,33 @@ class ERLTrainer:
                         )
 
                         if promoted:
+                            print(f"\n{'='*60}")
+                            print(f"🎯 AGENT PROMOTED TO GLOBAL 50!")
+                            print(f"{'='*60}")
+                            print(f"  Rank: #{rank}")
+                            print(f"  Gauntlet Score: {g50_gauntlet_score:.2f}")
+                            if self.maverick_mode:
+                                print(f"  Type: Maverick")
+                                print(f"  Target Rank: <= #{Config.MAVERICK_TARGET_RANK}")
+                            
                             # Maverick stopping condition: Top 20 achieved
                             if self.maverick_mode and rank <= Config.MAVERICK_TARGET_RANK:
                                 self._maverick_goal_achieved = True
                                 self._maverick_final_rank = rank
+                                print(f"\n  ✅ MAVERICK GOAL ACHIEVED!")
+                                print(f"  Training will stop at end of this generation")
+                            elif self.maverick_mode:
+                                print(f"\n  ⏳ Maverick goal not yet achieved (rank #{rank} > #{Config.MAVERICK_TARGET_RANK})")
+                                print(f"  Training continues...")
+                            print(f"{'='*60}\n")
+                    elif g50_gauntlet_score is not None and self.maverick_mode:
+                        # Agent passed gauntlet but didn't qualify for promotion
+                        print(f"\n  ⓘ Agent did not qualify for Global 50 promotion")
+                        print(f"  Gauntlet Score: {g50_gauntlet_score:.2f}")
+                        print(f"  ROI: {g50_gauntlet_results.get('roi', 0.0):.2f}% (threshold: {self.global_hof.roi_threshold:.2f}%)")
+                        print(f"  Expectancy: {g50_gauntlet_results.get('expectancy', 0.0):.4f} (threshold: {self.global_hof.expectancy_threshold:.4f})")
+                        print(f"  CV: {g50_gauntlet_results.get('cv', 100.0):.3f} (threshold: <{self.global_hof.cv_threshold:.3f})")
+                        print(f"  Training continues to find agent that reaches rank <= #{Config.MAVERICK_TARGET_RANK}")
 
                     # Log to wandb
                     wandb.log({
