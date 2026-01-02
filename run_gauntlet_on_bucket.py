@@ -291,17 +291,12 @@ class GauntletRunner:
 
         # --- ANTI-SWINDLE: EFFICIENCY-ADJUSTED GAUNTLET SCORE ---
         # (See global50.py for full explanation)
+        # Formula: Adjusted Score = Raw Score + abs(Raw Score) * (10 * (ROI% - BaselineROI%))
+        # Convert percentage points to decimal: (ROI% - BaselineROI%) / 100
         efficiency_ratio = roi / Config.EFFICIENCY_BASELINE_ROI
-
-        if raw_gauntlet_score >= 0:
-            gauntlet_score = raw_gauntlet_score * efficiency_ratio
-        else:
-            if roi >= 0:
-                rescue_factor = max(1.0, efficiency_ratio)
-                gauntlet_score = raw_gauntlet_score / rescue_factor
-            else:
-                penalty_multiplier = max(1.0, abs(efficiency_ratio))
-                gauntlet_score = raw_gauntlet_score * penalty_multiplier
+        roi_diff_percentage_points = roi - Config.EFFICIENCY_BASELINE_ROI
+        adjustment = abs(raw_gauntlet_score) * (10.0 * roi_diff_percentage_points / 100.0)
+        gauntlet_score = raw_gauntlet_score + adjustment
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])

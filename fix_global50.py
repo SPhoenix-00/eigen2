@@ -116,6 +116,8 @@ class Global50Fixer:
                 self.train_end_idx = val_start_idx
 
                 full_end_idx = len(data_loader.data_array_full)
+                # Note: consistency_mode is set per-evaluation based on is_maverick flag
+                # Maverick agents are incompatible with consistency mode
                 self.eval_env = TradingEnvironment(
                     data_array=data_loader.data_array,
                     dates=data_loader.dates,
@@ -124,7 +126,7 @@ class Global50Fixer:
                     end_idx=full_end_idx,
                     trading_end_idx=Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS,
                     data_array_full=data_loader.data_array_full,
-                    consistency_mode=True
+                    consistency_mode=False  # Will be set per-evaluation based on is_maverick
                 )
                 self.replay_buffer = None
 
@@ -253,8 +255,15 @@ class Global50Fixer:
         else:
             return None
 
-    def run_gauntlet(self, agent: DDPGAgent, agent_name: str) -> Tuple[float, dict]:
-        """Run gauntlet validation on an agent."""
+    def run_gauntlet(self, agent: DDPGAgent, agent_name: str, is_maverick: bool = False) -> Tuple[float, dict]:
+        """
+        Run gauntlet validation on an agent.
+        
+        Args:
+            agent: Agent to evaluate
+            agent_name: Name for logging
+            is_maverick: If True, disables consistency mode (maverick agents are incompatible with consistency mode)
+        """
         gauntlet_slices = self.gauntlet_helper.generate_gauntlet_slices()
 
         slice_results = []
@@ -262,6 +271,11 @@ class Global50Fixer:
 
         agent.actor.eval()
         agent.critic.eval()
+        
+        # Set consistency mode: disabled for maverick agents (incompatible)
+        # Maverick agents use aggressive reward functions that conflict with consistency training
+        self.gauntlet_helper.eval_env.set_consistency_mode(not is_maverick)
+        
         self.gauntlet_helper.eval_env.set_gauntlet_mode(True)
 
         for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
@@ -293,17 +307,32 @@ class Global50Fixer:
             if 'closed_trades' in episode_info and episode_info['closed_trades']:
                 all_closed_trades.extend(episode_info['closed_trades'])
 
+        # Extract fitness scores
         fitness_scores = [result['fitness'] for result in slice_results]
-        max_score = float(np.max(fitness_scores))
-        scores_without_top = sorted(fitness_scores)[:-1]
 
-        mean_score = float(np.mean(scores_without_top))
-        min_score = float(np.min(scores_without_top))
-        raw_gauntlet_score = float((0.67 * mean_score) + (0.33 * min_score))
+        # Calculate statistics for Penalized Median scoring
+        max_score = float(np.max(fitness_scores))
+        min_score = float(np.min(fitness_scores))
+        mean_score = float(np.mean(fitness_scores))
+        median_score = float(np.median(fitness_scores))
+        std_score = float(np.std(fitness_scores))
+
+        # Calculate Coefficient of Variation (CV) - measures "noise" relative to "signal"
+        # CV = StdDev / |Mean| (use absolute value to handle negative means)
+        # Lower CV = more stable/consistent agent
+        if abs(mean_score) > 1e-10:
+            cv = std_score / abs(mean_score)
+        else:
+            cv = float('inf')  # Undefined CV when mean is ~0
+
+        # NEW SCORING FORMULA: Penalized Median
+        # This rewards agents that reliably perform well while penalizing volatility
+        # gauntlet_score = Median - (0.5 * StdDev)
+        raw_gauntlet_score = float(median_score - (0.5 * std_score))
 
         # Penalty for agents that consistently refuse to trade
         # Score between -8.99 and -10 indicates no trades across all slices
-        if -10.0 <= raw_gauntlet_score <= -8.99:
+        if -10.0 <= raw_gauntlet_score <= -9.00:
             raw_gauntlet_score = -2000.0
 
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -311,51 +340,75 @@ class Global50Fixer:
         roi = float((total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0)
 
         # --- ANTI-SWINDLE: EFFICIENCY-ADJUSTED GAUNTLET SCORE ---
-        # (See global50.py for full explanation)
+        #
+        # The raw Gauntlet score (Median - 0.5*StdDev) can be gamed by volume.
+        # We normalize by ROI to ensure only efficient agents get high scores.
+        #
+        # Baseline: Config.EFFICIENCY_BASELINE_ROI (default 8.0%)
+        #
+        # Formula: Adjusted Score = Raw Score + abs(Raw Score) * (10 * (ROI% - BaselineROI%))
+        #
+        # This symmetric formula:
+        # - Adds a bonus/penalty proportional to the magnitude of the raw score
+        # - Bonus when ROI > baseline, penalty when ROI < baseline
+        # - Works symmetrically for both positive and negative raw scores
+        # - Example: Raw=-100, ROI=10%, Baseline=8% → -100 + 100*10*(10-8)/100 = -100 + 20 = -80
+        # - Example: Raw=100, ROI=6%, Baseline=8% → 100 + 100*10*(6-8)/100 = 100 - 20 = 80
+        #
         efficiency_ratio = roi / Config.EFFICIENCY_BASELINE_ROI
-
-        if raw_gauntlet_score >= 0:
-            gauntlet_score = raw_gauntlet_score * efficiency_ratio
-        else:
-            if roi >= 0:
-                rescue_factor = max(1.0, efficiency_ratio)
-                gauntlet_score = raw_gauntlet_score / rescue_factor
-            else:
-                penalty_multiplier = max(1.0, abs(efficiency_ratio))
-                gauntlet_score = raw_gauntlet_score * penalty_multiplier
+        roi_diff_percentage_points = roi - Config.EFFICIENCY_BASELINE_ROI
+        # Formula: 10 * (ROI% - BaselineROI%) where both are percentages
+        # Convert percentage points to decimal: (ROI% - BaselineROI%) / 100
+        adjustment = abs(raw_gauntlet_score) * (10.0 * roi_diff_percentage_points / 100.0)
+        gauntlet_score = raw_gauntlet_score + adjustment
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])
         total_trades = int(total_wins + total_losses)
+        win_rate = float((total_wins / total_trades * 100) if total_trades > 0 else 0.0)
 
+        # Use ERLTrainer's calculate_expectancy method
         expectancy = float(self.gauntlet_helper.calculate_expectancy(all_closed_trades))
 
-        quality_threshold = Config.ROI_QUALITY_THRESHOLD
+        # Calculate quality_count (trades with gain >= Config.ROI_QUALITY_THRESHOLD)
+        # This is the threshold used for confidence factor in ROI adjustment
+        quality_threshold = Config.ROI_QUALITY_THRESHOLD  # Default: 7.5% gain
         if all_closed_trades:
             quality_count = sum(1 for t in all_closed_trades if t.get('gain_pct', 0) >= quality_threshold)
         else:
             quality_count = 0
 
+        # Calculate ratios
         quality_ratio = float(quality_count / total_trades) if total_trades > 0 else 0.0
         win_ratio = float(total_wins / total_trades) if total_trades > 0 else 0.0
 
+        # Reset gauntlet mode after validation
         self.gauntlet_helper.eval_env.set_gauntlet_mode(False)
+        # Reset consistency mode (will be set again for next evaluation)
+        self.gauntlet_helper.eval_env.set_consistency_mode(False)
 
-        return gauntlet_score, {
+        detailed_metrics = {
             'gauntlet_score': gauntlet_score,
             'raw_gauntlet_score': raw_gauntlet_score,  # Pre-efficiency adjustment
             'efficiency_ratio': efficiency_ratio,  # ROI / baseline
             'mean_fitness': mean_score,
+            'median_fitness': median_score,
+            'std_fitness': std_score,
             'min_fitness': min_score,
             'max_fitness': max_score,
+            'cv': cv,  # Coefficient of Variation - lower is more stable
             'roi': roi,
             'total_trades': total_trades,
             'quality_count': quality_count,
             'quality_ratio': quality_ratio,
+            'win_rate': win_rate,
             'win_ratio': win_ratio,
             'expectancy': expectancy,
+            'num_slices': len(gauntlet_slices),
             'fitness_all_slices': [float(score) for score in fitness_scores]
         }
+
+        return gauntlet_score, detailed_metrics
 
     def evaluate_agent_multiple_times(self, agent_path: Path, num_evals: int = 3) -> Dict:
         """
@@ -400,7 +453,8 @@ class Global50Fixer:
 
         for i in range(num_evals):
             try:
-                score, metrics = self.run_gauntlet(agent, stem)
+                # Default to False for maverick (can be enhanced to check existing global50.json)
+                score, metrics = self.run_gauntlet(agent, stem, is_maverick=False)
                 scores.append(score)
                 metrics_list.append(metrics)
             except Exception as e:
@@ -568,6 +622,11 @@ class Global50Fixer:
                 print(f"   Avg of lowest 2: {result['avg_lowest_2']:.2f}")
                 print(f"   ROI: {result['median_metrics']['roi']:.2f}%")
                 print(f"   Expectancy: {result['median_metrics']['expectancy']:.4f}")
+                cv = result['median_metrics'].get('cv', float('inf'))
+                if cv == float('inf'):
+                    print(f"   CV: inf")
+                else:
+                    print(f"   CV: {cv:.4f}")
 
                 # Check if ROI is below threshold - if so, mark for exclusion
                 if result['median_metrics']['roi'] < self.MIN_ROI_THRESHOLD:
@@ -803,11 +862,17 @@ class Global50Fixer:
                 agent = DDPGAgent(agent_id=r['agent_id'])
                 agent.load(str(agent_path))
 
-                final_score, final_metrics = self.run_gauntlet(agent, r['run_name'])
+                # Default to False for maverick (can be enhanced to check existing global50.json)
+                final_score, final_metrics = self.run_gauntlet(agent, r['run_name'], is_maverick=False)
 
                 print(f"   Final Score: {final_score:.2f}")
                 print(f"   ROI: {final_metrics['roi']:.2f}%")
                 print(f"   Expectancy: {final_metrics['expectancy']:.4f}")
+                cv = final_metrics.get('cv', float('inf'))
+                if cv == float('inf'):
+                    print(f"   CV: inf")
+                else:
+                    print(f"   CV: {cv:.4f}")
 
                 entry = GlobalHoFEntry(
                     agent_id=r['agent_id'],

@@ -2710,10 +2710,11 @@ class ERLTrainer:
                 peak_capital = total_inv if total_inv > 0 else 1.0
 
             # 1. Base Score: ROI Efficiency
-            # (Raw PnL / Peak Capital Employed) * log10(Peak Capital + 10)
+            # (Raw PnL / Peak Capital Employed) * log10(Peak Capital + 10) * win_rate^2
             roi_efficiency = (raw_pnl / peak_capital) * 100.0 if peak_capital > 0 else 0.0
             volume_scalar = math.log10(peak_capital + 10)
-            base_score = roi_efficiency * volume_scalar
+            win_rate_multiplier = win_rate ** 2  # Scale base score by win rate squared
+            base_score = roi_efficiency * volume_scalar * win_rate_multiplier
 
             # 2. FOMO Penalty (Relative Performance)
             # Get market return from stats (Col 44 = S&P 500 proxy)
@@ -3728,9 +3729,9 @@ class ERLTrainer:
             'gauntlet_median': self.global_hof.gauntlet_median,
             'roi_median': self.global_hof.roi_median,
             'expectancy_median': self.global_hof.expectancy_median,
-            'gauntlet_p75': self.global_hof.gauntlet_p75,
-            'roi_p75': self.global_hof.roi_p75,
-            'expectancy_p75': self.global_hof.expectancy_p75,
+            'gauntlet_p25': self.global_hof.gauntlet_p25,
+            'roi_p25': self.global_hof.roi_p25,
+            'expectancy_p25': self.global_hof.expectancy_p25,
         }
         # Set thresholds to allow any agent through should_promote()
         self.global_hof.entry_threshold = float('-inf')
@@ -3740,9 +3741,9 @@ class ERLTrainer:
         self.global_hof.gauntlet_median = float('-inf')
         self.global_hof.roi_median = float('-inf')
         self.global_hof.expectancy_median = float('-inf')
-        self.global_hof.gauntlet_p75 = float('-inf')
-        self.global_hof.roi_p75 = float('-inf')
-        self.global_hof.expectancy_p75 = float('-inf')
+        self.global_hof.gauntlet_p25 = float('-inf')
+        self.global_hof.roi_p25 = float('-inf')
+        self.global_hof.expectancy_p25 = float('-inf')
 
         # Upload to Global50 on every improvement
         # Pass the parent entry to be replaced so check_and_promote can:
@@ -4312,21 +4313,30 @@ class ERLTrainer:
         # Pooled ROI: sum of peak capitals (slices are parallel/independent scenarios)
         # This answers: "For every dollar of max drawdown capacity across all scenarios, how much profit?"
         total_peak_capital = sum([r['peak_capital_employed'] for r in slice_results])
-        roi = (total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0
+        roi = float((total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0)
 
         # --- ANTI-SWINDLE: EFFICIENCY-ADJUSTED GAUNTLET SCORE ---
-        # (See global50.py for full explanation)
+        #
+        # The raw Gauntlet score (Median - 0.5*StdDev) can be gamed by volume.
+        # We normalize by ROI to ensure only efficient agents get high scores.
+        #
+        # Baseline: Config.EFFICIENCY_BASELINE_ROI (default 8.0%)
+        #
+        # Formula: Adjusted Score = Raw Score + abs(Raw Score) * (10 * (ROI% - BaselineROI%))
+        #
+        # This symmetric formula:
+        # - Adds a bonus/penalty proportional to the magnitude of the raw score
+        # - Bonus when ROI > baseline, penalty when ROI < baseline
+        # - Works symmetrically for both positive and negative raw scores
+        # - Example: Raw=-100, ROI=10%, Baseline=8% → -100 + 100*10*(10-8)/100 = -100 + 20 = -80
+        # - Example: Raw=100, ROI=6%, Baseline=8% → 100 + 100*10*(6-8)/100 = 100 - 20 = 80
+        #
         efficiency_ratio = roi / Config.EFFICIENCY_BASELINE_ROI
-
-        if raw_gauntlet_score >= 0:
-            gauntlet_score = raw_gauntlet_score * efficiency_ratio
-        else:
-            if roi >= 0:
-                rescue_factor = max(1.0, efficiency_ratio)
-                gauntlet_score = raw_gauntlet_score / rescue_factor
-            else:
-                penalty_multiplier = max(1.0, abs(efficiency_ratio))
-                gauntlet_score = raw_gauntlet_score * penalty_multiplier
+        roi_diff_percentage_points = roi - Config.EFFICIENCY_BASELINE_ROI
+        # Formula: 10 * (ROI% - BaselineROI%) where both are percentages
+        # Convert percentage points to decimal: (ROI% - BaselineROI%) / 100
+        adjustment = abs(raw_gauntlet_score) * (10.0 * roi_diff_percentage_points / 100.0)
+        gauntlet_score = raw_gauntlet_score + adjustment
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])
@@ -5198,7 +5208,7 @@ class ERLTrainer:
                         else:
                             print(f"   ⓘ Agent gauntlet score: {gauntlet_score:.2f}")
                             if self.global_hof.enabled:
-                                print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p75: {self.global_hof.gauntlet_p75:.2f}")
+                                print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p25: {self.global_hof.gauntlet_p25:.2f}")
 
                     # Attempt promotion if we have a consistency-aligned score
                     should_promote_result = False

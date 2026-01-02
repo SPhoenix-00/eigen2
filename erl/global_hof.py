@@ -163,10 +163,10 @@ class GlobalHallOfFame:
         self.gauntlet_median: float = float('-inf')
         self.roi_median: float = float('-inf')
         self.expectancy_median: float = float('-inf')
-        # 75th percentile thresholds (must beat at least 2 of 3)
-        self.gauntlet_p75: float = float('-inf')
-        self.roi_p75: float = float('-inf')
-        self.expectancy_p75: float = float('-inf')
+        # 25th percentile thresholds (must beat at least 2 of 3)
+        self.gauntlet_p25: float = float('-inf')
+        self.roi_p25: float = float('-inf')
+        self.expectancy_p25: float = float('-inf')
         self.league_compatible: bool = False
 
         # Thread safety for atomic updates
@@ -428,9 +428,9 @@ class GlobalHallOfFame:
             self.gauntlet_median = float('-inf')
             self.roi_median = float('-inf')
             self.expectancy_median = float('-inf')
-            self.gauntlet_p75 = float('-inf')
-            self.roi_p75 = float('-inf')
-            self.expectancy_p75 = float('-inf')
+            self.gauntlet_p25 = float('-inf')
+            self.roi_p25 = float('-inf')
+            self.expectancy_p25 = float('-inf')
         else:
             # Get the 50th ranked agent's score (worst in top 50)
             sorted_entries = sorted(self.entries, key=lambda e: e.gauntlet_score, reverse=True)
@@ -442,7 +442,7 @@ class GlobalHallOfFame:
             # Lower CV is better, so new agents must have CV below the worst current CV
             self.cv_threshold = max(e.cv for e in self.entries)
 
-            # Calculate median (50th percentile) and 75th percentile for all 3 metrics
+            # Calculate median (50th percentile) and 25th percentile for all 3 metrics
             gauntlet_scores = [e.gauntlet_score for e in self.entries]
             roi_values = [e.roi for e in self.entries]
             expectancy_values = [e.expectancy for e in self.entries]
@@ -451,9 +451,9 @@ class GlobalHallOfFame:
             self.roi_median = float(np.percentile(roi_values, 50))
             self.expectancy_median = float(np.percentile(expectancy_values, 50))
 
-            self.gauntlet_p75 = float(np.percentile(gauntlet_scores, 75))
-            self.roi_p75 = float(np.percentile(roi_values, 75))
-            self.expectancy_p75 = float(np.percentile(expectancy_values, 75))
+            self.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
+            self.roi_p25 = float(np.percentile(roi_values, 25))
+            self.expectancy_p25 = float(np.percentile(expectancy_values, 25))
 
     def _discover_fallback_leagues(self):
         """
@@ -575,7 +575,7 @@ class GlobalHallOfFame:
         Criteria (all must be satisfied):
         1. All 4 metrics must beat their minimum thresholds (gauntlet, ROI, expectancy, CV)
            Note: For CV, "beating" means being LOWER (more stable)
-        2. At least 2 of 3 metrics must beat the 75th percentile (gauntlet, ROI, expectancy)
+        2. At least 2 of 3 metrics must beat the 25th percentile (gauntlet, ROI, expectancy)
         3. At least 1 metric must beat the median (50th percentile)
 
         Args:
@@ -601,17 +601,16 @@ class GlobalHallOfFame:
         if cv >= self.cv_threshold:
             return False
 
-        # Criterion 2: At least 2 of 3 metrics must beat 75th percentile
-        beats_gauntlet_p75 = gauntlet_score > self.gauntlet_p75
-        beats_roi_p75 = roi > self.roi_p75
-        beats_expectancy_p75 = expectancy > self.expectancy_p75
-        count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
-        if count_above_p75 < 2:
+        # Criterion 2: At least 2 of 3 metrics must beat 25th percentile
+        beats_gauntlet_p25 = gauntlet_score > self.gauntlet_p25
+        beats_roi_p25 = roi > self.roi_p25
+        beats_expectancy_p25 = expectancy > self.expectancy_p25
+        count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
+        if count_above_p25 < 2:
             return False
 
         # Criterion 3: At least 1 metric must beat median (50th percentile)
-        # Note: If 2+ metrics beat p75, they automatically beat median, so this is always satisfied
-        # But we check explicitly for clarity and edge cases
+        # Note: This gate is meaningful now that we use p25 instead of p75
         beats_gauntlet_median = gauntlet_score > self.gauntlet_median
         beats_roi_median = roi > self.roi_median
         beats_expectancy_median = expectancy > self.expectancy_median

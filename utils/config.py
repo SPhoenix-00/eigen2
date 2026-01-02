@@ -231,7 +231,7 @@ class Config:
     # - Positive scores scaled by (ROI / baseline): 10% ROI = neutral, 20% = 2x boost, 5% = 0.5x deflation
     # - Negative scores with positive ROI: rescued by dividing (ROI is king)
     # - Negative scores with negative ROI: amplified by multiplying
-    EFFICIENCY_BASELINE_ROI = 10.0  # Baseline ROI % for neutral efficiency multiplier (1.0)
+    EFFICIENCY_BASELINE_ROI = 8.0  # Baseline ROI % for neutral efficiency adjustment
 
     # Breakthrough detection
     BREAKTHROUGH_WARMUP_GENERATIONS = 3  # No breakthrough detection until Generation > this value (let population churn)
