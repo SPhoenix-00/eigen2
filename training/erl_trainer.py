@@ -3189,6 +3189,12 @@ class ERLTrainer:
 
                 # Update total_added counter
                 self.replay_buffer.total_added = file_id_counter
+                
+                # CRITICAL FIX: Update total_transitions counter
+                # Each file contains exactly 1 transition (written by workers)
+                num_new_transitions = len(all_transition_file_paths)
+                num_evicted_transitions = len(old_paths_to_delete) if old_paths_to_delete else 0
+                self.replay_buffer.total_transitions += num_new_transitions - num_evicted_transitions
 
                 # Force DataLoader reset to ensure workers drop references to files we just pushed out
                 if should_reset_workers:
