@@ -4304,7 +4304,7 @@ class ERLTrainer:
         # NEW SCORING FORMULA: Penalized Median
         # This rewards agents that reliably perform well while penalizing volatility
         # gauntlet_score = Median - (0.5 * StdDev)
-        gauntlet_score = float(median_score - (0.5 * std_score))
+        raw_gauntlet_score = float(median_score - (0.5 * std_score))
 
         # Calculate aggregate metrics
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -4313,6 +4313,20 @@ class ERLTrainer:
         # This answers: "For every dollar of max drawdown capacity across all scenarios, how much profit?"
         total_peak_capital = sum([r['peak_capital_employed'] for r in slice_results])
         roi = (total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0
+
+        # --- ANTI-SWINDLE: EFFICIENCY-ADJUSTED GAUNTLET SCORE ---
+        # (See global50.py for full explanation)
+        efficiency_ratio = roi / Config.EFFICIENCY_BASELINE_ROI
+
+        if raw_gauntlet_score >= 0:
+            gauntlet_score = raw_gauntlet_score * efficiency_ratio
+        else:
+            if roi >= 0:
+                rescue_factor = max(1.0, efficiency_ratio)
+                gauntlet_score = raw_gauntlet_score / rescue_factor
+            else:
+                penalty_multiplier = max(1.0, abs(efficiency_ratio))
+                gauntlet_score = raw_gauntlet_score * penalty_multiplier
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])
@@ -4349,6 +4363,8 @@ class ERLTrainer:
 
         return {
             'gauntlet_score': gauntlet_score,
+            'raw_gauntlet_score': raw_gauntlet_score,  # Pre-efficiency adjustment
+            'efficiency_ratio': efficiency_ratio,  # ROI / baseline
             'cv': cv,  # Coefficient of Variation - lower is more stable
             'median_fitness': median_score,
             'std_fitness': std_score,

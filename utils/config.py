@@ -226,6 +226,13 @@ class Config:
 
     GAUNTLET_MODE_ENABLED = True  # Enable Gauntlet Mode breakthrough validation
 
+    # Efficiency Gating - prevents "volume swindling" where agents inflate scores via capital usage
+    # Gauntlet scores are adjusted by ROI efficiency: Score_Final = f(raw_score, ROI / baseline)
+    # - Positive scores scaled by (ROI / baseline): 10% ROI = neutral, 20% = 2x boost, 5% = 0.5x deflation
+    # - Negative scores with positive ROI: rescued by dividing (ROI is king)
+    # - Negative scores with negative ROI: amplified by multiplying
+    EFFICIENCY_BASELINE_ROI = 10.0  # Baseline ROI % for neutral efficiency multiplier (1.0)
+
     # Breakthrough detection
     BREAKTHROUGH_WARMUP_GENERATIONS = 3  # No breakthrough detection until Generation > this value (let population churn)
     BREAKTHROUGH_THRESHOLD_NORMAL = 0.10  # 10% improvement over baseline in normal mode

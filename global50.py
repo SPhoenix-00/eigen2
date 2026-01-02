@@ -8,6 +8,23 @@ The script maintains a mirrored directory structure between local (global50/)
 and GCP cloud storage. Use --mirror to check sync status across ALL context
 windows (cw151, cw504, etc.) and automatically download any missing agent files.
 
+EFFICIENCY GATING:
+    Gauntlet scores are efficiency-adjusted to prevent "volume swindling" where
+    agents inflate scores via massive capital usage with low ROI efficiency.
+    
+    Formula: final_score = f(raw_score, ROI / baseline)
+    - Positive scores: multiplied by (ROI / baseline)
+    - Negative scores with positive ROI: divided by efficiency ratio (ROI rescues)
+    - Negative scores with negative ROI: multiplied by |efficiency_ratio| (amplified)
+    
+    Baseline: Config.EFFICIENCY_BASELINE_ROI (default: 10.0%)
+    This ensures only efficient agents (high ROI per dollar) get high scores.
+
+MAVERICK MODE:
+    Maverick agents [M] are trained with aggressive reward functions (FOMO, ROI-First)
+    and are tracked separately. They can break committee inaction but must still
+    meet efficiency standards to enter Global 50.
+
 Usage:
     python global50.py --init                              # Initialize Global 50
     python global50.py --mirror                            # Check sync status
@@ -21,7 +38,7 @@ Usage:
 Options:
     --init              First-time setup. Creates empty global50.json and validates cloud sync.
     --mirror            Check mirror status between local and GCP. Downloads missing agent files.
-    --eval              Re-evaluate all agents in Global 50 with current evaluation logic.
+    --eval              Re-evaluate all agents with efficiency-adjusted gauntlet scoring.
     --trim              Interactive trim mode: prompts for gauntlet, ROI, expectancy, and trades thresholds.
     --archive-fill      Fill Global 50 from archive. Evaluates archived agents and promotes qualifying ones.
     --cleanup           Find and archive orphan agents (files in agents/ not in global50.json).
@@ -31,7 +48,7 @@ Options:
     --run-name NAME     Run name for evaluation batch (default: batch-evaluation).
 
 Examples:
-    python global50.py --eval                              # Update all metrics
+    python global50.py --eval                              # Update all metrics (with efficiency gating)
     python global50.py --trim                              # Interactive trim
     python global50.py --cleanup-dry-run                   # Preview orphan cleanup
     python global50.py --cleanup                           # Archive orphan agents
@@ -303,12 +320,12 @@ class AgentEvaluator:
         # NEW SCORING FORMULA: Penalized Median
         # This rewards agents that reliably perform well while penalizing volatility
         # gauntlet_score = Median - (0.5 * StdDev)
-        gauntlet_score = float(median_score - (0.5 * std_score))
+        raw_gauntlet_score = float(median_score - (0.5 * std_score))
 
         # Penalty for agents that consistently refuse to trade
         # Score between -8.99 and -10 indicates no trades across all slices
-        if -10.0 <= gauntlet_score <= -9.00:
-            gauntlet_score = -2000.0
+        if -10.0 <= raw_gauntlet_score <= -9.00:
+            raw_gauntlet_score = -2000.0
 
         # Aggregate metrics (same calculations as ERLTrainer)
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -317,6 +334,43 @@ class AgentEvaluator:
         # This answers: "For every dollar of max drawdown capacity across all scenarios, how much profit?"
         total_peak_capital = sum([r['peak_capital_employed'] for r in slice_results])
         roi = float((total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0)
+
+        # --- ANTI-SWINDLE: EFFICIENCY-ADJUSTED GAUNTLET SCORE ---
+        #
+        # The raw Gauntlet score (Median - 0.5*StdDev) can be gamed by volume.
+        # We normalize by ROI to ensure only efficient agents get high scores.
+        #
+        # Baseline: Config.EFFICIENCY_BASELINE_ROI (default 10.0%)
+        #
+        # Positive raw scores: Multiplied by (ROI / baseline)
+        #   - Efficient agents (high ROI) get boosted
+        #   - Volume swindlers (low ROI) get deflated
+        #   - Agents with negative ROI get flipped negative
+        #
+        # Negative raw scores with positive ROI: Divided by max(1.0, ROI / baseline)
+        #   - High ROI rescues the score (ROI is king)
+        #   - Low positive ROI is neutral (floor of 1.0)
+        #
+        # Negative raw scores with negative ROI: Multiplied by max(1.0, |ROI| / baseline)
+        #   - Keeps score negative and amplifies penalty for big losses
+        #
+        efficiency_ratio = roi / Config.EFFICIENCY_BASELINE_ROI
+
+        if raw_gauntlet_score >= 0:
+            # Positive score: scale by signed efficiency ratio
+            gauntlet_score = raw_gauntlet_score * efficiency_ratio
+        else:
+            # Negative score: ROI can rescue or amplify
+            if roi >= 0:
+                # Positive ROI: high ROI rescues the negative score
+                # Divide by efficiency ratio (higher ROI = less negative)
+                # Floor at 1.0 so low positive ROI doesn't penalize further
+                rescue_factor = max(1.0, efficiency_ratio)
+                gauntlet_score = raw_gauntlet_score / rescue_factor
+            else:
+                # Negative ROI: amplify the penalty
+                penalty_multiplier = max(1.0, abs(efficiency_ratio))
+                gauntlet_score = raw_gauntlet_score * penalty_multiplier
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])
@@ -343,6 +397,8 @@ class AgentEvaluator:
 
         detailed_metrics = {
             'gauntlet_score': gauntlet_score,
+            'raw_gauntlet_score': raw_gauntlet_score,  # Pre-efficiency adjustment
+            'efficiency_ratio': efficiency_ratio,  # ROI / baseline
             'mean_fitness': mean_score,
             'median_fitness': median_score,
             'std_fitness': std_score,
@@ -399,7 +455,11 @@ class AgentEvaluator:
             gauntlet_score, metrics = self.run_gauntlet(agent, agent_name)
 
             print(f"\nGauntlet Results:")
-            print(f"   Gauntlet Score:    {gauntlet_score:>10.2f}  (Penalized Median)")
+            raw_score = metrics.get('raw_gauntlet_score', gauntlet_score)
+            efficiency_ratio = metrics.get('efficiency_ratio', 1.0)
+            print(f"   Raw Score:         {raw_score:>10.2f}  (Median - 0.5*StdDev)")
+            print(f"   Efficiency Ratio:  {efficiency_ratio:>10.3f}  (ROI {metrics['roi']:.2f}% / {Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
+            print(f"   Final Score:       {gauntlet_score:>10.2f}  (Efficiency-Adjusted)")
             print(f"   Median Fitness:    {metrics['median_fitness']:>10.2f}")
             print(f"   Std Fitness:       {metrics['std_fitness']:>10.2f}")
             print(f"   CV (Stability):    {metrics['cv']:>10.3f}")
@@ -1339,9 +1399,12 @@ class AgentEvaluator:
         print("\n⚠ This will:")
         print("  1. Download and load each agent")
         print("  2. Run full gauntlet evaluation for each agent")
-        print(f"  3. Update metrics in global50.json")
-        print("  4. Sync changes to cloud")
+        print("  3. Apply efficiency gating (ROI-adjusted scoring to prevent volume swindling)")
+        print(f"  4. Update metrics in global50.json")
+        print("  5. Sync changes to cloud")
         print(f"\nEstimated time: ~{len(self.global_hof.entries) * 2} minutes")
+        print(f"\nNote: Gauntlet scores are now efficiency-adjusted (raw_score × ROI/{Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
+        print(f"      Maverick agents [M] are identified and tracked separately.")
 
         while True:
             confirmation = input("\nProceed with re-evaluation? (yes/no): ").strip().lower()
@@ -1408,11 +1471,15 @@ class AgentEvaluator:
                     total_trades=metrics['total_trades']
                 )
 
-                # Show results
+                # Show results with efficiency gating details
                 score_change = new_score - entry.gauntlet_score
                 score_symbol = "↑" if score_change > 0 else "↓" if score_change < 0 else "="
-                print(f"  New Score: {new_score:.2f} ({score_symbol} {abs(score_change):.2f})")
-                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f} | CV: {metrics['cv']:.3f}")
+                raw_score = metrics.get('raw_gauntlet_score', new_score)
+                efficiency_ratio = metrics.get('efficiency_ratio', 1.0)
+                
+                print(f"  Raw Score: {raw_score:.2f} → Efficiency-Adjusted: {new_score:.2f} ({score_symbol} {abs(score_change):.2f})")
+                print(f"  Efficiency Ratio: {efficiency_ratio:.3f} (ROI {metrics['roi']:.2f}% / baseline {Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
+                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f}% | CV: {metrics['cv']:.3f}")
                 print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
 
                 results.append({
@@ -1718,6 +1785,13 @@ class AgentEvaluator:
         print(f"Current Global 50 State")
         print(f"{'='*70}")
         print(f"  Population size: {len(self.global_hof.entries)}/{self.global_hof.CAPACITY}")
+        
+        # Count Mavericks
+        maverick_count = sum(1 for e in self.global_hof.entries if e.is_maverick)
+        if maverick_count > 0:
+            print(f"  Mavericks: {maverick_count} (agents trained with aggressive reward functions)")
+        
+        print(f"\n  Note: Gauntlet scores are efficiency-adjusted (raw × ROI/{Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
 
         if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
             print(f"\n  Current Thresholds (population full):")
@@ -1865,6 +1939,7 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print(f"⚠ WARNING: {len(agents_to_remove)} agents will be REMOVED from Global 50:")
         print(f"{'='*70}")
+        print(f"Note: Gauntlet scores shown are efficiency-adjusted (raw × ROI/{Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
         print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'CV':<8} {'Trades':<8} {'Run Name':<25} {'Agent':<8} {'M':<3} {'Reason'}")
         print(f"{'-'*115}")
 
@@ -2594,11 +2669,12 @@ class AgentEvaluator:
         print(f"Failed:            {failed:>10}")
 
         if promoted > 0:
-            print(f"\nPromoted Agents:")
+            print(f"\nPromoted Agents (efficiency-adjusted gauntlet scores):")
             print("-" * 70)
             for r in results:
                 if r['promoted']:
-                    print(f"  {r['agent_name']:.<50} {r['gauntlet_score']:>10.2f}")
+                    maverick_tag = " [M]" if r.get('is_maverick', False) else ""
+                    print(f"  {r['agent_name']:.<50} {r['gauntlet_score']:>10.2f}{maverick_tag}")
 
         if self.global_hof.enabled:
             stats = self.global_hof.get_stats()
@@ -2623,13 +2699,14 @@ Examples:
   # Check mirror status between local and GCP
   python global50.py --mirror
 
-  # Re-evaluate all agents with current logic (updates metrics)
+  # Re-evaluate all agents with efficiency-adjusted gauntlet scoring (updates metrics)
   python global50.py --eval
 
   # Re-evaluate agents in a specific context window (e.g., cw504)
   python global50.py --eval --cw 504
 
-  # Interactive trim - prompts for gauntlet, ROI, expectancy, and total trades thresholds
+  # Interactive trim - prompts for gauntlet (efficiency-adjusted), ROI, expectancy, and total trades thresholds
+  # Maverick agents [M] are identified in the output
   python global50.py --trim
 
   # Evaluate agents from Hall of Fame directory
@@ -2684,13 +2761,13 @@ Examples:
     parser.add_argument(
         '--trim',
         action='store_true',
-        help='Interactive trim mode: shows current thresholds and prompts for gauntlet, ROI, expectancy, and total trades thresholds'
+        help='Interactive trim mode: shows current thresholds and prompts for gauntlet (efficiency-adjusted), ROI, expectancy, and total trades thresholds. Maverick agents [M] are identified.'
     )
 
     parser.add_argument(
         '--eval',
         action='store_true',
-        help='Re-evaluate all agents in Global 50 with current evaluation logic. Updates all metrics.'
+        help='Re-evaluate all agents in Global 50 with efficiency-adjusted gauntlet scoring. Updates all metrics including raw_gauntlet_score and efficiency_ratio.'
     )
 
     parser.add_argument(
