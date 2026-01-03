@@ -726,7 +726,7 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     Uses last 50 rows from production as history for proper indicator calculation.
     History provides warm-up for EMAs (need 34 minimum) plus overlap for validation.
     """
-    HISTORY_ROWS = 50  # History rows: 34 minimum + 16 overlap for validation
+    HISTORY_ROWS = 100  # History rows: Need enough for EMAs to fully converge before validation
     VBA_CALC_RAMP_UP_ROWS = 34  # Ramp-up rows to skip
     
     print("="*60)
@@ -847,21 +847,22 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     # --- Step 4: Combine History and New Data ---
     print(f"\nStep 4: Combining history ({HISTORY_ROWS} rows) with new data ({len(df_new_lists)} rows)...")
     
-    # FIX: Convert history to raw format (Indices 0-3 only: Open, Close, High, Low)
-    # The processed history (Skinny) does not contain the intermediate EMA states 
-    # (indices 4, 5, 7, 8, etc.) required to continue calculations directly.
-    # We must treat the history as raw data and let the model "warm up" again.
-    def to_raw(cell_list):
-        """Convert processed cell (9 elements) back to raw OHLC (4 elements)."""
-        if isinstance(cell_list, list) and len(cell_list) >= 4:
-            return cell_list[:4]  # Keep only [Open, Close, High, Low]
-        return None
+    # FIX: Convert history from Skinny format (9 elements) back to raw OHLC (4 elements)
+    # Then we'll process the entire combined dataset to recreate the full 16-element format
+    # This ensures all intermediate EMA states are calculated correctly with proper context
+    def to_raw_from_skinny(cell_list):
+        """Convert Skinny format (9 elements) back to raw OHLC (4 elements)."""
+        if not isinstance(cell_list, list) or len(cell_list) < 4:
+            return None
+        # Extract just OHLC (first 4 elements in both formats)
+        return cell_list[:4]
     
-    # Strip history down to raw OHLC
-    print("  Converting history from processed (9 elements) to raw (4 elements)...")
-    df_history_raw = df_history.map(to_raw)
+    # Convert history from Skinny to raw OHLC
+    print("  Converting history from Skinny format (9 elements) to raw OHLC (4 elements)...")
+    df_history_raw = df_history.map(to_raw_from_skinny)
     
-    # Combine: history (now raw) + new raw data
+    # New data is already in raw format (4 elements)
+    # Combine: history (raw OHLC) + new data (raw OHLC)
     df_combined = pd.concat([df_history_raw, df_new_lists], axis=0)
     # Safety: combined dataset must not contain duplicate indices
     if df_combined.index.duplicated().any():
@@ -871,7 +872,7 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
         return
     
     print(f"Combined dataset: {len(df_combined)} rows × {len(df_combined.columns)} columns")
-    print("  (History converted to raw OHLC to allow indicator warm-up)")
+    print("  (History converted to raw OHLC; will be processed to recreate full 16-element format)")
     
     # WARNING: shift_data_down will align data to the bottom of the DataFrame.
     # If a stock stopped trading (delisted/missing data), its old historical prices
@@ -941,7 +942,13 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
             production_last_row = df_production.iloc[-1]
             
             # Compare row by row (cell by cell)
+            # TOLERANCES DISABLED: Showing all differences for analysis
+            # ABS_TOLERANCE = 1e-5  # Absolute tolerance for small values (DISABLED)
+            # REL_TOLERANCE = 0.0001  # 0.01% relative tolerance for larger values (DISABLED)
+            
             mismatches = []
+            all_diffs = []  # All differences (tolerances disabled)
+            
             for col in df_production.columns:
                 recalc_val = recalculated_last_row[col]
                 prod_val = production_last_row[col]
@@ -960,32 +967,57 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
                     else:
                         for i, (r, p) in enumerate(zip(recalc_val, prod_val)):
                             if r != p and not (pd.isna(r) and pd.isna(p)):
-                                # Allow small floating point differences
+                                # Report all differences (tolerances disabled)
                                 if isinstance(r, (int, float)) and isinstance(p, (int, float)):
-                                    if abs(r - p) > 1e-6:
-                                        mismatches.append(f"{col}[{i}]: recalc={r}, prod={p} (diff={abs(r-p)})")
+                                    diff = abs(r - p)
+                                    max_val = max(abs(r), abs(p))
+                                    if max_val > 1.0:
+                                        # Show relative difference for larger values
+                                        all_diffs.append(f"{col}[{i}]: recalc={r}, prod={p} (diff={diff:.6f}, {diff/max_val*100:.2f}%)")
+                                    else:
+                                        # Show absolute difference for small values
+                                        all_diffs.append(f"{col}[{i}]: recalc={r}, prod={p} (diff={diff:.6f})")
                                 else:
                                     mismatches.append(f"{col}[{i}]: recalc={r}, prod={p}")
                 elif recalc_val != prod_val:
-                    # Allow small floating point differences for numeric values
+                    # Report all differences (tolerances disabled)
                     if isinstance(recalc_val, (int, float)) and isinstance(prod_val, (int, float)):
-                        if abs(recalc_val - prod_val) > 1e-6:
-                            mismatches.append(f"{col}: recalc={recalc_val}, prod={prod_val} (diff={abs(recalc_val-prod_val)})")
+                        diff = abs(recalc_val - prod_val)
+                        max_val = max(abs(recalc_val), abs(prod_val))
+                        if max_val > 1.0:
+                            # Show relative difference for larger values
+                            all_diffs.append(f"{col}: recalc={recalc_val}, prod={prod_val} (diff={diff:.6f}, {diff/max_val*100:.2f}%)")
+                        else:
+                            # Show absolute difference for small values
+                            all_diffs.append(f"{col}: recalc={recalc_val}, prod={prod_val} (diff={diff:.6f})")
                     else:
                         mismatches.append(f"{col}: recalc={recalc_val}, prod={prod_val}")
             
-            if mismatches:
-                print(f"⚠️  Warning: {len(mismatches)} mismatches detected in validation check:")
-                for mismatch in mismatches[:10]:  # Show first 10
-                    print(f"  {mismatch}")
-                if len(mismatches) > 10:
-                    print(f"  ... and {len(mismatches) - 10} more")
-                response = input("\nValidation check failed. Continue anyway? (y/n): ").strip().lower()
+            # Report results (tolerances disabled - showing all differences)
+            if mismatches or all_diffs:
+                print(f"⚠️  Validation check results (tolerances disabled - showing all differences):")
+                if all_diffs:
+                    print(f"  Found {len(all_diffs)} differences:")
+                    for diff in all_diffs[:20]:  # Show first 20
+                        print(f"    {diff}")
+                    if len(all_diffs) > 20:
+                        print(f"    ... and {len(all_diffs) - 20} more")
+                if mismatches:
+                    print(f"  ❌ {len(mismatches)} critical mismatches (None values or type mismatches):")
+                    for mismatch in mismatches[:10]:
+                        print(f"    {mismatch}")
+                    if len(mismatches) > 10:
+                        print(f"    ... and {len(mismatches) - 10} more")
+                
+                print(f"\nNote: Tolerances are currently disabled for analysis.")
+                print(f"      All differences are shown regardless of magnitude.")
+                
+                response = input("\nContinue anyway? (y/n): ").strip().lower()
                 if response != 'y':
                     print("Aborted by user.")
                     return
             else:
-                print("✓ Validation check passed: Recalculated last row matches production")
+                print("✓ Validation check passed: Recalculated last row matches production exactly")
         else:
             print(f"⚠️  Warning: Cannot find production last index {production_last_index} in combined dataset for validation")
             response = input("Continue anyway? (y/n): ").strip().lower()
