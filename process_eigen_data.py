@@ -58,11 +58,28 @@ def rsi_d(current_day, prev_day):
 def rsi_u_ema7(current_day_data, history):
     """Appends RSI_U_EMA7. history is 7 days before current."""
     full_history = history + [current_day_data] # 8 days total
-    rsi_u_0 = rsi_u(full_history[-1], full_history[-2])
     prev_day_data = full_history[-2] # This is history[-1]
     
+    # Fix: Handle None values in history - check before calling rsi_u
+    if prev_day_data is None or full_history[-1] is None:
+        # If previous day data is None, calculate 7-day SMA as fallback
+        # Filter out None values from history for calculation
+        valid_history = [h for h in full_history if h is not None]
+        if len(valid_history) < 2:
+            # Not enough valid data, return current_day_data with 0
+            return current_day_data + [0.0]
+        rsi_u_vals = [rsi_u(valid_history[j], valid_history[j-1]) for j in range(1, min(len(valid_history), 8))]
+        if len(rsi_u_vals) > 0:
+            v_calc = np.mean(rsi_u_vals)
+        else:
+            v_calc = 0.0
+        return current_day_data + [v_calc]
+    
+    # Now safe to call rsi_u
+    rsi_u_0 = rsi_u(full_history[-1], full_history[-2])
+    
     # VBA: If CountChrInString(prevDay, ",") < 4 Then
-    if len(prev_day_data) < 5: 
+    if len(prev_day_data) < 5:
         # Calculate 7-day SMA
         rsi_u_vals = [rsi_u(full_history[j], full_history[j-1]) for j in range(1, 8)]
         v_calc = np.mean(rsi_u_vals)
@@ -76,8 +93,25 @@ def rsi_u_ema7(current_day_data, history):
 def rsi_d_ema7(current_day_data, history):
     """Appends RSI_D_EMA7. history is 7 days before current."""
     full_history = history + [current_day_data] # 8 days total
-    rsi_d_0 = rsi_d(full_history[-1], full_history[-2])
     prev_day_data = full_history[-2]
+    
+    # Fix: Handle None values in history - check before calling rsi_d
+    if prev_day_data is None or full_history[-1] is None:
+        # If previous day data is None, calculate 7-day SMA as fallback
+        # Filter out None values from history for calculation
+        valid_history = [h for h in full_history if h is not None]
+        if len(valid_history) < 2:
+            # Not enough valid data, return current_day_data with 0
+            return current_day_data + [0.0]
+        rsi_d_vals = [rsi_d(valid_history[j], valid_history[j-1]) for j in range(1, min(len(valid_history), 8))]
+        if len(rsi_d_vals) > 0:
+            v_calc = np.mean(rsi_d_vals)
+        else:
+            v_calc = 0.0
+        return current_day_data + [v_calc]
+    
+    # Now safe to call rsi_d
+    rsi_d_0 = rsi_d(full_history[-1], full_history[-2])
     
     # VBA: If CountChrInString(prevDay, ",") < 5 Then
     if len(prev_day_data) < 6: # Note: VBA index is < 5, so we check < 6
@@ -715,32 +749,6 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     prod_index_ts = pd.to_datetime(df_production.index, errors='coerce')
     new_index_ts = pd.to_datetime(df_new_lists.index, errors='coerce')
 
-    # #region agent log
-    try:
-        os.makedirs('.cursor', exist_ok=True)
-        with open('.cursor/debug.log', 'a') as f:
-            import json
-            log_entry = {
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "A",
-                "location": "process_eigen_data.py:715-716",
-                "message": "Type check after pd.to_datetime",
-                "data": {
-                    "prod_index_ts_type": str(type(prod_index_ts)),
-                    "prod_index_ts_has_iloc": hasattr(prod_index_ts, 'iloc'),
-                    "new_index_ts_type": str(type(new_index_ts)),
-                    "new_index_ts_has_iloc": hasattr(new_index_ts, 'iloc'),
-                    "prod_index_ts_len": len(prod_index_ts),
-                    "new_index_ts_len": len(new_index_ts)
-                },
-                "timestamp": int(time.time() * 1000)
-            }
-            f.write(json.dumps(log_entry) + '\n')
-    except Exception:
-        pass  # Ignore logging errors
-    # #endregion
-
     if prod_index_ts.isna().any():
         print("Error: Could not parse one or more production index values as dates.")
         print("Append mode requires a date-like index.")
@@ -751,27 +759,6 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
         print(f"  {list(bad[:10])}" + (" ..." if len(bad) > 10 else ""))
         print("Append mode requires a date-like index.")
         return
-
-    # #region agent log
-    try:
-        with open('.cursor/debug.log', 'a') as f:
-            import json
-            log_entry = {
-                "sessionId": "debug-session",
-                "runId": "run1",
-                "hypothesisId": "A",
-                "location": "process_eigen_data.py:729",
-                "message": "Before accessing index",
-                "data": {
-                    "prod_index_ts_type": str(type(prod_index_ts)),
-                    "prod_index_ts_attrs": [attr for attr in dir(prod_index_ts) if not attr.startswith('_')][:10]
-                },
-                "timestamp": int(time.time() * 1000)
-            }
-            f.write(json.dumps(log_entry) + '\n')
-    except Exception:
-        pass  # Ignore logging errors
-    # #endregion
 
     # Fix: DatetimeIndex doesn't have .iloc, use direct indexing instead
     prod_last_ts = prod_index_ts[-1]
