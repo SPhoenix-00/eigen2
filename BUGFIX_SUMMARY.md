@@ -79,6 +79,17 @@ def to_dict(self) -> dict:
 
 ---
 
+### 6. wandb.run.step AttributeError on Resume (training/erl_trainer.py:1169-1172)
+**Problem**: `AttributeError: property 'step' of 'Run' object has no setter` when resuming training from checkpoint.
+
+**Root Cause**: In newer versions of wandb, `wandb.run.step` is a read-only property and cannot be set directly. The code attempted to sync the step counter after loading a checkpoint by assigning `wandb.run.step = self.start_generation - 1`.
+
+**Solution**: Removed the direct assignment. Step tracking works correctly because all `wandb.log()` calls in the codebase already specify the `step` parameter explicitly (e.g., `wandb.log(..., step=self.generation)`). When resuming from checkpoint, logs will use the correct generation number as the step.
+
+**Impact**: Training can now resume from checkpoints without errors. Step tracking continues to work correctly via explicit step parameters in log calls.
+
+---
+
 ## Verification Performed
 
 ### CUDA Serialization
@@ -106,7 +117,7 @@ def to_dict(self) -> dict:
 ## Files Modified
 
 1. `erl/global_hof.py` - Dynamic context window discovery + numpy serialization fix
-2. `training/erl_trainer.py` - CUDA tensor fix + missing dict key fix
+2. `training/erl_trainer.py` - CUDA tensor fix + missing dict key fix + wandb.run.step fix
 3. `compare_context_windows.py` - Numpy serialization fix
 
 ## Testing Recommendations
