@@ -355,24 +355,25 @@ def _run_validation_worker(args):
     agent = _get_cached_agent(state_hash)
     if agent is None:
         # Reconstruct agent from state dict
-        # CRITICAL FIX: Validation workers must use CPU to avoid GPU OOM with many parallel workers
-        # The main process uses GPU for training, but parallel validation workers should use CPU
         from models.ddpg_agent import DDPGAgent
         agent = DDPGAgent(agent_id=0)
-        # Force agent to CPU (validation workers are separate processes, should not use GPU)
-        agent.move_to_device(torch.device('cpu'), recreate_optimizers=False)
+        # Use GPU if available (with fewer workers, GPU OOM is avoided)
+        # Each worker process gets its own GPU context, but with limited workers we stay within memory
+        target_device = Config.DEVICE  # Use GPU if available, CPU otherwise
+        agent.move_to_device(target_device, recreate_optimizers=False)
         agent.actor.load_state_dict(agent_state['actor'])
         agent.critic.load_state_dict(agent_state['critic'])
         agent.actor.eval()
         agent.critic.eval()
         _cache_agent(state_hash, agent)
     else:
-        # Ensure cached agent is in eval mode and on CPU (safety check)
+        # Ensure cached agent is in eval mode
         agent.actor.eval()
         agent.critic.eval()
-        # Ensure cached agent is on CPU (may have been created before fix)
-        if agent.device.type == 'cuda':
-            agent.move_to_device(torch.device('cpu'), recreate_optimizers=False)
+        # Ensure cached agent is on correct device (may have been created with different device)
+        target_device = Config.DEVICE
+        if agent.device != target_device:
+            agent.move_to_device(target_device, recreate_optimizers=False)
 
     # OPTIMIZATION: Reuse worker's environment instead of creating new one
     env = _worker_env
@@ -394,7 +395,7 @@ def _run_validation_worker(args):
         trading_states = env.get_batch_observations(start_idx, num_trading_steps)
         with torch.no_grad():
             # Process in chunks to avoid OOM (similar to local mode)
-            # Note: Agent is on CPU (forced above), so inference runs on CPU (slower but avoids GPU OOM)
+            # Agent uses GPU if available (with fewer workers, GPU memory is manageable)
             chunk_size = 16
             action_chunks = []
             for i in range(0, num_trading_steps, chunk_size):
@@ -4230,11 +4231,22 @@ class ERLTrainer:
         )
 
         # Execute validation in parallel
-        num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
+        # With GPU: Use fewer workers (GPU is fast, fewer workers needed, avoids OOM)
+        # Without GPU: Use more workers (CPU is slower, need more parallelism)
+        if torch.cuda.is_available():
+            # GPU available: Use 4-8 workers (GPU is fast, fewer workers = less memory contention)
+            # Each worker uses GPU, but with fewer workers we avoid OOM
+            gpu_workers = min(8, max(4, mp.cpu_count() // 8))  # 4-8 workers based on CPU count
+            num_workers = min(gpu_workers, len(tasks))  # Don't use more workers than tasks
+            device_note = "GPU"
+        else:
+            # CPU only: Use more workers (CPU is slower, need more parallelism)
+            num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
+            device_note = "CPU"
+        
         cache_hits = len(self.population) - len(tasks)
         print(f"Validating {len(tasks)} agents ({cache_hits} cached, {len(tasks)} fresh)")
-        print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs)")
-        print(f"  Note: Validation workers use CPU to avoid GPU OOM (main process uses GPU for training)")
+        print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs) on {device_note}")
 
         with ProcessPoolExecutor(
             max_workers=num_workers,

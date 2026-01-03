@@ -122,7 +122,7 @@ def to_dict(self) -> dict:
 
 ---
 
-### 7. CUDA Out of Memory in Parallel Validation (training/erl_trainer.py:324-395)
+### 7. CUDA Out of Memory in Parallel Validation (training/erl_trainer.py:324-395, 4232-4237)
 **Problem**: CUDA OOM errors during validation phase with 48 parallel workers. Error: "CUDA out of memory. Tried to allocate 278.00 MiB. GPU 0 has a total capacity of 94.98 GiB of which 215.00 MiB is free."
 
 **Root Cause**: 
@@ -131,21 +131,20 @@ def to_dict(self) -> dict:
 - GPU memory from evaluation phase wasn't being cleared before validation started
 
 **Solution**:
-1. **Force validation workers to use CPU**: In `_run_validation_worker()`, explicitly move agents to CPU after creation:
-   ```python
-   agent = DDPGAgent(agent_id=0)
-   agent.move_to_device(torch.device('cpu'), recreate_optimizers=False)
-   ```
-2. **Ensure cached agents are on CPU**: Check cached agents and move to CPU if needed
+1. **Adaptive worker count based on GPU availability**: 
+   - **With GPU**: Use 4-8 workers (GPU is fast, fewer workers needed, avoids OOM)
+   - **Without GPU**: Use up to 48 workers (CPU is slower, need more parallelism)
+2. **Allow workers to use GPU**: Workers use GPU when available (with fewer workers, GPU memory is manageable)
 3. **Add GPU cleanup after evaluation**: Clear GPU cache and run garbage collection between evaluation and validation phases
 
 **Impact**: 
-- Validation workers now use CPU for inference (slightly slower but avoids GPU OOM)
-- Main training process still uses GPU for training
+- Validation workers use GPU when available (faster than CPU)
+- With fewer GPU workers (4-8 instead of 48), GPU memory usage is manageable
+- CPU-only systems still get full parallelism (48 workers)
 - No more CUDA OOM errors during validation phase
 
 **Files Modified**:
-- `training/erl_trainer.py` - Lines ~365, ~372, ~6767: Force CPU usage in validation workers + GPU cleanup
+- `training/erl_trainer.py` - Lines ~361-375, ~4232-4237, ~6767: Adaptive worker count + GPU usage + GPU cleanup
 
 ---
 
