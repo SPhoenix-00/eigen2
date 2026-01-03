@@ -4,13 +4,17 @@ Evolutionary Reinforcement Learning for Stock Trading
 """
 
 import os
-# GPU environment setup must happen before importing torch
-# This sets PYTORCH_CUDA_ALLOC_CONF (NVIDIA) or PYTORCH_HIP_ALLOC_CONF (AMD)
-from utils.device import setup_gpu_environment
-setup_gpu_environment()
+# Set GPU environment variables before importing torch
+# These environment variables must be set before torch is imported to take effect
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+os.environ.setdefault('PYTORCH_HIP_ALLOC_CONF', 'expandable_segments:True')
+os.environ.setdefault('HSA_FORCE_FINE_GRAIN_PCIE', '1')
 
 import argparse
 import torch
+# Now that torch is imported, configure GPU environment and detect backend
+from utils.device import setup_gpu_environment
+backend = setup_gpu_environment(verbose=True)
 import numpy as np
 import random
 import sys

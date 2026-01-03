@@ -589,6 +589,9 @@ def get_cloud_sync_from_env() -> CloudSync:
 
     Returns:
         Configured CloudSync instance
+    
+    Raises:
+        ValueError: If cloud provider is set but required credentials are missing
     """
     provider = os.environ.get("CLOUD_PROVIDER", "local").lower()
     bucket_name = os.environ.get("CLOUD_BUCKET")
@@ -596,9 +599,30 @@ def get_cloud_sync_from_env() -> CloudSync:
     # Check both GOOGLE_APPLICATION_CREDENTIALS (standard) and GCS_CREDENTIALS (legacy)
     credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GCS_CREDENTIALS")
 
-    if provider != "local" and not bucket_name:
-        print("Warning: CLOUD_BUCKET not set. Using local storage only.")
-        provider = "local"
+    # Validate cloud configuration
+    if provider != "local":
+        if not bucket_name:
+            raise ValueError(
+                f"CLOUD_PROVIDER={provider} is set but CLOUD_BUCKET is not set. "
+                f"Please set CLOUD_BUCKET environment variable or use CLOUD_PROVIDER=local for local-only storage."
+            )
+        
+        if provider == "gcs":
+            if not credentials_path:
+                raise ValueError(
+                    "CLOUD_PROVIDER=gcs is set but GOOGLE_APPLICATION_CREDENTIALS is not set. "
+                    "Please set GOOGLE_APPLICATION_CREDENTIALS to the path of your GCS credentials JSON file."
+                )
+            if not os.path.exists(credentials_path):
+                raise ValueError(
+                    f"GCS credentials file not found: {credentials_path}. "
+                    f"Please ensure the file exists and the path is correct."
+                )
+            if not os.access(credentials_path, os.R_OK):
+                raise ValueError(
+                    f"GCS credentials file is not readable: {credentials_path}. "
+                    f"Please check file permissions."
+                )
 
     return CloudSync(
         provider=provider,

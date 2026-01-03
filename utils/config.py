@@ -296,7 +296,24 @@ class Config:
         
         # Check data path exists
         if not Path(cls.DATA_PATH).exists():
+            expected_filename = cls.DATA_PATH.name
             errors.append(f"Data file not found: {cls.DATA_PATH}")
+            errors.append(f"  Expected filename: {expected_filename}")
+            errors.append(f"  Please download the training data file to: {cls.DATA_PATH.parent}")
+            errors.append(f"  Or update OUTPUT_FILE_PKL in process_eigen_data.py if using a different file")
+        
+        # Check cloud credentials if cloud provider is set
+        import os
+        cloud_provider = os.environ.get("CLOUD_PROVIDER", "").lower()
+        if cloud_provider == "gcs":
+            creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("GCS_CREDENTIALS")
+            if not creds_path:
+                errors.append("CLOUD_PROVIDER=gcs is set but GOOGLE_APPLICATION_CREDENTIALS is not set")
+            elif not Path(creds_path).exists():
+                errors.append(f"GCS credentials file not found: {creds_path}")
+            bucket_name = os.environ.get("CLOUD_BUCKET")
+            if not bucket_name:
+                errors.append("CLOUD_PROVIDER=gcs is set but CLOUD_BUCKET is not set")
         
         # Check directories exist
         cls.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -307,7 +324,12 @@ class Config:
             print("WARNING: CUDA not available. Training will be slow on CPU.")
         
         if errors:
-            print("\n".join(errors))
+            print("\n" + "="*60)
+            print("CONFIGURATION VALIDATION ERRORS:")
+            print("="*60)
+            for error in errors:
+                print(f"  ❌ {error}")
+            print("="*60 + "\n")
             return False
         return True
 

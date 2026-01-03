@@ -130,14 +130,11 @@ def get_gpu_memory_info() -> dict:
 
 def setup_gpu_environment(verbose: bool = False) -> str:
     """
-    Configure environment variables for optimal GPU performance.
+    Configure GPU environment and detect backend.
 
-    Sets backend-specific memory allocation settings:
-    - CUDA: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-    - ROCm: PYTORCH_HIP_ALLOC_CONF=expandable_segments:True + HSA settings
-
-    IMPORTANT: This should be called BEFORE importing torch in main.py,
-    or the environment variables may not take effect.
+    NOTE: Environment variables (PYTORCH_CUDA_ALLOC_CONF, PYTORCH_HIP_ALLOC_CONF)
+    should be set BEFORE importing torch. This function is called AFTER torch
+    import to detect the backend and configure torch-specific settings.
 
     Args:
         verbose: If True, print configuration info
@@ -148,6 +145,7 @@ def setup_gpu_environment(verbose: bool = False) -> str:
     backend = get_gpu_backend()
 
     if backend == "ROCm":
+        # Ensure environment variables are set (should already be set before torch import)
         os.environ['PYTORCH_HIP_ALLOC_CONF'] = 'expandable_segments:True'
         os.environ['HSA_FORCE_FINE_GRAIN_PCIE'] = '1'
         # Disable TF32 on AMD (not supported)
@@ -155,17 +153,58 @@ def setup_gpu_environment(verbose: bool = False) -> str:
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
         if verbose:
-            print("Configured environment for ROCm (AMD GPU)")
+            device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+            print(f"Configured environment for ROCm (AMD GPU)")
+            print(f"  Device: {device_name}")
 
     elif backend == "CUDA":
+        # Ensure environment variable is set (should already be set before torch import)
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         if verbose:
-            print("Configured environment for CUDA (NVIDIA GPU)")
+            device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+            print(f"Configured environment for CUDA (NVIDIA GPU)")
+            print(f"  Device: {device_name}")
     else:
         if verbose:
             print("No GPU detected, running on CPU")
 
     return backend
+
+
+def test_rocm_functionality() -> bool:
+    """
+    Test if ROCm is actually functional by performing a simple matrix operation.
+    
+    Similar to CUDA cuBLAS test, this verifies that GPU operations work correctly.
+    Some systems may detect GPU but have broken drivers/runtime.
+    
+    Returns:
+        True if ROCm functionality test passes, False otherwise
+    """
+    if not torch.cuda.is_available():
+        return False
+    
+    try:
+        # Create test tensors on GPU
+        device = torch.device("cuda:0")
+        a = torch.randn(100, 100, device=device, dtype=torch.float32)
+        b = torch.randn(100, 100, device=device, dtype=torch.float32)
+        
+        # Perform matrix multiplication (tests ROCm/HIP functionality)
+        c = torch.matmul(a, b)
+        
+        # Verify result is valid (not NaN or Inf)
+        if torch.isnan(c).any() or torch.isinf(c).any():
+            return False
+        
+        # Clean up
+        del a, b, c
+        torch.cuda.empty_cache()
+        
+        return True
+    except Exception as e:
+        print(f"ROCm functionality test failed: {e}")
+        return False
 
 
 def empty_cache() -> None:
@@ -218,6 +257,14 @@ if __name__ == "__main__":
         # Test environment setup
         print(f"\nEnvironment setup:")
         setup_gpu_environment(verbose=True)
+        
+        # Test ROCm functionality if ROCm backend
+        if backend == "ROCm":
+            print(f"\nROCm Functionality Test:")
+            if test_rocm_functionality():
+                print("  ✓ ROCm functionality test passed")
+            else:
+                print("  ❌ ROCm functionality test failed")
 
     print("\n" + "=" * 50)
     print("Test complete!")
