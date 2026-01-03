@@ -120,9 +120,39 @@ def to_dict(self) -> dict:
 2. `training/erl_trainer.py` - CUDA tensor fix + missing dict key fix + wandb.run.step fix
 3. `compare_context_windows.py` - Numpy serialization fix
 
+---
+
+### 7. CUDA Out of Memory in Parallel Validation (training/erl_trainer.py:324-395)
+**Problem**: CUDA OOM errors during validation phase with 48 parallel workers. Error: "CUDA out of memory. Tried to allocate 278.00 MiB. GPU 0 has a total capacity of 94.98 GiB of which 215.00 MiB is free."
+
+**Root Cause**: 
+- Validation workers were creating agents on GPU (using `Config.DEVICE` which is CUDA)
+- With 48 parallel workers all trying to allocate GPU memory simultaneously, the GPU ran out of memory
+- GPU memory from evaluation phase wasn't being cleared before validation started
+
+**Solution**:
+1. **Force validation workers to use CPU**: In `_run_validation_worker()`, explicitly move agents to CPU after creation:
+   ```python
+   agent = DDPGAgent(agent_id=0)
+   agent.move_to_device(torch.device('cpu'), recreate_optimizers=False)
+   ```
+2. **Ensure cached agents are on CPU**: Check cached agents and move to CPU if needed
+3. **Add GPU cleanup after evaluation**: Clear GPU cache and run garbage collection between evaluation and validation phases
+
+**Impact**: 
+- Validation workers now use CPU for inference (slightly slower but avoids GPU OOM)
+- Main training process still uses GPU for training
+- No more CUDA OOM errors during validation phase
+
+**Files Modified**:
+- `training/erl_trainer.py` - Lines ~365, ~372, ~6767: Force CPU usage in validation workers + GPU cleanup
+
+---
+
 ## Testing Recommendations
 
 1. **Parallel Validation**: Run training with 48+ workers to ensure no CUDA errors
 2. **Global HOF**: Promote agent to Global50 to test JSON serialization
 3. **Context Windows**: Check that only existing leagues are attempted (no 404s)
 4. **Docker**: Test in restricted container environment
+5. **CUDA OOM**: Run validation with 48+ parallel workers on CUDA system to verify no OOM errors
