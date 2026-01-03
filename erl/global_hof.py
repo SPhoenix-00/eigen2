@@ -568,9 +568,16 @@ class GlobalHallOfFame:
         else:
             print(f"  Total fallback leagues: {len(self.fallback_leagues)}")
 
-    def analyze_promotion(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0) -> Tuple[bool, List[str]]:
+    def analyze_promotion(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0, is_maverick: bool = False) -> Tuple[bool, List[str]]:
         """
         Analyze if an agent qualifies for Global 50 and return detailed reasons.
+        
+        Args:
+            gauntlet_score: Agent's certified Gauntlet score
+            roi: Agent's ROI percentage
+            expectancy: Agent's expectancy metric
+            cv: Agent's Coefficient of Variation (lower = more stable)
+            is_maverick: If True, skip expectancy gating requirements (mavericks only)
         
         Returns:
             Tuple of (passed: bool, reasons: List[str])
@@ -581,13 +588,14 @@ class GlobalHallOfFame:
         if not self.league_compatible:
             return False, ["League configuration incompatible"]
 
-        # Criterion 1: Must beat ALL 4 minimum thresholds
+        # Criterion 1: Must beat ALL 4 minimum thresholds (3 for mavericks - skip expectancy)
         failures = []
         if gauntlet_score <= self.entry_threshold:
             failures.append(f"Gauntlet Score {gauntlet_score:.2f} <= Threshold {self.entry_threshold:.2f}")
         if roi <= self.roi_threshold:
             failures.append(f"ROI {roi:.2f}% <= Threshold {self.roi_threshold:.2f}%")
-        if expectancy <= self.expectancy_threshold:
+        # Mavericks skip expectancy minimum threshold check
+        if not is_maverick and expectancy <= self.expectancy_threshold:
             failures.append(f"Expectancy {expectancy:.4f} <= Threshold {self.expectancy_threshold:.4f}")
         if cv >= self.cv_threshold:
             failures.append(f"CV {cv:.2f} >= Threshold {self.cv_threshold:.2f} (Lower is better)")
@@ -597,54 +605,72 @@ class GlobalHallOfFame:
             reasons.extend([f"  - {f}" for f in failures])
             return False, reasons
 
-        # Criterion 2: At least 2 of 3 metrics must beat 25th percentile
+        # Criterion 2: At least 2 of 3 metrics must beat 25th percentile (2 of 2 for mavericks - skip expectancy)
         beats_gauntlet_p25 = gauntlet_score > self.gauntlet_p25
         beats_roi_p25 = roi > self.roi_p25
-        beats_expectancy_p25 = expectancy > self.expectancy_p25
-        count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
+        beats_expectancy_p25 = expectancy > self.expectancy_p25 if not is_maverick else False  # Skip for mavericks
+        # For mavericks: need 2 of 2 (gauntlet, ROI). For regular: need 2 of 3 (gauntlet, ROI, expectancy)
+        metrics_to_check = [beats_gauntlet_p25, beats_roi_p25]
+        if not is_maverick:
+            metrics_to_check.append(beats_expectancy_p25)
+        count_above_p25 = sum(metrics_to_check)
+        required_p25 = 2 if is_maverick else 2  # Still need 2, but from 2 metrics instead of 3
         
-        if count_above_p25 < 2:
-            reasons.append(f"Failed p25 Criterion (Need 2/3, got {count_above_p25}):")
+        if count_above_p25 < required_p25:
+            metric_count = "2/2" if is_maverick else "2/3"
+            reasons.append(f"Failed p25 Criterion (Need {metric_count}, got {count_above_p25}):")
             reasons.append(f"  - Gauntlet > p25 ({self.gauntlet_p25:.2f}): {'✅' if beats_gauntlet_p25 else '❌'}")
             reasons.append(f"  - ROI > p25 ({self.roi_p25:.2f}%): {'✅' if beats_roi_p25 else '❌'}")
-            reasons.append(f"  - Expectancy > p25 ({self.expectancy_p25:.4f}): {'✅' if beats_expectancy_p25 else '❌'}")
+            if not is_maverick:
+                reasons.append(f"  - Expectancy > p25 ({self.expectancy_p25:.4f}): {'✅' if beats_expectancy_p25 else '❌'}")
             return False, reasons
 
-        # Criterion 3: At least 1 metric must beat median (50th percentile)
+        # Criterion 3: At least 1 metric must beat median (50th percentile) (1 of 2 for mavericks - skip expectancy)
         beats_gauntlet_median = gauntlet_score > self.gauntlet_median
         beats_roi_median = roi > self.roi_median
-        beats_expectancy_median = expectancy > self.expectancy_median
-        count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
+        beats_expectancy_median = expectancy > self.expectancy_median if not is_maverick else False  # Skip for mavericks
+        # For mavericks: need 1 of 2 (gauntlet, ROI). For regular: need 1 of 3 (gauntlet, ROI, expectancy)
+        metrics_to_check_median = [beats_gauntlet_median, beats_roi_median]
+        if not is_maverick:
+            metrics_to_check_median.append(beats_expectancy_median)
+        count_above_median = sum(metrics_to_check_median)
+        required_median = 1  # Always need at least 1
         
-        if count_above_median < 1:
-            reasons.append(f"Failed Median Criterion (Need 1/3, got {count_above_median}):")
+        if count_above_median < required_median:
+            metric_count = "1/2" if is_maverick else "1/3"
+            reasons.append(f"Failed Median Criterion (Need {metric_count}, got {count_above_median}):")
             reasons.append(f"  - Gauntlet > Median ({self.gauntlet_median:.2f}): {'✅' if beats_gauntlet_median else '❌'}")
             reasons.append(f"  - ROI > Median ({self.roi_median:.2f}%): {'✅' if beats_roi_median else '❌'}")
-            reasons.append(f"  - Expectancy > Median ({self.expectancy_median:.4f}): {'✅' if beats_expectancy_median else '❌'}")
+            if not is_maverick:
+                reasons.append(f"  - Expectancy > Median ({self.expectancy_median:.4f}): {'✅' if beats_expectancy_median else '❌'}")
             return False, reasons
 
         return True, ["Passed all criteria"]
 
-    def should_promote(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0) -> bool:
+    def should_promote(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0, is_maverick: bool = False) -> bool:
         """
         Check if an agent qualifies for Global 50.
 
         Criteria (all must be satisfied):
         1. All 4 metrics must beat their minimum thresholds (gauntlet, ROI, expectancy, CV)
            Note: For CV, "beating" means being LOWER (more stable)
+           Note: Mavericks skip expectancy minimum threshold check
         2. At least 2 of 3 metrics must beat the 25th percentile (gauntlet, ROI, expectancy)
+           Note: For mavericks, this becomes 2 of 2 (gauntlet, ROI) - expectancy is skipped
         3. At least 1 metric must beat the median (50th percentile)
+           Note: For mavericks, this becomes 1 of 2 (gauntlet, ROI) - expectancy is skipped
 
         Args:
             gauntlet_score: Agent's certified Gauntlet score (Penalized Median)
             roi: Agent's ROI percentage
             expectancy: Agent's expectancy metric
             cv: Agent's Coefficient of Variation (lower = more stable)
+            is_maverick: If True, skip expectancy gating requirements (mavericks only)
 
         Returns:
             True if agent should be promoted, False otherwise
         """
-        passed, _ = self.analyze_promotion(gauntlet_score, roi, expectancy, cv)
+        passed, _ = self.analyze_promotion(gauntlet_score, roi, expectancy, cv, is_maverick=is_maverick)
         return passed
 
     # Maximum number of Maverick agents allowed in Global 50 (The "Highlander" Rule)
@@ -692,7 +718,7 @@ class GlobalHallOfFame:
             - promoted: True if agent was promoted, False otherwise
             - rank: 1-based rank of agent in Global 50 (-1 if not promoted)
         """
-        if not self.should_promote(gauntlet_score, roi, expectancy, cv):
+        if not self.should_promote(gauntlet_score, roi, expectancy, cv, is_maverick=is_maverick):
             return False, -1
 
         with self._lock:
