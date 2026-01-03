@@ -1730,10 +1730,44 @@ class ERLTrainer:
         temp_population = []
 
         for member_idx, member in enumerate(members):
+            # Validate member structure
+            if not isinstance(member, dict):
+                raise ValueError(f"Committee member {member_idx} is not a dictionary: {type(member)}")
+            if 'run_name' not in member or 'agent_id' not in member:
+                raise ValueError(f"Committee member {member_idx} missing required fields. "
+                               f"Has keys: {list(member.keys())}, needs: ['run_name', 'agent_id']")
+
             agent_path = get_agent_filepath(member, context_window)
 
             if not agent_path.exists():
-                raise FileNotFoundError(f"Committee member agent not found: {agent_path}")
+                # Try to download from cloud if available
+                download_attempted = False
+                download_success = False
+                cloud_agent_path = None
+                
+                if hasattr(self, 'cloud_sync') and self.cloud_sync.provider != "local":
+                    cloud_base = f"{self.cloud_sync.project_name}/global50/cw{context_window}"
+                    cloud_agent_path = f"{cloud_base}/agents/{agent_path.name}"
+
+                    print(f"  Downloading committee member {member_idx + 1}/{len(members)} from cloud: {agent_path.name}")
+                    agent_path.parent.mkdir(parents=True, exist_ok=True)
+                    download_attempted = True
+                    download_success = self.cloud_sync.download_file(cloud_agent_path, str(agent_path), silent=False)
+
+                if not agent_path.exists():
+                    error_msg = f"Committee member agent not found: {agent_path}\n"
+                    error_msg += f"  Member {member_idx + 1}/{len(members)}: {member.get('run_name', 'unknown')}_{member.get('agent_id', 'unknown')}\n"
+                    if download_attempted:
+                        if not download_success:
+                            error_msg += f"  Cloud download failed. File may not exist in cloud storage.\n"
+                            if cloud_agent_path:
+                                error_msg += f"  Cloud path: {cloud_agent_path}\n"
+                        else:
+                            error_msg += f"  Cloud download succeeded but file still missing (possible permission issue).\n"
+                    else:
+                        error_msg += f"  Cloud sync not available (provider: {getattr(self.cloud_sync, 'provider', 'unknown') if hasattr(self, 'cloud_sync') else 'not initialized'})\n"
+                    error_msg += f"  Try running: python download_global50.py --context-window {context_window}"
+                    raise FileNotFoundError(error_msg)
 
             # Load member agent
             agent = DDPGAgent(agent_id=member_idx)
@@ -1924,6 +1958,29 @@ class ERLTrainer:
                 print(f"  Turnovers for this agent: {self.maverick_turnovers_per_agent[list_idx]}/{Config.MULTI_TARGET_TURNOVERS}")
 
         agent_path = get_agent_filepath(member, context_window)
+        
+        # Download from cloud if file doesn't exist locally
+        if not agent_path.exists():
+            if hasattr(self, 'cloud_sync') and self.cloud_sync.provider != "local":
+                cloud_base = f"{self.cloud_sync.project_name}/global50/cw{context_window}"
+                cloud_agent_path = f"{cloud_base}/agents/{agent_path.name}"
+                print(f"  Downloading member agent from cloud: {agent_path.name}")
+                agent_path.parent.mkdir(parents=True, exist_ok=True)
+                download_success = self.cloud_sync.download_file(cloud_agent_path, str(agent_path), silent=False)
+                if not download_success:
+                    raise FileNotFoundError(
+                        f"Failed to download committee member agent: {agent_path}\n"
+                        f"  Member: {member.get('run_name', 'unknown')}_{member.get('agent_id', 'unknown')}\n"
+                        f"  Cloud path: {cloud_agent_path}\n"
+                        f"  Try running: python download_global50.py --context-window {context_window}"
+                    )
+            else:
+                raise FileNotFoundError(
+                    f"Committee member agent not found: {agent_path}\n"
+                    f"  Member: {member.get('run_name', 'unknown')}_{member.get('agent_id', 'unknown')}\n"
+                    f"  Cloud sync not available. Try running: python download_global50.py --context-window {context_window}"
+                )
+        
         source_agent = DDPGAgent(agent_id=0)
         source_agent.load(str(agent_path))
 
@@ -6022,6 +6079,16 @@ class ERLTrainer:
                     member = self.multi_roster['members'][self.current_member_idx]
                     context_window = self.multi_roster['context_window_days']
                     agent_path = get_agent_filepath(member, context_window)
+                    
+                    # Download from cloud if file doesn't exist locally
+                    if not agent_path.exists():
+                        if hasattr(self, 'cloud_sync') and self.cloud_sync.provider != "local":
+                            cloud_base = f"{self.cloud_sync.project_name}/global50/cw{context_window}"
+                            cloud_agent_path = f"{cloud_base}/agents/{agent_path.name}"
+                            print(f"  Downloading member agent from cloud for checkpoint restore: {agent_path.name}")
+                            agent_path.parent.mkdir(parents=True, exist_ok=True)
+                            self.cloud_sync.download_file(cloud_agent_path, str(agent_path), silent=False)
+                    
                     if agent_path.exists():
                         self.multi_parent_agent = DDPGAgent(agent_id=-1)
                         self.multi_parent_agent.load(str(agent_path))
