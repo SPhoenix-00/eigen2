@@ -147,6 +147,15 @@ def run_ema12(current_day_data, history):
     full_history = history + [current_day_data] # 12 days total
     prev_day_data = full_history[-2]
     
+    # Fix: Handle None values in history
+    if prev_day_data is None or current_day_data is None:
+        # If previous day data is None, calculate 12-day SMA as fallback
+        valid_history = [h for h in full_history if h is not None]
+        if len(valid_history) == 0:
+            return current_day_data + [0.0] if current_day_data is not None else [0.0] * 8
+        v_calc = np.mean([get_close(day) for day in valid_history])
+        return (current_day_data if current_day_data is not None else []) + [v_calc]
+    
     # VBA: If commaTest < 7 Then
     if len(prev_day_data) < 8:
         # Calculate 12-day SMA of Close
@@ -162,12 +171,23 @@ def run_ema12(current_day_data, history):
 def run_ema26_init(current_day_data, history):
     """Calculates initial SMA for EMA26. history is 25 days before."""
     full_history = history + [current_day_data] # 26 days total
+    # Fix: Handle None values in history
+    valid_history = [h for h in full_history if h is not None]
+    if len(valid_history) == 0:
+        return (current_day_data if current_day_data is not None else []) + [0.0]
     # Calculate 26-day SMA of Close
-    v_calc = np.mean([get_close(day) for day in full_history])
-    return current_day_data + [v_calc]
+    v_calc = np.mean([get_close(day) for day in valid_history])
+    return (current_day_data if current_day_data is not None else []) + [v_calc]
 
 def run_ema26(current_day_data, prev_day_data):
     """Appends EMA26. Assumes EMA26_init was already run."""
+    # Fix: Handle None values
+    if prev_day_data is None or current_day_data is None:
+        return (current_day_data if current_day_data is not None else []) + [0.0]
+    if len(prev_day_data) < 9:
+        # Fallback to SMA if not enough data
+        return current_day_data + [get_close(current_day_data)]
+    
     curr_close = get_close(current_day_data)
     ema_prev = prev_day_data[8] # Get previous EMA26
     v_calc = (curr_close - ema_prev) * (2 / 27) + ema_prev
@@ -184,6 +204,15 @@ def run_macd_signal(current_day_data, history):
     """Appends MACD_Signal. history is 8 days before current."""
     full_history = history + [current_day_data] # 9 days total
     prev_day_data = full_history[-2]
+    
+    # Fix: Handle None values in history
+    if prev_day_data is None or current_day_data is None:
+        # If previous day data is None, calculate 9-day SMA as fallback
+        valid_history = [h for h in full_history if h is not None and len(h) > 9]
+        if len(valid_history) == 0:
+            return current_day_data + [0.0] if current_day_data is not None else [0.0] * 11
+        v_calc = np.mean([day[9] for day in valid_history])  # Get MACD (index 9)
+        return (current_day_data if current_day_data is not None else []) + [v_calc]
     
     # VBA: If commaTest < 10 Then
     if len(prev_day_data) < 11:
@@ -202,6 +231,15 @@ def run_ema12ema(current_day_data, history):
     full_history = history + [current_day_data] # 12 days total
     prev_day_data = full_history[-2]
 
+    # Fix: Handle None values in history
+    if prev_day_data is None or current_day_data is None:
+        # If previous day data is None, calculate 12-day SMA as fallback
+        valid_history = [h for h in full_history if h is not None and len(h) > 7]
+        if len(valid_history) == 0:
+            return current_day_data + [0.0] if current_day_data is not None else [0.0] * 12
+        v_calc = np.mean([day[7] for day in valid_history])  # Get EMA12 (index 7)
+        return (current_day_data if current_day_data is not None else []) + [v_calc]
+
     # VBA: If commaTest < 11 Then
     if len(prev_day_data) < 12:
         # Calculate 12-day SMA of EMA12
@@ -219,6 +257,15 @@ def run_ema12emaema(current_day_data, history):
     full_history = history + [current_day_data] # 12 days total
     prev_day_data = full_history[-2]
     
+    # Fix: Handle None values in history
+    if prev_day_data is None or current_day_data is None:
+        # If previous day data is None, calculate 12-day SMA as fallback
+        valid_history = [h for h in full_history if h is not None and len(h) > 11]
+        if len(valid_history) == 0:
+            return current_day_data + [0.0] if current_day_data is not None else [0.0] * 13
+        v_calc = np.mean([day[11] for day in valid_history])  # Get EMA12EMA (index 11)
+        return (current_day_data if current_day_data is not None else []) + [v_calc]
+    
     # VBA: If commaTest < 12 Then
     if len(prev_day_data) < 13:
         # Calculate 12-day SMA of EMA12EMA
@@ -233,6 +280,12 @@ def run_ema12emaema(current_day_data, history):
 
 def run_trix(current_day_data, prev_day_data):
     """Appends Trix."""
+    # Fix: Handle None values
+    if prev_day_data is None or current_day_data is None:
+        return (current_day_data if current_day_data is not None else []) + [0.0]
+    if len(current_day_data) < 13 or len(prev_day_data) < 13:
+        return current_day_data + [0.0]
+    
     ema_curr = current_day_data[12] # EMA12EMAEMA
     ema_prev = prev_day_data[12] # EMA12EMAEMA
     
@@ -242,9 +295,13 @@ def run_trix(current_day_data, prev_day_data):
 def run_x20dma(current_day_data, history):
     """Appends x20DMA. history is 19 days before current."""
     full_history = history + [current_day_data] # 20 days total
+    # Fix: Handle None values in history
+    valid_history = [h for h in full_history if h is not None]
+    if len(valid_history) == 0:
+        return (current_day_data if current_day_data is not None else []) + [0.0]
     # Calculate 20-day SMA of Close
-    v_calc = np.mean([get_close(day) for day in full_history])
-    return current_day_data + [v_calc]
+    v_calc = np.mean([get_close(day) for day in valid_history])
+    return (current_day_data if current_day_data is not None else []) + [v_calc]
 
 def run_xdiffdma(current_day_data):
     """Appends xDiffDMA."""
