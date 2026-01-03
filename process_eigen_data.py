@@ -723,10 +723,10 @@ def generate_output_filename(base_filename):
 def append_mode(production_file, new_data_file, *, update_config=False, allow_overlap=False):
     """
     Append mode: Process new raw data and append to existing production dataset.
-    Uses last 50 rows from production as history for proper indicator calculation.
+    Uses last HISTORY_ROWS rows from production as history for proper indicator calculation.
     History provides warm-up for EMAs (need 34 minimum) plus overlap for validation.
     """
-    HISTORY_ROWS = 100  # History rows: Need enough for EMAs to fully converge before validation
+    HISTORY_ROWS = 200  # History rows: Need enough for EMAs to fully converge before validation
     VBA_CALC_RAMP_UP_ROWS = 34  # Ramp-up rows to skip
     
     print("="*60)
@@ -746,7 +746,7 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
         print(f"Error: Production dataset has only {len(df_production)} rows, but {HISTORY_ROWS} rows are required for history.")
         return
     
-    # Extract last 100 rows for history
+    # Extract last HISTORY_ROWS rows for history
     df_history = df_production.iloc[-HISTORY_ROWS:].copy()
     print(f"Extracted last {HISTORY_ROWS} rows for history")
     
@@ -898,7 +898,7 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     df_combined_final = df_combined_shifted.map(manipulate_list)
     
     # Extract only the new rows
-    # FIX: We have HISTORY_ROWS (100) which serves as the warm-up period.
+    # FIX: We have HISTORY_ROWS which serves as the warm-up period.
     # Therefore, the indicators are stable by the time we hit the first new row.
     # We do NOT need to discard the first 34 rows of the new data.
     
