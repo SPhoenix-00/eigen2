@@ -716,25 +716,29 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     new_index_ts = pd.to_datetime(df_new_lists.index, errors='coerce')
 
     # #region agent log
-    with open('.cursor/debug.log', 'a') as f:
-        import json
-        log_entry = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "A",
-            "location": "process_eigen_data.py:715-716",
-            "message": "Type check after pd.to_datetime",
-            "data": {
-                "prod_index_ts_type": str(type(prod_index_ts)),
-                "prod_index_ts_has_iloc": hasattr(prod_index_ts, 'iloc'),
-                "new_index_ts_type": str(type(new_index_ts)),
-                "new_index_ts_has_iloc": hasattr(new_index_ts, 'iloc'),
-                "prod_index_ts_len": len(prod_index_ts),
-                "new_index_ts_len": len(new_index_ts)
-            },
-            "timestamp": int(time.time() * 1000)
-        }
-        f.write(json.dumps(log_entry) + '\n')
+    try:
+        os.makedirs('.cursor', exist_ok=True)
+        with open('.cursor/debug.log', 'a') as f:
+            import json
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "A",
+                "location": "process_eigen_data.py:715-716",
+                "message": "Type check after pd.to_datetime",
+                "data": {
+                    "prod_index_ts_type": str(type(prod_index_ts)),
+                    "prod_index_ts_has_iloc": hasattr(prod_index_ts, 'iloc'),
+                    "new_index_ts_type": str(type(new_index_ts)),
+                    "new_index_ts_has_iloc": hasattr(new_index_ts, 'iloc'),
+                    "prod_index_ts_len": len(prod_index_ts),
+                    "new_index_ts_len": len(new_index_ts)
+                },
+                "timestamp": int(time.time() * 1000)
+            }
+            f.write(json.dumps(log_entry) + '\n')
+    except Exception:
+        pass  # Ignore logging errors
     # #endregion
 
     if prod_index_ts.isna().any():
@@ -749,21 +753,24 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
         return
 
     # #region agent log
-    with open('.cursor/debug.log', 'a') as f:
-        import json
-        log_entry = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "A",
-            "location": "process_eigen_data.py:729",
-            "message": "Before accessing iloc",
-            "data": {
-                "prod_index_ts_type": str(type(prod_index_ts)),
-                "prod_index_ts_attrs": [attr for attr in dir(prod_index_ts) if not attr.startswith('_')][:10]
-            },
-            "timestamp": int(time.time() * 1000)
-        }
-        f.write(json.dumps(log_entry) + '\n')
+    try:
+        with open('.cursor/debug.log', 'a') as f:
+            import json
+            log_entry = {
+                "sessionId": "debug-session",
+                "runId": "run1",
+                "hypothesisId": "A",
+                "location": "process_eigen_data.py:729",
+                "message": "Before accessing index",
+                "data": {
+                    "prod_index_ts_type": str(type(prod_index_ts)),
+                    "prod_index_ts_attrs": [attr for attr in dir(prod_index_ts) if not attr.startswith('_')][:10]
+                },
+                "timestamp": int(time.time() * 1000)
+            }
+            f.write(json.dumps(log_entry) + '\n')
+    except Exception:
+        pass  # Ignore logging errors
     # #endregion
 
     # Fix: DatetimeIndex doesn't have .iloc, use direct indexing instead
