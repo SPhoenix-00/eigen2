@@ -9,7 +9,7 @@ import re
 
 # --- Configuration ---
 INPUT_FILE = 'Eigen2_Master(GFIN)_05_skinny - MASTER.csv'
-OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_151025.pkl'
+OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_030126.pkl'
 OUTPUT_FILE_CSV = 'Eigen2_Master_PY_OUTPUT_151025_FOR_COMPARE.csv'
 
 # --- Index Map for Slicing (Step 2: ManipulateArrayString) ---
@@ -643,7 +643,7 @@ def update_config_files(new_filename):
         
         # Update OUTPUT_FILE_PKL
         pattern = r"OUTPUT_FILE_PKL = '[^']+'"
-        replacement = f"OUTPUT_FILE_PKL = '{new_basename}'"
+        replacement = f"OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_030126.pkl'"
         new_content = re.sub(pattern, replacement, content)
         
         if new_content != content:
