@@ -681,11 +681,15 @@ def update_config_files(new_filename):
         print(f"  No files needed updating (or update failed)")
 
 # --- Helper function for date suffix generation ---
-def generate_output_filename(base_filename):
+def generate_output_filename(base_filename, date=None):
     """
     Generate output filename with date suffix in format _ddmmyy.{ext}
     Removes existing date suffix if present.
     Supports both .pkl and .csv files.
+    
+    Args:
+        base_filename: Base filename to add date suffix to
+        date: Optional datetime/date object to use for suffix. If None, uses current date.
     """
     # Extract extension
     if base_filename.endswith('.pkl'):
@@ -708,8 +712,17 @@ def generate_output_filename(base_filename):
         base_name = base_name[:-len(ext)]
     
     # Add new date suffix
-    today = datetime.now()
-    date_suffix = today.strftime('%d%m%y')
+    if date is not None:
+        # Convert to datetime if it's a string or other type
+        if isinstance(date, str):
+            date = pd.to_datetime(date)
+        elif not isinstance(date, (datetime, pd.Timestamp)):
+            # Try to convert if it's a date-like object
+            date = pd.to_datetime(date)
+        date_suffix = date.strftime('%d%m%y')
+    else:
+        today = datetime.now()
+        date_suffix = today.strftime('%d%m%y')
     
     # Handle special case for CSV (add _FOR_COMPARE)
     if ext == '.csv' and '_FOR_COMPARE' not in base_name:
@@ -1057,8 +1070,10 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     print(f"Final dataset: {df_final.shape[0]} rows × {df_final.shape[1]} columns")
     print(f"  (Original: {len(df_production_full)} rows, Added: {len(df_new_processed)} rows)")
     
-    # Generate output filename
-    output_filename = generate_output_filename(production_file)
+    # Generate output filename using the last date in the dataset
+    last_date = pd.to_datetime(df_final.index[-1])
+    print(f"Using last date in dataset for filename: {last_date.strftime('%Y-%m-%d')}")
+    output_filename = generate_output_filename(production_file, date=last_date)
     # For CSV, replace .pkl with _FOR_COMPARE.csv in the output filename
     output_csv_filename = output_filename.replace('.pkl', '_FOR_COMPARE.csv')
     
