@@ -54,8 +54,10 @@ class DDPGAgent:
             weight_decay=Config.WEIGHT_DECAY
         )
 
-        self.actor_scaler = GradScaler(Config.DEVICE_TYPE)
-        self.critic_scaler = GradScaler(Config.DEVICE_TYPE)
+        # GradScaler for mixed precision - only enabled on CUDA
+        scaler_device = 'cuda' if self.device.type == 'cuda' else 'cpu'
+        self.actor_scaler = GradScaler(scaler_device, enabled=(self.device.type == 'cuda'))
+        self.critic_scaler = GradScaler(scaler_device, enabled=(self.device.type == 'cuda'))
         
         # Exploration noise
         self.noise_scale = Config.NOISE_SCALE
@@ -66,7 +68,62 @@ class DDPGAgent:
         self.actor_loss_history = deque(maxlen=1000)
         self.critic_loss_history = deque(maxlen=1000)
         self.update_count = 0
-        
+
+    def move_to_device(self, device: torch.device, recreate_optimizers: bool = True):
+        """
+        Move agent to a new device, properly handling optimizer references.
+
+        CRITICAL: When moving networks with .to(device), PyTorch creates NEW tensors.
+        The old tensors are only freed when ALL references are dropped. Optimizers
+        hold references to the old parameters, so we MUST recreate them to free
+        the old GPU memory.
+
+        Args:
+            device: Target device (e.g., torch.device('cpu') or torch.device('cuda'))
+            recreate_optimizers: If True, recreate optimizers to reference new params.
+                                 Set False for inference-only (saves time but breaks training).
+        """
+        # Compare by type, not object equality
+        # torch.device('cuda') != torch.device('cuda:0') but both are cuda device 0
+        same_type = self.device.type == device.type
+        if same_type and device.type == 'cpu':
+            return  # Already on CPU
+        if same_type and device.type == 'cuda':
+            # Both are CUDA - check if same GPU index (None means default = 0)
+            current_idx = self.device.index if self.device.index is not None else 0
+            target_idx = device.index if device.index is not None else 0
+            if current_idx == target_idx:
+                return  # Already on same CUDA device
+
+        # Move networks to new device
+        self.actor = self.actor.to(device)
+        self.actor_target = self.actor_target.to(device)
+        self.critic = self.critic.to(device)
+        self.critic_target = self.critic_target.to(device)
+
+        # Update device tracking
+        old_device = self.device
+        self.device = device
+
+        if recreate_optimizers:
+            # Recreate optimizers to reference the new parameters
+            # This drops references to old GPU tensors, allowing them to be freed
+            self.actor_optimizer = optim.Adam(
+                self.actor.parameters(),
+                lr=Config.ACTOR_LR,
+                weight_decay=Config.WEIGHT_DECAY
+            )
+            self.critic_optimizer = optim.Adam(
+                self.critic.parameters(),
+                lr=Config.CRITIC_LR,
+                weight_decay=Config.WEIGHT_DECAY
+            )
+
+            # Recreate GradScalers for the new device
+            scaler_device = 'cuda' if device.type == 'cuda' else 'cpu'
+            self.actor_scaler = GradScaler(scaler_device, enabled=(device.type == 'cuda'))
+            self.critic_scaler = GradScaler(scaler_device, enabled=(device.type == 'cuda'))
+
     def select_action(self, state: np.ndarray, add_noise: bool = True) -> np.ndarray:
         """
         Select action using current policy.
@@ -115,8 +172,8 @@ class DDPGAgent:
         """
         Batched action selection for faster evaluation.
 
-        Processes multiple states in a single forward pass through the actor network,
-        providing significant speedup (10-15%) for GPU inference during evaluation.
+        Uses GPU if available for fast batch inference.
+        CPU→GPU transfer is amortized over the entire batch (125 items).
 
         Args:
             states: Batch of state observations [batch_size, context_days, num_columns, features]
@@ -128,26 +185,21 @@ class DDPGAgent:
         self.actor.eval()
 
         with torch.no_grad():
-            # Convert to tensor and move to GPU
+            # Transfer to device and run batch inference
             states_tensor = torch.FloatTensor(states).to(self.device)
 
-            # Single forward pass for entire batch (FAST!)
+            # Forward pass through actor network
             actions_tensor = self.actor(states_tensor)
-
-            # Move back to CPU
             actions = actions_tensor.cpu().numpy()
 
-            # Add noise if requested (training mode)
+            # Add noise if requested (vectorized)
             if add_noise:
                 noise = np.random.normal(0, self.noise_scale, actions.shape)
                 actions = actions + noise
-
-                # Clip to valid ranges
-                actions[:, :, 0] = np.maximum(actions[:, :, 0], 0)  # Coefficient >= 0
+                actions[:, :, 0] = np.maximum(actions[:, :, 0], 0)
                 actions[:, :, 1] = np.clip(actions[:, :, 1], Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
 
-            # Safety clip for coefficients after noise addition
-            # NOTE: Actor network clamps to [0, 100] internally; this handles noise overflow
+            # Safety clip for coefficients
             actions[:, :, 0] = np.clip(actions[:, :, 0], 0, 100)
 
         self.actor.train()
@@ -182,7 +234,7 @@ class DDPGAgent:
             # Compute target: r + gamma * Q_target(s', a')
             target_q = rewards + (1 - dones) * Config.GAMMA * target_q
         
-        with autocast(device_type=Config.DEVICE_TYPE):
+        with autocast(device_type='cuda'):
             current_q = self.critic(states, actions)
             critic_loss = nn.MSELoss()(current_q, target_q)
         
@@ -205,7 +257,7 @@ class DDPGAgent:
         for param in self.critic.parameters():
             param.requires_grad = False
         
-        with autocast(device_type=Config.DEVICE_TYPE):
+        with autocast(device_type='cuda'):
             actor_actions = self.actor(states)
             actor_loss = -self.critic(states, actor_actions).mean()
         
@@ -292,6 +344,12 @@ class DDPGAgent:
         self.noise_scale = checkpoint['noise_scale']
         self.update_count = checkpoint['update_count']
 
+        # Safety: Ensure networks are on correct device after loading
+        self.actor = self.actor.to(self.device)
+        self.actor_target = self.actor_target.to(self.device)
+        self.critic = self.critic.to(self.device)
+        self.critic_target = self.critic_target.to(self.device)
+
     def load_weights_only(self, path: str):
         """
         Load only network weights without optimizer states.
@@ -313,6 +371,12 @@ class DDPGAgent:
         self.noise_scale = checkpoint.get('noise_scale', Config.NOISE_SCALE)
         # Note: optimizers remain fresh (initialized in __init__)
         # Note: update_count remains 0 (this agent starts fresh in the population)
+
+        # Safety: Ensure networks are on correct device after loading
+        self.actor = self.actor.to(self.device)
+        self.actor_target = self.actor_target.to(self.device)
+        self.critic = self.critic.to(self.device)
+        self.critic_target = self.critic_target.to(self.device)
     
     def clone(self) -> 'DDPGAgent':
         """Create a deep copy of this agent."""
@@ -327,6 +391,15 @@ class DDPGAgent:
         new_agent.critic_target.load_state_dict(self.critic_target.state_dict())
         new_agent.noise_scale = self.noise_scale
         new_agent.is_elite = self.is_elite  # Preserve elite status
+
+        # CRITICAL: Ensure networks are on the correct device after loading state_dict
+        # load_state_dict doesn't move tensors - it keeps them on the source device
+        # If source agent was on CPU, we need to move to target device (GPU if available)
+        target_device = new_agent.device
+        new_agent.actor = new_agent.actor.to(target_device)
+        new_agent.actor_target = new_agent.actor_target.to(target_device)
+        new_agent.critic = new_agent.critic.to(target_device)
+        new_agent.critic_target = new_agent.critic_target.to(target_device)
 
         # Clear GPU cache after cloning
         if torch.cuda.is_available():

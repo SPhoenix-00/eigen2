@@ -6,11 +6,12 @@ All hyperparameters and settings in one place
 import torch
 from pathlib import Path
 
-from utils.device import get_device, get_device_type, get_gpu_backend
+# Import the output filename from process_eigen_data.py
+from process_eigen_data import OUTPUT_FILE_PKL
 
 class Config:
     # ============ Data Parameters ============
-    DATA_PATH = Path(__file__).parent.parent / "Eigen2_Master_PY_OUTPUT.pkl"
+    DATA_PATH = Path(__file__).parent.parent / OUTPUT_FILE_PKL
     DATE_COLUMN = 0  # Column A (0-indexed)
     INVESTABLE_START_COL = 9  # Column J (0-indexed) - First investable stock: DFAC
     INVESTABLE_END_COL = 116  # Column DO (0-indexed, inclusive) - Last investable stock: VXX
@@ -120,6 +121,12 @@ class Config:
     # Replay buffer
     BUFFER_SIZE = 1500000  # Maximum buffer size
     BATCH_SIZE = 160
+    LOCAL_BATCH_SIZE = 64  # Batch size for local mode training
+    LOCAL_GRADIENT_ACCUMULATION_STEPS = 1  # No accumulation in local mode - each step = 1 disk read (vs 16x with accumulation)
+    LOCAL_NUM_DATALOADER_WORKERS = 0  # Run in main process - Windows/WSL multiprocessing overhead is massive for 64-item batches
+    LOCAL_POPULATION_SIZE = 32  # Smaller population for local mode (vs 96 for distributed)
+    LOCAL_GRADIENT_STEPS_PER_GENERATION = 8  # Fewer gradient steps for local mode (vs 32 for distributed)
+    LOCAL_TRAINING_AGENT_BATCH_SIZE = 8  # Train 8 agents at a time on GPU (4 batches of 8 = 32 agents)
     MIN_BUFFER_SIZE = 23200  # Start training after this many transitions
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     
@@ -187,15 +194,10 @@ class Config:
     GRADIENT_ACCUMULATION_STEPS = 1
     
     # ============ Training Parameters ============
-    # Device configuration - supports both NVIDIA (CUDA) and AMD (ROCm) GPUs
-    DEVICE = get_device()  # Auto-detects GPU backend
-    DEVICE_TYPE = get_device_type()  # For autocast/GradScaler ("cuda" or "cpu")
-    GPU_BACKEND = get_gpu_backend()  # "CUDA", "ROCm", or "CPU"
-
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     NUM_WORKERS = 6  # For data loading (deprecated, kept for compatibility)
     NUM_DATALOADER_WORKERS = 6  # Number of background workers for async batch loading
-    PREFETCH_FACTOR = 2  # Batches to prefetch per worker
-    # With 6 workers and prefetch=2, up to 12 batches prepared ahead
+    # With 4 workers, batches are prepared in parallel while GPU trains
     # Higher = more CPU usage but better GPU utilization
     # NOTE: Random seed is now set dynamically per wandb run in ERLTrainer
     # This ensures parallel runs have unique, independent behavior
@@ -223,6 +225,13 @@ class Config:
     # SUBSEQUENT BREAKTHROUGHS: Must exceed confirmed baseline by threshold percentage
 
     GAUNTLET_MODE_ENABLED = True  # Enable Gauntlet Mode breakthrough validation
+
+    # Efficiency Gating - prevents "volume swindling" where agents inflate scores via capital usage
+    # Gauntlet scores are adjusted by ROI efficiency: Score_Final = f(raw_score, ROI / baseline)
+    # - Positive scores scaled by (ROI / baseline): 10% ROI = neutral, 20% = 2x boost, 5% = 0.5x deflation
+    # - Negative scores with positive ROI: rescued by dividing (ROI is king)
+    # - Negative scores with negative ROI: amplified by multiplying
+    EFFICIENCY_BASELINE_ROI = 8.0  # Baseline ROI % for neutral efficiency adjustment
 
     # Breakthrough detection
     BREAKTHROUGH_WARMUP_GENERATIONS = 3  # No breakthrough detection until Generation > this value (let population churn)
@@ -293,11 +302,9 @@ class Config:
         cls.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         cls.LOG_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Check GPU availability and display backend info
+        # Check GPU availability
         if not torch.cuda.is_available():
-            print("WARNING: No GPU detected. Training will be slow on CPU.")
-        else:
-            print(f"GPU Backend: {cls.GPU_BACKEND} ({torch.cuda.get_device_name(0)})")
+            print("WARNING: CUDA not available. Training will be slow on CPU.")
         
         if errors:
             print("\n".join(errors))

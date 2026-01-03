@@ -8,20 +8,41 @@ The script maintains a mirrored directory structure between local (global50/)
 and GCP cloud storage. Use --mirror to check sync status across ALL context
 windows (cw151, cw504, etc.) and automatically download any missing agent files.
 
+EFFICIENCY GATING:
+    Gauntlet scores are efficiency-adjusted to prevent "volume swindling" where
+    agents inflate scores via massive capital usage with low ROI efficiency.
+    
+    Formula: Adjusted Score = Raw Score + abs(Raw Score) * (10 * (ROI% - BaselineROI%))
+    
+    This symmetric formula:
+    - Adds a bonus/penalty proportional to the magnitude of the raw score
+    - Bonus when ROI > baseline, penalty when ROI < baseline
+    - Works symmetrically for both positive and negative raw scores
+    - Example: Raw=-100, ROI=10%, Baseline=8% → -100 + 100*10*(10-8)/100 = -100 + 20 = -80
+    - Example: Raw=100, ROI=6%, Baseline=8% → 100 + 100*10*(6-8)/100 = 100 - 20 = 80
+    
+    Baseline: Config.EFFICIENCY_BASELINE_ROI (default: 8.0%)
+    This ensures only efficient agents (high ROI per dollar) get high scores.
+
+MAVERICK MODE:
+    Maverick agents [M] are trained with aggressive reward functions (FOMO, ROI-First)
+    and are tracked separately. They can break committee inaction but must still
+    meet efficiency standards to enter Global 50.
+
 Usage:
-    python evaluate_for_global50.py --init                              # Initialize Global 50
-    python evaluate_for_global50.py --mirror                            # Check sync status
-    python evaluate_for_global50.py --eval                              # Re-evaluate all agents
-    python evaluate_for_global50.py --trim                              # Interactive trim (prompts for thresholds)
-    python evaluate_for_global50.py --archive-fill                      # Fill Global 50 from archive
-    python evaluate_for_global50.py --cleanup                           # Archive orphan agents
-    python evaluate_for_global50.py --cleanup-dry-run                   # Report orphans (no changes)
-    python evaluate_for_global50.py --agent-dir <path> [--run-name <name>]
+    python global50.py --init                              # Initialize Global 50
+    python global50.py --mirror                            # Check sync status
+    python global50.py --eval                              # Re-evaluate all agents
+    python global50.py --trim                              # Interactive trim (prompts for thresholds)
+    python global50.py --archive-fill                      # Fill Global 50 from archive
+    python global50.py --cleanup                           # Archive orphan agents
+    python global50.py --cleanup-dry-run                   # Report orphans (no changes)
+    python global50.py --agent-dir <path> [--run-name <name>] [--maverick]
 
 Options:
     --init              First-time setup. Creates empty global50.json and validates cloud sync.
     --mirror            Check mirror status between local and GCP. Downloads missing agent files.
-    --eval              Re-evaluate all agents in Global 50 with current evaluation logic.
+    --eval              Re-evaluate all agents with efficiency-adjusted gauntlet scoring.
     --trim              Interactive trim mode: prompts for gauntlet, ROI, expectancy, and trades thresholds.
     --archive-fill      Fill Global 50 from archive. Evaluates archived agents and promotes qualifying ones.
     --cleanup           Find and archive orphan agents (files in agents/ not in global50.json).
@@ -29,14 +50,16 @@ Options:
     --cw DAYS           Context window size in days (e.g., --cw 504 for cw504).
     --agent-dir PATH    Directory containing agent .pth files to evaluate.
     --run-name NAME     Run name for evaluation batch (default: batch-evaluation).
+    --maverick          Flag agents from --agent-dir as Maverick. For --archive-fill, Maverick status is read from archive metadata.
 
 Examples:
-    python evaluate_for_global50.py --eval                              # Update all metrics
-    python evaluate_for_global50.py --trim                              # Interactive trim
-    python evaluate_for_global50.py --cleanup-dry-run                   # Preview orphan cleanup
-    python evaluate_for_global50.py --cleanup                           # Archive orphan agents
-    python evaluate_for_global50.py --agent-dir checkpoints/run-123/hall_of_fame
-    python evaluate_for_global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
+    python global50.py --eval                              # Update all metrics (with efficiency gating)
+    python global50.py --trim                              # Interactive trim
+    python global50.py --cleanup-dry-run                   # Preview orphan cleanup
+    python global50.py --cleanup                           # Archive orphan agents
+    python global50.py --agent-dir checkpoints/run-123/hall_of_fame
+    python global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
+    python global50.py --agent-dir checkpoints/maverick-run-456/hall_of_fame --maverick
 """
 
 import argparse
@@ -143,6 +166,8 @@ class AgentEvaluator:
                 self.train_end_idx = val_start_idx
 
                 # Create persistent evaluation environment (reused across slices)
+                # Note: consistency_mode is set per-evaluation based on is_maverick flag
+                # Maverick agents are incompatible with consistency mode
                 full_end_idx = len(data_loader.data_array_full)
                 self.eval_env = TradingEnvironment(
                     data_array=data_loader.data_array,
@@ -152,7 +177,7 @@ class AgentEvaluator:
                     end_idx=full_end_idx,
                     trading_end_idx=Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS,
                     data_array_full=data_loader.data_array_full,
-                    consistency_mode=True  # Global 50 ALWAYS uses consistency mode for rigorous evaluation
+                    consistency_mode=False  # Will be set per-evaluation based on is_maverick
                 )
 
                 # Replay buffer is not needed for gauntlet (training=False)
@@ -220,7 +245,7 @@ class AgentEvaluator:
         """
         return self.gauntlet_helper.generate_gauntlet_slices()
 
-    def run_gauntlet(self, agent: DDPGAgent, agent_name: str) -> Tuple[float, dict]:
+    def run_gauntlet(self, agent: DDPGAgent, agent_name: str, is_maverick: bool = False) -> Tuple[float, dict]:
         """
         Run gauntlet validation on an agent using ERLTrainer's methods.
 
@@ -230,6 +255,7 @@ class AgentEvaluator:
         Args:
             agent: Agent to evaluate
             agent_name: Name for logging
+            is_maverick: If True, disables consistency mode (maverick agents are incompatible with consistency mode)
 
         Returns:
             Tuple of (gauntlet_score, detailed_metrics)
@@ -245,6 +271,10 @@ class AgentEvaluator:
         agent.actor.eval()
         agent.critic.eval()
 
+        # Set consistency mode: disabled for maverick agents (incompatible)
+        # Maverick agents use aggressive reward functions that conflict with consistency training
+        self.gauntlet_helper.eval_env.set_consistency_mode(not is_maverick)
+        
         # Enable gauntlet mode for soft zero-trades penalty (tactical no-trade is acceptable)
         self.gauntlet_helper.eval_env.set_gauntlet_mode(True)
 
@@ -303,12 +333,12 @@ class AgentEvaluator:
         # NEW SCORING FORMULA: Penalized Median
         # This rewards agents that reliably perform well while penalizing volatility
         # gauntlet_score = Median - (0.5 * StdDev)
-        gauntlet_score = float(median_score - (0.5 * std_score))
+        raw_gauntlet_score = float(median_score - (0.5 * std_score))
 
         # Penalty for agents that consistently refuse to trade
         # Score between -8.99 and -10 indicates no trades across all slices
-        if -10.0 <= gauntlet_score <= -9.00:
-            gauntlet_score = -2000.0
+        if -10.0 <= raw_gauntlet_score <= -9.00:
+            raw_gauntlet_score = -2000.0
 
         # Aggregate metrics (same calculations as ERLTrainer)
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -317,6 +347,29 @@ class AgentEvaluator:
         # This answers: "For every dollar of max drawdown capacity across all scenarios, how much profit?"
         total_peak_capital = sum([r['peak_capital_employed'] for r in slice_results])
         roi = float((total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0)
+
+        # --- ANTI-SWINDLE: EFFICIENCY-ADJUSTED GAUNTLET SCORE ---
+        #
+        # The raw Gauntlet score (Median - 0.5*StdDev) can be gamed by volume.
+        # We normalize by ROI to ensure only efficient agents get high scores.
+        #
+        # Baseline: Config.EFFICIENCY_BASELINE_ROI (default 8.0%)
+        #
+        # Formula: Adjusted Score = Raw Score + abs(Raw Score) * (10 * (ROI% - BaselineROI%))
+        #
+        # This symmetric formula:
+        # - Adds a bonus/penalty proportional to the magnitude of the raw score
+        # - Bonus when ROI > baseline, penalty when ROI < baseline
+        # - Works symmetrically for both positive and negative raw scores
+        # - Example: Raw=-100, ROI=10%, Baseline=8% → -100 + 100*10*(10-8)/100 = -100 + 20 = -80
+        # - Example: Raw=100, ROI=6%, Baseline=8% → 100 + 100*10*(6-8)/100 = 100 - 20 = 80
+        #
+        efficiency_ratio = roi / Config.EFFICIENCY_BASELINE_ROI
+        roi_diff_percentage_points = roi - Config.EFFICIENCY_BASELINE_ROI
+        # Formula: 10 * (ROI% - BaselineROI%) where both are percentages
+        # Convert percentage points to decimal: (ROI% - BaselineROI%) / 100
+        adjustment = abs(raw_gauntlet_score) * (10.0 * roi_diff_percentage_points / 100.0)
+        gauntlet_score = raw_gauntlet_score + adjustment
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])
@@ -340,9 +393,13 @@ class AgentEvaluator:
 
         # Reset gauntlet mode after validation
         self.gauntlet_helper.eval_env.set_gauntlet_mode(False)
+        # Reset consistency mode (will be set again for next evaluation)
+        self.gauntlet_helper.eval_env.set_consistency_mode(False)
 
         detailed_metrics = {
             'gauntlet_score': gauntlet_score,
+            'raw_gauntlet_score': raw_gauntlet_score,  # Pre-efficiency adjustment
+            'efficiency_ratio': efficiency_ratio,  # ROI / baseline
             'mean_fitness': mean_score,
             'median_fitness': median_score,
             'std_fitness': std_score,
@@ -362,13 +419,14 @@ class AgentEvaluator:
 
         return gauntlet_score, detailed_metrics
 
-    def evaluate_agent(self, agent_path: Path, generation: int = 0) -> dict:
+    def evaluate_agent(self, agent_path: Path, generation: int = 0, is_maverick: bool = False) -> dict:
         """
         Evaluate a single agent for Global 50.
 
         Args:
             agent_path: Path to agent .pth file
             generation: Generation number (default 0 for external agents)
+            is_maverick: If True, flag this agent as Maverick (aggressive reward function)
 
         Returns:
             Dictionary with evaluation results
@@ -384,7 +442,10 @@ class AgentEvaluator:
             'agent_path': str(agent_path),
             'success': False,
             'promoted': False,
-            'error': None
+            'qualified': False,  # Whether agent qualified for promotion (even if not promoted)
+            'error': None,
+            'agent': None,  # Store agent object if qualified but not promoted (for archiving)
+            'metrics': None  # Store metrics if qualified but not promoted
         }
 
         try:
@@ -396,10 +457,14 @@ class AgentEvaluator:
 
             # Run gauntlet
             print(f"Running gauntlet ({Config.GAUNTLET_NUM_SLICES} slices)...")
-            gauntlet_score, metrics = self.run_gauntlet(agent, agent_name)
+            gauntlet_score, metrics = self.run_gauntlet(agent, agent_name, is_maverick=is_maverick)
 
             print(f"\nGauntlet Results:")
-            print(f"   Gauntlet Score:    {gauntlet_score:>10.2f}  (Penalized Median)")
+            raw_score = metrics.get('raw_gauntlet_score', gauntlet_score)
+            efficiency_ratio = metrics.get('efficiency_ratio', 1.0)
+            print(f"   Raw Score:         {raw_score:>10.2f}  (Median - 0.5*StdDev)")
+            print(f"   Efficiency Ratio:  {efficiency_ratio:>10.3f}  (ROI {metrics['roi']:.2f}% / {Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
+            print(f"   Final Score:       {gauntlet_score:>10.2f}  (Efficiency-Adjusted)")
             print(f"   Median Fitness:    {metrics['median_fitness']:>10.2f}")
             print(f"   Std Fitness:       {metrics['std_fitness']:>10.2f}")
             print(f"   CV (Stability):    {metrics['cv']:>10.3f}")
@@ -414,6 +479,7 @@ class AgentEvaluator:
 
             # Check if qualifies for Global 50 (now includes CV as 4th criterion)
             if self.global_hof.should_promote(gauntlet_score, metrics['roi'], metrics['expectancy'], metrics['cv']):
+                result['qualified'] = True
                 print(f"\n   Agent QUALIFIES for Global 50!")
                 print(f"   Gauntlet Threshold: {self.global_hof.entry_threshold:.2f}")
                 print(f"   ROI Threshold: {self.global_hof.roi_threshold:.2f}%")
@@ -431,7 +497,8 @@ class AgentEvaluator:
                     cv=metrics['cv'],
                     quality_ratio=metrics['quality_ratio'],
                     win_ratio=metrics['win_ratio'],
-                    total_trades=metrics['total_trades']
+                    total_trades=metrics['total_trades'],
+                    is_maverick=is_maverick
                 )
 
                 result['promoted'] = promoted
@@ -439,7 +506,20 @@ class AgentEvaluator:
                 if promoted:
                     print(f"   SUCCESS: Agent promoted to Global 50!")
                 else:
-                    print(f"   WARNING: Promotion failed (concurrent update?)")
+                    # Store agent and metrics for potential archiving (if maverick cap reached)
+                    if is_maverick:
+                        result['agent'] = agent
+                        result['metrics'] = {
+                            'gauntlet_score': gauntlet_score,
+                            'generation': generation,
+                            'roi': metrics['roi'],
+                            'expectancy': metrics['expectancy'],
+                            'cv': metrics['cv'],
+                            'quality_ratio': metrics['quality_ratio'],
+                            'win_ratio': metrics['win_ratio'],
+                            'total_trades': metrics['total_trades']
+                        }
+                    print(f"   WARNING: Promotion failed (concurrent update or maverick cap?)")
             else:
                 print(f"\n   Agent does not qualify for Global 50")
                 # Check individual criteria for detailed feedback (4/4 minimums required)
@@ -447,14 +527,14 @@ class AgentEvaluator:
                 passes_roi_min = metrics['roi'] > self.global_hof.roi_threshold
                 passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold
                 passes_cv_min = metrics['cv'] < self.global_hof.cv_threshold  # CV: lower is better
-                beats_gauntlet_p75 = gauntlet_score > self.global_hof.gauntlet_p75
-                beats_roi_p75 = metrics['roi'] > self.global_hof.roi_p75
-                beats_expectancy_p75 = metrics['expectancy'] > self.global_hof.expectancy_p75
-                count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
+                beats_gauntlet_p25 = gauntlet_score > self.global_hof.gauntlet_p25
+                beats_roi_p25 = metrics['roi'] > self.global_hof.roi_p25
+                beats_expectancy_p25 = metrics['expectancy'] > self.global_hof.expectancy_p25
+                count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
 
                 count_above_min = sum([passes_gauntlet_min, passes_roi_min, passes_expectancy_min, passes_cv_min])
                 print(f"   Minimums ({count_above_min}/4, 4 required): Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'} | CV {'✓' if passes_cv_min else '✗'}")
-                print(f"   P75 ({count_above_p75}/3, 2 required): Gauntlet {'✓' if beats_gauntlet_p75 else '✗'} | ROI {'✓' if beats_roi_p75 else '✗'} | Expectancy {'✓' if beats_expectancy_p75 else '✗'}")
+                print(f"   P25 ({count_above_p25}/3, 2 required): Gauntlet {'✓' if beats_gauntlet_p25 else '✗'} | ROI {'✓' if beats_roi_p25 else '✗'} | Expectancy {'✓' if beats_expectancy_p25 else '✗'}")
 
         except Exception as e:
             print(f"\n   ERROR: {e}")
@@ -464,12 +544,17 @@ class AgentEvaluator:
 
         return result
 
-    def evaluate_batch(self, agent_dir: Path) -> List[dict]:
+    def evaluate_batch(self, agent_dir: Path, is_maverick: bool = False) -> List[dict]:
         """
         Evaluate all agents in a directory.
 
+        When using --maverick flag:
+        - Enforces MAVERICK_CAP (5) limit on promotions
+        - Archives any qualifying maverick agents that can't be promoted due to cap
+
         Args:
             agent_dir: Directory containing agent .pth files
+            is_maverick: If True, flag all agents as Maverick (aggressive reward function)
 
         Returns:
             List of evaluation results
@@ -480,18 +565,90 @@ class AgentEvaluator:
         if len(agent_files) == 0:
             return []
 
+        # Check current maverick count if evaluating mavericks
+        current_maverick_count = 0
+        if is_maverick and self.global_hof.enabled:
+            # Re-download to get latest state
+            self.global_hof._download_global_ledger()
+            self.global_hof._load_local_ledger()
+            current_maverick_count = sum(1 for e in self.global_hof.entries if e.is_maverick)
+            remaining_slots = self.global_hof.MAVERICK_CAP - current_maverick_count
+            print(f"\nCurrent Maverick count in Global 50: {current_maverick_count}/{self.global_hof.MAVERICK_CAP}")
+            if remaining_slots <= 0:
+                print(f"⚠ WARNING: Maverick cap ({self.global_hof.MAVERICK_CAP}) already reached.")
+                print(f"   Qualifying mavericks will be archived instead of promoted.")
+            else:
+                print(f"Remaining maverick slots: {remaining_slots}")
+
         # Evaluate each agent
         results = []
+        mavericks_promoted_this_batch = 0
 
         print(f"\n{'='*70}")
         print(f"Evaluating {len(agent_files)} agents")
+        if is_maverick:
+            print(f"Maverick Mode: All agents will be flagged as Maverick [M]")
         print(f"{'='*70}")
 
         for i, agent_path in enumerate(agent_files, 1):
+            # Check maverick cap before evaluating
+            if is_maverick and self.global_hof.enabled:
+                # Re-check current count (may have changed if previous agent was promoted)
+                self.global_hof._download_global_ledger()
+                self.global_hof._load_local_ledger()
+                current_maverick_count = sum(1 for e in self.global_hof.entries if e.is_maverick)
+                
+                if current_maverick_count >= self.global_hof.MAVERICK_CAP:
+                    print(f"\n[{i}/{len(agent_files)}] Processing {agent_path.name}")
+                    print(f"⚠ Maverick cap ({self.global_hof.MAVERICK_CAP}) reached.")
+                    print(f"   Evaluating agent to check if it qualifies (will archive if qualified)...")
+                    # Continue to evaluate - we'll archive if it qualifies
+
             print(f"\n[{i}/{len(agent_files)}] Processing {agent_path.name}")
 
-            result = self.evaluate_agent(agent_path, generation=i)
+            result = self.evaluate_agent(agent_path, generation=i, is_maverick=is_maverick)
             results.append(result)
+            
+            # Track maverick promotions
+            if is_maverick and result.get('promoted', False):
+                mavericks_promoted_this_batch += 1
+            
+            # If maverick qualified but wasn't promoted (likely due to cap), archive it
+            if is_maverick and result.get('qualified', False) and not result.get('promoted', False):
+                # Check if cap is the reason (re-check current count)
+                self.global_hof._download_global_ledger()
+                self.global_hof._load_local_ledger()
+                current_maverick_count = sum(1 for e in self.global_hof.entries if e.is_maverick)
+                
+                if current_maverick_count >= self.global_hof.MAVERICK_CAP and result.get('agent') and result.get('metrics'):
+                    print(f"\n   Archiving qualifying maverick (cap reached)...")
+                    archived = self.archive_qualifying_maverick(
+                        agent_path=agent_path,
+                        agent=result['agent'],
+                        gauntlet_score=result['metrics']['gauntlet_score'],
+                        generation=result['metrics']['generation'],
+                        roi=result['metrics']['roi'],
+                        expectancy=result['metrics']['expectancy'],
+                        cv=result['metrics']['cv'],
+                        quality_ratio=result['metrics']['quality_ratio'],
+                        win_ratio=result['metrics']['win_ratio'],
+                        total_trades=result['metrics']['total_trades'],
+                        run_name=self.run_name
+                    )
+                    if archived:
+                        result['archived'] = True
+                        print(f"   ✓ Agent archived (qualified but maverick cap reached)")
+
+        # Print summary
+        if is_maverick:
+            print(f"\n{'='*70}")
+            print(f"Maverick Evaluation Summary")
+            print(f"{'='*70}")
+            print(f"  Promoted: {mavericks_promoted_this_batch} maverick(s)")
+            archived_count = sum(1 for r in results if r.get('archived', False))
+            if archived_count > 0:
+                print(f"  Archived: {archived_count} qualifying maverick(s) (cap reached)")
+            print(f"{'='*70}")
 
         # Final sync to ensure everything is mirrored to GCP
         if self.global_hof.enabled:
@@ -634,6 +791,96 @@ class AgentEvaluator:
             print(f"   ✗ Error excluding {filename}: {e}")
             return False
 
+    def archive_qualifying_maverick(self, agent_path: Path, agent: DDPGAgent, gauntlet_score: float,
+                                    generation: int, roi: float, expectancy: float, cv: float,
+                                    quality_ratio: float, win_ratio: float, total_trades: int,
+                                    run_name: str) -> bool:
+        """
+        Archive a maverick agent that qualifies for Global 50 but cannot be promoted due to maverick cap.
+
+        Args:
+            agent_path: Path to the agent .pth file
+            agent: The DDPGAgent instance
+            gauntlet_score: Gauntlet score
+            generation: Generation number
+            roi: ROI percentage
+            expectancy: Expectancy metric
+            cv: Coefficient of Variation
+            quality_ratio: Quality ratio
+            win_ratio: Win ratio
+            total_trades: Total trades
+            run_name: Run name for this agent
+
+        Returns:
+            True if successfully archived, False otherwise
+        """
+        import shutil
+
+        filename = f"{run_name}_{agent.agent_id}.pth"
+        scoresheet_filename = filename.replace('.pth', '.json')
+
+        print(f"   Archiving qualifying maverick (cap reached): {filename}")
+
+        # Create entry for archive metadata
+        entry = GlobalHoFEntry(
+            agent_id=agent.agent_id,
+            run_name=run_name,
+            gauntlet_score=gauntlet_score,
+            generation=generation,
+            roi=roi,
+            expectancy=expectancy,
+            cv=cv,
+            quality_ratio=quality_ratio,
+            win_ratio=win_ratio,
+            total_trades=total_trades,
+            is_maverick=True
+        )
+
+        # Local paths
+        local_src = agent_path
+        local_dst = self.global_hof.local_archive_dir / filename
+        local_scoresheet_dst = self.global_hof.local_archive_dir / scoresheet_filename
+
+        # Cloud paths
+        cloud_archive_path = f"{self.global_hof.cloud_base}/archive/{filename}"
+        cloud_archive_json = f"{self.global_hof.cloud_base}/archive/{scoresheet_filename}"
+
+        try:
+            # Ensure archive directory exists
+            self.global_hof.local_archive_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy agent file to archive (don't move, keep original)
+            if local_src.exists():
+                shutil.copy2(str(local_src), str(local_dst))
+            else:
+                print(f"   ⚠ Source file not found: {local_src}")
+                return False
+
+            # Save metadata scoresheet with archive reason
+            entry_dict = entry.to_dict()
+            entry_dict['archived_at'] = datetime.now().isoformat()
+            entry_dict['archive_reason'] = 'maverick_cap_reached'
+            entry_dict['qualified_for_promotion'] = True
+            with open(local_scoresheet_dst, 'w') as f:
+                json.dump(entry_dict, f, indent=2)
+
+            # Upload to cloud archive/ with verification
+            if self.global_hof.enabled:
+                if local_dst.exists():
+                    self.cloud_sync.upload_file_verified(str(local_dst), cloud_archive_path)
+                self.cloud_sync.upload_file_verified(str(local_scoresheet_dst), cloud_archive_json)
+                print(f"   ✓ Archived: {filename}")
+                return True
+            else:
+                print(f"   ✓ Archived locally: {filename}")
+                return True
+
+        except Exception as e:
+            print(f"   ✗ Error archiving {filename}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def discover_cloud_context_windows(self) -> List[str]:
         """
         Discover all context window directories in cloud storage.
@@ -761,7 +1008,7 @@ class AgentEvaluator:
                 if choice == 'd':
                     break
                 elif choice == 'i':
-                    print(f"    → Please run: python evaluate_for_global50.py --init")
+                    print(f"    → Please run: python global50.py --init")
                     if temp_cloud_path and os.path.exists(temp_cloud_path):
                         os.unlink(temp_cloud_path)
                     return False
@@ -1232,7 +1479,7 @@ class AgentEvaluator:
             print(f"{'='*70}")
             print(f"Found {len(orphan_files)} orphan agent(s) that would be archived.")
             print(f"\nTo actually archive these orphans, run:")
-            print(f"  python evaluate_for_global50.py --cleanup")
+            print(f"  python global50.py --cleanup")
             return {
                 'success': True,
                 'valid_count': len(valid_filenames),
@@ -1339,9 +1586,12 @@ class AgentEvaluator:
         print("\n⚠ This will:")
         print("  1. Download and load each agent")
         print("  2. Run full gauntlet evaluation for each agent")
-        print(f"  3. Update metrics in global50.json")
-        print("  4. Sync changes to cloud")
+        print("  3. Apply efficiency gating (ROI-adjusted scoring to prevent volume swindling)")
+        print(f"  4. Update metrics in global50.json")
+        print("  5. Sync changes to cloud")
         print(f"\nEstimated time: ~{len(self.global_hof.entries) * 2} minutes")
+        print(f"\nNote: Gauntlet scores are now efficiency-adjusted (raw_score × ROI/{Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
+        print(f"      Maverick agents [M] are identified and tracked separately.")
 
         while True:
             confirmation = input("\nProceed with re-evaluation? (yes/no): ").strip().lower()
@@ -1363,7 +1613,8 @@ class AgentEvaluator:
         print(f"{'='*70}")
 
         for i, entry in enumerate(self.global_hof.entries, 1):
-            print(f"\n[{i}/{len(self.global_hof.entries)}] {entry.run_name} (Agent {entry.agent_id})")
+            maverick_tag = " [M]" if entry.is_maverick else ""
+            print(f"\n[{i}/{len(self.global_hof.entries)}] {entry.run_name} (Agent {entry.agent_id}){maverick_tag}")
             print(f"  Current Score: {entry.gauntlet_score:.2f}")
 
             try:
@@ -1391,7 +1642,7 @@ class AgentEvaluator:
 
                 # Run gauntlet
                 print(f"  Running gauntlet...")
-                new_score, metrics = self.run_gauntlet(agent, f"{entry.run_name}_{entry.agent_id}")
+                new_score, metrics = self.run_gauntlet(agent, f"{entry.run_name}_{entry.agent_id}", is_maverick=entry.is_maverick)
 
                 # Create updated entry
                 updated_entry = GlobalHoFEntry(
@@ -1407,11 +1658,12 @@ class AgentEvaluator:
                     total_trades=metrics['total_trades']
                 )
 
-                # Show results
+                # Show results - simple old vs new comparison
                 score_change = new_score - entry.gauntlet_score
                 score_symbol = "↑" if score_change > 0 else "↓" if score_change < 0 else "="
-                print(f"  New Score: {new_score:.2f} ({score_symbol} {abs(score_change):.2f})")
-                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f} | CV: {metrics['cv']:.3f}")
+                
+                print(f"  Old Score: {entry.gauntlet_score:.2f} → New Score: {new_score:.2f} ({score_symbol} {abs(score_change):.2f})")
+                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f}% | CV: {metrics['cv']:.3f}")
                 print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
 
                 results.append({
@@ -1688,7 +1940,7 @@ class AgentEvaluator:
         This is a manual trimming tool that allows custom thresholds.
         Note: Automatic promotion uses stricter criteria:
         - All 4 metrics must beat minimum thresholds (including CV)
-        - 2 of 3 metrics must beat 75th percentile
+        - 2 of 3 metrics must beat 25th percentile
         - 1 of 3 metrics must beat median
         """
         print(f"\n{'='*70}")
@@ -1717,12 +1969,19 @@ class AgentEvaluator:
         print(f"Current Global 50 State")
         print(f"{'='*70}")
         print(f"  Population size: {len(self.global_hof.entries)}/{self.global_hof.CAPACITY}")
+        
+        # Count Mavericks
+        maverick_count = sum(1 for e in self.global_hof.entries if e.is_maverick)
+        if maverick_count > 0:
+            print(f"  Mavericks: {maverick_count} (agents trained with aggressive reward functions)")
+        
+        print(f"\n  Note: Gauntlet scores are efficiency-adjusted (raw × ROI/{Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
 
         if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
             print(f"\n  Current Thresholds (population full):")
             print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}, CV={self.global_hof.cv_threshold:.3f}")
             print(f"    Medians:   Gauntlet={self.global_hof.gauntlet_median:.2f}, ROI={self.global_hof.roi_median:.2f}%, Expectancy={self.global_hof.expectancy_median:.4f}")
-            print(f"    P75:       Gauntlet={self.global_hof.gauntlet_p75:.2f}, ROI={self.global_hof.roi_p75:.2f}%, Expectancy={self.global_hof.expectancy_p75:.4f}")
+            print(f"    P25:       Gauntlet={self.global_hof.gauntlet_p25:.2f}, ROI={self.global_hof.roi_p25:.2f}%, Expectancy={self.global_hof.expectancy_p25:.4f}")
         else:
             # Show current minimums for reference
             min_gauntlet = min(e.gauntlet_score for e in self.global_hof.entries)
@@ -1748,7 +2007,7 @@ class AgentEvaluator:
         print(f"Enter Trim Thresholds")
         print(f"{'='*70}")
         print(f"Agents will be KEPT if: gauntlet >= threshold AND ROI >= threshold AND expectancy >= threshold AND CV <= threshold AND trades >= threshold")
-        print(f"(Note: CV uses <= because lower is better. This is a manual trim. Automatic promotion requires additional p75/median criteria)")
+        print(f"(Note: CV uses <= because lower is better. This is a manual trim. Automatic promotion requires additional p25/median criteria)")
         print(f"Press Enter to skip a threshold (use -inf for min thresholds, +inf for CV, or 0 for trades)")
 
         # Get gauntlet threshold
@@ -1864,8 +2123,9 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print(f"⚠ WARNING: {len(agents_to_remove)} agents will be REMOVED from Global 50:")
         print(f"{'='*70}")
-        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'CV':<8} {'Trades':<8} {'Run Name':<25} {'Agent':<8} {'Reason'}")
-        print(f"{'-'*110}")
+        print(f"Note: Gauntlet scores shown are efficiency-adjusted (raw × ROI/{Config.EFFICIENCY_BASELINE_ROI:.1f}%)")
+        print(f"{'Gauntlet':<10} {'ROI %':<10} {'Expect':<10} {'CV':<8} {'Trades':<8} {'Run Name':<25} {'Agent':<8} {'M':<3} {'Reason'}")
+        print(f"{'-'*115}")
 
         for entry in sorted(agents_to_remove, key=lambda e: e.gauntlet_score):
             # Determine why agent fails
@@ -1888,7 +2148,8 @@ class AgentEvaluator:
                 reasons.append("trades")
             reason_str = ", ".join(reasons) if reasons else "filter"
 
-            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.cv:<8.3f} {entry.total_trades:<8} {entry.run_name:<25} {entry.agent_id:<8} {reason_str}")
+            maverick_flag = "Y" if entry.is_maverick else ""
+            print(f"{entry.gauntlet_score:<10.2f} {entry.roi:<10.2f} {entry.expectancy:<10.4f} {entry.cv:<8.3f} {entry.total_trades:<8} {entry.run_name:<25} {entry.agent_id:<8} {maverick_flag:<3} {reason_str}")
 
         print(f"\n{len(agents_to_keep)} agents will remain in Global 50.")
 
@@ -2076,9 +2337,9 @@ class AgentEvaluator:
             self.global_hof.roi_median = float(np.percentile(roi_values, 50))
             self.global_hof.expectancy_median = float(np.percentile(expectancy_values, 50))
 
-            self.global_hof.gauntlet_p75 = float(np.percentile(gauntlet_scores, 75))
-            self.global_hof.roi_p75 = float(np.percentile(roi_values, 75))
-            self.global_hof.expectancy_p75 = float(np.percentile(expectancy_values, 75))
+            self.global_hof.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
+            self.global_hof.roi_p25 = float(np.percentile(roi_values, 25))
+            self.global_hof.expectancy_p25 = float(np.percentile(expectancy_values, 25))
 
         if current_size > 0 and current_size < self.global_hof.CAPACITY:
             recompute_thresholds_from_population()
@@ -2088,10 +2349,10 @@ class AgentEvaluator:
         print(f"\n  Current Thresholds:")
         print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}, CV={self.global_hof.cv_threshold:.3f}")
         print(f"    Medians:   Gauntlet={self.global_hof.gauntlet_median:.2f}, ROI={self.global_hof.roi_median:.2f}%, Expectancy={self.global_hof.expectancy_median:.4f}")
-        print(f"    P75:       Gauntlet={self.global_hof.gauntlet_p75:.2f}, ROI={self.global_hof.roi_p75:.2f}%, Expectancy={self.global_hof.expectancy_p75:.4f}")
+        print(f"    P25:       Gauntlet={self.global_hof.gauntlet_p25:.2f}, ROI={self.global_hof.roi_p25:.2f}%, Expectancy={self.global_hof.expectancy_p25:.4f}")
         print(f"\n  Promotion Criteria:")
         print(f"    1. All 4 metrics must beat minimum thresholds (CV: lower is better)")
-        print(f"    2. At least 2 of 3 metrics must beat 75th percentile")
+        print(f"    2. At least 2 of 3 metrics must beat 25th percentile")
         print(f"    3. At least 1 metric must beat median (50th percentile)")
 
         # Discover archived agents in cloud storage
@@ -2136,14 +2397,15 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print("Candidates for Evaluation")
         print(f"{'='*70}")
-        print(f"{'#':<4} {'Archived Score':<15} {'ROI %':<10} {'Expectancy':<12} {'Run Name':<30}")
-        print(f"{'-'*75}")
+        print(f"{'#':<4} {'Archived Score':<15} {'ROI %':<10} {'Expectancy':<12} {'Run Name':<30} {'M'}")
+        print(f"{'-'*80}")
 
         for i, candidate in enumerate(candidates, 1):
+            maverick_tag = " [M]" if candidate.get('is_maverick', False) else ""
             print(f"{i:<4} {candidate.get('gauntlet_score', 0):<15.2f} "
                   f"{candidate.get('roi', 0):<10.2f} "
                   f"{candidate.get('expectancy', 0):<12.4f} "
-                  f"{candidate['run_name']:<30}")
+                  f"{candidate['run_name']:<30}{maverick_tag}")
 
         # Ask for confirmation
         print(f"\n{'='*70}")
@@ -2154,7 +2416,7 @@ class AgentEvaluator:
         print(f"\nFilters applied:")
         print(f"  - Minimum archived ROI: {self.MIN_ROI_THRESHOLD}% (excluded {excluded_low_roi} agents)")
         print(f"  - Must beat all 4 minimum thresholds (Gauntlet, ROI, Expectancy, CV)")
-        print(f"  - Must beat 2 of 3 metrics at P75 (Gauntlet, ROI, Expectancy)")
+        print(f"  - Must beat 2 of 3 metrics at P25 (Gauntlet, ROI, Expectancy)")
         print(f"  - Must beat 1 of 3 metrics at median (Gauntlet, ROI, Expectancy)")
         print(f"\nEstimated time: ~{len(candidates) * 2} minutes")
 
@@ -2170,10 +2432,10 @@ class AgentEvaluator:
                 print("Please enter 'yes' or 'no'.")
 
         # Tiered promotion criteria (progressively relaxed):
-        # Tier 0: Full criteria - minimums (4/4) + 2/3 P75 + 1/3 median
-        # Tier 1: Remove median requirement - minimums (4/4) + 2/3 P75
-        # Tier 2: Relax P75 to 1/3 - minimums (4/4) + 1/3 P75
-        # Tier 3: Remove P75 requirement - minimums only (4/4)
+        # Tier 0: Full criteria - minimums (4/4) + 2/3 P25 + 1/3 median
+        # Tier 1: Remove median requirement - minimums (4/4) + 2/3 P25
+        # Tier 2: Relax P25 to 1/3 - minimums (4/4) + 1/3 P25
+        # Tier 3: Remove P25 requirement - minimums only (4/4)
         def should_promote_with_tier(gauntlet_score: float, roi: float, expectancy: float, cv: float, tier: int) -> bool:
             """Check promotion with tiered criteria relaxation."""
             # Criterion 1: Must beat ALL 4 minimum thresholds (always required)
@@ -2187,11 +2449,11 @@ class AgentEvaluator:
             if cv >= self.global_hof.cv_threshold:
                 return False
 
-            # Count P75 breaches
-            beats_gauntlet_p75 = gauntlet_score > self.global_hof.gauntlet_p75
-            beats_roi_p75 = roi > self.global_hof.roi_p75
-            beats_expectancy_p75 = expectancy > self.global_hof.expectancy_p75
-            count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
+            # Count P25 breaches
+            beats_gauntlet_p25 = gauntlet_score > self.global_hof.gauntlet_p25
+            beats_roi_p25 = roi > self.global_hof.roi_p25
+            beats_expectancy_p25 = expectancy > self.global_hof.expectancy_p25
+            count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
 
             # Count median breaches
             beats_gauntlet_median = gauntlet_score > self.global_hof.gauntlet_median
@@ -2200,14 +2462,14 @@ class AgentEvaluator:
             count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
 
             if tier == 0:
-                # Full criteria: 2/3 P75 + 1/3 median
-                return count_above_p75 >= 2 and count_above_median >= 1
+                # Full criteria: 2/3 P25 + 1/3 median
+                return count_above_p25 >= 2 and count_above_median >= 1
             elif tier == 1:
-                # Remove median requirement: 2/3 P75 only
-                return count_above_p75 >= 2
+                # Remove median requirement: 2/3 P25 only
+                return count_above_p25 >= 2
             elif tier == 2:
-                # Relax P75 to 1/3: 1/3 P75 only
-                return count_above_p75 >= 1
+                # Relax P25 to 1/3: 1/3 P25 only
+                return count_above_p25 >= 1
             else:
                 # Tier 3+: minimums only (already passed above)
                 return True
@@ -2215,13 +2477,13 @@ class AgentEvaluator:
         def get_tier_description(tier: int) -> str:
             """Get human-readable description of tier criteria."""
             if tier == 0:
-                return "Full criteria (minimums + 2/3 P75 + 1/3 median)"
+                return "Full criteria (minimums + 2/3 P25 + 1/3 median)"
             elif tier == 1:
-                return "Relaxed (minimums + 2/3 P75, no median requirement)"
+                return "Relaxed (minimums + 2/3 P25, no median requirement)"
             elif tier == 2:
-                return "Further relaxed (minimums + 1/3 P75)"
+                return "Further relaxed (minimums + 1/3 P25)"
             else:
-                return "Minimums only (no P75/median requirements)"
+                return "Minimums only (no P25/median requirements)"
 
         # First pass: evaluate all candidates and cache results
         evaluated_candidates = []  # List of {candidate, agent, new_score, metrics, promoted}
@@ -2231,7 +2493,8 @@ class AgentEvaluator:
         print(f"{'='*70}")
 
         for i, candidate in enumerate(candidates, 1):
-            print(f"\n[{i}/{len(candidates)}] {candidate['run_name']} (Agent {candidate['agent_id']})")
+            maverick_tag = " [M]" if candidate.get('is_maverick', False) else ""
+            print(f"\n[{i}/{len(candidates)}] {candidate['run_name']} (Agent {candidate['agent_id']}){maverick_tag}")
             print(f"  Archived Score: {candidate.get('gauntlet_score', 0):.2f}")
 
             try:
@@ -2254,7 +2517,7 @@ class AgentEvaluator:
 
                 # Run gauntlet
                 print(f"  Running gauntlet...")
-                new_score, metrics = self.run_gauntlet(agent, f"{candidate['run_name']}_{candidate['agent_id']}")
+                new_score, metrics = self.run_gauntlet(agent, f"{candidate['run_name']}_{candidate['agent_id']}", is_maverick=candidate.get('is_maverick', False))
 
                 # Show results
                 score_change = new_score - candidate.get('gauntlet_score', 0)
@@ -2338,7 +2601,7 @@ class AgentEvaluator:
                 print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f}")
 
                 # Attempt promotion - we bypass should_promote check since we did our own
-                # Temporarily set all thresholds (minimums, medians, P75) to -inf/+inf to allow promotion
+                # Temporarily set all thresholds (minimums, medians, P25) to -inf/+inf to allow promotion
                 self.global_hof.entry_threshold = float('-inf')
                 self.global_hof.roi_threshold = float('-inf')
                 self.global_hof.expectancy_threshold = float('-inf')
@@ -2346,10 +2609,13 @@ class AgentEvaluator:
                 self.global_hof.gauntlet_median = float('-inf')
                 self.global_hof.roi_median = float('-inf')
                 self.global_hof.expectancy_median = float('-inf')
-                self.global_hof.gauntlet_p75 = float('-inf')
-                self.global_hof.roi_p75 = float('-inf')
-                self.global_hof.expectancy_p75 = float('-inf')
+                self.global_hof.gauntlet_p25 = float('-inf')
+                self.global_hof.roi_p25 = float('-inf')
+                self.global_hof.expectancy_p25 = float('-inf')
 
+                # Read is_maverick from archive metadata (if available)
+                is_maverick = candidate.get('is_maverick', False)
+                
                 promoted = self.global_hof.check_and_promote(
                     agent=agent,
                     gauntlet_score=new_score,
@@ -2361,7 +2627,8 @@ class AgentEvaluator:
                     win_ratio=metrics['win_ratio'],
                     total_trades=metrics['total_trades'],
                     run_name=candidate['run_name'],
-                    suppress_threshold_output=True  # Suppress -inf threshold during archive-fill
+                    suppress_threshold_output=True,  # Suppress -inf threshold during archive-fill
+                    is_maverick=is_maverick
                 )
 
                 # Restore and recompute thresholds
@@ -2434,7 +2701,7 @@ class AgentEvaluator:
             print(f"\n  Updated Thresholds:")
             print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}, CV={self.global_hof.cv_threshold:.3f}")
             print(f"    Medians:   Gauntlet={self.global_hof.gauntlet_median:.2f}, ROI={self.global_hof.roi_median:.2f}%, Expectancy={self.global_hof.expectancy_median:.4f}")
-            print(f"    P75:       Gauntlet={self.global_hof.gauntlet_p75:.2f}, ROI={self.global_hof.roi_p75:.2f}%, Expectancy={self.global_hof.expectancy_p75:.4f}")
+            print(f"    P25:       Gauntlet={self.global_hof.gauntlet_p25:.2f}, ROI={self.global_hof.roi_p25:.2f}%, Expectancy={self.global_hof.expectancy_p25:.4f}")
 
         print(f"\n{'='*70}")
 
@@ -2592,11 +2859,12 @@ class AgentEvaluator:
         print(f"Failed:            {failed:>10}")
 
         if promoted > 0:
-            print(f"\nPromoted Agents:")
+            print(f"\nPromoted Agents (efficiency-adjusted gauntlet scores):")
             print("-" * 70)
             for r in results:
                 if r['promoted']:
-                    print(f"  {r['agent_name']:.<50} {r['gauntlet_score']:>10.2f}")
+                    maverick_tag = " [M]" if r.get('is_maverick', False) else ""
+                    print(f"  {r['agent_name']:.<50} {r['gauntlet_score']:>10.2f}{maverick_tag}")
 
         if self.global_hof.enabled:
             stats = self.global_hof.get_stats()
@@ -2616,40 +2884,47 @@ def main():
         epilog="""
 Examples:
   # First-time setup (initialize Global 50 structure)
-  python evaluate_for_global50.py --init
+  python global50.py --init
 
   # Check mirror status between local and GCP
-  python evaluate_for_global50.py --mirror
+  python global50.py --mirror
 
-  # Re-evaluate all agents with current logic (updates metrics)
-  python evaluate_for_global50.py --eval
+  # Re-evaluate all agents with efficiency-adjusted gauntlet scoring (updates metrics)
+  python global50.py --eval
 
   # Re-evaluate agents in a specific context window (e.g., cw504)
-  python evaluate_for_global50.py --eval --cw 504
+  python global50.py --eval --cw 504
 
-  # Interactive trim - prompts for gauntlet, ROI, expectancy, and total trades thresholds
-  python evaluate_for_global50.py --trim
+  # Interactive trim - prompts for gauntlet (efficiency-adjusted), ROI, expectancy, and total trades thresholds
+  # Maverick agents [M] are identified in the output
+  python global50.py --trim
 
   # Evaluate agents from Hall of Fame directory
-  python evaluate_for_global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
+  python global50.py --agent-dir checkpoints/azure-thunder-123/hall_of_fame
+
+  # Evaluate Maverick agents (trained with aggressive reward functions)
+  python global50.py --agent-dir checkpoints/maverick-run-789/hall_of_fame --maverick
 
   # Evaluate with custom run name
-  python evaluate_for_global50.py --agent-dir workspace/elite_agents --run-name backfill-2025
+  python global50.py --agent-dir workspace/elite_agents --run-name backfill-2025
 
   # Evaluate specific run's champions
-  python evaluate_for_global50.py --agent-dir checkpoints/crimson-wave-456/hall_of_fame
+  python global50.py --agent-dir checkpoints/crimson-wave-456/hall_of_fame
+
+  # Fill Global 50 from archive (Maverick status preserved from archive metadata)
+  python global50.py --archive-fill
 
   # Find orphan agents (dry run - report only)
-  python evaluate_for_global50.py --cleanup-dry-run
+  python global50.py --cleanup-dry-run
 
   # Archive orphan agents (move from agents/ to archive/)
-  python evaluate_for_global50.py --cleanup
+  python global50.py --cleanup
 
   # Fill Global 50 from archive (after trimming)
-  python evaluate_for_global50.py --archive-fill
+  python global50.py --archive-fill
 
   # Fill Global 50 from archive for a specific context window
-  python evaluate_for_global50.py --archive-fill --cw 504
+  python global50.py --archive-fill --cw 504
         """
     )
 
@@ -2668,6 +2943,12 @@ Examples:
     )
 
     parser.add_argument(
+        '--maverick',
+        action='store_true',
+        help='Flag agents from --agent-dir as Maverick (trained with aggressive reward functions). For --archive-fill, Maverick status is read from archive metadata.'
+    )
+
+    parser.add_argument(
         '--init',
         action='store_true',
         help='Initialize Global 50 structure (first-time setup). Creates empty global50.json and validates cloud sync.'
@@ -2682,13 +2963,13 @@ Examples:
     parser.add_argument(
         '--trim',
         action='store_true',
-        help='Interactive trim mode: shows current thresholds and prompts for gauntlet, ROI, expectancy, and total trades thresholds'
+        help='Interactive trim mode: shows current thresholds and prompts for gauntlet (efficiency-adjusted), ROI, expectancy, and total trades thresholds. Maverick agents [M] are identified.'
     )
 
     parser.add_argument(
         '--eval',
         action='store_true',
-        help='Re-evaluate all agents in Global 50 with current evaluation logic. Updates all metrics.'
+        help='Re-evaluate all agents in Global 50 with efficiency-adjusted gauntlet scoring. Updates all metrics including raw_gauntlet_score and efficiency_ratio.'
     )
 
     parser.add_argument(
@@ -2754,7 +3035,7 @@ Examples:
 
             print("\n✓ Setup complete! You can now run evaluations.")
             print("\nNext step:")
-            print(f"  python evaluate_for_global50.py --agent-dir <path>")
+            print(f"  python global50.py --agent-dir <path>")
         else:
             print("\n✗ Initialization FAILED")
             print(f"  Cloud Provider: {evaluator.cloud_sync.provider}")
@@ -2832,7 +3113,7 @@ Examples:
     agent_dir = Path(args.agent_dir)
 
     # Evaluate agents
-    results = evaluator.evaluate_batch(agent_dir)
+    results = evaluator.evaluate_batch(agent_dir, is_maverick=args.maverick)
 
     # Print summary
     if results:

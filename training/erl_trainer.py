@@ -19,7 +19,9 @@ import math
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-from multiprocessing import shared_memory, resource_tracker
+from multiprocessing import shared_memory
+if sys.platform != 'win32':
+    from multiprocessing import resource_tracker
 from enum import Enum
 from dataclasses import dataclass
 from collections import OrderedDict
@@ -45,6 +47,9 @@ from utils.cloud_sync import get_cloud_sync_from_env
 from utils.cleanup_orphans import cleanup_orphans
 from torch.utils.data import DataLoader
 # from utils.memory_profiler import get_profiler, log_memory  # Memory profiling disabled
+
+# Local mode evaluator (CPU-optimized, no I/O during evaluation)
+from training.local_evaluator import LocalEvaluator
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -326,14 +331,16 @@ def _run_validation_worker(args):
     Similar to _run_episode_worker but focused on validation-only tasks.
 
     Args:
-        args: Tuple of (agent_state, validation_slices, quality_threshold, seed)
+        args: Tuple of (agent_state, validation_slices, quality_threshold, seed, use_penalized_median)
               Note: env_config, env, and agent_cache are accessed from globals
+              use_penalized_median: If True, use Penalized Median (median - 0.5*std) instead of
+                                    pessimistic (0.4*mean + 0.6*min) aggregation
 
     Returns:
         Dict with validation results (fitness, metrics, etc.)
     """
     global _worker_env_config, _worker_env, _worker_agent_cache
-    agent_state, validation_slices, quality_threshold, seed = args
+    agent_state, validation_slices, quality_threshold, seed, use_penalized_median = args
 
     # Set worker-specific seed for reproducibility
     np.random.seed(seed)
@@ -427,11 +434,20 @@ def _run_validation_worker(args):
         if 'closed_trades' in episode_info and episode_info['closed_trades']:
             all_closed_trades.extend(episode_info['closed_trades'])
 
-    # Calculate aggregated validation fitness (0.4*mean + 0.6*min)
+    # Calculate aggregated validation fitness
     fitness_scores = [result['fitness'] for result in slice_results]
     mean_score = np.mean(fitness_scores)
     min_score = np.min(fitness_scores)
-    validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
+
+    if use_penalized_median:
+        # Penalized Median: median - (0.5 * std)
+        # Rewards consistent performance, penalizes volatility
+        median_score = np.median(fitness_scores)
+        std_score = np.std(fitness_scores)
+        validation_fitness = float(median_score - (0.5 * std_score))
+    else:
+        # Pessimistic: 0.4*mean + 0.6*min
+        validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
 
     # Aggregate metrics
     total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -553,7 +569,8 @@ class ERLTrainer:
     def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
                  consistency_mode: bool = False, heroes_hof_dir: str = None, single_agent_path: str = None,
                  buffer_storage_path: str = None, reset_limit: bool = False, original_stdout=None, original_stderr=None,
-                 multi_mode: bool = False, multi_roster: dict = None, maverick_mode: bool = False):
+                 multi_mode: bool = False, multi_roster: dict = None, maverick_mode: bool = False,
+                 local_mode: bool = False):
         """
         Initialize ERL trainer.
 
@@ -571,6 +588,7 @@ class ERLTrainer:
             multi_mode: If True, enable multi-agent committee training mode
             multi_roster: Committee roster dict with 9 members (required if multi_mode=True)
             maverick_mode: If True, enable Maverick training mode (aggressive reward functions)
+            local_mode: If True, use sequential evaluation/validation and serialize disk writes
         """
         self.data_loader = data_loader
         self.resume_run_name = resume_run_name
@@ -582,6 +600,7 @@ class ERLTrainer:
         self.external_buffer_storage_path = buffer_storage_path  # Optional path to reuse existing buffer
         self.reset_limit = reset_limit  # Reset fallback counter on resume
         self.maverick_mode = maverick_mode  # Maverick training mode (aggressive reward functions)
+        self.local_mode = local_mode  # Local mode: sequential execution and serialized disk writes
 
         # Multi-agent committee mode (sequential training of each member)
         self.multi_mode = multi_mode
@@ -598,6 +617,14 @@ class ERLTrainer:
             self.multi_parent_agent = None  # Reference to the parent agent for parent mutant injection
             self.multi_gens_since_improvement = 0  # Generations since last improvement (post-warmup)
             self.multi_best_score_for_member = float('-inf')  # Best score seen for current member
+            # Phase tracking for maverick/non-maverick separation
+            self.multi_phase = 'non_maverick'  # 'non_maverick' or 'maverick'
+            self.non_maverick_members = []  # List of member indices that are non-maverick
+            self.maverick_members = []  # List of member indices that are maverick
+            self.current_non_maverick_idx = 0  # Index into non_maverick_members list
+            self.current_maverick_idx = 0  # Index into maverick_members list
+            self.non_maverick_turnovers_per_agent = []  # Track turnovers per non-maverick agent
+            self.maverick_turnovers_per_agent = []  # Track turnovers per maverick agent
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -615,8 +642,9 @@ class ERLTrainer:
         self.normalization_stats = data_loader.compute_normalization_stats()
 
         # Initialize population (multi-mode uses standard size, trains one member at a time)
-        pop_size = Config.POPULATION_SIZE  # 96 for all modes
-        print(f"Initializing population of {pop_size} agents...")
+        # Local mode uses smaller population (32 vs 96) for faster iteration
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+        print(f"Initializing population of {pop_size} agents{'  (local mode)' if self.local_mode else ''}...")
         self.population = [DDPGAgent(agent_id=i) for i in range(pop_size)]
 
         # Training range (excludes validation set)
@@ -686,7 +714,7 @@ class ERLTrainer:
                             id=wandb_run_id,
                             resume="must",  # Must resume this specific run
                             config={
-                                "population_size": Config.POPULATION_SIZE,
+                                "population_size": Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE,
                                 "num_generations": Config.NUM_GENERATIONS,
                                 "buffer_size": Config.BUFFER_SIZE,
                                 "batch_size": Config.BATCH_SIZE,
@@ -707,7 +735,7 @@ class ERLTrainer:
                             name=self.resume_run_name,  # Try to use same name
                             resume="allow",
                             config={
-                                "population_size": Config.POPULATION_SIZE,
+                                "population_size": Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE,
                                 "num_generations": Config.NUM_GENERATIONS,
                                 "buffer_size": Config.BUFFER_SIZE,
                                 "batch_size": Config.BATCH_SIZE,
@@ -726,6 +754,15 @@ class ERLTrainer:
 
                     # Update last_run.json with the resumed run info
                     self._write_last_run_file()
+
+                    # Suppress W&B step order warnings when resuming
+                    # (W&B's internal step counter may be ahead of our resume point)
+                    import warnings
+                    warnings.filterwarnings(
+                        'ignore',
+                        message='.*step.*less than the current step.*',
+                        module='wandb.*'
+                    )
                 else:
                     # New training run
                     print("--- Initializing new W&B run (main.py mode) ---")
@@ -733,7 +770,7 @@ class ERLTrainer:
                         project="eigen2-self",
                         #name=f"erl-{Config.NUM_GENERATIONS}gen",
                         config={
-                            "population_size": Config.POPULATION_SIZE,
+                            "population_size": Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE,
                             "num_generations": Config.NUM_GENERATIONS,
                             "buffer_size": Config.BUFFER_SIZE,
                             "batch_size": Config.BATCH_SIZE,
@@ -1026,8 +1063,19 @@ class ERLTrainer:
 
         # Initialize shared memory for parallel worker data (eliminates serialization overhead)
         # This creates shared memory blocks for data arrays that workers can access directly
-        print("Initializing shared memory for parallel workers...")
-        self._init_shared_memory()
+        if not self.local_mode:
+            print("Initializing shared memory for parallel workers...")
+            self._init_shared_memory()
+        else:
+            print("Local mode: Skipping shared memory (CPU-optimized evaluation)")
+            self._shared_memory_names = {}  # Empty dict for compatibility
+
+        # Initialize LocalEvaluator for CPU-optimized local mode
+        # This must be initialized after eval_env but before checkpoint loading
+        self.local_evaluator = None
+        if self.local_mode:
+            print("Initializing LocalEvaluator for CPU-optimized execution...")
+            self.local_evaluator = LocalEvaluator(self)
 
         # Load heroes from Hall of Fame if specified (must happen after env creation, before checkpoint load)
         if self.heroes_hof_dir:
@@ -1103,7 +1151,9 @@ class ERLTrainer:
         shm_data_view[:] = data_array[:]
         self._shm_blocks.append(self._shm_data_array)
         # Register with resource tracker for crash-safe cleanup (prevents zombie segments)
-        resource_tracker.register(self._shm_data_array.name, "shared_memory")
+        # Note: resource_tracker is POSIX-only, not available on Windows
+        if sys.platform != 'win32':
+            resource_tracker.register(self._shm_data_array.name, "shared_memory")
 
         # Create shared memory for data_array_full (full features for environment)
         data_array_full = self.data_loader.data_array_full
@@ -1120,7 +1170,9 @@ class ERLTrainer:
         shm_full_view[:] = data_array_full[:]
         self._shm_blocks.append(self._shm_data_array_full)
         # Register with resource tracker for crash-safe cleanup (prevents zombie segments)
-        resource_tracker.register(self._shm_data_array_full.name, "shared_memory")
+        # Note: resource_tracker is POSIX-only, not available on Windows
+        if sys.platform != 'win32':
+            resource_tracker.register(self._shm_data_array_full.name, "shared_memory")
 
         # Store metadata for workers
         self._shm_metadata = {
@@ -1220,15 +1272,37 @@ class ERLTrainer:
         # Force garbage collection to ensure workers are cleaned up
         gc.collect()
 
-        print(f"Creating DataLoader with {Config.NUM_DATALOADER_WORKERS} background workers...")
-        self.replay_dataloader = DataLoader(
-            self.replay_buffer,
-            batch_size=None,  # Already batched by __iter__
-            num_workers=Config.NUM_DATALOADER_WORKERS,
-            pin_memory=True,  # Faster GPU transfer
-            prefetch_factor=Config.PREFETCH_FACTOR,  # Each worker prefetches batches ahead
-            persistent_workers=True  # Keep workers alive between epochs
-        )
+        # Set batch size and workers based on mode
+        # Local mode: FORCE num_workers=0 to prevent "Stale Buffer" issue on Windows
+        # With workers > 0, worker processes get a COPY of self.buffer at iter() time.
+        # They never see new files added in Generation 2+, causing infinite sleep/starvation.
+        # With num_workers=0, main process runs __iter__ directly and always sees updates.
+        if self.local_mode:
+            self.replay_buffer.training_batch_size = Config.LOCAL_BATCH_SIZE
+            num_workers = Config.LOCAL_NUM_DATALOADER_WORKERS  # Should be 0 for local mode
+            print(f"Creating DataLoader with {num_workers} workers (batch_size={Config.LOCAL_BATCH_SIZE} for local mode)...")
+        else:
+            self.replay_buffer.training_batch_size = Config.BATCH_SIZE
+            num_workers = Config.NUM_DATALOADER_WORKERS
+            print(f"Creating DataLoader with {num_workers} background workers...")
+
+        # num_workers=0 runs in main process - different options required
+        if num_workers == 0:
+            self.replay_dataloader = DataLoader(
+                self.replay_buffer,
+                batch_size=None,  # Already batched by __iter__
+                num_workers=0,
+                pin_memory=True  # Faster GPU transfer
+            )
+        else:
+            self.replay_dataloader = DataLoader(
+                self.replay_buffer,
+                batch_size=None,  # Already batched by __iter__
+                num_workers=num_workers,
+                pin_memory=True,  # Faster GPU transfer
+                prefetch_factor=2,  # Each worker prefetches 2 batches ahead
+                persistent_workers=True  # Keep workers alive between epochs
+            )
         # Reset iterator when creating new DataLoader
         self.batch_iterator = None
 
@@ -1391,9 +1465,11 @@ class ERLTrainer:
                 final_fitness = np.mean(sorted_fitness[:2])
             hero_fitness.append((final_fitness, loaded_agents[agent_idx]))
 
-        # Sort by fitness (descending) and select top 32
+        # Sort by fitness (descending) and select top agents
+        # Respect local mode's smaller population size
         hero_fitness.sort(key=lambda x: x[0], reverse=True)
-        num_to_select = min(Config.POPULATION_SIZE, len(hero_fitness))
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+        num_to_select = min(pop_size, len(hero_fitness))
 
         print(f"\n--- Selecting top {num_to_select} heroes ---")
         print("Top 5 heroes:")
@@ -1408,7 +1484,7 @@ class ERLTrainer:
             selected_heroes.append(agent)
 
         # Fill remaining slots with random agents if needed (NOT clones)
-        num_random_needed = Config.POPULATION_SIZE - len(selected_heroes)
+        num_random_needed = pop_size - len(selected_heroes)
         if num_random_needed > 0:
             print(f"\n  Filling {num_random_needed} remaining slots with random agents")
             for i in range(num_random_needed):
@@ -1492,10 +1568,10 @@ class ERLTrainer:
             print(f"   Median HoF ROI: {hof_stats['median_roi']:.2f}% (benchmark for ROI adjustment)")
 
         print(f"\nUsing heroes mode elite/offspring fractions:")
-        print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_ELITE_FRAC)} agents)")
-        print(f"  Offspring: {Config.HEROES_OFFSPRING_FRAC * 100:.1f}% ({int(Config.POPULATION_SIZE * Config.HEROES_OFFSPRING_FRAC)} agents)")
+        print(f"  Elite: {Config.HEROES_ELITE_FRAC * 100:.1f}% ({int(pop_size * Config.HEROES_ELITE_FRAC)} agents)")
+        print(f"  Offspring: {Config.HEROES_OFFSPRING_FRAC * 100:.1f}% ({int(pop_size * Config.HEROES_OFFSPRING_FRAC)} agents)")
         mutant_frac = 1.0 - Config.HEROES_ELITE_FRAC - Config.HEROES_OFFSPRING_FRAC
-        print(f"  Mutants: {mutant_frac * 100:.1f}% ({int(Config.POPULATION_SIZE * mutant_frac)} agents)")
+        print(f"  Mutants: {mutant_frac * 100:.1f}% ({int(pop_size * mutant_frac)} agents)")
         print("="*60 + "\n")
 
     def load_single_agent(self, agent_path: str, stored_gauntlet_score: float = None):
@@ -1539,7 +1615,8 @@ class ERLTrainer:
         self.initial_single_baseline = baseline  # Store original for final summary
 
         # 4. Initialize population with clones + mutations
-        pop_size = Config.POPULATION_SIZE
+        # Respect local mode's smaller population size
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
         num_clones = int(pop_size * Config.SINGLE_CLONE_FRAC)
         num_normal_mutants = int(pop_size * Config.SINGLE_NORMAL_MUTATION_FRAC)
         num_plateau_mutants = pop_size - num_clones - num_normal_mutants
@@ -1639,7 +1716,10 @@ class ERLTrainer:
 
         # Run full validation to establish self-referential baselines
         # Note: validate_population_parallel returns raw validation metrics
-        validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
+        if self.local_mode:
+            validation_results = self.local_evaluator.validate_population(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
+        else:
+            validation_results = self.validate_population_parallel(quality_threshold=Config.ROI_QUALITY_THRESHOLD)
 
         # Initialize storage for each member's specific starting ROI
         # This allows each member to compete against THEMSELVES, not a global median
@@ -1658,14 +1738,23 @@ class ERLTrainer:
             self.member_starting_rois[member_idx] = agent_roi
 
             # 2. Calculate Base Fitness
-            base_combined_fitness = val_fitness + min(0.0, train_fitness)
+            # BUGFIX: Clamp val_fitness to 0 if agent isn't trading (val_fitness = -500)
+            # Without this, a non-trading agent gets baseline of -500, making any improvement trivial
+            clamped_val_fitness = max(0.0, val_fitness)
+            base_combined_fitness = clamped_val_fitness + min(0.0, train_fitness)
 
-            # 3. Force ZERO adjustment for the baseline (Self vs Self = 0)
-            # We want the baseline to represent "no improvement yet"
-            # During training, the hurdle will be set to this member's starting ROI
-            roi_adjustment = 0.0
+            # 3. Calculate ROI adjustment using the SAME formula as training
+            # This ensures baseline and training scores are comparable
+            # Formula: |base_fitness| * multiplier * (agent_roi - hurdle_roi) / 100
+            # For baseline, hurdle_roi = agent's own ROI, so adjustment = 0
+            # But we compute it explicitly to match the training path
+            hurdle_roi = agent_roi  # Self-referential: competing against own starting ROI
+            min_trades_threshold = Config.ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY
+            confidence_factor = min(1.0, quality_count / min_trades_threshold) if min_trades_threshold > 0 else 1.0
+            roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - hurdle_roi) / 100.0
+            roi_adjustment = roi_adjustment * confidence_factor  # = 0 since agent_roi == hurdle_roi
 
-            # 4. Set the baseline (no ROI adjustment for initial baseline)
+            # 4. Set the baseline
             combined_fitness = base_combined_fitness + roi_adjustment
 
             # Store in result
@@ -1690,10 +1779,52 @@ class ERLTrainer:
         print(f"\n✓ All {len(members)} members evaluated")
         print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
         print(f"  Breakthrough threshold: {Config.MULTI_BREAKTHROUGH_THRESHOLD * 100:.0f}%")
-        print(f"  Training sequence: One breakthrough per member, then rotate")
-
+        
+        # Separate members into non-maverick and maverick lists
+        self.non_maverick_members = []
+        self.maverick_members = []
+        
+        for member_idx, member in enumerate(members):
+            is_maverick = member.get('is_maverick', False)
+            if is_maverick:
+                self.maverick_members.append(member_idx)
+            else:
+                self.non_maverick_members.append(member_idx)
+        
+        # Validate: at least one maverick in committee (user requirement)
+        if len(self.maverick_members) == 0:
+            raise ValueError(
+                "ERROR: No maverick agents found in committee. "
+                "At least one maverick agent is required in the committee."
+            )
+        
+        # If all members are mavericks, skip non-maverick phase
+        if len(self.non_maverick_members) == 0:
+            print(f"\n⚠ All {len(members)} members are mavericks - skipping non-maverick phase")
+            self.multi_phase = 'maverick'
+            self.maverick_mode = True
+            # Initialize maverick turnovers tracking
+            self.maverick_turnovers_per_agent = [0] * len(self.maverick_members)
+            self.current_maverick_idx = 0
+            print(f"  Training sequence: 3 turnovers per maverick agent, sequentially")
+        else:
+            # Start with non-maverick phase
+            self.multi_phase = 'non_maverick'
+            self.maverick_mode = False
+            # Initialize non-maverick turnovers tracking
+            self.non_maverick_turnovers_per_agent = [0] * len(self.non_maverick_members)
+            self.current_non_maverick_idx = 0
+            print(f"  Non-maverick members: {len(self.non_maverick_members)}")
+            print(f"  Maverick members: {len(self.maverick_members)}")
+            print(f"  Training sequence: 3 turnovers per non-maverick agent, sequentially")
+            print(f"  Then: Clear buffer/population and train maverick agents")
+        
         # Now load the first member for training
-        self._load_multi_member(0)
+        if self.multi_phase == 'maverick':
+            first_member_idx = self.maverick_members[0]
+        else:
+            first_member_idx = self.non_maverick_members[0]
+        self._load_multi_member(first_member_idx)
 
     def _load_multi_member(self, member_idx: int):
         """
@@ -1708,6 +1839,27 @@ class ERLTrainer:
         self.current_member_idx = member_idx
         member = self.multi_roster['members'][member_idx]
         context_window = self.multi_roster['context_window_days']
+        
+        # Ensure maverick_mode is set correctly based on phase
+        if self.multi_phase == 'maverick':
+            self.maverick_mode = True
+            # Recreate environment with maverick_mode=True if not already set
+            if not hasattr(self.eval_env, 'maverick_mode') or not self.eval_env.maverick_mode:
+                print(f"  Recreating environment with maverick_mode=True...")
+                self.eval_env = TradingEnvironment(
+                    data_array=self.data_loader.data_array,
+                    dates=self.data_loader.dates,
+                    normalization_stats=self.normalization_stats,
+                    start_idx=self.train_start_idx,
+                    end_idx=self.train_end_idx,
+                    trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+                    data_array_full=self.data_loader.data_array_full,
+                    consistency_mode=self.consistency_mode,
+                    maverick_mode=True
+                )
+                print(f"  ✓ Environment updated for maverick mode")
+        else:
+            self.maverick_mode = False
 
         # Record when this member started training for warmup enforcement
         self.member_training_start_gen = self.generation
@@ -1721,16 +1873,39 @@ class ERLTrainer:
         print(f"\n{'='*60}")
         print(f"🎯 MULTI-MODE: Loading Member {member_idx} for Training")
         print(f"{'='*60}")
+        print(f"  Phase: {self.multi_phase}")
         print(f"  Member: {member['run_name']}_{member['agent_id']}")
+        print(f"  Maverick mode: {self.maverick_mode}")
         print(f"  Member Starting ROI: {target_roi:.2f}%")
         print(f"  Training Hurdle set to: {self.roi_hurdle_ema:.2f}%")
         print(f"  Baseline: {self.member_baselines[member_idx]:.2f}")
         print(f"  Current breakthroughs: {self.member_breakthroughs[member_idx]}")
-        print(f"  Target for this round: {self.turnovers_completed + 1}")
+        if self.multi_phase == 'non_maverick':
+            list_idx = self.non_maverick_members.index(member_idx) if member_idx in self.non_maverick_members else -1
+            if list_idx >= 0:
+                print(f"  Turnovers for this agent: {self.non_maverick_turnovers_per_agent[list_idx]}/{Config.MULTI_TARGET_TURNOVERS}")
+        elif self.multi_phase == 'maverick':
+            list_idx = self.maverick_members.index(member_idx) if member_idx in self.maverick_members else -1
+            if list_idx >= 0:
+                print(f"  Turnovers for this agent: {self.maverick_turnovers_per_agent[list_idx]}/{Config.MULTI_TARGET_TURNOVERS}")
 
         agent_path = get_agent_filepath(member, context_window)
         source_agent = DDPGAgent(agent_id=0)
         source_agent.load(str(agent_path))
+
+        # FIX 2: Re-evaluate baseline if in Maverick phase (or if maverick_mode changed)
+        # The stored baseline might be from a different reward function (Standard vs Maverick)
+        # Maverick reward function uses completely different scale (e.g., -5000 penalties, different volume scalars)
+        # Comparing Maverick scores against Standard baselines is mathematically invalid
+        if self.maverick_mode:
+            print(f"  Re-evaluating baseline for Maverick scoring...")
+            # Use the helper to evaluate with current reward function (maverick_mode=True)
+            # This ensures the baseline matches the CURRENT reward function's scale
+            fresh_baseline = self._evaluate_single_agent_for_baseline(source_agent)
+            self.member_baselines[member_idx] = fresh_baseline
+            print(f"  Updated Baseline (Maverick Scale): {fresh_baseline:.2f}")
+        # Note: For non-maverick phase, we keep the original baseline from initialization
+        # which was calculated with the standard reward function
 
         # Store the parent agent for potential stuck recovery (parent mutant injection)
         self.multi_parent_agent = source_agent.clone()
@@ -1745,7 +1920,8 @@ class ERLTrainer:
         self.initial_single_baseline = self.member_baselines[member_idx]
 
         # Initialize population with clones + mutations (same as single mode)
-        pop_size = Config.POPULATION_SIZE
+        # Respect local mode's smaller population size
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
         num_clones = int(pop_size * Config.SINGLE_CLONE_FRAC)
         num_normal_mutants = int(pop_size * Config.SINGLE_NORMAL_MUTATION_FRAC)
         num_plateau_mutants = pop_size - num_clones - num_normal_mutants
@@ -1806,38 +1982,199 @@ class ERLTrainer:
 
     def _advance_to_next_multi_member(self) -> bool:
         """
-        Advance to the next committee member that needs a breakthrough for current turnover.
+        Advance to the next committee member based on phase.
+        
+        Non-maverick phase: Train each non-maverick agent for 3 turnovers sequentially.
+        Maverick phase: Train each maverick agent for 3 turnovers sequentially.
 
         Returns:
-            True if advanced to next member, False if turnover complete or all done
+            True if advanced to next member, False if all done or phase transition needed
         """
-        target_breakthroughs = self.turnovers_completed + 1
-
-        # Find next member that hasn't achieved current target
-        start_idx = self.current_member_idx
-        for offset in range(1, self.num_committee_members + 1):
-            next_idx = (start_idx + offset) % self.num_committee_members
-            if self.member_breakthroughs[next_idx] < target_breakthroughs:
-                self._load_multi_member(next_idx)
+        if self.multi_phase == 'non_maverick':
+            # Non-maverick phase: sequential 3 turnovers per agent
+            if len(self.non_maverick_members) == 0:
+                # No non-maverick members - transition to maverick phase
+                return self._transition_to_maverick_phase()
+            
+            current_list_idx = self.current_non_maverick_idx
+            current_member_idx = self.non_maverick_members[current_list_idx]
+            # Check breakthroughs (turnovers) for current agent
+            current_breakthroughs = self.member_breakthroughs[current_member_idx]
+            
+            # Check if current non-maverick agent has completed 3 turnovers (breakthroughs)
+            if current_breakthroughs >= Config.MULTI_TARGET_TURNOVERS:
+                # Move to next non-maverick agent
+                self.current_non_maverick_idx += 1
+                
+                # Check if all non-maverick agents are done
+                if self.current_non_maverick_idx >= len(self.non_maverick_members):
+                    # All non-maverick agents complete - transition to maverick phase
+                    print(f"\n{'='*60}")
+                    print(f"✓ NON-MAVERICK PHASE COMPLETE")
+                    print(f"  All {len(self.non_maverick_members)} non-maverick agents completed {Config.MULTI_TARGET_TURNOVERS} turnovers each")
+                    print(f"{'='*60}")
+                    return self._transition_to_maverick_phase()
+                
+                # Load next non-maverick agent
+                next_member_idx = self.non_maverick_members[self.current_non_maverick_idx]
+                self._load_multi_member(next_member_idx)
                 return True
-
-        # All members have achieved target - check for turnover
-        min_breakthroughs = min(self.member_breakthroughs)
-        if min_breakthroughs > self.turnovers_completed:
-            self.turnovers_completed = min_breakthroughs
-            self._process_multi_turnover()
-
-            # Check if we've reached final target
-            if self.turnovers_completed >= Config.MULTI_TARGET_TURNOVERS:
-                return False  # All done!
-
-            # Start next round with first member that needs breakthrough
-            for idx in range(self.num_committee_members):
-                if self.member_breakthroughs[idx] < self.turnovers_completed + 1:
-                    self._load_multi_member(idx)
-                    return True
-
+            else:
+                # Current agent needs more turnovers - continue training same agent
+                return True
+        
+        elif self.multi_phase == 'maverick':
+            # Maverick phase: sequential 3 turnovers per agent
+            if len(self.maverick_members) == 0:
+                return False  # No maverick members (shouldn't happen due to validation)
+            
+            current_list_idx = self.current_maverick_idx
+            current_member_idx = self.maverick_members[current_list_idx]
+            # Check breakthroughs (turnovers) for current agent
+            current_breakthroughs = self.member_breakthroughs[current_member_idx]
+            
+            # Check if current maverick agent has completed 3 turnovers (breakthroughs)
+            if current_breakthroughs >= Config.MULTI_TARGET_TURNOVERS:
+                # Move to next maverick agent
+                self.current_maverick_idx += 1
+                
+                # Check if all maverick agents are done
+                if self.current_maverick_idx >= len(self.maverick_members):
+                    # All maverick agents complete - training done!
+                    print(f"\n{'='*60}")
+                    print(f"✓ MAVERICK PHASE COMPLETE")
+                    print(f"  All {len(self.maverick_members)} maverick agents completed {Config.MULTI_TARGET_TURNOVERS} turnovers each")
+                    print(f"{'='*60}")
+                    return False
+                
+                # Load next maverick agent
+                next_member_idx = self.maverick_members[self.current_maverick_idx]
+                self._load_multi_member(next_member_idx)
+                return True
+            else:
+                # Current agent needs more turnovers - continue training same agent
+                return True
+        
         return False  # Should not reach here
+    
+    def _transition_to_maverick_phase(self) -> bool:
+        """
+        Transition from non-maverick phase to maverick phase.
+        Clears buffer, resets population, and enables maverick mode.
+        
+        Returns:
+            True if transition successful and first maverick loaded, False otherwise
+        """
+        print(f"\n{'='*60}")
+        print(f"🔄 TRANSITIONING TO MAVERICK PHASE")
+        print(f"{'='*60}")
+        
+        # Reset buffer and population
+        self._reset_for_maverick_phase()
+        
+        # Load first maverick agent
+        if len(self.maverick_members) > 0:
+            first_maverick_idx = self.maverick_members[0]
+            self.current_maverick_idx = 0
+            self._load_multi_member(first_maverick_idx)
+            return True
+        
+        return False
+    
+    def _reset_for_maverick_phase(self):
+        """
+        Reset buffer, population, and environment for maverick phase.
+        Called when transitioning from non-maverick to maverick phase.
+        """
+        print(f"\n  Clearing replay buffer and resetting population...")
+        
+        # Clear replay buffer
+        if hasattr(self.replay_buffer, 'clear'):
+            self.replay_buffer.clear()
+            
+            # FIX 3: Physically delete buffer files to prevent "zombie" files
+            # The clear() method clears the deque but doesn't delete physical files
+            import shutil
+            if hasattr(self.replay_buffer, 'storage_path'):
+                storage_path = Path(self.replay_buffer.storage_path)
+                if storage_path.exists():
+                    print(f"  Physically deleting buffer files in {storage_path}...")
+                    try:
+                        # Delete entire directory and recreate to ensure clean slate
+                        shutil.rmtree(storage_path)
+                        storage_path.mkdir(parents=True, exist_ok=True)
+                        print(f"  ✓ Buffer directory cleaned (deleted and recreated)")
+                    except Exception as e:
+                        print(f"  ⚠ Failed to clean buffer directory: {e}")
+                    
+                    # Reset file ID counter if buffer uses one
+                    if hasattr(self.replay_buffer, 'file_id_counter'):
+                        self.replay_buffer.file_id_counter = 0
+                    if hasattr(self.replay_buffer, 'total_added'):
+                        self.replay_buffer.total_added = 0
+                    if hasattr(self.replay_buffer, 'total_transitions'):
+                        self.replay_buffer.total_transitions = 0
+            
+            print(f"  ✓ Replay buffer cleared (memory + disk)")
+        else:
+            print(f"  ⚠ Replay buffer does not support clear() - manual cleanup may be needed")
+        
+        # Reset population - create fresh population
+        pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+        print(f"  Creating fresh population of {pop_size} agents...")
+        self.population = [DDPGAgent(agent_id=i) for i in range(pop_size)]
+        print(f"  ✓ Population reset")
+        
+        # Set phase and enable maverick mode
+        self.multi_phase = 'maverick'
+        self.maverick_mode = True
+        
+        # Initialize maverick turnovers tracking
+        self.maverick_turnovers_per_agent = [0] * len(self.maverick_members)
+        self.current_maverick_idx = 0
+        
+        # Reset breakthrough tracking for maverick phase (keep member_breakthroughs for all members)
+        # But reset member-specific tracking
+        self.multi_gens_since_improvement = 0
+        self.multi_best_score_for_member = float('-inf')
+        self.multi_parent_agent = None
+        
+        # CRITICAL: Reset baselines for maverick phase
+        # Mavericks use a different reward function (FOMO/ROI-First) with different fitness scale
+        # Comparing maverick performance against non-maverick baselines would be incorrect
+        self.confirmed_baseline = 0.0
+        self.initial_single_baseline = 0.0
+        print(f"  ✓ Baselines reset for maverick phase (different fitness scale)")
+        
+        # Recreate environment with maverick_mode=True
+        print(f"  Recreating environment with maverick_mode=True...")
+        self.eval_env = TradingEnvironment(
+            data_array=self.data_loader.data_array,
+            dates=self.data_loader.dates,
+            normalization_stats=self.normalization_stats,
+            start_idx=self.train_start_idx,
+            end_idx=self.train_end_idx,
+            trading_end_idx=self.train_start_idx + Config.TRADING_PERIOD_DAYS,
+            data_array_full=self.data_loader.data_array_full,
+            consistency_mode=self.consistency_mode,
+            maverick_mode=True  # Enable maverick mode
+        )
+        print(f"  ✓ Environment recreated with maverick_mode=True")
+        
+        # Update shared memory config for workers (if not in local mode)
+        # CRITICAL: Recreate shared memory with maverick_mode=True to prevent global state leaks
+        # Workers cache _worker_env_config globally, so we must recreate shared memory
+        # to ensure they get the updated maverick_mode flag
+        if not self.local_mode:
+            print(f"  Recreating shared memory with maverick_mode=True for workers...")
+            # FIX 1: Clean up OLD shared memory before creating new blocks
+            # This prevents memory leaks (2-3GB of old shared memory staying locked)
+            self._cleanup_shared_memory()
+            # Reinitialize shared memory with updated maverick_mode
+            self._init_shared_memory()
+            print(f"  ✓ Shared memory recreated - workers will use maverick_mode=True on next ProcessPoolExecutor")
+        
+        print(f"  ✓ Reset complete - ready for maverick phase")
 
     def _evaluate_single_agent_for_baseline(self, agent: DDPGAgent) -> float:
         """
@@ -1912,17 +2249,25 @@ class ERLTrainer:
                     print(f"\n  ! Worker failed: {e}")
                     slice_fitness_scores.append(-10000.0)
 
-        # Calculate pessimistic fitness (0.4*mean + 0.6*min)
-        final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+        # Calculate fitness using appropriate aggregator
+        if self.multi_mode:
+            # Penalized Median for multi-mode (consistent with Gauntlet/committee.py)
+            final_fitness = self._calculate_penalized_median_fitness(slice_fitness_scores)
+            aggregation_method = "Penalized Median"
+        else:
+            # Pessimistic for single/heroes mode
+            final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+            aggregation_method = "Pessimistic"
 
         print(f"  Slice scores: {[f'{s:.2f}' for s in slice_fitness_scores]}")
-        print(f"  Pessimistic aggregation: {final_fitness:.2f}")
+        print(f"  {aggregation_method} aggregation: {final_fitness:.2f}")
 
         return final_fitness
 
     def run_episode(self, agent: DDPGAgent, env: TradingEnvironment,
                    start_idx: int, end_idx: int,
-                   training: bool = True) -> Tuple[float, Dict]:
+                   training: bool = True,
+                   transition_collector: list = None) -> Tuple[float, Dict]:
         """
         Run one episode with an agent using a persistent environment.
 
@@ -1932,6 +2277,9 @@ class ERLTrainer:
             start_idx: Starting day index (first day of trading period)
             end_idx: Ending day index (includes settlement period)
             training: Whether this is training (adds to replay buffer)
+            transition_collector: Optional list to collect transitions instead of writing to disk.
+                                  When provided, transitions are appended here for batch writing later.
+                                  Used in local mode to serialize disk I/O.
 
         Returns:
             Tuple of (cumulative_reward, episode_info)
@@ -1951,24 +2299,30 @@ class ERLTrainer:
         )
         cumulative_reward = 0.0
         steps = 0
-        
+
         # Run episode
         while True:
             # Select action
             action = agent.select_action(state, add_noise=training)
-            
+
             # Take step
             next_state, reward, terminated, truncated, info = env.step(action)
-            
-            # Store transition in replay buffer (Off-Policy Buffer: all agents contribute)
-            # Note: training flag controls noise (line 776), not buffer saving
-            self.replay_buffer.add(
-                state=state.astype(np.float32),
-                action=action.astype(np.float32),
-                reward=reward,
-                next_state=next_state.astype(np.float32),
-                done=float(terminated or truncated)
-            )
+
+            # Store transition - either in collector for batch writing or directly to buffer
+            transition = {
+                'state': state.astype(np.float32),
+                'action': action.astype(np.float32),
+                'reward': reward,
+                'next_state': next_state.astype(np.float32),
+                'done': float(terminated or truncated)
+            }
+
+            if transition_collector is not None:
+                # Collect for batch writing (local mode)
+                transition_collector.append(transition)
+            else:
+                # Write directly to buffer (parallel mode writes in workers)
+                self.replay_buffer.add(**transition)
             
             cumulative_reward += reward
             steps += 1
@@ -2307,11 +2661,13 @@ class ERLTrainer:
         If Positive: Boosted by WR and QR
         If Negative: Penalized by Inconsistency
 
-        MAVERICK MODE: FOMO/ROI-First scoring designed to break committee deadlock.
-        Formula: Base Score - FOMO Penalty - Fear Factor
-        - Base Score: (Raw PnL / Peak Capital) * log10(Peak Capital + 10)
+        MAVERICK MODE: FOMO/ROI-First scoring with WR Gate.
+        Formula: Base Score + Expectancy Bonus - FOMO Penalty - Fear Factor - WR Penalty
+        - Base Score: (Raw PnL / Peak Capital) * log10(Peak Capital + 10) * WR^4
+        - Expectancy Bonus: Expectancy * 20.0
         - FOMO Penalty: max(0, Market Return - Agent ROI) * 10.0
-        - Fear Factor: 2.0 * (num_losses ^ 1.2) - gentle drag on losing streaks
+        - Fear Factor: 2.0 * (num_losses ^ 1.2)
+        - WR Penalty: max(0, 0.60 - WR) * 100.0 (Forces WR > 60%)
         """
         total_trades = stats.get('num_trades', 0)
 
@@ -2355,25 +2711,57 @@ class ERLTrainer:
             if peak_capital <= 0:
                 peak_capital = total_inv if total_inv > 0 else 1.0
 
-            # 1. Base Score: ROI Efficiency
-            # (Raw PnL / Peak Capital Employed) * log10(Peak Capital + 10)
+            # Calculate Expectancy explicitly
+            # Expectancy = (Win Rate * Avg Win) - (Loss Rate * Avg Loss)
+            avg_win = 0.0
+            avg_loss = 0.0
+            if closed_trades:
+                wins = [t.get('gain_pct', 0) for t in closed_trades if t.get('gain_pct', 0) >= 0]
+                losses = [abs(t.get('gain_pct', 0)) for t in closed_trades if t.get('gain_pct', 0) < 0]
+                if wins:
+                    avg_win = sum(wins) / len(wins)
+                if losses:
+                    avg_loss = sum(losses) / len(losses)
+            
+            loss_rate = 1.0 - win_rate
+            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+
+            # 1. Base Score: ROI Efficiency + WR Boost
+            # (Raw PnL / Peak Capital Employed) * log10(Peak Capital + 10) * win_rate^4
             roi_efficiency = (raw_pnl / peak_capital) * 100.0 if peak_capital > 0 else 0.0
             volume_scalar = math.log10(peak_capital + 10)
-            base_score = roi_efficiency * volume_scalar
+            
+            # Massive boost for high WR (convex function)
+            # WR 0.50 -> 0.0625 multiplier
+            # WR 0.60 -> 0.1296 multiplier (2x boost)
+            # WR 0.70 -> 0.2401 multiplier (4x boost)
+            win_rate_multiplier = win_rate ** 4
+            
+            base_score = roi_efficiency * volume_scalar * win_rate_multiplier
 
-            # 2. FOMO Penalty (Relative Performance)
+            # 2. Expectancy Bonus
+            # Add raw expectancy score (scaled to match ROI magnitude)
+            # e.g., Expectancy 0.5% -> +10 points
+            expectancy_score = expectancy * 20.0
+
+            # 3. FOMO Penalty (Relative Performance)
             # Get market return from stats (Col 44 = S&P 500 proxy)
             market_return = stats.get('market_return_pct', 0.0)
             alpha_gap = market_return - roi_pct
             fomo_penalty = max(0.0, alpha_gap) * 10.0
 
-            # 3. Fear Factor (Limited Ratchet)
+            # 4. Fear Factor (Limited Ratchet)
             # Gentle non-linear drag on losses: 2.0 * (num_losses ^ 1.2)
-            # A few losses are acceptable, but streaks become expensive
             fear_factor = 2.0 * (num_losses ** 1.2) if num_losses > 0 else 0.0
+            
+            # 5. WR Gate / Penalty
+            # Severe penalty for WR < 60% to force quality
+            wr_penalty = 0.0
+            if win_rate < 0.60:
+                wr_penalty = (0.60 - win_rate) * 100.0  # e.g., 55% WR -> 5.0 penalty
 
             # Final Maverick Fitness
-            fitness = base_score - fomo_penalty - fear_factor
+            fitness = base_score + expectancy_score - fomo_penalty - fear_factor - wr_penalty
 
             return float(fitness)
 
@@ -2429,6 +2817,25 @@ class ERLTrainer:
         mean_score = np.mean(slice_fitness_scores)
         min_score = np.min(slice_fitness_scores)
         return (0.4 * mean_score) + (0.6 * min_score)
+
+    def _calculate_penalized_median_fitness(self, slice_fitness_scores: List[float]) -> float:
+        """
+        Calculate fitness using Penalized Median scoring: Median - (0.5 * StdDev).
+
+        This rewards agents that reliably perform well while penalizing volatility.
+        Used by Gauntlet validation and --multi mode to ensure consistent performance
+        across diverse market conditions.
+
+        Args:
+            slice_fitness_scores: List of fitness scores from multiple evaluation slices
+
+        Returns:
+            Penalized median fitness score
+        """
+        scores_np = np.array(slice_fitness_scores)
+        median_score = float(np.median(scores_np))
+        std_score = float(np.std(scores_np))
+        return median_score - (0.5 * std_score)
 
     def _aggregate_agent_stats(self, slice_episode_stats: List[Dict]) -> Dict:
         """
@@ -2490,6 +2897,9 @@ class ERLTrainer:
         - Final fitness = average of the LOWEST 2 scores (conservative, robust estimate)
         - This prevents "lucky" agents from advancing and selects for consistency
 
+        In local mode, transitions are collected in memory and batch-written to disk
+        at the end to avoid I/O thrashing from many small writes.
+
         Returns:
             Tuple of (fitness_scores, aggregate_stats)
         """
@@ -2497,9 +2907,13 @@ class ERLTrainer:
         all_episode_stats = []
 
         # Use same number of episodes and scoring method for both modes
-        # ALWAYS use pessimistic aggregator (0.4*mean + 0.6*min) to align with validation gatekeeper
         num_episodes = 5 if self.consistency_mode else 3
-        scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
+
+        # Use Penalized Median for multi-mode, pessimistic otherwise
+        if self.multi_mode:
+            scoring_method = "median - 0.5*std (Penalized Median, matches Gauntlet)"
+        else:
+            scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
@@ -2508,6 +2922,11 @@ class ERLTrainer:
         num_elites = sum(1 for a in self.population if a.is_elite)
         num_exploratory = len(self.population) - num_elites
         print(f"Elite Demonstration: {num_elites} elites (no noise) + {num_exploratory} exploratory (with noise) contribute to buffer")
+
+        # In local mode, collect transitions for batch writing to avoid I/O thrashing
+        transition_collector = [] if self.local_mode else None
+        if self.local_mode:
+            print(f"Local mode: Collecting transitions for batch write")
 
         for agent_idx, agent in enumerate(tqdm(self.population, desc="Evaluating agents")):
             # Evaluate agent on multiple random training slices
@@ -2535,7 +2954,8 @@ class ERLTrainer:
                     env=self.eval_env,  # Reuse persistent environment instead of creating new ones
                     start_idx=start_idx,
                     end_idx=end_idx,
-                    training=(not agent.is_elite)  # Only exploratory agents contribute to buffer
+                    training=(not agent.is_elite),  # Only exploratory agents contribute to buffer
+                    transition_collector=transition_collector  # Collect transitions in local mode
                 )
 
                 # Calculate Structural Fitness for Evolution
@@ -2544,8 +2964,11 @@ class ERLTrainer:
                 slice_fitness_scores.append(triad_fitness)
                 slice_episode_stats.append(episode_info)
 
-            # Calculate fitness using pessimistic aggregator (same as validation gatekeeper)
-            final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+            # Calculate fitness using appropriate aggregator
+            if self.multi_mode:
+                final_fitness = self._calculate_penalized_median_fitness(slice_fitness_scores)
+            else:
+                final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
             fitness_scores.append(final_fitness)
 
             # Aggregate episode stats across all training slices for this agent
@@ -2556,6 +2979,12 @@ class ERLTrainer:
 
         # Aggregate statistics across all agents
         aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
+
+        # In local mode, batch-write all collected transitions to disk
+        if self.local_mode and transition_collector:
+            print(f"\n--- Batch writing {len(transition_collector)} transitions to replay buffer ---")
+            self.replay_buffer.add_batch(transition_collector)
+            del transition_collector  # Free memory
 
         # CRITICAL FIX: Delete large all_episode_stats list and force aggressive GC
         del all_episode_stats
@@ -2577,9 +3006,13 @@ class ERLTrainer:
             Tuple of (fitness_scores, aggregate_stats)
         """
         # Use same number of episodes and scoring method for both modes
-        # ALWAYS use pessimistic aggregator (0.4*mean + 0.6*min) to align with validation gatekeeper
         num_episodes = 5 if self.consistency_mode else 3
-        scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
+
+        # Use Penalized Median for multi-mode, pessimistic otherwise
+        if self.multi_mode:
+            scoring_method = "median - 0.5*std (Penalized Median, matches Gauntlet)"
+        else:
+            scoring_method = "0.4*mean + 0.6*min (pessimistic, matches validation)"
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population (Parallel) ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
@@ -2720,8 +3153,11 @@ class ERLTrainer:
                 slice_fitness = [f for f, _ in agent_slices]
                 slice_stats = [info for _, info in agent_slices]
 
-                # Calculate fitness using pessimistic aggregator (same as validation gatekeeper)
-                final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
+                # Calculate fitness using appropriate aggregator
+                if self.multi_mode:
+                    final_fitness = self._calculate_penalized_median_fitness(slice_fitness)
+                else:
+                    final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
                 fitness_scores.append(final_fitness)
 
                 # Aggregate stats for this agent
@@ -2786,6 +3222,12 @@ class ERLTrainer:
 
                 # Update total_added counter
                 self.replay_buffer.total_added = file_id_counter
+                
+                # CRITICAL FIX: Update total_transitions counter
+                # Each file contains exactly 1 transition (written by workers)
+                num_new_transitions = len(all_transition_file_paths)
+                num_evicted_transitions = len(old_paths_to_delete) if old_paths_to_delete else 0
+                self.replay_buffer.total_transitions += num_new_transitions - num_evicted_transitions
 
                 # Force DataLoader reset to ensure workers drop references to files we just pushed out
                 if should_reset_workers:
@@ -2852,10 +3294,20 @@ class ERLTrainer:
 
         print(f"\n--- Training Population (Buffer: {len(self.replay_buffer)}) ---")
 
+        # Debug: Check GPU memory at start of training
+        if torch.cuda.is_available():
+            gpu_mem = torch.cuda.memory_allocated() / 1024**3
+            gpu_reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"  [GPU] Memory at training start: {gpu_mem:.2f} GB allocated, {gpu_reserved:.2f} GB reserved")
+
         # Use reduced gradient steps during stabilization phase or multi-mode for faster iteration
         # Normal: 32 steps × 192 batch = 6,144 samples (full exploration)
         # Stabilization/Multi: 10 steps × 192 batch = 1,920 samples (maintenance training)
-        if self.breakthrough_state == BreakthroughState.STABILIZATION or self.multi_mode:
+        # Local: 8 steps for faster iteration on single GPU
+        if self.local_mode:
+            gradient_steps = Config.LOCAL_GRADIENT_STEPS_PER_GENERATION
+            print(f"  [Local Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} distributed)]")
+        elif self.breakthrough_state == BreakthroughState.STABILIZATION or self.multi_mode:
             gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION_STABILIZATION
             mode_name = "Multi-Agent" if self.multi_mode else "Stabilization"
             print(f"  [{mode_name} Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} normal)]")
@@ -2863,53 +3315,126 @@ class ERLTrainer:
             gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION
 
         # Train each agent
-        for agent in tqdm(self.population, desc="Training agents"):
-            actor_losses = []
-            critic_losses = []
+        # Local mode with GPU: Process agents in batches to manage GPU memory
+        # Agents were moved to CPU after inference; we move them to GPU in batches
+        # 32 agents / 8 per batch = 4 batches
+        LOCAL_TRAINING_BATCH_SIZE = Config.LOCAL_TRAINING_AGENT_BATCH_SIZE
 
-            # Multiple gradient steps per agent
-            for step in range(gradient_steps):
-                # Gradient accumulation loop
-                for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
-                    # Get next batch from DataLoader (already prefetched by workers)
-                    # This is FAST - batch is already in RAM, loaded asynchronously
-                    batch_cpu = next(self.batch_iterator)
+        # Local mode: Use larger batches to saturate GPU and minimize disk I/O
+        # The LSTM processes batch_size × 117 sequences
+        # Config.LOCAL_BATCH_SIZE (256) × 117 = 29,952 sequences - saturates GPU compute
 
-                    # Move batch to GPU (fast transfer thanks to pin_memory)
-                    batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+        if self.local_mode and torch.cuda.is_available():
+            # Batched GPU training for local mode
+            # Uses move_to_device() to properly handle optimizer references and free GPU memory
+            num_batches = (len(self.population) + LOCAL_TRAINING_BATCH_SIZE - 1) // LOCAL_TRAINING_BATCH_SIZE
+            cpu_device = torch.device('cpu')
 
-                    # Update with gradient accumulation
-                    is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
-                    critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+            # Local mode optimizations to reduce disk I/O (the bottleneck)
+            # - Smaller population (32 vs 96)
+            # - Fewer gradient steps (8 vs 32)
+            # - Accumulation steps set via Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
+            local_accumulation_steps = Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
+            print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {gradient_steps} steps/agent (batch_size={Config.LOCAL_BATCH_SIZE}, accum={local_accumulation_steps})")
 
-                    # Capture attention weights from actor (after forward pass in update)
-                    # Only capture from first agent to avoid redundant logging
+            for batch_idx in range(num_batches):
+                batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
+                batch_end = min(batch_start + LOCAL_TRAINING_BATCH_SIZE, len(self.population))
+                batch_agents = self.population[batch_start:batch_end]
+
+                # Move batch of agents to GPU (with optimizer recreation)
+                for agent in batch_agents:
+                    agent.move_to_device(Config.DEVICE, recreate_optimizers=True)
+
+                # Train agents in this batch using DataLoader iterator
+                for agent in tqdm(batch_agents, desc=f"Training batch {batch_idx + 1}/{num_batches}"):
+                    actor_losses = []
+                    critic_losses = []
+
+                    for step in range(gradient_steps):
+                        for accum_step in range(local_accumulation_steps):
+                            # Use DataLoader iterator (has async prefetching)
+                            batch_cpu = next(self.batch_iterator)
+                            batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+
+                            is_last_accum = (accum_step == local_accumulation_steps - 1)
+                            critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+
+                            if agent.agent_id == 0:
+                                attention_weights = agent.actor.get_attention_weights()
+                                if attention_weights is not None:
+                                    self.update_feature_importance(attention_weights)
+
+                            actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
+                            critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+                            del batch
+
                     if agent.agent_id == 0:
-                        attention_weights = agent.actor.get_attention_weights()
-                        if attention_weights is not None:
-                            self.update_feature_importance(attention_weights)
+                        self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
+                        self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
+                        wandb.log({
+                            "train/actor_loss": np.mean(actor_losses),
+                            "train/critic_loss": np.mean(critic_losses),
+                        }, step=self.generation)
 
-                    # Detach from computation graph to prevent memory leak
-                    actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
-                    critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+                    del actor_losses
+                    del critic_losses
 
-                    # Explicitly delete batch tensors to free GPU memory
-                    del batch
+                # Move batch of agents back to CPU (with optimizer recreation to free GPU memory)
+                for agent in batch_agents:
+                    agent.move_to_device(cpu_device, recreate_optimizers=True)
 
-            # Log agent stats
-            if agent.agent_id == 0:  # Log first agent as representative
-                self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
-                self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
+                torch.cuda.empty_cache()
 
-                # Log to wandb
-                wandb.log({
-                    "train/actor_loss": np.mean(actor_losses),
-                    "train/critic_loss": np.mean(critic_losses),
-                }, step=self.generation)
+        else:
+            # Original code path for distributed mode or CPU-only
+            for agent in tqdm(self.population, desc="Training agents"):
+                actor_losses = []
+                critic_losses = []
 
-            # Explicitly clear loss lists to free memory
-            del actor_losses
-            del critic_losses
+                # Multiple gradient steps per agent
+                for step in range(gradient_steps):
+                    # Gradient accumulation loop
+                    for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                        # Get next batch from DataLoader (already prefetched by workers)
+                        # This is FAST - batch is already in RAM, loaded asynchronously
+                        batch_cpu = next(self.batch_iterator)
+
+                        # Move batch to GPU (fast transfer thanks to pin_memory)
+                        batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+
+                        # Update with gradient accumulation
+                        is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
+                        critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+
+                        # Capture attention weights from actor (after forward pass in update)
+                        # Only capture from first agent to avoid redundant logging
+                        if agent.agent_id == 0:
+                            attention_weights = agent.actor.get_attention_weights()
+                            if attention_weights is not None:
+                                self.update_feature_importance(attention_weights)
+
+                        # Detach from computation graph to prevent memory leak
+                        actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
+                        critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+
+                        # Explicitly delete batch tensors to free GPU memory
+                        del batch
+
+                # Log agent stats
+                if agent.agent_id == 0:  # Log first agent as representative
+                    self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
+                    self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
+
+                    # Log to wandb
+                    wandb.log({
+                        "train/actor_loss": np.mean(actor_losses),
+                        "train/critic_loss": np.mean(critic_losses),
+                    }, step=self.generation)
+
+                # Explicitly clear loss lists to free memory
+                del actor_losses
+                del critic_losses
 
         # Clear GPU cache once after training all agents
         # Note: With expandable_segments=True, CUDA handles fragmentation efficiently
@@ -2953,7 +3478,8 @@ class ERLTrainer:
         # This helps the evolution "find its way back" if it drifted too far from the parent
         if self.multi_mode and self.multi_gens_since_improvement >= 5 and self.multi_parent_agent is not None:
             # Calculate how many mutant slots to use for parent mutants (half of total mutants)
-            pop_size = Config.POPULATION_SIZE
+            # Respect local mode's smaller population size
+            pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
             num_elites = int(pop_size * Config.HEROES_ELITE_FRAC)
             num_offspring = int(pop_size * Config.HEROES_OFFSPRING_FRAC)
             num_mutants = pop_size - num_elites - num_offspring
@@ -3025,7 +3551,10 @@ class ERLTrainer:
 
         Args:
             improved_agent: The agent that achieved the improvement
-            score: The validation score achieved (base_combined_fitness)
+            score: The BASE validation score (base_combined_fitness, WITHOUT ROI adjustment).
+                   This is critical for fair comparison since baseline is also stored without
+                   ROI adjustment. Using combined_fitness would cause score inflation when
+                   the ROI hurdle changes.
             val_result: Full validation result dict with metrics
             is_breakthrough: If True, this improvement also qualifies as a breakthrough (5%+)
         """
@@ -3051,11 +3580,10 @@ class ERLTrainer:
         print(f"  Baseline: {self.member_baselines[member_idx]:.2f} -> New: {score:.2f}")
         print(f"  Improvement: {improvement_pct:.1f}%")
 
-        # Archive original member agent (locally and in cloud Global50)
+        # Archive original member agent locally (cloud archiving is handled by check_and_promote)
         original_path = get_agent_filepath(member, context_window)
-        old_filename = f"{member['run_name']}_{member['agent_id']}.pth"
 
-        # Archive locally
+        # Archive locally (for local backup)
         if original_path.exists():
             archive_dir = original_path.parent / "archive"
             archive_dir.mkdir(exist_ok=True)
@@ -3064,28 +3592,10 @@ class ERLTrainer:
             shutil.copy(original_path, archive_path)
             print(f"  Archived original to: {archive_path.name}")
 
-        # Archive in cloud Global50 (move from agents/ to archive/)
-        # This prevents orphan agents from accumulating in cloud storage
-        cloud_agents_path = f"{self.global_hof.cloud_base}/agents/{old_filename}"
-        cloud_archive_path = f"{self.global_hof.cloud_base}/archive/{old_filename}"
-
-        if self.global_hof.enabled and self.cloud_sync.file_exists(cloud_agents_path):
-            # Download to local archive if we don't have it
-            local_archive_path = self.global_hof.local_archive_dir / old_filename
-            if not local_archive_path.exists():
-                self.cloud_sync.download_file(cloud_agents_path, str(local_archive_path))
-
-            # Upload to cloud archive
-            if local_archive_path.exists():
-                upload_success = self.cloud_sync.upload_file_verified(str(local_archive_path), cloud_archive_path)
-                if upload_success:
-                    # Delete from cloud agents/ only after verified archive
-                    if self.cloud_sync.delete_file(cloud_agents_path):
-                        print(f"  Archived parent in cloud: {old_filename} (agents/ -> archive/)")
-                    else:
-                        print(f"  ⚠ Parent archived but failed to delete from cloud agents/: {old_filename}")
-                else:
-                    print(f"  ⚠ Failed to archive parent in cloud: {old_filename}")
+        # NOTE: Cloud archiving (move from agents/ to archive/) is now handled by
+        # check_and_promote via the replacing_entry parameter. This ensures atomic
+        # operations where the parent entry is removed from the JSON and its file
+        # is archived in a single transaction, preventing race conditions in --multi mode.
 
         # Save improved agent with new filename
         new_filename = f"{self.run_name}_{improved_agent.agent_id}.pth"
@@ -3116,12 +3626,10 @@ class ERLTrainer:
         total_decisions = num_wins + num_losses
         win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
 
-        # Calculate fresh conviction_threshold_vector for the improved agent
-        # This is required because the agent may have evolved different trading patterns
-        # The 95th percentile thresholds determine when conviction trades trigger
-        print(f"  Calculating conviction thresholds for improved agent...")
-        conviction_threshold_vector = self.calculate_conviction_threshold_vector(improved_agent)
-        print(f"  ✓ Conviction thresholds calculated (mean p95: {np.mean(conviction_threshold_vector):.3f})")
+        # Skip conviction threshold calculation during training - it's only needed for committee inference
+        # The thresholds will be recalculated when the committee is loaded for production use
+        # This saves ~10-30 seconds per improvement
+        conviction_threshold_vector = member.get('stats', {}).get('conviction_threshold_vector', [0.0] * Config.NUM_INVESTABLE_STOCKS)
 
         self.multi_roster['members'][member_idx] = {
             'filename': new_filename,
@@ -3166,10 +3674,38 @@ class ERLTrainer:
         if is_breakthrough:
             # Update breakthrough count for this member
             self.member_breakthroughs[member_idx] += 1
+            
+            # Track turnovers per agent based on phase
+            # Note: In this context, "turnover" = "breakthrough", so 3 turnovers = 3 breakthroughs
+            if self.multi_phase == 'non_maverick':
+                # Find which non-maverick agent this is
+                if member_idx in self.non_maverick_members:
+                    list_idx = self.non_maverick_members.index(member_idx)
+                    # Turnovers = breakthroughs (each breakthrough is a turnover)
+                    breakthroughs_for_agent = self.member_breakthroughs[member_idx]
+                    self.non_maverick_turnovers_per_agent[list_idx] = breakthroughs_for_agent
+                    
+                    if breakthroughs_for_agent >= Config.MULTI_TARGET_TURNOVERS:
+                        print(f"\n  ✓ Non-Maverick Agent {list_idx} completed {Config.MULTI_TARGET_TURNOVERS} turnovers!")
+            elif self.multi_phase == 'maverick':
+                # Find which maverick agent this is
+                if member_idx in self.maverick_members:
+                    list_idx = self.maverick_members.index(member_idx)
+                    breakthroughs_for_agent = self.member_breakthroughs[member_idx]
+                    self.maverick_turnovers_per_agent[list_idx] = breakthroughs_for_agent
+                    
+                    if breakthroughs_for_agent >= Config.MULTI_TARGET_TURNOVERS:
+                        print(f"\n  ✓ Maverick Agent {list_idx} completed {Config.MULTI_TARGET_TURNOVERS} turnovers!")
 
             # Print overall progress
             print(f"\n  Multi-Mode Progress:")
-            print(f"    Turnovers: {self.turnovers_completed}/{Config.MULTI_TARGET_TURNOVERS}")
+            print(f"    Phase: {self.multi_phase}")
+            if self.multi_phase == 'non_maverick':
+                print(f"    Current non-maverick agent: {self.current_non_maverick_idx}/{len(self.non_maverick_members)}")
+                print(f"    Non-maverick turnovers: {self.non_maverick_turnovers_per_agent}")
+            elif self.multi_phase == 'maverick':
+                print(f"    Current maverick agent: {self.current_maverick_idx}/{len(self.maverick_members)}")
+                print(f"    Maverick turnovers: {self.maverick_turnovers_per_agent}")
             print(f"    Breakthroughs: {self.member_breakthroughs}")
 
         print("="*60)
@@ -3220,7 +3756,41 @@ class ERLTrainer:
         total_decisions = num_wins + num_losses
         win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
 
+        # MULTI-MODE FIX: Bypass should_promote() gate by temporarily setting all thresholds to -inf/+inf
+        # Committee members are already in Global50 - they're replacing themselves, not competing for entry.
+        # The parent agent was archived from cloud storage but is still in the ledger until promotion completes.
+        # Without this bypass, should_promote() uses thresholds that include the parent, causing rejection.
+        original_thresholds = {
+            'entry_threshold': self.global_hof.entry_threshold,
+            'roi_threshold': self.global_hof.roi_threshold,
+            'expectancy_threshold': self.global_hof.expectancy_threshold,
+            'cv_threshold': self.global_hof.cv_threshold,
+            'gauntlet_median': self.global_hof.gauntlet_median,
+            'roi_median': self.global_hof.roi_median,
+            'expectancy_median': self.global_hof.expectancy_median,
+            'gauntlet_p25': self.global_hof.gauntlet_p25,
+            'roi_p25': self.global_hof.roi_p25,
+            'expectancy_p25': self.global_hof.expectancy_p25,
+        }
+        # Set thresholds to allow any agent through should_promote()
+        self.global_hof.entry_threshold = float('-inf')
+        self.global_hof.roi_threshold = float('-inf')
+        self.global_hof.expectancy_threshold = float('-inf')
+        self.global_hof.cv_threshold = float('inf')  # CV: lower is better, so +inf allows all
+        self.global_hof.gauntlet_median = float('-inf')
+        self.global_hof.roi_median = float('-inf')
+        self.global_hof.expectancy_median = float('-inf')
+        self.global_hof.gauntlet_p25 = float('-inf')
+        self.global_hof.roi_p25 = float('-inf')
+        self.global_hof.expectancy_p25 = float('-inf')
+
         # Upload to Global50 on every improvement
+        # Pass the parent entry to be replaced so check_and_promote can:
+        # 1. Remove it from the candidate pool before merging
+        # 2. Archive its file as part of normal dropout handling
+        # This prevents race conditions where the parent's entry persists in JSON
+        # after its file has been archived by a concurrent run.
+        parent_entry = (member['run_name'], member['agent_id'])
         promoted, rank = self.global_hof.check_and_promote(
             agent=agent,
             gauntlet_score=score,
@@ -3231,8 +3801,15 @@ class ERLTrainer:
             quality_ratio=quality_ratio,
             win_ratio=win_ratio,
             total_trades=total_trades,
-            is_maverick=self.maverick_mode
+            is_maverick=self.maverick_mode,
+            replacing_entry=parent_entry
         )
+
+        # Restore original thresholds (check_and_promote may have updated them via _update_entry_threshold)
+        # We restore only if promotion failed; if it succeeded, thresholds are already recalculated correctly
+        if not promoted:
+            for key, value in original_thresholds.items():
+                setattr(self.global_hof, key, value)
 
         if promoted:
             print(f"  ✓ Promoted to Global50: {new_filename} (Rank #{rank})")
@@ -3241,7 +3818,7 @@ class ERLTrainer:
                 self._maverick_goal_achieved = True
                 self._maverick_final_rank = rank
         else:
-            print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={self.global_hof.entry_threshold:.2f})")
+            print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={original_thresholds['entry_threshold']:.2f})")
 
     def _process_multi_turnover(self):
         """
@@ -3591,7 +4168,10 @@ class ERLTrainer:
                 # Create unique seed for this validation task
                 task_seed = self.seed + self.generation * 10000 + idx * 100
 
-                tasks.append((agent_state, validation_slices, quality_threshold, task_seed))
+                # Use Penalized Median for multi-mode (consistent with Gauntlet/committee.py)
+                use_penalized_median = self.multi_mode
+
+                tasks.append((agent_state, validation_slices, quality_threshold, task_seed, use_penalized_median))
                 agent_indices_to_validate.append((idx, agent_hash, cache_key))
 
         # If all agents were cached, return early
@@ -3764,7 +4344,7 @@ class ERLTrainer:
         # NEW SCORING FORMULA: Penalized Median
         # This rewards agents that reliably perform well while penalizing volatility
         # gauntlet_score = Median - (0.5 * StdDev)
-        gauntlet_score = float(median_score - (0.5 * std_score))
+        raw_gauntlet_score = float(median_score - (0.5 * std_score))
 
         # Calculate aggregate metrics
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -3772,7 +4352,30 @@ class ERLTrainer:
         # Pooled ROI: sum of peak capitals (slices are parallel/independent scenarios)
         # This answers: "For every dollar of max drawdown capacity across all scenarios, how much profit?"
         total_peak_capital = sum([r['peak_capital_employed'] for r in slice_results])
-        roi = (total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0
+        roi = float((total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0)
+
+        # --- ANTI-SWINDLE: EFFICIENCY-ADJUSTED GAUNTLET SCORE ---
+        #
+        # The raw Gauntlet score (Median - 0.5*StdDev) can be gamed by volume.
+        # We normalize by ROI to ensure only efficient agents get high scores.
+        #
+        # Baseline: Config.EFFICIENCY_BASELINE_ROI (default 8.0%)
+        #
+        # Formula: Adjusted Score = Raw Score + abs(Raw Score) * (10 * (ROI% - BaselineROI%))
+        #
+        # This symmetric formula:
+        # - Adds a bonus/penalty proportional to the magnitude of the raw score
+        # - Bonus when ROI > baseline, penalty when ROI < baseline
+        # - Works symmetrically for both positive and negative raw scores
+        # - Example: Raw=-100, ROI=10%, Baseline=8% → -100 + 100*10*(10-8)/100 = -100 + 20 = -80
+        # - Example: Raw=100, ROI=6%, Baseline=8% → 100 + 100*10*(6-8)/100 = 100 - 20 = 80
+        #
+        efficiency_ratio = roi / Config.EFFICIENCY_BASELINE_ROI
+        roi_diff_percentage_points = roi - Config.EFFICIENCY_BASELINE_ROI
+        # Formula: 10 * (ROI% - BaselineROI%) where both are percentages
+        # Convert percentage points to decimal: (ROI% - BaselineROI%) / 100
+        adjustment = abs(raw_gauntlet_score) * (10.0 * roi_diff_percentage_points / 100.0)
+        gauntlet_score = raw_gauntlet_score + adjustment
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])
@@ -3809,6 +4412,8 @@ class ERLTrainer:
 
         return {
             'gauntlet_score': gauntlet_score,
+            'raw_gauntlet_score': raw_gauntlet_score,  # Pre-efficiency adjustment
+            'efficiency_ratio': efficiency_ratio,  # ROI / baseline
             'cv': cv,  # Coefficient of Variation - lower is more stable
             'median_fitness': median_score,
             'std_fitness': std_score,
@@ -4218,7 +4823,9 @@ class ERLTrainer:
             stabilization_mutation_std = self.current_mutation_std * 0.5  # Half the normal noise
 
             # Fill the rest of the population with mutants of the candidate
-            for i in range(1, Config.POPULATION_SIZE):
+            # Respect local mode's smaller population size
+            pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+            for i in range(1, pop_size):
                 mutant = mutate(
                     self.breakthrough_candidate.agent,
                     mutation_rate=stabilization_mutation_rate,
@@ -4231,7 +4838,7 @@ class ERLTrainer:
             # Replace the trainer's population
             self.population = new_population
 
-            print(f"  ✓ Population locked: 1 elite + {Config.POPULATION_SIZE - 1} mutants")
+            print(f"  ✓ Population locked: 1 elite + {pop_size - 1} mutants")
             print(f"  ✓ Stabilization mutation: rate={stabilization_mutation_rate}, std={stabilization_mutation_std:.4f}")
 
             # Cleanup old population to free memory
@@ -4640,15 +5247,19 @@ class ERLTrainer:
                         else:
                             print(f"   ⓘ Agent gauntlet score: {gauntlet_score:.2f}")
                             if self.global_hof.enabled:
-                                print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p75: {self.global_hof.gauntlet_p75:.2f}")
+                                print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p25: {self.global_hof.gauntlet_p25:.2f}")
 
                     # Attempt promotion if we have a consistency-aligned score
-                    if g50_gauntlet_score is not None and self.global_hof.should_promote(
-                        g50_gauntlet_score,
-                        g50_gauntlet_results.get('roi', 0.0),
-                        g50_gauntlet_results.get('expectancy', 0.0),
-                        g50_gauntlet_results.get('cv', 100.0)
-                    ):
+                    should_promote_result = False
+                    if g50_gauntlet_score is not None:
+                        should_promote_result = self.global_hof.should_promote(
+                            g50_gauntlet_score,
+                            g50_gauntlet_results.get('roi', 0.0),
+                            g50_gauntlet_results.get('expectancy', 0.0),
+                            g50_gauntlet_results.get('cv', 100.0)
+                        )
+                    
+                    if g50_gauntlet_score is not None and should_promote_result:
                         agent_to_admit = self.breakthrough_candidate.agent
                         agent_roi = g50_gauntlet_results['roi']
                         agent_expectancy = g50_gauntlet_results['expectancy']
@@ -4675,10 +5286,41 @@ class ERLTrainer:
                         )
 
                         if promoted:
+                            print(f"\n{'='*60}")
+                            print(f"🎯 AGENT PROMOTED TO GLOBAL 50!")
+                            print(f"{'='*60}")
+                            print(f"  Rank: #{rank}")
+                            print(f"  Gauntlet Score: {g50_gauntlet_score:.2f}")
+                            if self.maverick_mode:
+                                print(f"  Type: Maverick")
+                                print(f"  Target Rank: <= #{Config.MAVERICK_TARGET_RANK}")
+                            
                             # Maverick stopping condition: Top 20 achieved
                             if self.maverick_mode and rank <= Config.MAVERICK_TARGET_RANK:
                                 self._maverick_goal_achieved = True
                                 self._maverick_final_rank = rank
+                                print(f"\n  ✅ MAVERICK GOAL ACHIEVED!")
+                                print(f"  Training will stop at end of this generation")
+                            elif self.maverick_mode:
+                                print(f"\n  ⏳ Maverick goal not yet achieved (rank #{rank} > #{Config.MAVERICK_TARGET_RANK})")
+                                print(f"  Training continues...")
+                            print(f"{'='*60}\n")
+                    elif g50_gauntlet_score is not None and self.maverick_mode:
+                        # Agent passed gauntlet but didn't qualify for promotion
+                        print(f"\n  ⓘ Agent did not qualify for Global 50 promotion")
+                        
+                        # Explicitly analyze and print promotion failure reasons
+                        _, reasons = self.global_hof.analyze_promotion(
+                            g50_gauntlet_score,
+                            g50_gauntlet_results.get('roi', 0.0),
+                            g50_gauntlet_results.get('expectancy', 0.0),
+                            g50_gauntlet_results.get('cv', 100.0)
+                        )
+                        print("  ❌ Promotion Metrics Analysis:")
+                        for r in reasons:
+                            print(f"     {r}")
+                            
+                        print(f"  Training continues to find agent that reaches rank <= #{Config.MAVERICK_TARGET_RANK}")
 
                     # Log to wandb
                     wandb.log({
@@ -4847,8 +5489,20 @@ class ERLTrainer:
                 print("  ✓ Evaluation complete - results saved to evaluation_summary.txt and evaluation_trades.csv")
             else:
                 print(f"  ⚠ Evaluation script failed with code {result.returncode}")
+                # Show stdout first (actual error messages usually go here)
+                if result.stdout:
+                    # Filter out tqdm progress bars, show last 500 chars
+                    stdout_lines = [l for l in result.stdout.split('\n') if not l.strip().startswith('Processing')]
+                    filtered_stdout = '\n'.join(stdout_lines[-10:])  # Last 10 lines
+                    if filtered_stdout.strip():
+                        print(f"  Output: {filtered_stdout}")
+                # Show stderr (often contains traceback)
                 if result.stderr:
-                    print(f"  Error: {result.stderr[:200]}")  # Print first 200 chars of error
+                    # Filter out tqdm progress bars
+                    stderr_lines = [l for l in result.stderr.split('\n') if not ('|' in l and '%' in l)]
+                    filtered_stderr = '\n'.join(stderr_lines[-15:])  # Last 15 lines
+                    if filtered_stderr.strip():
+                        print(f"  Error:\n{filtered_stderr}")
         except subprocess.TimeoutExpired:
             print("  ⚠ Evaluation script timed out after 5 minutes")
         except Exception as e:
@@ -5101,6 +5755,14 @@ class ERLTrainer:
                 # Stuck detection state
                 'multi_gens_since_improvement': getattr(self, 'multi_gens_since_improvement', 0),
                 'multi_best_score_for_member': getattr(self, 'multi_best_score_for_member', float('-inf')),
+                # Phase tracking for maverick/non-maverick separation
+                'multi_phase': getattr(self, 'multi_phase', 'non_maverick'),
+                'non_maverick_members': getattr(self, 'non_maverick_members', []),
+                'maverick_members': getattr(self, 'maverick_members', []),
+                'current_non_maverick_idx': getattr(self, 'current_non_maverick_idx', 0),
+                'current_maverick_idx': getattr(self, 'current_maverick_idx', 0),
+                'non_maverick_turnovers_per_agent': getattr(self, 'non_maverick_turnovers_per_agent', []),
+                'maverick_turnovers_per_agent': getattr(self, 'maverick_turnovers_per_agent', []),
             } if self.multi_mode else None,
 
             # Gauntlet Mode state
@@ -5302,6 +5964,21 @@ class ERLTrainer:
                     # Restore stuck detection state
                     self.multi_gens_since_improvement = multi_state.get('multi_gens_since_improvement', 0)
                     self.multi_best_score_for_member = multi_state.get('multi_best_score_for_member', float('-inf'))
+                    
+                    # Restore phase tracking state
+                    self.multi_phase = multi_state.get('multi_phase', 'non_maverick')
+                    self.non_maverick_members = multi_state.get('non_maverick_members', [])
+                    self.maverick_members = multi_state.get('maverick_members', [])
+                    self.current_non_maverick_idx = multi_state.get('current_non_maverick_idx', 0)
+                    self.current_maverick_idx = multi_state.get('current_maverick_idx', 0)
+                    self.non_maverick_turnovers_per_agent = multi_state.get('non_maverick_turnovers_per_agent', [])
+                    self.maverick_turnovers_per_agent = multi_state.get('maverick_turnovers_per_agent', [])
+                    
+                    # Ensure maverick_mode is set correctly based on phase
+                    if self.multi_phase == 'maverick':
+                        self.maverick_mode = True
+                    else:
+                        self.maverick_mode = False
 
                     # Reload the parent agent for the current member (needed for stuck recovery)
                     # The population was restored from checkpoint, but multi_parent_agent is separate
@@ -5444,9 +6121,12 @@ class ERLTrainer:
             self.current_generation_val_slices = self.generate_validation_slices()
             self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
 
-            # Re-evaluate population on training data (using parallel evaluation for speed)
+            # Re-evaluate population on training data
             print("\nRe-evaluating population on training data...")
-            fitness_scores, _ = self.evaluate_population_parallel()
+            if self.local_mode:
+                fitness_scores, _ = self.local_evaluator.evaluate_population()
+            else:
+                fitness_scores, _ = self.evaluate_population_parallel()
 
             # Re-evaluate population on validation data
             print("\nRe-evaluating population on validation data...")
@@ -5790,6 +6470,17 @@ class ERLTrainer:
         print("Starting ERL Training")
         print("="*60)
 
+        # Print local mode notice if enabled
+        if self.local_mode:
+            print("\n" + "-"*60)
+            print("LOCAL MODE ENABLED")
+            print("-"*60)
+            print("  - Sequential evaluation (no process spawning)")
+            print("  - Sequential validation (no worker pool)")
+            print("  - Batch disk writes (no I/O thrashing)")
+            print("  - Optimized for local machines (Windows/WSL)")
+            print("-"*60 + "\n")
+
         # Initialize leverage mode if requested
         if self.enable_leverage and not self.leverage_mode_active:
             hof_size = len(self.hall_of_fame)
@@ -5848,8 +6539,12 @@ class ERLTrainer:
         # Use start_generation for the loop
         # Stopping condition: Gauntlet Mode uses breakthroughs, fallback to generation limit
         # In consistency mode, fallback resets with each turnover (checked inside loop)
+        # Maverick mode: no generation limit - train until target rank achieved
         if self.consistency_mode and self.gauntlet_mode_enabled:
             # Use a high ceiling - actual stopping is controlled by turnover-based fallback inside loop
+            max_generations = 10000
+        elif self.maverick_mode:
+            # Maverick mode: no timeout - train until target rank (default: 20) is achieved in Global 50
             max_generations = 10000
         else:
             max_generations = Config.MAX_GENERATIONS_GAUNTLET if self.gauntlet_mode_enabled else Config.NUM_GENERATIONS
@@ -5948,7 +6643,7 @@ class ERLTrainer:
                     print(f"  Generation: {gen + 1}")
                     print(f"{'='*60}")
                     break
-            elif self.gauntlet_mode_enabled and not self.consistency_mode and self.confirmed_breakthroughs >= self.target_breakthroughs:
+            elif self.gauntlet_mode_enabled and not self.consistency_mode and not self.maverick_mode and self.confirmed_breakthroughs >= self.target_breakthroughs:
                 print(f"\n{'='*60}")
                 print(f"🎯 TARGET BREAKTHROUGHS ACHIEVED!")
                 print(f"{'='*60}")
@@ -5983,8 +6678,11 @@ class ERLTrainer:
             print(f"{'='*60}")
 
             # 1. Evaluate population (collect experiences)
-            # Use parallel evaluation for significant speedup
-            fitness_scores, pop_stats = self.evaluate_population_parallel()
+            # Use LocalEvaluator in local mode for CPU-optimized execution with in-memory transitions
+            if self.local_mode:
+                fitness_scores, pop_stats = self.local_evaluator.evaluate_population()
+            else:
+                fitness_scores, pop_stats = self.evaluate_population_parallel()
 
             # Update resource tracker after evaluation
             self.resource_tracker.update()
@@ -6064,8 +6762,12 @@ class ERLTrainer:
             # Update instance variable for use in fitness calculation
             self.quality_threshold = quality_threshold
 
-            # Validate entire population in parallel
-            all_val_results = self.validate_population_parallel(quality_threshold=quality_threshold)
+            # Validate entire population
+            # Use LocalEvaluator in local mode for CPU-optimized validation
+            if self.local_mode:
+                all_val_results = self.local_evaluator.validate_population(quality_threshold=quality_threshold)
+            else:
+                all_val_results = self.validate_population_parallel(quality_threshold=quality_threshold)
 
             # Process validation results and calculate combined fitness
             for idx, val_results in enumerate(all_val_results):
@@ -6143,6 +6845,12 @@ class ERLTrainer:
             # Extract combined scores for elite selection (sorted by agent index)
             validation_scores = [result['combined_fitness'] for result in sorted(validation_results, key=lambda x: x['idx'])]
 
+            # MULTI-MODE: Also extract base_combined_fitness for baseline comparisons
+            # This is critical because ROI adjustment varies with hurdle, making combined_fitness
+            # incomparable across different hurdle values. Base fitness is consistent.
+            if self.multi_mode:
+                base_validation_scores = [result['base_combined_fitness'] for result in sorted(validation_results, key=lambda x: x['idx'])]
+
             # Print summary showing training vs validation rankings
             print(f"\n--- Validation Summary ---")
             if self.consistency_mode and not self.multi_mode:
@@ -6216,15 +6924,18 @@ class ERLTrainer:
                         print(f"  ⏳ Member {self.current_member_idx} warmup completes next generation")
                 else:
                     # Check for breakthrough on current committee member
-                    breakthrough_result = self._check_multi_breakthrough(validation_scores)
+                    # CRITICAL: Use base_validation_scores (no ROI adjustment) for fair comparison
+                    # Baseline was set using base_combined_fitness, so we compare apples to apples
+                    breakthrough_result = self._check_multi_breakthrough(base_validation_scores)
 
                 if breakthrough_result is not None:
-                    improved_agent, score = breakthrough_result
+                    improved_agent, base_score = breakthrough_result
                     # Get full validation result for this agent to extract metrics
                     agent_idx = self.population.index(improved_agent)
                     agent_val_result = [r for r in validation_results if r['idx'] == agent_idx][0]
                     # Process the breakthrough and advance to next member
-                    self._process_multi_breakthrough(improved_agent, score, agent_val_result)
+                    # Pass base_score (base_combined_fitness) as the score
+                    self._process_multi_breakthrough(improved_agent, base_score, agent_val_result)
                     self._advance_to_next_multi_member()
 
                     # CRITICAL: Skip evolution for this generation
@@ -6239,24 +6950,28 @@ class ERLTrainer:
                 # Check for ANY improvement over baseline (save immediately to Global50/committee)
                 # Also track stuck generations for local optima detection
                 if generations_trained >= warmup_generations:
-                    best_idx = np.argmax(validation_scores)
-                    best_score_this_gen = validation_scores[best_idx]
+                    # CRITICAL: Use base_validation_scores for baseline comparison
+                    # This ensures consistency since baseline is stored as base_combined_fitness
+                    best_idx = np.argmax(base_validation_scores)
+                    best_base_score_this_gen = base_validation_scores[best_idx]
                     current_baseline = self.member_baselines[self.current_member_idx]
 
                     # Check for improvement over baseline (any amount, not just 5%)
-                    if best_score_this_gen > current_baseline:
+                    if best_base_score_this_gen > current_baseline:
                         improved_agent = self.population[best_idx]
                         agent_val_result = [r for r in validation_results if r['idx'] == best_idx][0]
 
                         # Save improvement immediately (updates Global50, committee, baseline)
                         # Note: This is NOT a breakthrough (no advance to next member)
-                        self._process_multi_improvement(improved_agent, best_score_this_gen, agent_val_result, is_breakthrough=False)
+                        # Pass base_score (base_combined_fitness) as the score
+                        self._process_multi_improvement(improved_agent, best_base_score_this_gen, agent_val_result, is_breakthrough=False)
 
                         # _process_multi_improvement already resets stuck counter and updates best score
                     else:
                         # No improvement over baseline - check if we at least improved over previous best
-                        if best_score_this_gen > self.multi_best_score_for_member:
-                            self.multi_best_score_for_member = best_score_this_gen
+                        # Use base_score for consistency with baseline comparison
+                        if best_base_score_this_gen > self.multi_best_score_for_member:
+                            self.multi_best_score_for_member = best_base_score_this_gen
                             self.multi_gens_since_improvement = 0
                         else:
                             self.multi_gens_since_improvement += 1
@@ -6456,6 +7171,12 @@ class ERLTrainer:
             wandb.log(log_data, step=gen)
 
             # 2. Train agents using replay buffer
+            # First, wait for background transfer to complete (if running in local mode)
+            if self.local_mode:
+                self.local_evaluator.wait_for_transfer()
+                # Move agents to CPU before training (frees GPU memory)
+                # Training will move agents to GPU in batches of 16
+                self.local_evaluator.restore_agents_to_cpu()
             self.train_population()
 
             # Update resource tracker after training

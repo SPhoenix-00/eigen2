@@ -339,7 +339,7 @@ class StockDataLoader:
         print(f"  Training days:   {len(self.train_indices):>4} (indices {self.train_indices[0]:>4} to {self.train_indices[-1]:>4}) - {self.dates[0]} to {self.dates[train_end_idx-1]}")
         print(f"  Validation days: {len(self.val_indices):>4} (indices {val_start_idx:>4} to {holdout_start-1:>4}) - {self.dates[val_start_idx]} to {self.dates[holdout_start-1]}")
         print(f"  Holdout days:    {Config.COMMITTEE_HOLDOUT_DAYS:>4} (indices {holdout_start:>4} to {num_days-1:>4}) - {self.dates[holdout_start]} to {self.dates[-1]}")
-        print(f"\n  ⚠ CRITICAL: Holdout data is NEVER used during training!")
+        print(f"\n  [!] CRITICAL: Holdout data is NEVER used during training!")
         print(f"             It is reserved EXCLUSIVELY for committee.py")
         print(f"\n  Validation strategy:")
         print(f"    - Training episodes: Sample from training data only")

@@ -279,7 +279,7 @@ class GauntletRunner:
         # Use same aggregator as ERLTrainer: 0.67*mean + 0.33*min (excluding top slice)
         mean_score = float(np.mean(scores_without_top))
         min_score = float(np.min(scores_without_top))
-        gauntlet_score = float((0.67 * mean_score) + (0.33 * min_score))
+        raw_gauntlet_score = float((0.67 * mean_score) + (0.33 * min_score))
 
         # Aggregate metrics
         total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
@@ -288,6 +288,15 @@ class GauntletRunner:
         # This answers: "For every dollar of max drawdown capacity across all scenarios, how much profit?"
         total_peak_capital = sum([r['peak_capital_employed'] for r in slice_results])
         roi = float((total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0)
+
+        # --- ANTI-SWINDLE: EFFICIENCY-ADJUSTED GAUNTLET SCORE ---
+        # (See global50.py for full explanation)
+        # Formula: Adjusted Score = Raw Score + abs(Raw Score) * (10 * (ROI% - BaselineROI%))
+        # Convert percentage points to decimal: (ROI% - BaselineROI%) / 100
+        efficiency_ratio = roi / Config.EFFICIENCY_BASELINE_ROI
+        roi_diff_percentage_points = roi - Config.EFFICIENCY_BASELINE_ROI
+        adjustment = abs(raw_gauntlet_score) * (10.0 * roi_diff_percentage_points / 100.0)
+        gauntlet_score = raw_gauntlet_score + adjustment
 
         total_wins = sum([r['num_wins'] for r in slice_results])
         total_losses = sum([r['num_losses'] for r in slice_results])
@@ -329,6 +338,8 @@ class GauntletRunner:
         return {
             'agent_name': agent_name,
             'gauntlet_score': gauntlet_score,
+            'raw_gauntlet_score': raw_gauntlet_score,  # Pre-efficiency adjustment
+            'efficiency_ratio': efficiency_ratio,  # ROI / baseline
             'mean_fitness': mean_score,
             'min_fitness': min_score,
             'max_fitness': max_score,

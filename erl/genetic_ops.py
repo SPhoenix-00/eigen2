@@ -80,24 +80,31 @@ def crossover(parent1: DDPGAgent, parent2: DDPGAgent,
     if alpha is None:
         alpha = np.random.uniform(Config.CROSSOVER_ALPHA_MIN, Config.CROSSOVER_ALPHA_MAX)
     
-    # Create new agent
+    # Create new agent (uses Config.DEVICE - GPU if available)
     offspring = DDPGAgent(agent_id=-1)  # Will be assigned proper ID later
-    
+    target_device = offspring.device
+
     # Blend actor networks: child = alpha * parent1 + (1-alpha) * parent2
+    # Ensure computation happens on offspring's device for correct placement
     for child_param, p1_param, p2_param in zip(
         offspring.actor.parameters(),
         parent1.actor.parameters(),
         parent2.actor.parameters()
     ):
-        child_param.data.copy_(alpha * p1_param.data + (1 - alpha) * p2_param.data)
-    
+        # Move parent params to target device for blending, then copy
+        p1_data = p1_param.data.to(target_device)
+        p2_data = p2_param.data.to(target_device)
+        child_param.data.copy_(alpha * p1_data + (1 - alpha) * p2_data)
+
     # Blend critic networks
     for child_param, p1_param, p2_param in zip(
         offspring.critic.parameters(),
         parent1.critic.parameters(),
         parent2.critic.parameters()
     ):
-        child_param.data.copy_(alpha * p1_param.data + (1 - alpha) * p2_param.data)
+        p1_data = p1_param.data.to(target_device)
+        p2_data = p2_param.data.to(target_device)
+        child_param.data.copy_(alpha * p1_data + (1 - alpha) * p2_data)
     
     # Copy target networks from blended networks
     offspring.actor_target.load_state_dict(offspring.actor.state_dict())
@@ -164,7 +171,7 @@ def create_next_generation(population: List[DDPGAgent],
                           injection_count: int = 0) -> List[DDPGAgent]:
     """
     Create next generation using selection, crossover, and mutation.
-    Calculates population segments dynamically using Config.POPULATION_SIZE.
+    Maintains the same population size as the input (supports local mode's smaller population).
 
     Args:
         population: Current population of agents
@@ -183,7 +190,8 @@ def create_next_generation(population: List[DDPGAgent],
         - injection_pool/injection_count: Used in heroes+consistency mode to inject mutated
           Global50 agents until first breakthrough (prevents HoF poisoning)
     """
-    pop_size = Config.POPULATION_SIZE
+    # Use actual population size (supports local mode's smaller population)
+    pop_size = len(population)
 
     # Use validation scores (elite_scores) for elitism, or fall back to training fitness
     scores_for_elites = elite_scores if elite_scores is not None else fitness_scores
@@ -310,8 +318,8 @@ def create_next_generation(population: List[DDPGAgent],
         agent.agent_id = i
     
     # This assertion will now pass for ANY population size
-    assert len(next_gen) == Config.POPULATION_SIZE, \
-        f"Population size mismatch: {len(next_gen)} != {Config.POPULATION_SIZE}"
+    assert len(next_gen) == pop_size, \
+        f"Population size mismatch: {len(next_gen)} != {pop_size}"
     
     return next_gen
 

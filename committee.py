@@ -176,6 +176,93 @@ class CommitteeManager:
 
         with open(self.local_roster_path, 'r') as f:
             return json.load(f)
+    
+    def update_maverick_flags(self) -> bool:
+        """
+        Update is_maverick flags in existing committee roster by syncing from Global50.
+        
+        This is useful when:
+        - Global50 entries have been updated with maverick flags
+        - Committee roster was created before maverick flags were set
+        - Need to align committee roster with current Global50 state
+        
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        print("\n" + "="*60)
+        print(f"UPDATING MAVERICK FLAGS IN COMMITTEE ROSTER ({self.context_window_id})")
+        print("="*60)
+        
+        # Load current roster
+        roster = self.load_roster()
+        if not roster:
+            print("❌ No committee roster found. Run --draft first.")
+            return False
+        
+        # Load Global50 entries
+        entries = load_global50_candidates(self.context_window_days)
+        if not entries:
+            print("❌ No agents in Global50")
+            return False
+        
+        # Create lookup dict: (run_name, agent_id) -> is_maverick
+        global50_maverick_map = {}
+        for entry in entries:
+            key = (entry['run_name'], entry['agent_id'])
+            global50_maverick_map[key] = entry.get('is_maverick', False)
+        
+        # Update roster members
+        updated_count = 0
+        members = roster.get('members', [])
+        
+        print(f"\nChecking {len(members)} committee members...")
+        for member in members:
+            run_name = member.get('run_name')
+            agent_id = member.get('agent_id')
+            key = (run_name, agent_id)
+            
+            if key in global50_maverick_map:
+                new_maverick_flag = global50_maverick_map[key]
+                old_maverick_flag = member.get('is_maverick', False)
+                
+                if new_maverick_flag != old_maverick_flag:
+                    member['is_maverick'] = new_maverick_flag
+                    updated_count += 1
+                    action = "SET" if new_maverick_flag else "UNSET"
+                    print(f"  {action}: {run_name}_{agent_id} -> is_maverick={new_maverick_flag}")
+            else:
+                print(f"  ⚠ {run_name}_{agent_id}: Not found in Global50 (may have been removed)")
+        
+        if updated_count == 0:
+            print(f"\n✓ No updates needed - all maverick flags are already in sync")
+            return True
+        
+        # Update timestamp
+        roster['last_updated'] = datetime.now().isoformat() + 'Z'
+        roster['maverick_flags_updated_at'] = datetime.now().isoformat() + 'Z'
+        
+        # Save updated roster
+        print(f"\nSaving updated roster...")
+        if self.save_roster(roster):
+            print(f"✓ Updated {updated_count} member(s) and synced to cloud")
+            
+            # Print summary
+            maverick_count = sum(1 for m in members if m.get('is_maverick', False))
+            print(f"\n  Committee Summary:")
+            print(f"    Total members: {len(members)}")
+            print(f"    Maverick members: {maverick_count}")
+            print(f"    Non-maverick members: {len(members) - maverick_count}")
+            
+            if maverick_count == 0:
+                print(f"\n  ⚠ WARNING: No maverick agents in committee!")
+                print(f"    --multi mode requires at least one maverick agent.")
+                print(f"    Use fix_global50.py --set-maverick to mark agents as mavericks in Global50,")
+                print(f"    then run --draft to create a new committee with mavericks.")
+            
+            return True
+        else:
+            print(f"✗ Failed to save updated roster")
+            return False
 
     def check_mirror_status(self) -> bool:
         """
@@ -1035,6 +1122,139 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
     return current_indices
 
 
+def automatic_correlation_refinement(committee_indices: tuple, entries: list,
+                                      corr_matrix: np.ndarray,
+                                      max_iterations: int = 50) -> tuple:
+    """
+    Automated refinement: iteratively swap to improve both objective and max_corr.
+
+    Selection logic per iteration:
+    1. Find highest correlation pair, identify swap candidate (lower fitness)
+    2. Test all valid replacements
+    3. Among candidates that IMPROVE objective, select the one with LOWEST max_corr
+    4. Only apply if that candidate also LOWERS max_corr
+    5. Stop when no candidate improves BOTH
+
+    Args:
+        committee_indices: Initial committee indices from optimization
+        entries: Full list of Global50 entries
+        corr_matrix: Full NxN correlation matrix
+        max_iterations: Safety limit on number of swap iterations
+
+    Returns:
+        Final committee indices after all swaps
+    """
+    current_indices = committee_indices
+    swap_count = 0
+
+    # Calculate starting metrics
+    start_obj, start_score_sum, start_avg_corr, start_max_corr = committee_objective(
+        current_indices, entries, corr_matrix
+    )
+
+    print(f"\n{'='*60}")
+    print("PHASE 1b: CORRELATION REFINEMENT (Automatic Deep)")
+    print(f"{'='*60}")
+    print(f"Starting: obj={start_obj:.2f}, max_corr={start_max_corr:.4f}")
+
+    # Valid entries for candidate search
+    valid_entries = [i for i in range(len(entries))
+                     if corr_matrix[i, i] == 1.0]
+
+    for iteration in range(1, max_iterations + 1):
+        # Calculate current metrics
+        curr_obj, curr_score_sum, curr_avg_corr, curr_max_corr = committee_objective(
+            current_indices, entries, corr_matrix
+        )
+
+        # Find highest correlation pair
+        drop_idx, keep_idx, max_corr, drop_entry, keep_entry = find_highest_correlation_pair(
+            current_indices, entries, corr_matrix
+        )
+
+        if drop_idx is None:
+            print(f"\n  No valid pairs found in committee.")
+            break
+
+        print(f"\n  Iteration {iteration}:")
+        print(f"    Highest pair: {drop_entry['run_name']}_{drop_entry['agent_id']} <-> "
+              f"{keep_entry['run_name']}_{keep_entry['agent_id']} (corr={max_corr:.4f})")
+
+        # Build remaining committee (without the dropped agent)
+        remaining = [idx for idx in current_indices if idx != drop_idx]
+
+        # Test all valid candidates
+        improving_candidates = []
+
+        for candidate_idx in valid_entries:
+            # Skip if already in committee
+            if candidate_idx in current_indices:
+                continue
+
+            # Create new committee with swap
+            new_indices = tuple(sorted(remaining + [candidate_idx]))
+
+            # Calculate metrics for this swap
+            new_obj, new_score_sum, new_avg_corr, new_max_corr = committee_objective(
+                new_indices, entries, corr_matrix
+            )
+
+            # Only consider if objective IMPROVES
+            if new_obj > curr_obj:
+                improving_candidates.append({
+                    'idx': candidate_idx,
+                    'new_indices': new_indices,
+                    'obj': new_obj,
+                    'max_corr': new_max_corr,
+                    'entry': entries[candidate_idx]
+                })
+
+        print(f"    Testing {len(valid_entries) - len(current_indices)} candidates...")
+        print(f"    Candidates improving objective: {len(improving_candidates)}")
+
+        if not improving_candidates:
+            print(f"    No candidate improves objective")
+            print(f"    Stopping")
+            break
+
+        # Among those that improve objective, pick the one with lowest max_corr
+        improving_candidates.sort(key=lambda x: x['max_corr'])
+        best = improving_candidates[0]
+
+        # Only apply if max_corr also improves
+        if best['max_corr'] >= curr_max_corr:
+            print(f"    Best objective-improving candidate has max_corr={best['max_corr']:.4f} "
+                  f"(not better than {curr_max_corr:.4f})")
+            print(f"    Stopping")
+            break
+
+        # Apply the swap
+        print(f"    Best among those (lowest max_corr): "
+              f"{best['entry']['run_name']}_{best['entry']['agent_id']}")
+        print(f"      obj: {curr_obj:.2f} -> {best['obj']:.2f} ({best['obj'] - curr_obj:+.2f})")
+        print(f"      max_corr: {curr_max_corr:.4f} -> {best['max_corr']:.4f} "
+              f"({best['max_corr'] - curr_max_corr:+.4f})")
+        print(f"    Swap applied")
+
+        current_indices = best['new_indices']
+        swap_count += 1
+
+    # Final summary
+    final_obj, final_score_sum, final_avg_corr, final_max_corr = committee_objective(
+        current_indices, entries, corr_matrix
+    )
+
+    print(f"\n{'='*60}")
+    print(f"REFINEMENT COMPLETE: {swap_count} swap(s) made")
+    print(f"{'='*60}")
+    print(f"  Final: obj={final_obj:.2f}, max_corr={final_max_corr:.4f}")
+    if swap_count > 0:
+        print(f"  Delta: obj {final_obj - start_obj:+.2f}, "
+              f"max_corr {final_max_corr - start_max_corr:+.4f}")
+
+    return current_indices
+
+
 # --- Committee Agent Class ---
 
 class CommitteeAgent:
@@ -1291,52 +1511,116 @@ class CommitteeAgent:
         torch.cuda.empty_cache()
 
 
-def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray) -> np.ndarray:
+def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray,
+                                      percentile: int = 95) -> np.ndarray:
     """
-    Calculates the 95th percentile conviction threshold for each stock.
+    Calculates the Nth percentile conviction threshold for each stock.
 
     CRITICAL: Only considers coefficients that would actually trigger a trade
     (>= Config.COEFFICIENT_THRESHOLD). Including non-trading noise (< 1.0) drags
-    the P95 down, allowing sub-threshold signals to masquerade as 'high conviction'.
+    the percentile down, allowing sub-threshold signals to masquerade as 'high conviction'.
 
     Args:
         agent_coeff_history_2d: Numpy array [Days, Stocks] for a single agent
+        percentile: Percentile to use for conviction threshold (default: 95)
 
     Returns:
-        p95_vector: Numpy array [Stocks] of 95th percentile conviction thresholds
+        threshold_vector: Numpy array [Stocks] of Nth percentile conviction thresholds
     """
     days, num_stocks = agent_coeff_history_2d.shape
-    p95_vector = np.zeros(num_stocks, dtype=np.float32)
+    threshold_vector = np.zeros(num_stocks, dtype=np.float32)
 
     # Filter: Only look at coefficients that are actual trades
     # We use Config.COEFFICIENT_THRESHOLD (1.0) as the floor
     valid_trades_mask = agent_coeff_history_2d >= Config.COEFFICIENT_THRESHOLD
     all_active = agent_coeff_history_2d[valid_trades_mask]
 
-    # Calculate Global P95 fallback
+    # Calculate Global percentile fallback
     # If the agent has NEVER traded (or very rarely), we set a high fallback
     # so it cannot easily trigger conviction on noise.
     if len(all_active) > 0:
-        global_p95 = np.percentile(all_active, 95)
+        global_threshold = np.percentile(all_active, percentile)
     else:
-        # Agent is a ghost (no trades > 1.0). Set P95 to infinity to disable conviction.
-        global_p95 = 100.0
+        # Agent is a ghost (no trades > 1.0). Set threshold to infinity to disable conviction.
+        global_threshold = 100.0
 
     for i in range(num_stocks):
         # Extract history for this specific stock
         stock_coeffs = agent_coeff_history_2d[:, i]
 
-        # Only calculate P95 based on actual trades for this stock
+        # Only calculate percentile based on actual trades for this stock
         active_coeffs = stock_coeffs[stock_coeffs >= Config.COEFFICIENT_THRESHOLD]
 
         if len(active_coeffs) >= 20:
             # Sufficient history for this stock
-            p95_vector[i] = np.percentile(active_coeffs, 95)
+            threshold_vector[i] = np.percentile(active_coeffs, percentile)
         else:
-            # Insufficient history, fallback to global P95
-            p95_vector[i] = global_p95
+            # Insufficient history, fallback to global threshold
+            threshold_vector[i] = global_threshold
 
-    return p95_vector
+    return threshold_vector
+
+
+def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info,
+                                       context_window_days: int, percentile: int) -> list:
+    """
+    Recalculate conviction thresholds for all committee members at a given percentile.
+
+    This creates a deep copy of members with updated conviction_threshold_vector values,
+    avoiding pollution of the original roster data.
+
+    Args:
+        members: Original list of member dicts from roster
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        percentile: Percentile to use for conviction threshold (e.g., 90, 95, 99)
+
+    Returns:
+        New list of member dicts with recalculated conviction thresholds
+    """
+    import copy
+
+    # Deep copy to avoid modifying original
+    new_members = copy.deepcopy(members)
+
+    # Get validation data tensor (same as used during draft)
+    val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+    num_days = len(valid_indices)
+    num_stocks = Config.NUM_INVESTABLE_STOCKS
+
+    for member in tqdm(new_members, desc=f"Recalculating P{percentile} thresholds"):
+        filepath = get_agent_filepath(member, context_window_days)
+        agent = load_agent_actor_only(filepath, 0)
+
+        if agent is not None:
+            # Generate coefficients using same method as calculate_coefficient_correlations
+            with torch.no_grad():
+                batch_size = 32
+                num_samples = val_tensor.shape[0]
+                all_coefs = []
+
+                for start_idx in range(0, num_samples, batch_size):
+                    end_idx = min(start_idx + batch_size, num_samples)
+                    batch = val_tensor[start_idx:end_idx]
+                    batch_actions = agent.actor(batch).cpu().numpy()
+                    # Extract coefficients (first output dimension)
+                    all_coefs.append(batch_actions[:, :, 0])
+
+                # Concatenate to [Days, Stocks]
+                agent_coeffs_2d = np.concatenate(all_coefs, axis=0)
+
+            # Recalculate with new percentile
+            conviction_threshold_vector = calculate_agent_stats_vectorized(
+                agent_coeffs_2d, percentile=percentile
+            )
+            member['stats']['conviction_threshold_vector'] = conviction_threshold_vector.tolist()
+
+            del agent
+            torch.cuda.empty_cache()
+
+    return new_members
 
 
 # --- Validation ---
@@ -1510,9 +1794,19 @@ def evaluate_committee_on_slice(members: list, loader, stats,
 
 
 def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
-                   context_window_days: int) -> dict:
+                   context_window_days: int, members_override: list = None,
+                   conviction_percentile: int = None) -> dict:
     """
     Run 5-slice validation on the committee: 3 slices on validation data, 2 slices on holdout data.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        members_override: Optional pre-computed members list (for A/B testing)
+        conviction_percentile: Optional percentile override (recalculates thresholds if provided)
 
     Returns validation results dict with comprehensive metrics.
     """
@@ -1525,7 +1819,19 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         print(f"❌ No roster found. Run --draft first.")
         return None
 
-    members = roster['members']
+    # Use override members if provided, otherwise use roster members
+    if members_override is not None:
+        members = members_override
+        print(f"  Using custom members (A/B test mode)")
+    elif conviction_percentile is not None:
+        # Recalculate conviction thresholds with custom percentile
+        print(f"  Recalculating conviction thresholds at P{conviction_percentile}...")
+        members = recalculate_conviction_thresholds(
+            roster['members'], loader, stats, holdout_info,
+            context_window_days, conviction_percentile
+        )
+    else:
+        members = roster['members']
     num_slices = Config.COMMITTEE_VALIDATION_SLICES
 
     # Episode structure (matching training):
@@ -1889,14 +2195,215 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     return results
 
 
+def run_quorum_sweep(manager: CommitteeManager, loader, stats, holdout_info,
+                     context_window_days: int, quorum_values: list) -> dict:
+    """
+    Run validation with multiple quorum values for A/B testing.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        quorum_values: List of quorum values to test (e.g., [2, 3, 4, 5])
+
+    Returns:
+        Dict mapping quorum value to validation results
+    """
+    print("\n" + "="*60)
+    print("QUORUM SWEEP: A/B Testing Multiple Quorum Values")
+    print("="*60)
+    print(f"  Quorum values to test: {quorum_values}")
+    print(f"  Committee size: {Config.COMMITTEE_SIZE}")
+
+    original_quorum = Config.COMMITTEE_QUORUM
+    all_results = {}
+
+    for quorum in quorum_values:
+        print(f"\n{'='*60}")
+        print(f"TESTING QUORUM = {quorum}")
+        print(f"{'='*60}")
+
+        # Override quorum
+        Config.COMMITTEE_QUORUM = quorum
+
+        # Run validation
+        results = run_validation(manager, loader, stats, holdout_info, context_window_days)
+
+        if results:
+            all_results[quorum] = {
+                'aggregate': results['committee_aggregate'],
+                'consensus': results['consensus_summary'],
+            }
+
+        # Clean up between runs
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Restore original quorum
+    Config.COMMITTEE_QUORUM = original_quorum
+
+    # Print comparison summary
+    print("\n" + "="*60)
+    print("QUORUM SWEEP COMPARISON SUMMARY")
+    print("="*60)
+
+    # Header
+    print(f"\n{'Quorum':<8} {'Fitness':<10} {'Win Rate':<10} {'Quality':<10} {'Expectancy':<12} {'ROI':<10} {'Trades':<8}")
+    print("-" * 78)
+
+    for quorum in sorted(all_results.keys()):
+        agg = all_results[quorum]['aggregate']
+        print(f"{quorum:<8} {agg['mean_fitness']:<10.2f} {agg['mean_win_rate']*100:<10.1f}% "
+              f"{agg['mean_quality_ratio']:<10.3f} {agg['mean_expectancy']:<12.6f} "
+              f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
+
+    # Consensus breakdown
+    print(f"\n{'Quorum':<8} {'By Quorum':<12} {'By Conviction':<14} {'Vetoed':<10} {'Unanimity':<12} {'Avg Votes':<10}")
+    print("-" * 78)
+
+    for quorum in sorted(all_results.keys()):
+        cs = all_results[quorum]['consensus']
+        if 'note' not in cs:
+            print(f"{quorum:<8} {cs.get('total_trades_by_quorum', 0):<12} "
+                  f"{cs.get('total_trades_by_conviction', 0):<14} "
+                  f"{cs.get('total_trades_vetoed', 0):<10} "
+                  f"{cs.get('avg_unanimity_pct', 0):<12.1f}% "
+                  f"{cs.get('avg_consensus_votes', 0):<10.2f}")
+        else:
+            print(f"{quorum:<8} {cs['note']}")
+
+    # Find best quorum by fitness
+    best_quorum = max(all_results.keys(), key=lambda q: all_results[q]['aggregate']['mean_fitness'])
+    best_fitness = all_results[best_quorum]['aggregate']['mean_fitness']
+
+    print(f"\n{'='*60}")
+    print(f"RECOMMENDATION: Quorum {best_quorum} achieved highest mean fitness ({best_fitness:.2f})")
+    print(f"{'='*60}")
+
+    return all_results
+
+
+def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
+                         context_window_days: int, percentile_values: list) -> dict:
+    """
+    Run validation with multiple conviction percentile values for A/B testing.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        percentile_values: List of percentile values to test (e.g., [90, 95, 99])
+
+    Returns:
+        Dict mapping percentile value to validation results
+    """
+    print("\n" + "="*60)
+    print("CONVICTION SWEEP: A/B Testing Multiple Percentiles")
+    print("="*60)
+    print(f"  Percentile values to test: {percentile_values}")
+    print(f"  Committee size: {Config.COMMITTEE_SIZE}")
+    print(f"  Current quorum: {Config.COMMITTEE_QUORUM}")
+
+    roster = manager.load_roster()
+    if roster is None:
+        print(f"❌ No roster found. Run --draft first.")
+        return None
+
+    all_results = {}
+
+    for percentile in percentile_values:
+        print(f"\n{'='*60}")
+        print(f"TESTING CONVICTION PERCENTILE = P{percentile}")
+        print(f"{'='*60}")
+
+        # Recalculate conviction thresholds with this percentile
+        print(f"  Recalculating thresholds for {len(roster['members'])} members...")
+        members_with_new_thresholds = recalculate_conviction_thresholds(
+            roster['members'], loader, stats, holdout_info,
+            context_window_days, percentile
+        )
+
+        # Run validation with recalculated members
+        results = run_validation(
+            manager, loader, stats, holdout_info, context_window_days,
+            members_override=members_with_new_thresholds
+        )
+
+        if results:
+            all_results[percentile] = {
+                'aggregate': results['committee_aggregate'],
+                'consensus': results['consensus_summary'],
+            }
+
+        # Clean up between runs
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Print comparison summary
+    print("\n" + "="*60)
+    print("CONVICTION SWEEP COMPARISON SUMMARY")
+    print("="*60)
+
+    # Header
+    print(f"\n{'Percentile':<12} {'Fitness':<10} {'Win Rate':<10} {'Quality':<10} {'Expectancy':<12} {'ROI':<10} {'Trades':<8}")
+    print("-" * 82)
+
+    for percentile in sorted(all_results.keys()):
+        agg = all_results[percentile]['aggregate']
+        print(f"P{percentile:<11} {agg['mean_fitness']:<10.2f} {agg['mean_win_rate']*100:<10.1f}% "
+              f"{agg['mean_quality_ratio']:<10.3f} {agg['mean_expectancy']:<12.6f} "
+              f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
+
+    # Consensus breakdown (conviction trades are the key metric here)
+    print(f"\n{'Percentile':<12} {'By Quorum':<12} {'By Conviction':<14} {'Vetoed':<10} {'Unanimity':<12}")
+    print("-" * 70)
+
+    for percentile in sorted(all_results.keys()):
+        cs = all_results[percentile]['consensus']
+        if 'note' not in cs:
+            print(f"P{percentile:<11} {cs.get('total_trades_by_quorum', 0):<12} "
+                  f"{cs.get('total_trades_by_conviction', 0):<14} "
+                  f"{cs.get('total_trades_vetoed', 0):<10} "
+                  f"{cs.get('avg_unanimity_pct', 0):<12.1f}%")
+        else:
+            print(f"P{percentile:<11} {cs['note']}")
+
+    # Find best percentile by fitness
+    best_percentile = max(all_results.keys(), key=lambda p: all_results[p]['aggregate']['mean_fitness'])
+    best_fitness = all_results[best_percentile]['aggregate']['mean_fitness']
+
+    # Also show conviction trade counts for context
+    best_conviction_trades = all_results[best_percentile]['consensus'].get('total_trades_by_conviction', 'N/A')
+
+    print(f"\n{'='*60}")
+    print(f"RECOMMENDATION: P{best_percentile} achieved highest mean fitness ({best_fitness:.2f})")
+    print(f"  Conviction trades at P{best_percentile}: {best_conviction_trades}")
+    print(f"{'='*60}")
+
+    return all_results
+
+
 # --- Phase 1: Draft Day ---
 
-def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
+def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool = False):
     """
     Phase 1: Select committee from Global50 using coefficient correlation optimization.
 
     IMPORTANT: Correlation is calculated on VALIDATION data (not holdout) to prevent
     data leakage. The holdout period remains unseen until Phase 2 validation.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization statistics
+        holdout_info: Holdout period information
+        deep: If True, use automatic deep refinement instead of interactive refinement
     """
     print("\n" + "="*60)
     print("PHASE 1: DRAFT DAY (Global50 Selection)")
@@ -1912,7 +2419,8 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
 
     print(f"\n  Top 5 agents by gauntlet score:")
     for i, e in enumerate(entries[:5]):
-        print(f"    {i+1}. {e['run_name']}_{e['agent_id']}: "
+        maverick_tag = " [M]" if e.get('is_maverick', False) else ""
+        print(f"    {i+1}. {e['run_name']}_{e['agent_id']}{maverick_tag}: "
               f"score={e['gauntlet_score']:.2f}, roi={e.get('roi', 0):.2f}%")
 
     # 2. Prepare VALIDATION data for correlation calculation (NOT holdout - prevents data leakage)
@@ -1932,10 +2440,15 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
         print("❌ Optimization failed")
         return None
 
-    # 4b. Interactive correlation refinement pass
-    refined_indices = interactive_correlation_refinement(
-        result['committee_indices'], entries, corr_matrix
-    )
+    # 4b. Correlation refinement pass
+    if deep:
+        refined_indices = automatic_correlation_refinement(
+            result['committee_indices'], entries, corr_matrix
+        )
+    else:
+        refined_indices = interactive_correlation_refinement(
+            result['committee_indices'], entries, corr_matrix
+        )
 
     # Recalculate metrics after refinement
     final_obj, final_score_sum, final_avg_corr, final_max_corr = committee_objective(
@@ -1978,6 +2491,7 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
                 'expectancy': e.get('expectancy', 0.0),
                 'quality_ratio': e.get('quality_ratio', 0.0),
                 'win_ratio': e.get('win_ratio', 0.0),
+                'is_maverick': e.get('is_maverick', False),
                 'stats': {
                     'conviction_threshold_vector': conviction_threshold_vector.tolist()
                 }
@@ -2015,9 +2529,30 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info):
     print("FINAL COMMITTEE")
     print(f"{'='*60}")
 
+    maverick_count = 0
     for i, m in enumerate(roster_data['members']):
-        print(f"  {i+1}. {m['run_name']}_{m['agent_id']}: "
+        maverick_tag = " [M]" if m.get('is_maverick', False) else ""
+        if m.get('is_maverick', False):
+            maverick_count += 1
+        print(f"  {i+1}. {m['run_name']}_{m['agent_id']}{maverick_tag}: "
               f"score={m['gauntlet_score']:.2f}, roi={m['roi']:.2f}%")
+    
+    # Warn if no mavericks selected (required for --multi mode)
+    print(f"\n  Committee Summary:")
+    print(f"    Total members: {len(roster_data['members'])}")
+    print(f"    Maverick members: {maverick_count}")
+    print(f"    Non-maverick members: {len(roster_data['members']) - maverick_count}")
+    
+    if maverick_count == 0:
+        print(f"\n  ⚠ WARNING: No maverick agents selected in committee!")
+        print(f"    --multi mode requires at least one maverick agent.")
+        print(f"    Options:")
+        print(f"      1. Use fix_global50.py --set-maverick to mark agents as mavericks in Global50")
+        print(f"      2. Re-run --draft to select a committee with mavericks")
+        print(f"      3. Use committee.py --update-maverick-flags after setting flags in Global50")
+    elif maverick_count > Config.MAVERICK_CAP:
+        print(f"\n  ⚠ WARNING: {maverick_count} mavericks selected (exceeds cap of {Config.MAVERICK_CAP})")
+        print(f"    This may cause issues with Global50 promotion (Highlander Rule)")
 
     print(f"\n  Aggregate Score: {final_score_sum:.2f}")
     print(f"  Objective Value: {final_obj:.2f}")
@@ -2456,24 +2991,42 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Committee Selection from Global50")
     parser.add_argument('--draft', action='store_true',
                         help='Run Phase 1: Draft committee from Global50')
+    parser.add_argument('--draft-deep', action='store_true',
+                        help='Run Phase 1 with automatic deep refinement (no manual swaps)')
     parser.add_argument('--validate', action='store_true',
                         help='Run Phase 2: Validate on holdout slices')
     parser.add_argument('--verify-only', action='store_true',
                         help='Only verify data split')
     parser.add_argument('--mirror', action='store_true',
                         help='Check cloud sync status, download missing files')
+    parser.add_argument('--update-maverick-flags', action='store_true',
+                        help='Update is_maverick flags in committee roster from Global50')
     parser.add_argument('--simulate', action='store_true',
                         help='Simulate committee deployment over a custom date range')
+    parser.add_argument('--quorum', type=int, default=None,
+                        help=f'Override quorum threshold (default: {Config.COMMITTEE_QUORUM})')
+    parser.add_argument('--sweep-quorum', type=str, default=None,
+                        help='Sweep multiple quorum values, comma-separated (e.g., "2,3,4,5")')
+    parser.add_argument('--conviction-percentile', type=int, default=None,
+                        help='Override conviction percentile threshold (default: 95)')
+    parser.add_argument('--sweep-conviction', type=str, default=None,
+                        help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99")')
     args = parser.parse_args()
 
-    if not args.draft and not args.validate and not args.verify_only and not args.mirror and not args.simulate:
-        print("Usage: python committee.py [--draft] [--validate] [--verify-only] [--mirror] [--simulate]")
+    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.update_maverick_flags and not args.simulate and not args.sweep_quorum and not args.sweep_conviction:
+        print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--update-maverick-flags] [--simulate]")
         print("\nOptions:")
-        print("  --draft        Run Phase 1: Draft committee from Global50")
-        print("  --validate     Run Phase 2: Validate committee on holdout slices")
-        print("  --verify-only  Verify data split without running")
-        print("  --mirror       Check cloud sync status, download missing files")
-        print("  --simulate     Simulate committee deployment over a custom date range")
+        print("  --draft              Run Phase 1: Draft committee from Global50 (interactive refinement)")
+        print("  --draft-deep         Run Phase 1 with automatic deep refinement (no manual swaps)")
+        print("  --validate           Run Phase 2: Validate committee on holdout slices")
+        print("  --verify-only        Verify data split without running")
+        print("  --mirror             Check cloud sync status, download missing files")
+        print("  --update-maverick-flags  Update is_maverick flags in committee roster from Global50")
+        print("  --simulate           Simulate committee deployment over a custom date range")
+        print("  --quorum N       Override quorum threshold for validation (default: 3)")
+        print("  --sweep-quorum   Sweep multiple quorum values (e.g., '2,3,4,5')")
+        print("  --conviction-percentile N  Override conviction percentile (default: 95)")
+        print("  --sweep-conviction  Sweep multiple conviction percentiles (e.g., '90,95,99')")
         exit(0)
 
     print("Initializing Committee Engine...")
@@ -2492,6 +3045,11 @@ if __name__ == "__main__":
     # Handle --mirror mode
     if args.mirror:
         manager.check_mirror_status()
+        exit(0)
+    
+    # Handle --update-maverick-flags mode
+    if args.update_maverick_flags:
+        manager.update_maverick_flags()
         exit(0)
 
     # Load data for other operations
@@ -2513,26 +3071,58 @@ if __name__ == "__main__":
         print("\n✓ Verification complete.")
         exit(0)
 
-    if args.draft:
-        roster = run_draft(manager, loader, stats, holdout_info)
+    if args.draft or args.draft_deep:
+        roster = run_draft(manager, loader, stats, holdout_info, deep=args.draft_deep)
 
         # Auto-run validation after draft if requested
         if roster and args.validate:
             gc.collect()
             torch.cuda.empty_cache()
 
+    # Handle --sweep-quorum (runs validation multiple times with different quorums)
+    if args.sweep_quorum:
+        quorum_values = [int(q.strip()) for q in args.sweep_quorum.split(',')]
+        run_quorum_sweep(manager, loader, stats, holdout_info, context_window_days, quorum_values)
+        exit(0)
+
+    # Handle --sweep-conviction (runs validation multiple times with different percentiles)
+    if args.sweep_conviction:
+        percentile_values = [int(p.strip()) for p in args.sweep_conviction.split(',')]
+        run_conviction_sweep(manager, loader, stats, holdout_info, context_window_days, percentile_values)
+        exit(0)
+
+    # Handle --quorum override
+    if args.quorum is not None:
+        original_quorum = Config.COMMITTEE_QUORUM
+        Config.COMMITTEE_QUORUM = args.quorum
+        print(f"\n⚙ Quorum override: {original_quorum} → {args.quorum}")
+
+    # Handle --conviction-percentile override
+    conviction_percentile = args.conviction_percentile
+    if conviction_percentile is not None:
+        print(f"\n⚙ Conviction percentile override: 95 → P{conviction_percentile}")
+
     if args.validate:
         validation_results = run_validation(
-            manager, loader, stats, holdout_info, context_window_days
+            manager, loader, stats, holdout_info, context_window_days,
+            conviction_percentile=conviction_percentile
         )
 
         if validation_results:
-            # Update roster with validation results
-            roster = manager.load_roster()
-            if roster:
-                roster['validation'] = validation_results
-                manager.save_roster(roster)
-                print(f"\n✓ Validation results added and synced to cloud")
+            # Update roster with validation results (only if not using custom overrides)
+            if args.quorum is None and conviction_percentile is None:
+                roster = manager.load_roster()
+                if roster:
+                    roster['validation'] = validation_results
+                    manager.save_roster(roster)
+                    print(f"\n✓ Validation results added and synced to cloud")
+            else:
+                overrides = []
+                if args.quorum is not None:
+                    overrides.append(f"quorum={args.quorum}")
+                if conviction_percentile is not None:
+                    overrides.append(f"conviction=P{conviction_percentile}")
+                print(f"\n⚠ Skipping roster update ({', '.join(overrides)} used for A/B testing)")
 
     if args.simulate:
         run_simulation(manager, loader, stats, context_window_days)

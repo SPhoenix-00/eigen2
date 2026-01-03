@@ -163,10 +163,10 @@ class GlobalHallOfFame:
         self.gauntlet_median: float = float('-inf')
         self.roi_median: float = float('-inf')
         self.expectancy_median: float = float('-inf')
-        # 75th percentile thresholds (must beat at least 2 of 3)
-        self.gauntlet_p75: float = float('-inf')
-        self.roi_p75: float = float('-inf')
-        self.expectancy_p75: float = float('-inf')
+        # 25th percentile thresholds (must beat at least 2 of 3)
+        self.gauntlet_p25: float = float('-inf')
+        self.roi_p25: float = float('-inf')
+        self.expectancy_p25: float = float('-inf')
         self.league_compatible: bool = False
 
         # Thread safety for atomic updates
@@ -428,9 +428,9 @@ class GlobalHallOfFame:
             self.gauntlet_median = float('-inf')
             self.roi_median = float('-inf')
             self.expectancy_median = float('-inf')
-            self.gauntlet_p75 = float('-inf')
-            self.roi_p75 = float('-inf')
-            self.expectancy_p75 = float('-inf')
+            self.gauntlet_p25 = float('-inf')
+            self.roi_p25 = float('-inf')
+            self.expectancy_p25 = float('-inf')
         else:
             # Get the 50th ranked agent's score (worst in top 50)
             sorted_entries = sorted(self.entries, key=lambda e: e.gauntlet_score, reverse=True)
@@ -442,7 +442,7 @@ class GlobalHallOfFame:
             # Lower CV is better, so new agents must have CV below the worst current CV
             self.cv_threshold = max(e.cv for e in self.entries)
 
-            # Calculate median (50th percentile) and 75th percentile for all 3 metrics
+            # Calculate median (50th percentile) and 25th percentile for all 3 metrics
             gauntlet_scores = [e.gauntlet_score for e in self.entries]
             roi_values = [e.roi for e in self.entries]
             expectancy_values = [e.expectancy for e in self.entries]
@@ -451,9 +451,9 @@ class GlobalHallOfFame:
             self.roi_median = float(np.percentile(roi_values, 50))
             self.expectancy_median = float(np.percentile(expectancy_values, 50))
 
-            self.gauntlet_p75 = float(np.percentile(gauntlet_scores, 75))
-            self.roi_p75 = float(np.percentile(roi_values, 75))
-            self.expectancy_p75 = float(np.percentile(expectancy_values, 75))
+            self.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
+            self.roi_p25 = float(np.percentile(roi_values, 25))
+            self.expectancy_p25 = float(np.percentile(expectancy_values, 25))
 
     def _discover_fallback_leagues(self):
         """
@@ -568,6 +568,63 @@ class GlobalHallOfFame:
         else:
             print(f"  Total fallback leagues: {len(self.fallback_leagues)}")
 
+    def analyze_promotion(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0) -> Tuple[bool, List[str]]:
+        """
+        Analyze if an agent qualifies for Global 50 and return detailed reasons.
+        
+        Returns:
+            Tuple of (passed: bool, reasons: List[str])
+        """
+        reasons = []
+        if not self.enabled:
+            return False, ["Global HoF is disabled"]
+        if not self.league_compatible:
+            return False, ["League configuration incompatible"]
+
+        # Criterion 1: Must beat ALL 4 minimum thresholds
+        failures = []
+        if gauntlet_score <= self.entry_threshold:
+            failures.append(f"Gauntlet Score {gauntlet_score:.2f} <= Threshold {self.entry_threshold:.2f}")
+        if roi <= self.roi_threshold:
+            failures.append(f"ROI {roi:.2f}% <= Threshold {self.roi_threshold:.2f}%")
+        if expectancy <= self.expectancy_threshold:
+            failures.append(f"Expectancy {expectancy:.4f} <= Threshold {self.expectancy_threshold:.4f}")
+        if cv >= self.cv_threshold:
+            failures.append(f"CV {cv:.2f} >= Threshold {self.cv_threshold:.2f} (Lower is better)")
+        
+        if failures:
+            reasons.append("Failed Minimum Thresholds:")
+            reasons.extend([f"  - {f}" for f in failures])
+            return False, reasons
+
+        # Criterion 2: At least 2 of 3 metrics must beat 25th percentile
+        beats_gauntlet_p25 = gauntlet_score > self.gauntlet_p25
+        beats_roi_p25 = roi > self.roi_p25
+        beats_expectancy_p25 = expectancy > self.expectancy_p25
+        count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
+        
+        if count_above_p25 < 2:
+            reasons.append(f"Failed p25 Criterion (Need 2/3, got {count_above_p25}):")
+            reasons.append(f"  - Gauntlet > p25 ({self.gauntlet_p25:.2f}): {'✅' if beats_gauntlet_p25 else '❌'}")
+            reasons.append(f"  - ROI > p25 ({self.roi_p25:.2f}%): {'✅' if beats_roi_p25 else '❌'}")
+            reasons.append(f"  - Expectancy > p25 ({self.expectancy_p25:.4f}): {'✅' if beats_expectancy_p25 else '❌'}")
+            return False, reasons
+
+        # Criterion 3: At least 1 metric must beat median (50th percentile)
+        beats_gauntlet_median = gauntlet_score > self.gauntlet_median
+        beats_roi_median = roi > self.roi_median
+        beats_expectancy_median = expectancy > self.expectancy_median
+        count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
+        
+        if count_above_median < 1:
+            reasons.append(f"Failed Median Criterion (Need 1/3, got {count_above_median}):")
+            reasons.append(f"  - Gauntlet > Median ({self.gauntlet_median:.2f}): {'✅' if beats_gauntlet_median else '❌'}")
+            reasons.append(f"  - ROI > Median ({self.roi_median:.2f}%): {'✅' if beats_roi_median else '❌'}")
+            reasons.append(f"  - Expectancy > Median ({self.expectancy_median:.4f}): {'✅' if beats_expectancy_median else '❌'}")
+            return False, reasons
+
+        return True, ["Passed all criteria"]
+
     def should_promote(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0) -> bool:
         """
         Check if an agent qualifies for Global 50.
@@ -575,7 +632,7 @@ class GlobalHallOfFame:
         Criteria (all must be satisfied):
         1. All 4 metrics must beat their minimum thresholds (gauntlet, ROI, expectancy, CV)
            Note: For CV, "beating" means being LOWER (more stable)
-        2. At least 2 of 3 metrics must beat the 75th percentile (gauntlet, ROI, expectancy)
+        2. At least 2 of 3 metrics must beat the 25th percentile (gauntlet, ROI, expectancy)
         3. At least 1 metric must beat the median (50th percentile)
 
         Args:
@@ -587,39 +644,8 @@ class GlobalHallOfFame:
         Returns:
             True if agent should be promoted, False otherwise
         """
-        if not self.enabled or not self.league_compatible:
-            return False
-
-        # Criterion 1: Must beat ALL 4 minimum thresholds
-        if gauntlet_score <= self.entry_threshold:
-            return False
-        if roi <= self.roi_threshold:
-            return False
-        if expectancy <= self.expectancy_threshold:
-            return False
-        # CV check: lower is better, so agent CV must be < threshold (max CV in population)
-        if cv >= self.cv_threshold:
-            return False
-
-        # Criterion 2: At least 2 of 3 metrics must beat 75th percentile
-        beats_gauntlet_p75 = gauntlet_score > self.gauntlet_p75
-        beats_roi_p75 = roi > self.roi_p75
-        beats_expectancy_p75 = expectancy > self.expectancy_p75
-        count_above_p75 = sum([beats_gauntlet_p75, beats_roi_p75, beats_expectancy_p75])
-        if count_above_p75 < 2:
-            return False
-
-        # Criterion 3: At least 1 metric must beat median (50th percentile)
-        # Note: If 2+ metrics beat p75, they automatically beat median, so this is always satisfied
-        # But we check explicitly for clarity and edge cases
-        beats_gauntlet_median = gauntlet_score > self.gauntlet_median
-        beats_roi_median = roi > self.roi_median
-        beats_expectancy_median = expectancy > self.expectancy_median
-        count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
-        if count_above_median < 1:
-            return False
-
-        return True
+        passed, _ = self.analyze_promotion(gauntlet_score, roi, expectancy, cv)
+        return passed
 
     # Maximum number of Maverick agents allowed in Global 50 (The "Highlander" Rule)
     MAVERICK_CAP = 5
@@ -629,7 +655,8 @@ class GlobalHallOfFame:
                           quality_ratio: float = 0.0, win_ratio: float = 0.0,
                           total_trades: int = 0, run_name: Optional[str] = None,
                           suppress_threshold_output: bool = False,
-                          is_maverick: bool = False) -> Tuple[bool, int]:
+                          is_maverick: bool = False,
+                          replacing_entry: Optional[Tuple[str, int]] = None) -> Tuple[bool, int]:
         """
         Phase C: The Promotion Routine (Atomic Update)
 
@@ -654,6 +681,11 @@ class GlobalHallOfFame:
             run_name: Optional run name override (e.g., for archive fill)
             suppress_threshold_output: If True, suppress threshold output
             is_maverick: If True, this agent is a Maverick (aggressive reward function)
+            replacing_entry: Optional (run_name, agent_id) tuple of entry being replaced.
+                           When specified, this entry is explicitly removed from the candidate
+                           pool before merging. This is used in --multi mode where a child
+                           agent replaces its parent to prevent the parent's entry from
+                           persisting in the JSON after its file has been archived.
 
         Returns:
             Tuple of (promoted: bool, rank: int)
@@ -680,6 +712,19 @@ class GlobalHallOfFame:
 
             # Reload entries
             self._load_local_ledger()
+
+            # If replacing an existing entry (--multi mode parent replacement),
+            # remove it from the pool before merging to prevent orphaned references
+            replaced_entry = None
+            if replacing_entry is not None:
+                parent_run_name, parent_agent_id = replacing_entry
+                for entry in self.entries:
+                    if entry.run_name == parent_run_name and entry.agent_id == parent_agent_id:
+                        replaced_entry = entry
+                        break
+                if replaced_entry:
+                    self.entries = [e for e in self.entries if e != replaced_entry]
+                    print(f"  Replacing parent: {parent_run_name}_{parent_agent_id}")
 
             # Create new entry
             # Use provided run_name if given (e.g., for archive fill), otherwise use self.run_name
@@ -743,6 +788,10 @@ class GlobalHallOfFame:
             # Identify dropouts from original entries (not including the new entry if it failed)
             # dropouts are entries in self.entries that are not in final_list
             dropouts = [e for e in self.entries if e not in final_list]
+
+            # Also add the explicitly replaced entry to dropouts for proper archiving
+            if replaced_entry is not None:
+                dropouts.append(replaced_entry)
 
             # Apply the new list
             self.entries = final_list

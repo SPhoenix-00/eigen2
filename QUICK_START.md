@@ -7,6 +7,24 @@
 
 ---
 
+## Quick Reference: Training Modes
+
+| Mode | Command | Population | Use Case |
+|------|---------|------------|----------|
+| **Standard** | `python main.py` | 96 agents | Cloud/remote training (RunPod, AWS, GCP) |
+| **Local** | `python main.py --local` | 32 agents | Windows, local dev, single-core systems |
+| **Maverick** | `python main.py --maverick` | 96 agents | Aggressive agents to break committee inaction |
+| **Local + Maverick** | `python main.py --local --maverick` | 32 agents | Local development of aggressive agents |
+
+**Resume any mode:**
+```bash
+python main.py --resume              # Resume last run (uses same mode as original)
+python main.py --local --resume      # Resume with local mode
+python main.py --maverick --resume   # Resume maverick training
+```
+
+---
+
 ## Setup Commands
 
 ### 1. Create RunPod Instance
@@ -42,8 +60,8 @@ python3 << 'EOF'
 from google.cloud import storage
 client = storage.Client()
 bucket = client.bucket('eigen2-checkpoints-ase0')
-blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT.pkl')
-blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT.pkl')
+blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_151025.pkl')
+blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT_151025.pkl')
 print("✓ Training data downloaded")
 EOF
 ```
@@ -67,6 +85,114 @@ export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
 python main.py              # New training
 python main.py --resume     # Resume from last run
 ```
+
+---
+
+## Training Modes and Flags
+
+### Standard Training (Cloud/Remote)
+Default mode optimized for distributed cloud environments (RunPod, AWS, etc.):
+
+```bash
+python main.py              # New training (96 agents, parallel processing)
+python main.py --resume     # Resume from last run
+```
+
+**Characteristics:**
+- Population size: 96 agents
+- Parallel evaluation/validation workers
+- Optimized for multi-core cloud instances
+- Best for: RunPod, AWS, GCP instances with multiple CPU cores
+
+---
+
+### Local Mode (`--local`)
+
+Optimized for local machines (Windows, Mac, or single-core systems):
+
+```bash
+python main.py --local              # New training with local optimizations
+python main.py --local --resume     # Resume with local mode
+```
+
+**Use Cases:**
+- Running on Windows (avoids multiprocessing issues)
+- Local development/testing on personal machines
+- When parallel workers cause slowdowns or crashes
+- Single-core or limited CPU environments
+
+**Optimizations:**
+- Population size: 32 agents (reduced from 96)
+- Sequential evaluation/validation (no process spawning)
+- Eliminates IPC serialization overhead
+- Serialized disk writes (prevents I/O thrashing on NVMe)
+- GPU-accelerated batched inference (when GPU available)
+- In-memory transition buffers (no disk I/O during evaluation)
+
+**Performance:**
+- Faster on Windows and single-core systems
+- Lower memory footprint
+- More stable on systems with multiprocessing issues
+- Still uses GPU for inference when available
+
+---
+
+### Maverick Mode (`--maverick`)
+
+Aggressive training mode for producing signal generators that break committee inaction:
+
+```bash
+python main.py --maverick              # New maverick training
+python main.py --maverick --resume   # Resume maverick run
+python main.py --maverick --local    # Maverick + local mode
+```
+
+**Use Cases:**
+- Training aggressive agents to break committee deadlocks
+- Producing high-conviction signal generators
+- When committee shows excessive inaction (too few trades)
+- Creating "disruptor" agents for committee diversity
+
+**Training Characteristics:**
+- **Reward Function**: FOMO/ROI-First (aggressive)
+- **Hurdle Rate**: 50% of normal (lower barrier to entry)
+- **Forced Exit Penalty**: Disabled (encourages holding for bigger gains)
+- **Population**: Standard size (96 agents) unless combined with `--local` (32 agents)
+
+**Constraints:**
+- **Highlander Rule**: Maximum 5 mavericks allowed in Global 50
+- **Auto-Stop**: Training stops when maverick reaches rank 20 or higher in Global 50
+- **Purpose**: Designed to complement conservative committee members
+
+**When to Use:**
+- Committee evaluation shows low trade frequency
+- Need more aggressive signal generation
+- Want to diversify committee behavior
+- Training specialized "disruptor" agents
+
+---
+
+### Combining Flags
+
+Flags can be combined for specific use cases:
+
+```bash
+# Local development with maverick training
+python main.py --local --maverick
+
+# Resume local maverick training
+python main.py --local --maverick --resume
+
+# Standard training with other modes
+python main.py --heroes auto          # Train with Global 50 heroes
+python main.py --consistency          # Consistency-focused training
+python main.py --multi roster.json    # Multi-agent committee training
+```
+
+**Common Combinations:**
+- `--local --maverick`: Local development of aggressive agents
+- `--local --heroes auto`: Local training with Global 50 initialization
+- `--maverick --resume`: Continue aggressive training run
 
 ---
 
@@ -188,4 +314,28 @@ bucket = client.bucket('eigen2-checkpoints-ase0')
 blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT.pkl')
 blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT.pkl')
 EOF
+```
+
+**Multiprocessing errors or crashes on Windows:**
+```bash
+# Use --local flag to avoid multiprocessing issues
+python main.py --local
+```
+
+**Training too slow on local machine:**
+```bash
+# --local mode uses sequential processing (faster on single-core systems)
+python main.py --local
+```
+
+**Committee showing excessive inaction (too few trades):**
+```bash
+# Train maverick agents to break committee deadlocks
+python main.py --maverick
+```
+
+**Out of memory errors:**
+```bash
+# Use --local to reduce population size (32 vs 96 agents)
+python main.py --local
 ```

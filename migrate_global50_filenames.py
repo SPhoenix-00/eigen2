@@ -140,7 +140,7 @@ def migrate_filenames():
     print(f"  Agents renamed:   {renamed_count}")
     print(f"  Archives renamed: {archived_count}")
     print(f"  Cloud mirror:     gs://{cloud_sync.bucket_name}/{cloud_base}/")
-    print(f"\nYou can now run: python evaluate_for_global50.py --eval")
+    print(f"\nYou can now run: python global50.py --eval")
     print(f"{'='*70}\n")
 
 if __name__ == "__main__":

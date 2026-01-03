@@ -67,7 +67,6 @@ class TradingEnvironment(gym.Env):
             consistency_mode: If True, applies loss magnification for consistency training (see Config.CONSISTENCY_LOSS_MULTIPLIER)
             gauntlet_mode: If True, uses soft penalty for zero trades (tactical no-trade is acceptable)
             maverick_mode: If True, applies aggressive reward function (FOMO/ROI-First):
-                          - Reduced loss penalty (0.5x instead of 1.0x or 1.5x)
                           - Lower hurdle rate (50% of normal)
                           - No forced exit penalty
         """
@@ -330,15 +329,53 @@ class TradingEnvironment(gym.Env):
             observation = observation * (1.0 + noise_pct)
 
         return observation.astype(np.float32)
-    
+
+    def get_batch_observations(self, start_day_idx: int, count: int) -> np.ndarray:
+        """
+        ZERO-COPY batch observation fetch using numpy stride tricks.
+
+        Uses sliding_window_view to create 125 observations INSTANTLY
+        without a Python loop. This is ~100x faster than looping.
+
+        Args:
+            start_day_idx: Starting day index (current_idx at episode start)
+            count: Number of days/observations to fetch
+
+        Returns:
+            Batch of observations [count, context_window, num_cols, features]
+        """
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        # 1. Calculate exact data range needed
+        first_row = start_day_idx - Config.CONTEXT_WINDOW_DAYS + 1
+        last_row = start_day_idx + count  # exclusive
+
+        # 2. Single slice of raw data [total_days_needed, cols, feats]
+        data_slice = self.data_array[first_row:last_row]
+
+        # 3. Create sliding windows (ZERO-COPY strided view)
+        # Result shape: [count, cols, feats, context_window]
+        windows = sliding_window_view(data_slice, window_shape=Config.CONTEXT_WINDOW_DAYS, axis=0)
+
+        # 4. Transpose to [batch, context, cols, feats] and make contiguous
+        # This is the ONLY memory copy - one big block instead of 125 small ones
+        obs_batch = np.ascontiguousarray(windows.transpose(0, 3, 1, 2), dtype=np.float32)
+
+        # 5. Vectorized normalization (in-place)
+        obs_batch -= self.norm_stats['mean']
+        obs_batch /= self.norm_stats['std']
+
+        # 6. Vectorized noise (if training)
+        if self.is_training:
+            noise = np.random.normal(0.0, Config.OBSERVATION_NOISE_STD, obs_batch.shape).astype(np.float32)
+            obs_batch *= (1.0 + noise)
+
+        return obs_batch
+
     def _process_action(self, action: np.ndarray) -> float:
         """
-        Process the action and open new positions for all qualifying stocks.
-        Only opens positions during trading period.
-
-        NEW LOGIC: Evaluates ALL 108 stocks independently. Any stock with coefficient
-        >= COEFFICIENT_THRESHOLD will trigger a "buy" action, allowing the agent to
-        open multiple positions in a single day and learn true portfolio diversification.
+        Process the action and open new positions for qualifying stocks.
+        OPTIMIZED: Uses vectorized filtering to avoid looping over all 108 stocks.
 
         Args:
             action: Array [108, 2] with [coefficient, sale_target] per stock
@@ -348,122 +385,78 @@ class TradingEnvironment(gym.Env):
         """
         # Check if we're still in trading period
         if self.current_idx >= self.trading_end_idx:
-            # Settlement period - no new positions allowed
-            self.episode_actions.append({
-                'day': self.dates[self.current_idx],
-                'action': 'blocked',
-                'reason': 'settlement_period'
-            })
-            return 0.0
+            return 0.0  # Settlement period - skip logging for speed
 
-        # Extract coefficients and sale targets
         coefficients = action[:, 0]
         sale_targets = action[:, 1]
 
-        # Track max coefficient during episode (for validation gradient)
-        # Update with the maximum coefficient from this action
-        max_coeff_this_step = float(np.max(coefficients))
-        self.max_coefficient_during_episode = max(self.max_coefficient_during_episode, max_coeff_this_step)
+        # Track max coefficient (vectorized)
+        max_coeff = float(np.max(coefficients))
+        if max_coeff > self.max_coefficient_during_episode:
+            self.max_coefficient_during_episode = max_coeff
 
-        # Track if any positions were opened this step
-        positions_opened_this_step = 0
+        # VECTORIZED: Find only candidates above threshold (typically 0-5 stocks)
+        # This eliminates looping over all 108 stocks every step
+        candidate_indices = np.where(coefficients >= Config.COEFFICIENT_THRESHOLD)[0]
 
-        # Loop through ALL 108 stocks and evaluate each independently
-        for stock_id in range(Config.NUM_INVESTABLE_STOCKS):
-            coefficient = coefficients[stock_id]
-            sale_target = sale_targets[stock_id]
+        if len(candidate_indices) == 0:
+            return 0.0  # Fast exit - nothing to do
 
-            # Check if this stock's coefficient meets the threshold
-            if coefficient < Config.COEFFICIENT_THRESHOLD:
-                continue  # Skip this stock, coefficient too low
+        # Get close prices for all investable stocks at once (vectorized)
+        # data_array_full shape: [days, cols, features], close price is index 1
+        all_close_prices = self.data_array_full[self.current_idx, Config.INVESTABLE_START_COL:Config.INVESTABLE_START_COL + Config.NUM_INVESTABLE_STOCKS, 1]
 
-            # Check if we already have a position in this stock
+        positions_opened = 0
+        current_date = self.dates[self.current_idx]
+
+        # Only loop over candidates (sparse - typically 0-5 stocks)
+        for stock_id in candidate_indices:
+            # Skip if position already open
             if stock_id in self.open_positions:
-                # Cannot open duplicate position - log and skip
-                self.episode_actions.append({
-                    'day': self.dates[self.current_idx],
-                    'action': 'blocked',
-                    'stock_id': stock_id,
-                    'reason': 'position_already_open'
-                })
                 continue
 
-            # Get stock data for this day
-            # Stock ID in action space is relative to investable stocks (0-107)
-            # Need to map to actual column index (10-117)
-            actual_col_idx = Config.INVESTABLE_START_COL + stock_id
-            stock_data = self.data_array_full[self.current_idx, actual_col_idx, :]
+            entry_price = all_close_prices[stock_id]
 
-            # Check if stock data is valid (not all nan)
-            if np.all(np.isnan(stock_data)):
-                # Stock doesn't exist on this day - log and skip
-                self.episode_actions.append({
-                    'day': self.dates[self.current_idx],
-                    'action': 'blocked',
-                    'stock_id': stock_id,
-                    'reason': 'stock_data_invalid'
-                })
-                continue
-
-            # Extract close price (index 1 in full 9-feature dataset)
-            # Full dataset: [Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]
-            entry_price = stock_data[1]  # close price
-
+            # Skip invalid prices
             if np.isnan(entry_price) or entry_price <= 0:
-                # Invalid entry price - log and skip
-                self.episode_actions.append({
-                    'day': self.dates[self.current_idx],
-                    'action': 'blocked',
-                    'stock_id': stock_id,
-                    'reason': 'invalid_entry_price'
-                })
                 continue
 
-            # Validate and clip sale target
-            sale_target = np.clip(sale_target, Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
+            coefficient = coefficients[stock_id]
+            sale_target = np.clip(sale_targets[stock_id], Config.MIN_SALE_TARGET, Config.MAX_SALE_TARGET)
 
-            # All checks passed - open position for this stock
+            # Open position
             position = Position(
-                stock_id=stock_id,
-                entry_price=entry_price,
-                coefficient=coefficient,
-                sale_target_pct=sale_target,
+                stock_id=int(stock_id),
+                entry_price=float(entry_price),
+                coefficient=float(coefficient),
+                sale_target_pct=float(sale_target),
                 days_held=0,
                 entry_day_idx=self.current_idx,
-                entry_date=self.dates[self.current_idx]
+                entry_date=current_date
             )
 
             self.open_positions[stock_id] = position
             self.total_positions_opened += 1
-            positions_opened_this_step += 1
+            positions_opened += 1
 
-            # Track capital employed for accurate ROI calculation
+            # Track capital employed
             shares = int(coefficient)
-            cost = entry_price * shares
-            self.current_capital_employed += cost
-            # Update peak capital (high water mark)
+            self.current_capital_employed += entry_price * shares
             if self.current_capital_employed > self.peak_capital_employed:
                 self.peak_capital_employed = self.current_capital_employed
 
+            # Log action (can be disabled for max speed)
             self.episode_actions.append({
-                'day': self.dates[self.current_idx],
+                'day': current_date,
                 'action': 'open',
-                'stock_id': stock_id,
-                'entry_price': entry_price,
-                'coefficient': coefficient,
-                'sale_target_pct': sale_target,
+                'stock_id': int(stock_id),
+                'entry_price': float(entry_price),
+                'coefficient': float(coefficient),
+                'sale_target_pct': float(sale_target),
                 'sale_target_price': position.sale_target_price
             })
 
-        # If no positions were opened, log that no action was taken
-        if positions_opened_this_step == 0:
-            self.episode_actions.append({
-                'day': self.dates[self.current_idx],
-                'action': 'none',
-                'reason': 'no_stocks_above_threshold'
-            })
-
-        return 0.0  # No immediate reward for opening positions
+        return 0.0
     
     def _update_positions(self) -> float:
         """
@@ -553,16 +546,10 @@ class TradingEnvironment(gym.Env):
                     base_reward = scaled_coefficient * net_gain_pct
                     self.num_wins += 1
                 else:
-                    # LOSS: Apply mode-specific multiplier
+                    # LOSS: Apply magnification only in consistency mode
                     # Consistency mode: 1.5x magnification (focus on reducing drawdowns)
-                    # Normal mode: 1.0x (treat losses equally to gains)
-                    # MAVERICK MODE: 0.5x (reduced loss penalty to encourage aggressive trading)
-                    if self.maverick_mode:
-                        loss_multiplier = 0.5  # FOMO: Losses hurt less, encourages risk-taking
-                    elif self.consistency_mode:
-                        loss_multiplier = Config.CONSISTENCY_LOSS_MULTIPLIER
-                    else:
-                        loss_multiplier = 1.0
+                    # Normal/Maverick mode: 1.0x (treat losses equally to gains)
+                    loss_multiplier = Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0
                     base_reward = scaled_coefficient * net_gain_pct * loss_multiplier
                     self.num_losses += 1
 

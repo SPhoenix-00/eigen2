@@ -34,7 +34,7 @@ class TeeLogger:
             filepath: Path to the log file
         """
         self.terminal = sys.stdout
-        self.log_file = open(filepath, 'w', buffering=1)  # Line buffered
+        self.log_file = open(filepath, 'w', encoding='utf-8', buffering=1)  # Line buffered
 
     def write(self, message):
         """Write message to both terminal and file."""
@@ -150,9 +150,10 @@ def main():
         parser.add_argument(
             '--multi',
             action='store_true',
-            help='Multi-agent mode: Train all 9 committee members sequentially. '
-                 'Trains one member at a time until breakthrough (5%% improvement), then rotates to next. '
-                 'Ends after 3 turnovers (all 9 members achieve 3 breakthroughs each).'
+            help='Multi-agent mode: Two-phase training of committee members. '
+                 'Phase 1 (Non-Maverick): Train each non-maverick agent sequentially for 3 turnovers each, '
+                 'then clear buffer/population. Phase 2 (Maverick): Train each maverick agent sequentially '
+                 'for 3 turnovers each using maverick reward function. Requires at least one maverick in committee.'
         )
         parser.add_argument(
             '--cleanup',
@@ -174,6 +175,23 @@ def main():
             help='Use with --resume to reset the fallback generation counter to max. '
                  'In consistency mode, this resets the "generations since last turnover" counter, '
                  'giving the run a fresh runway of MAX_GENERATIONS_GAUNTLET generations.'
+        )
+        parser.add_argument(
+            '--maverick',
+            action='store_true',
+            help='Enable Maverick mode: aggressive training with FOMO/ROI-First reward functions. '
+                 'Produces aggressive signal generators designed to break committee inaction. '
+                 'Limited to 5 mavericks in Global 50 (Highlander Rule). Training stops when '
+                 'maverick reaches rank 20 or higher.'
+        )
+        parser.add_argument(
+            '--local',
+            action='store_true',
+            help='Enable local mode optimizations for running on local machines. '
+                 'Uses sequential evaluation/validation instead of parallel processing to '
+                 'eliminate process spawning overhead and IPC serialization. Also serializes '
+                 'disk writes to avoid I/O thrashing on local NVMe drives. Recommended for '
+                 'Windows or when parallel workers cause slowdowns.'
         )
         args = parser.parse_args()
         # --------------------------------
@@ -283,7 +301,8 @@ def main():
 
             print(f"\n🎯 MULTI-AGENT MODE")
             print(f"  Committee members: {len(roster['members'])}")
-            print(f"  Population size: {Config.POPULATION_SIZE} (standard)")
+            pop_size = Config.LOCAL_POPULATION_SIZE if args.local else Config.POPULATION_SIZE
+            print(f"  Population size: {pop_size}{' (local mode)' if args.local else ' (standard)'}")
             print(f"  Training mode: Sequential (one member at a time)")
             print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
             print(f"  Consistency mode: AUTO-ENABLED")
@@ -369,7 +388,9 @@ def main():
             original_stdout=tee_logger.terminal,
             original_stderr=tee_logger.terminal,
             multi_mode=args.multi,
-            multi_roster=getattr(args, 'multi_roster', None)
+            multi_roster=getattr(args, 'multi_roster', None),
+            maverick_mode=args.maverick,
+            local_mode=args.local
         )
 
         # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---
