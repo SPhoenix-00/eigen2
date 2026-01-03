@@ -10,6 +10,11 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 os.environ.setdefault('PYTORCH_HIP_ALLOC_CONF', 'expandable_segments:True')
 os.environ.setdefault('HSA_FORCE_FINE_GRAIN_PCIE', '1')
 
+# Suppress ROCm-related warnings
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.modules.module')
+warnings.filterwarnings('ignore', message='.*expandable_segments.*')
+
 import argparse
 import torch
 # Now that torch is imported, configure GPU environment and detect backend

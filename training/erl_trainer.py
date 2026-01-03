@@ -33,6 +33,9 @@ _WORKER_CACHE_MAX_SIZE = 50
 # Suppress common library warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='gymnasium')
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.cuda.amp')
+# Suppress PyTorch ROCm warnings about expandable_segments
+warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.modules.module')
+warnings.filterwarnings('ignore', message='.*expandable_segments.*')
 
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
@@ -87,6 +90,42 @@ def _init_worker(env_config):
         env_config: Environment configuration dict with shared memory refs for arrays
     """
     global _worker_env_config, _worker_env, _worker_agent_cache, _worker_shm_refs
+    
+    # Suppress ROCm-related warnings in worker processes
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.modules.module')
+    warnings.filterwarnings('ignore', message='.*expandable_segments.*')
+    warnings.filterwarnings('ignore', message='.*ROCm.*')
+    
+    # Suppress ROCm configuration messages by redirecting stdout temporarily during torch import
+    # This prevents "Configured environment for ROCm" messages from appearing
+    import sys
+    import io
+    from contextlib import redirect_stdout, redirect_stderr
+    
+    # Capture and filter ROCm configuration messages
+    class ROCmFilter:
+        def __init__(self, original):
+            self.original = original
+        
+        def write(self, text):
+            # Filter out ROCm configuration messages
+            text_str = str(text)
+            if 'Configured environment for ROCm' in text_str:
+                return
+            if 'Device: AMD' in text_str:
+                return
+            self.original.write(text)
+        
+        def flush(self):
+            self.original.flush()
+        
+        def __getattr__(self, name):
+            return getattr(self.original, name)
+    
+    # Apply filter to stdout and stderr to suppress ROCm messages
+    sys.stdout = ROCmFilter(sys.stdout)
+    sys.stderr = ROCmFilter(sys.stderr)
 
     # Reconstruct arrays from shared memory if using shared memory mode
     if 'shm_data_array_name' in env_config:
