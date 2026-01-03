@@ -590,19 +590,32 @@ class GlobalHallOfFame:
 
         # Criterion 1: Must beat ALL 4 minimum thresholds (3 for mavericks - skip expectancy)
         failures = []
-        if gauntlet_score <= self.entry_threshold:
+        passes_gauntlet_threshold = gauntlet_score > self.entry_threshold
+        passes_roi_threshold = roi > self.roi_threshold
+        passes_expectancy_threshold = expectancy > self.expectancy_threshold if not is_maverick else True  # Skip for mavericks
+        passes_cv_threshold = cv < self.cv_threshold  # CV: lower is better
+        
+        if not passes_gauntlet_threshold:
             failures.append(f"Gauntlet Score {gauntlet_score:.2f} <= Threshold {self.entry_threshold:.2f}")
-        if roi <= self.roi_threshold:
+        if not passes_roi_threshold:
             failures.append(f"ROI {roi:.2f}% <= Threshold {self.roi_threshold:.2f}%")
         # Mavericks skip expectancy minimum threshold check
-        if not is_maverick and expectancy <= self.expectancy_threshold:
+        if not is_maverick and not passes_expectancy_threshold:
             failures.append(f"Expectancy {expectancy:.4f} <= Threshold {self.expectancy_threshold:.4f}")
-        if cv >= self.cv_threshold:
+        if not passes_cv_threshold:
             failures.append(f"CV {cv:.2f} >= Threshold {self.cv_threshold:.2f} (Lower is better)")
         
+        # Always show threshold results for verbose output (especially for maverick mode)
+        reasons.append("Gate 1: Minimum Thresholds (All must pass):")
+        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > {self.entry_threshold:.2f} {'✅' if passes_gauntlet_threshold else '❌'}")
+        reasons.append(f"  - ROI: {roi:.2f}% > {self.roi_threshold:.2f}% {'✅' if passes_roi_threshold else '❌'}")
+        if not is_maverick:
+            reasons.append(f"  - Expectancy: {expectancy:.4f} > {self.expectancy_threshold:.4f} {'✅' if passes_expectancy_threshold else '❌'}")
+        else:
+            reasons.append(f"  - Expectancy: SKIPPED (Maverick mode)")
+        reasons.append(f"  - CV: {cv:.2f} < {self.cv_threshold:.2f} {'✅' if passes_cv_threshold else '❌'} (lower is better)")
+        
         if failures:
-            reasons.append("Failed Minimum Thresholds:")
-            reasons.extend([f"  - {f}" for f in failures])
             return False, reasons
 
         # Criterion 2: At least 2 of 3 metrics must beat 25th percentile (2 of 2 for mavericks - skip expectancy)
@@ -616,13 +629,17 @@ class GlobalHallOfFame:
         count_above_p25 = sum(metrics_to_check)
         required_p25 = 2 if is_maverick else 2  # Still need 2, but from 2 metrics instead of 3
         
+        metric_count = "2/2" if is_maverick else "2/3"
+        reasons.append(f"\nGate 2: p25 Criterion (Need {metric_count} to pass):")
+        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > p25 ({self.gauntlet_p25:.2f}) {'✅' if beats_gauntlet_p25 else '❌'}")
+        reasons.append(f"  - ROI: {roi:.2f}% > p25 ({self.roi_p25:.2f}%) {'✅' if beats_roi_p25 else '❌'}")
+        if not is_maverick:
+            reasons.append(f"  - Expectancy: {expectancy:.4f} > p25 ({self.expectancy_p25:.4f}) {'✅' if beats_expectancy_p25 else '❌'}")
+        else:
+            reasons.append(f"  - Expectancy: SKIPPED (Maverick mode)")
+        reasons.append(f"  Result: {count_above_p25}/{required_p25} passed {'✅' if count_above_p25 >= required_p25 else '❌'}")
+        
         if count_above_p25 < required_p25:
-            metric_count = "2/2" if is_maverick else "2/3"
-            reasons.append(f"Failed p25 Criterion (Need {metric_count}, got {count_above_p25}):")
-            reasons.append(f"  - Gauntlet > p25 ({self.gauntlet_p25:.2f}): {'✅' if beats_gauntlet_p25 else '❌'}")
-            reasons.append(f"  - ROI > p25 ({self.roi_p25:.2f}%): {'✅' if beats_roi_p25 else '❌'}")
-            if not is_maverick:
-                reasons.append(f"  - Expectancy > p25 ({self.expectancy_p25:.4f}): {'✅' if beats_expectancy_p25 else '❌'}")
             return False, reasons
 
         # Criterion 3: At least 1 metric must beat median (50th percentile) (1 of 2 for mavericks - skip expectancy)
@@ -636,16 +653,21 @@ class GlobalHallOfFame:
         count_above_median = sum(metrics_to_check_median)
         required_median = 1  # Always need at least 1
         
+        metric_count = "1/2" if is_maverick else "1/3"
+        reasons.append(f"\nGate 3: Median Criterion (Need {metric_count} to pass):")
+        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > Median ({self.gauntlet_median:.2f}) {'✅' if beats_gauntlet_median else '❌'}")
+        reasons.append(f"  - ROI: {roi:.2f}% > Median ({self.roi_median:.2f}%) {'✅' if beats_roi_median else '❌'}")
+        if not is_maverick:
+            reasons.append(f"  - Expectancy: {expectancy:.4f} > Median ({self.expectancy_median:.4f}) {'✅' if beats_expectancy_median else '❌'}")
+        else:
+            reasons.append(f"  - Expectancy: SKIPPED (Maverick mode)")
+        reasons.append(f"  Result: {count_above_median}/{required_median} passed {'✅' if count_above_median >= required_median else '❌'}")
+        
         if count_above_median < required_median:
-            metric_count = "1/2" if is_maverick else "1/3"
-            reasons.append(f"Failed Median Criterion (Need {metric_count}, got {count_above_median}):")
-            reasons.append(f"  - Gauntlet > Median ({self.gauntlet_median:.2f}): {'✅' if beats_gauntlet_median else '❌'}")
-            reasons.append(f"  - ROI > Median ({self.roi_median:.2f}%): {'✅' if beats_roi_median else '❌'}")
-            if not is_maverick:
-                reasons.append(f"  - Expectancy > Median ({self.expectancy_median:.4f}): {'✅' if beats_expectancy_median else '❌'}")
             return False, reasons
 
-        return True, ["Passed all criteria"]
+        reasons.append(f"\n✅ ALL GATES PASSED: Agent qualifies for Global50 promotion!")
+        return True, reasons
 
     def should_promote(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0, is_maverick: bool = False) -> bool:
         """
