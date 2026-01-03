@@ -715,6 +715,28 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     prod_index_ts = pd.to_datetime(df_production.index, errors='coerce')
     new_index_ts = pd.to_datetime(df_new_lists.index, errors='coerce')
 
+    # #region agent log
+    with open('.cursor/debug.log', 'a') as f:
+        import json
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "A",
+            "location": "process_eigen_data.py:715-716",
+            "message": "Type check after pd.to_datetime",
+            "data": {
+                "prod_index_ts_type": str(type(prod_index_ts)),
+                "prod_index_ts_has_iloc": hasattr(prod_index_ts, 'iloc'),
+                "new_index_ts_type": str(type(new_index_ts)),
+                "new_index_ts_has_iloc": hasattr(new_index_ts, 'iloc'),
+                "prod_index_ts_len": len(prod_index_ts),
+                "new_index_ts_len": len(new_index_ts)
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion
+
     if prod_index_ts.isna().any():
         print("Error: Could not parse one or more production index values as dates.")
         print("Append mode requires a date-like index.")
@@ -726,8 +748,27 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
         print("Append mode requires a date-like index.")
         return
 
-    prod_last_ts = prod_index_ts.iloc[-1]
-    new_first_ts = new_index_ts.iloc[0]
+    # #region agent log
+    with open('.cursor/debug.log', 'a') as f:
+        import json
+        log_entry = {
+            "sessionId": "debug-session",
+            "runId": "run1",
+            "hypothesisId": "A",
+            "location": "process_eigen_data.py:729",
+            "message": "Before accessing iloc",
+            "data": {
+                "prod_index_ts_type": str(type(prod_index_ts)),
+                "prod_index_ts_attrs": [attr for attr in dir(prod_index_ts) if not attr.startswith('_')][:10]
+            },
+            "timestamp": int(time.time() * 1000)
+        }
+        f.write(json.dumps(log_entry) + '\n')
+    # #endregion
+
+    # Fix: DatetimeIndex doesn't have .iloc, use direct indexing instead
+    prod_last_ts = prod_index_ts[-1]
+    new_first_ts = new_index_ts[0]
 
     if new_first_ts <= prod_last_ts:
         print(f"\n⚠️  WARNING: New data does not start strictly after production.")
