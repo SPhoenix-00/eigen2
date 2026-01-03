@@ -2661,11 +2661,13 @@ class ERLTrainer:
         If Positive: Boosted by WR and QR
         If Negative: Penalized by Inconsistency
 
-        MAVERICK MODE: FOMO/ROI-First scoring designed to break committee deadlock.
-        Formula: Base Score - FOMO Penalty - Fear Factor
-        - Base Score: (Raw PnL / Peak Capital) * log10(Peak Capital + 10)
+        MAVERICK MODE: FOMO/ROI-First scoring with WR Gate.
+        Formula: Base Score + Expectancy Bonus - FOMO Penalty - Fear Factor - WR Penalty
+        - Base Score: (Raw PnL / Peak Capital) * log10(Peak Capital + 10) * WR^4
+        - Expectancy Bonus: Expectancy * 20.0
         - FOMO Penalty: max(0, Market Return - Agent ROI) * 10.0
-        - Fear Factor: 2.0 * (num_losses ^ 1.2) - gentle drag on losing streaks
+        - Fear Factor: 2.0 * (num_losses ^ 1.2)
+        - WR Penalty: max(0, 0.60 - WR) * 100.0 (Forces WR > 60%)
         """
         total_trades = stats.get('num_trades', 0)
 
@@ -2709,26 +2711,57 @@ class ERLTrainer:
             if peak_capital <= 0:
                 peak_capital = total_inv if total_inv > 0 else 1.0
 
-            # 1. Base Score: ROI Efficiency
-            # (Raw PnL / Peak Capital Employed) * log10(Peak Capital + 10) * win_rate^2
+            # Calculate Expectancy explicitly
+            # Expectancy = (Win Rate * Avg Win) - (Loss Rate * Avg Loss)
+            avg_win = 0.0
+            avg_loss = 0.0
+            if closed_trades:
+                wins = [t.get('gain_pct', 0) for t in closed_trades if t.get('gain_pct', 0) >= 0]
+                losses = [abs(t.get('gain_pct', 0)) for t in closed_trades if t.get('gain_pct', 0) < 0]
+                if wins:
+                    avg_win = sum(wins) / len(wins)
+                if losses:
+                    avg_loss = sum(losses) / len(losses)
+            
+            loss_rate = 1.0 - win_rate
+            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+
+            # 1. Base Score: ROI Efficiency + WR Boost
+            # (Raw PnL / Peak Capital Employed) * log10(Peak Capital + 10) * win_rate^4
             roi_efficiency = (raw_pnl / peak_capital) * 100.0 if peak_capital > 0 else 0.0
             volume_scalar = math.log10(peak_capital + 10)
-            win_rate_multiplier = win_rate ** 2  # Scale base score by win rate squared
+            
+            # Massive boost for high WR (convex function)
+            # WR 0.50 -> 0.0625 multiplier
+            # WR 0.60 -> 0.1296 multiplier (2x boost)
+            # WR 0.70 -> 0.2401 multiplier (4x boost)
+            win_rate_multiplier = win_rate ** 4
+            
             base_score = roi_efficiency * volume_scalar * win_rate_multiplier
 
-            # 2. FOMO Penalty (Relative Performance)
+            # 2. Expectancy Bonus
+            # Add raw expectancy score (scaled to match ROI magnitude)
+            # e.g., Expectancy 0.5% -> +10 points
+            expectancy_score = expectancy * 20.0
+
+            # 3. FOMO Penalty (Relative Performance)
             # Get market return from stats (Col 44 = S&P 500 proxy)
             market_return = stats.get('market_return_pct', 0.0)
             alpha_gap = market_return - roi_pct
             fomo_penalty = max(0.0, alpha_gap) * 10.0
 
-            # 3. Fear Factor (Limited Ratchet)
+            # 4. Fear Factor (Limited Ratchet)
             # Gentle non-linear drag on losses: 2.0 * (num_losses ^ 1.2)
-            # A few losses are acceptable, but streaks become expensive
             fear_factor = 2.0 * (num_losses ** 1.2) if num_losses > 0 else 0.0
+            
+            # 5. WR Gate / Penalty
+            # Severe penalty for WR < 60% to force quality
+            wr_penalty = 0.0
+            if win_rate < 0.60:
+                wr_penalty = (0.60 - win_rate) * 100.0  # e.g., 55% WR -> 5.0 penalty
 
             # Final Maverick Fitness
-            fitness = base_score - fomo_penalty - fear_factor
+            fitness = base_score + expectancy_score - fomo_penalty - fear_factor - wr_penalty
 
             return float(fitness)
 
@@ -5275,10 +5308,18 @@ class ERLTrainer:
                     elif g50_gauntlet_score is not None and self.maverick_mode:
                         # Agent passed gauntlet but didn't qualify for promotion
                         print(f"\n  ⓘ Agent did not qualify for Global 50 promotion")
-                        print(f"  Gauntlet Score: {g50_gauntlet_score:.2f}")
-                        print(f"  ROI: {g50_gauntlet_results.get('roi', 0.0):.2f}% (threshold: {self.global_hof.roi_threshold:.2f}%)")
-                        print(f"  Expectancy: {g50_gauntlet_results.get('expectancy', 0.0):.4f} (threshold: {self.global_hof.expectancy_threshold:.4f})")
-                        print(f"  CV: {g50_gauntlet_results.get('cv', 100.0):.3f} (threshold: <{self.global_hof.cv_threshold:.3f})")
+                        
+                        # Explicitly analyze and print promotion failure reasons
+                        _, reasons = self.global_hof.analyze_promotion(
+                            g50_gauntlet_score,
+                            g50_gauntlet_results.get('roi', 0.0),
+                            g50_gauntlet_results.get('expectancy', 0.0),
+                            g50_gauntlet_results.get('cv', 100.0)
+                        )
+                        print("  ❌ Promotion Metrics Analysis:")
+                        for r in reasons:
+                            print(f"     {r}")
+                            
                         print(f"  Training continues to find agent that reaches rank <= #{Config.MAVERICK_TARGET_RANK}")
 
                     # Log to wandb
@@ -6602,7 +6643,7 @@ class ERLTrainer:
                     print(f"  Generation: {gen + 1}")
                     print(f"{'='*60}")
                     break
-            elif self.gauntlet_mode_enabled and not self.consistency_mode and self.confirmed_breakthroughs >= self.target_breakthroughs:
+            elif self.gauntlet_mode_enabled and not self.consistency_mode and not self.maverick_mode and self.confirmed_breakthroughs >= self.target_breakthroughs:
                 print(f"\n{'='*60}")
                 print(f"🎯 TARGET BREAKTHROUGHS ACHIEVED!")
                 print(f"{'='*60}")

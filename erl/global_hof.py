@@ -568,6 +568,63 @@ class GlobalHallOfFame:
         else:
             print(f"  Total fallback leagues: {len(self.fallback_leagues)}")
 
+    def analyze_promotion(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0) -> Tuple[bool, List[str]]:
+        """
+        Analyze if an agent qualifies for Global 50 and return detailed reasons.
+        
+        Returns:
+            Tuple of (passed: bool, reasons: List[str])
+        """
+        reasons = []
+        if not self.enabled:
+            return False, ["Global HoF is disabled"]
+        if not self.league_compatible:
+            return False, ["League configuration incompatible"]
+
+        # Criterion 1: Must beat ALL 4 minimum thresholds
+        failures = []
+        if gauntlet_score <= self.entry_threshold:
+            failures.append(f"Gauntlet Score {gauntlet_score:.2f} <= Threshold {self.entry_threshold:.2f}")
+        if roi <= self.roi_threshold:
+            failures.append(f"ROI {roi:.2f}% <= Threshold {self.roi_threshold:.2f}%")
+        if expectancy <= self.expectancy_threshold:
+            failures.append(f"Expectancy {expectancy:.4f} <= Threshold {self.expectancy_threshold:.4f}")
+        if cv >= self.cv_threshold:
+            failures.append(f"CV {cv:.2f} >= Threshold {self.cv_threshold:.2f} (Lower is better)")
+        
+        if failures:
+            reasons.append("Failed Minimum Thresholds:")
+            reasons.extend([f"  - {f}" for f in failures])
+            return False, reasons
+
+        # Criterion 2: At least 2 of 3 metrics must beat 25th percentile
+        beats_gauntlet_p25 = gauntlet_score > self.gauntlet_p25
+        beats_roi_p25 = roi > self.roi_p25
+        beats_expectancy_p25 = expectancy > self.expectancy_p25
+        count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
+        
+        if count_above_p25 < 2:
+            reasons.append(f"Failed p25 Criterion (Need 2/3, got {count_above_p25}):")
+            reasons.append(f"  - Gauntlet > p25 ({self.gauntlet_p25:.2f}): {'✅' if beats_gauntlet_p25 else '❌'}")
+            reasons.append(f"  - ROI > p25 ({self.roi_p25:.2f}%): {'✅' if beats_roi_p25 else '❌'}")
+            reasons.append(f"  - Expectancy > p25 ({self.expectancy_p25:.4f}): {'✅' if beats_expectancy_p25 else '❌'}")
+            return False, reasons
+
+        # Criterion 3: At least 1 metric must beat median (50th percentile)
+        beats_gauntlet_median = gauntlet_score > self.gauntlet_median
+        beats_roi_median = roi > self.roi_median
+        beats_expectancy_median = expectancy > self.expectancy_median
+        count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
+        
+        if count_above_median < 1:
+            reasons.append(f"Failed Median Criterion (Need 1/3, got {count_above_median}):")
+            reasons.append(f"  - Gauntlet > Median ({self.gauntlet_median:.2f}): {'✅' if beats_gauntlet_median else '❌'}")
+            reasons.append(f"  - ROI > Median ({self.roi_median:.2f}%): {'✅' if beats_roi_median else '❌'}")
+            reasons.append(f"  - Expectancy > Median ({self.expectancy_median:.4f}): {'✅' if beats_expectancy_median else '❌'}")
+            return False, reasons
+
+        return True, ["Passed all criteria"]
+
     def should_promote(self, gauntlet_score: float, roi: float = 0.0, expectancy: float = 0.0, cv: float = 100.0) -> bool:
         """
         Check if an agent qualifies for Global 50.
@@ -587,38 +644,8 @@ class GlobalHallOfFame:
         Returns:
             True if agent should be promoted, False otherwise
         """
-        if not self.enabled or not self.league_compatible:
-            return False
-
-        # Criterion 1: Must beat ALL 4 minimum thresholds
-        if gauntlet_score <= self.entry_threshold:
-            return False
-        if roi <= self.roi_threshold:
-            return False
-        if expectancy <= self.expectancy_threshold:
-            return False
-        # CV check: lower is better, so agent CV must be < threshold (max CV in population)
-        if cv >= self.cv_threshold:
-            return False
-
-        # Criterion 2: At least 2 of 3 metrics must beat 25th percentile
-        beats_gauntlet_p25 = gauntlet_score > self.gauntlet_p25
-        beats_roi_p25 = roi > self.roi_p25
-        beats_expectancy_p25 = expectancy > self.expectancy_p25
-        count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
-        if count_above_p25 < 2:
-            return False
-
-        # Criterion 3: At least 1 metric must beat median (50th percentile)
-        # Note: This gate is meaningful now that we use p25 instead of p75
-        beats_gauntlet_median = gauntlet_score > self.gauntlet_median
-        beats_roi_median = roi > self.roi_median
-        beats_expectancy_median = expectancy > self.expectancy_median
-        count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
-        if count_above_median < 1:
-            return False
-
-        return True
+        passed, _ = self.analyze_promotion(gauntlet_score, roi, expectancy, cv)
+        return passed
 
     # Maximum number of Maverick agents allowed in Global 50 (The "Highlander" Rule)
     MAVERICK_CAP = 5
