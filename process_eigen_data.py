@@ -942,12 +942,15 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
             production_last_row = df_production.iloc[-1]
             
             # Compare row by row (cell by cell)
-            # TOLERANCES DISABLED: Showing all differences for analysis
-            # ABS_TOLERANCE = 1e-5  # Absolute tolerance for small values (DISABLED)
-            # REL_TOLERANCE = 0.0001  # 0.01% relative tolerance for larger values (DISABLED)
+            # Use relative tolerance for larger values, absolute for small values
+            # When converting processed history back to raw and recalculating, small differences
+            # are expected due to EMA warm-up and floating point precision
+            ABS_TOLERANCE = 1e-5  # Absolute tolerance for small values
+            REL_TOLERANCE = 0.0001  # 0.01% relative tolerance for larger values
             
             mismatches = []
-            all_diffs = []  # All differences (tolerances disabled)
+            breaches = []  # Differences that breach tolerance
+            within_tolerance = 0  # Count of differences within tolerance
             
             for col in df_production.columns:
                 recalc_val = recalculated_last_row[col]
@@ -967,41 +970,57 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
                     else:
                         for i, (r, p) in enumerate(zip(recalc_val, prod_val)):
                             if r != p and not (pd.isna(r) and pd.isna(p)):
-                                # Report all differences (tolerances disabled)
+                                # Check if difference breaches tolerance
                                 if isinstance(r, (int, float)) and isinstance(p, (int, float)):
                                     diff = abs(r - p)
                                     max_val = max(abs(r), abs(p))
                                     if max_val > 1.0:
-                                        # Show relative difference for larger values
-                                        all_diffs.append(f"{col}[{i}]: recalc={r}, prod={p} (diff={diff:.6f}, {diff/max_val*100:.2f}%)")
+                                        # Relative tolerance for larger values
+                                        rel_diff = diff / max_val
+                                        if rel_diff > REL_TOLERANCE:
+                                            breaches.append(f"{col}[{i}]: recalc={r}, prod={p} (diff={diff:.6f}, {rel_diff*100:.2f}%)")
+                                        else:
+                                            within_tolerance += 1
                                     else:
-                                        # Show absolute difference for small values
-                                        all_diffs.append(f"{col}[{i}]: recalc={r}, prod={p} (diff={diff:.6f})")
+                                        # Absolute tolerance for small values
+                                        if diff > ABS_TOLERANCE:
+                                            breaches.append(f"{col}[{i}]: recalc={r}, prod={p} (diff={diff:.6f})")
+                                        else:
+                                            within_tolerance += 1
                                 else:
                                     mismatches.append(f"{col}[{i}]: recalc={r}, prod={p}")
                 elif recalc_val != prod_val:
-                    # Report all differences (tolerances disabled)
+                    # Check if difference breaches tolerance
                     if isinstance(recalc_val, (int, float)) and isinstance(prod_val, (int, float)):
                         diff = abs(recalc_val - prod_val)
                         max_val = max(abs(recalc_val), abs(prod_val))
                         if max_val > 1.0:
-                            # Show relative difference for larger values
-                            all_diffs.append(f"{col}: recalc={recalc_val}, prod={prod_val} (diff={diff:.6f}, {diff/max_val*100:.2f}%)")
+                            # Relative tolerance for larger values
+                            rel_diff = diff / max_val
+                            if rel_diff > REL_TOLERANCE:
+                                breaches.append(f"{col}: recalc={recalc_val}, prod={prod_val} (diff={diff:.6f}, {rel_diff*100:.2f}%)")
+                            else:
+                                within_tolerance += 1
                         else:
-                            # Show absolute difference for small values
-                            all_diffs.append(f"{col}: recalc={recalc_val}, prod={prod_val} (diff={diff:.6f})")
+                            # Absolute tolerance for small values
+                            if diff > ABS_TOLERANCE:
+                                breaches.append(f"{col}: recalc={recalc_val}, prod={prod_val} (diff={diff:.6f})")
+                            else:
+                                within_tolerance += 1
                     else:
                         mismatches.append(f"{col}: recalc={recalc_val}, prod={prod_val}")
             
-            # Report results (tolerances disabled - showing all differences)
-            if mismatches or all_diffs:
-                print(f"⚠️  Validation check results (tolerances disabled - showing all differences):")
-                if all_diffs:
-                    print(f"  Found {len(all_diffs)} differences:")
-                    for diff in all_diffs[:20]:  # Show first 20
-                        print(f"    {diff}")
-                    if len(all_diffs) > 20:
-                        print(f"    ... and {len(all_diffs) - 20} more")
+            # Report results
+            if mismatches or breaches:
+                print(f"⚠️  Validation check results:")
+                if within_tolerance > 0:
+                    print(f"  ✓ {within_tolerance} differences within tolerance ({REL_TOLERANCE*100}% relative or {ABS_TOLERANCE} absolute)")
+                if breaches:
+                    print(f"  ⚠ {len(breaches)} differences breach tolerance:")
+                    for breach in breaches[:20]:  # Show first 20 breaches
+                        print(f"    {breach}")
+                    if len(breaches) > 20:
+                        print(f"    ... and {len(breaches) - 20} more")
                 if mismatches:
                     print(f"  ❌ {len(mismatches)} critical mismatches (None values or type mismatches):")
                     for mismatch in mismatches[:10]:
@@ -1009,15 +1028,18 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
                     if len(mismatches) > 10:
                         print(f"    ... and {len(mismatches) - 10} more")
                 
-                print(f"\nNote: Tolerances are currently disabled for analysis.")
-                print(f"      All differences are shown regardless of magnitude.")
+                print(f"\nTolerance: {REL_TOLERANCE*100}% relative (for values > 1.0) or {ABS_TOLERANCE} absolute (for values ≤ 1.0)")
                 
                 response = input("\nContinue anyway? (y/n): ").strip().lower()
                 if response != 'y':
                     print("Aborted by user.")
                     return
             else:
-                print("✓ Validation check passed: Recalculated last row matches production exactly")
+                if within_tolerance > 0:
+                    print(f"✓ Validation check passed: Recalculated last row matches production")
+                    print(f"  ({within_tolerance} small differences within tolerance - expected due to floating point precision)")
+                else:
+                    print("✓ Validation check passed: Recalculated last row matches production exactly")
         else:
             print(f"⚠️  Warning: Cannot find production last index {production_last_index} in combined dataset for validation")
             response = input("Continue anyway? (y/n): ").strip().lower()
