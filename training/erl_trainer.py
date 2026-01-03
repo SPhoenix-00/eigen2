@@ -362,6 +362,10 @@ def _run_validation_worker(args):
         agent.actor.eval()
         agent.critic.eval()
         _cache_agent(state_hash, agent)
+    else:
+        # Ensure cached agent is in eval mode (safety check)
+        agent.actor.eval()
+        agent.critic.eval()
 
     # OPTIMIZATION: Reuse worker's environment instead of creating new one
     env = _worker_env
@@ -371,24 +375,45 @@ def _run_validation_worker(args):
     all_closed_trades = []
 
     for start_idx, end_idx, _ in validation_slices:
-        # Run episode (validation mode: no training, no noise, no buffer saving)
+        # Run episode using TIME-TRAVEL BATCHING (same optimization as local mode)
+        # This pre-fetches all states and does batch inference, then replays actions
         trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
+        num_trading_steps = Config.TRADING_PERIOD_DAYS
+        
         env.set_training_mode(False)
-        state, _ = env.reset(start_idx=start_idx, end_idx=end_idx, trading_end_idx=trading_end_idx)
+        env.reset(start_idx=start_idx, end_idx=end_idx, trading_end_idx=trading_end_idx)
+
+        # Pre-fetch all states and batch inference (chunked for memory efficiency)
+        trading_states = env.get_batch_observations(start_idx, num_trading_steps)
+        with torch.no_grad():
+            # Process in chunks to avoid OOM (similar to local mode)
+            chunk_size = 16
+            action_chunks = []
+            for i in range(0, num_trading_steps, chunk_size):
+                chunk = trading_states[i:i+chunk_size]
+                action_chunks.append(agent.select_actions_batch(chunk, add_noise=False))
+            trading_actions = np.concatenate(action_chunks, axis=0)
 
         cumulative_reward = 0.0
         steps = 0
 
-        while True:
-            action = agent.select_action(state, add_noise=False)
-            next_state, reward, terminated, truncated, info = env.step(action)
-
+        # Fast replay trading period
+        for i in range(num_trading_steps):
+            _, reward, terminated, truncated, _ = env.step(trading_actions[i])
             cumulative_reward += reward
             steps += 1
-            state = next_state
-
             if terminated or truncated:
                 break
+
+        # Settlement period
+        if not (terminated or truncated):
+            dummy_action = np.zeros((Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM), dtype=np.float32)
+            while True:
+                _, reward, terminated, truncated, _ = env.step(dummy_action)
+                cumulative_reward += reward
+                steps += 1
+                if terminated or truncated:
+                    break
 
         # Get episode summary
         episode_info = env.get_episode_summary()
@@ -1095,6 +1120,15 @@ class ERLTrainer:
             print("Loading checkpoint for resume...")
             print("="*60)
             self.load_checkpoint()
+            
+            # Sync wandb step counter to match generation (0-indexed)
+            # After loading checkpoint, start_generation is set to checkpoint_gen + 1 (next generation to run)
+            # We need to set wandb's step to start_generation - 1 (last completed generation)
+            # so that the next log with step=start_generation will be accepted
+            if wandb.run is not None:
+                # Set wandb step to the last completed generation (start_generation - 1)
+                # This ensures the next log with step=start_generation will be accepted
+                wandb.run.step = self.start_generation - 1
 
             # Refresh global50 entries after resume to get latest view from cloud
             print("\nRefreshing Global 50 entries...")
@@ -5928,7 +5962,9 @@ class ERLTrainer:
                     trainer_state = json.load(f)
 
                 # Load basic training state
-                self.start_generation = trainer_state.get('generation', 0) + 1
+                checkpoint_gen = trainer_state.get('generation', 0)
+                # Resume from next generation (0-indexed: if saved gen=27, resume at gen=28)
+                self.start_generation = checkpoint_gen + 1
                 self.best_fitness = trainer_state.get('best_fitness', float('-inf'))
                 self.best_validation_fitness = trainer_state.get('best_validation_fitness', float('-inf'))
 
@@ -6079,7 +6115,7 @@ class ERLTrainer:
                         print(f"  Current Median ROI: {self.hof_current_median:.2f}%")
                     print(f"  Generation at last turnover: {self.generation_at_last_turnover}")
 
-                print(f"✓ Resuming from Gen {self.start_generation} → Gen {self.start_generation + 1}")
+                print(f"✓ Resuming from generation {self.start_generation} (0-indexed)")
                 print(f"✓ Best validation fitness: {self.best_validation_fitness:.2f}")
                 if self.roi_hurdle_ema is not None:
                     print(f"✓ ROI Hurdle EMA: {self.roi_hurdle_ema:.2f}%")
@@ -6550,7 +6586,7 @@ class ERLTrainer:
             max_generations = Config.MAX_GENERATIONS_GAUNTLET if self.gauntlet_mode_enabled else Config.NUM_GENERATIONS
 
         for gen in range(self.start_generation, max_generations):
-            self.generation = gen  # Keep this to track the *current* gen
+            self.generation = gen  # Keep this to track the *current* gen (0-indexed)
             gen_start_time = time.time()
 
             # Check stopping conditions
