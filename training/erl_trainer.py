@@ -3213,15 +3213,22 @@ class ERLTrainer:
         # Fork method doesn't work with CUDA after initialization
         all_transition_file_paths = []  # Collect all file paths written by workers
 
+        # CRITICAL: Set SUPPRESS_GPU_OUTPUT before spawning workers so child processes inherit it
+        # This prevents GPU configuration messages during module imports in worker processes
+        # (which happen before _init_worker runs)
+        original_suppress_value = os.environ.get('SUPPRESS_GPU_OUTPUT', None)
+        os.environ['SUPPRESS_GPU_OUTPUT'] = '1'
+
         # Use initializer to pass env_config once per worker (not once per task)
         # This significantly reduces serialization overhead, especially in consistency mode
         # where we have 160 tasks (32 agents x 5 episodes) vs 96 in normal mode
-        with ProcessPoolExecutor(
-            max_workers=num_workers,
-            mp_context=mp.get_context('spawn'),
-            initializer=_init_worker,
-            initargs=(env_config,)
-        ) as executor:
+        try:
+            with ProcessPoolExecutor(
+                max_workers=num_workers,
+                mp_context=mp.get_context('spawn'),
+                initializer=_init_worker,
+                initargs=(env_config,)
+            ) as executor:
             # Submit all tasks
             futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
@@ -3374,14 +3381,20 @@ class ERLTrainer:
             # Aggregate statistics across all agents
             aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
 
-        # Clean up
-        del all_episode_stats
-        del all_transition_file_paths
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # Clean up
+            del all_episode_stats
+            del all_transition_file_paths
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        return (fitness_scores, aggregate_stats)
+            return (fitness_scores, aggregate_stats)
+        finally:
+            # Restore original SUPPRESS_GPU_OUTPUT value (or remove if it wasn't set)
+            if original_suppress_value is None:
+                os.environ.pop('SUPPRESS_GPU_OUTPUT', None)
+            else:
+                os.environ['SUPPRESS_GPU_OUTPUT'] = original_suppress_value
 
     def train_population(self):
         """Train all agents using shared replay buffer with gradient accumulation.
@@ -4329,12 +4342,17 @@ class ERLTrainer:
         print(f"Validating {len(tasks)} agents ({cache_hits} cached, {len(tasks)} fresh)")
         print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs)")
 
-        with ProcessPoolExecutor(
-            max_workers=num_workers,
-            mp_context=mp.get_context('spawn'),
-            initializer=_init_worker,
-            initargs=(env_config,)
-        ) as executor:
+        # CRITICAL: Set SUPPRESS_GPU_OUTPUT before spawning workers so child processes inherit it
+        original_suppress_value = os.environ.get('SUPPRESS_GPU_OUTPUT', None)
+        os.environ['SUPPRESS_GPU_OUTPUT'] = '1'
+
+        try:
+            with ProcessPoolExecutor(
+                max_workers=num_workers,
+                mp_context=mp.get_context('spawn'),
+                initializer=_init_worker,
+                initargs=(env_config,)
+            ) as executor:
             # Submit all validation tasks
             future_to_idx = {
                 executor.submit(_run_validation_worker, task): agent_info
@@ -4379,7 +4397,13 @@ class ERLTrainer:
                         'sample_trade': None
                     }
 
-        return validation_results
+            return validation_results
+        finally:
+            # Restore original SUPPRESS_GPU_OUTPUT value (or remove if it wasn't set)
+            if original_suppress_value is None:
+                os.environ.pop('SUPPRESS_GPU_OUTPUT', None)
+            else:
+                os.environ['SUPPRESS_GPU_OUTPUT'] = original_suppress_value
 
     def run_gauntlet_validation(self, agent: DDPGAgent) -> Dict:
         """
