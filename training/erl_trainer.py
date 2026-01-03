@@ -1121,14 +1121,10 @@ class ERLTrainer:
             print("="*60)
             self.load_checkpoint()
             
-            # Sync wandb step counter to match generation (0-indexed)
-            # After loading checkpoint, start_generation is set to checkpoint_gen + 1 (next generation to run)
-            # We need to set wandb's step to start_generation - 1 (last completed generation)
-            # so that the next log with step=start_generation will be accepted
-            if wandb.run is not None:
-                # Set wandb step to the last completed generation (start_generation - 1)
-                # This ensures the next log with step=start_generation will be accepted
-                wandb.run.step = self.start_generation - 1
+            # Note: wandb.run.step is read-only in newer wandb versions and cannot be set directly.
+            # This is not needed anyway - all wandb.log() calls in this codebase already specify
+            # the step parameter explicitly (e.g., wandb.log(..., step=self.generation)),
+            # so step tracking will work correctly when resuming from checkpoint.
 
             # Refresh global50 entries after resume to get latest view from cloud
             print("\nRefreshing Global 50 entries...")
