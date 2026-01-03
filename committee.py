@@ -23,11 +23,21 @@ Committee roster is stored in: global50/cw{N}/committee/
   - committee_roster.json: Full committee metadata
   - committee_correlation.png: Correlation heatmap visualization
 
+Agent files for committee members are stored in: global50/cw{N}/agents/
+  - {run_name}_{agent_id}.pth: Individual agent model weights
+
+MIRROR FUNCTIONALITY:
+The --mirror command synchronizes both committee metadata and agent files:
+  - Downloads missing roster/correlation files from cloud
+  - Downloads missing agent files from cloud (for all committee members)
+  - Uploads missing agent files to cloud (if local exists but cloud missing)
+  - Provides comprehensive sync status report
+
 USAGE:
   python committee.py --verify-only   # Check data split only
   python committee.py --draft         # Phase 1: Select committee from Global50
   python committee.py --validate      # Phase 2: Validate on holdout slices
-  python committee.py --mirror        # Check cloud sync status, download if needed
+  python committee.py --mirror        # Sync roster, correlation, and agent files
 """
 
 import os
@@ -332,15 +342,89 @@ class CommitteeManager:
                 print(f"    Use --draft to regenerate committee")
                 return False
 
-        # Summary
+        # Check and mirror agent files
+        agent_sync_success = True
+        roster = None
         if local_roster_exists:
             roster = self.load_roster()
+            members = roster.get('members', [])
+            
+            if members:
+                print(f"\n  Agent Files ({len(members)} members):")
+                agents_dir = self.local_base / "agents"
+                agents_dir.mkdir(parents=True, exist_ok=True)
+                
+                cloud_agents_base = f"{self.cloud_base}/agents"
+                
+                downloaded_count = 0
+                uploaded_count = 0
+                missing_local = []
+                missing_cloud = []
+                
+                for member in members:
+                    run_name = member.get('run_name')
+                    agent_id = member.get('agent_id')
+                    
+                    if not run_name or not agent_id:
+                        print(f"    ⚠ Skipping member with missing run_name or agent_id")
+                        continue
+                    
+                    # Get file paths
+                    local_agent_path = get_agent_filepath(member, self.context_window_days)
+                    filename = local_agent_path.name
+                    cloud_agent_path = f"{cloud_agents_base}/{filename}"
+                    
+                    local_exists = local_agent_path.exists()
+                    cloud_exists = self._cloud_file_exists(cloud_agent_path)
+                    
+                    # Download from cloud if local missing
+                    if cloud_exists and not local_exists:
+                        print(f"    → Downloading: {filename}")
+                        local_agent_path.parent.mkdir(parents=True, exist_ok=True)
+                        if self.cloud_sync.download_file(cloud_agent_path, str(local_agent_path)):
+                            print(f"      ✓ Downloaded {filename}")
+                            downloaded_count += 1
+                        else:
+                            print(f"      ✗ Failed to download {filename}")
+                            agent_sync_success = False
+                            missing_local.append(filename)
+                    elif not cloud_exists and not local_exists:
+                        print(f"    ✗ Missing both local and cloud: {filename}")
+                        missing_local.append(filename)
+                        agent_sync_success = False
+                    elif local_exists and not cloud_exists:
+                        # Upload to cloud if cloud missing (optional but helpful)
+                        print(f"    → Uploading: {filename}")
+                        if self.cloud_sync.upload_file_verified(str(local_agent_path), cloud_agent_path):
+                            print(f"      ✓ Uploaded {filename}")
+                            uploaded_count += 1
+                        else:
+                            print(f"      ✗ Failed to upload {filename}")
+                            missing_cloud.append(filename)
+                    # else: both exist, no action needed
+                
+                # Summary
+                if downloaded_count > 0 or uploaded_count > 0:
+                    print(f"\n  Agent Sync Summary:")
+                    if downloaded_count > 0:
+                        print(f"    ✓ Downloaded: {downloaded_count} agent(s)")
+                    if uploaded_count > 0:
+                        print(f"    ✓ Uploaded: {uploaded_count} agent(s)")
+                
+                if missing_local or missing_cloud:
+                    if missing_local:
+                        print(f"    ⚠ Missing locally: {len(missing_local)} agent(s)")
+                    if missing_cloud:
+                        print(f"    ⚠ Missing in cloud: {len(missing_cloud)} agent(s)")
+        
+        # Summary
+        if roster:
             print(f"\n  Committee Status:")
             print(f"    Size: {roster.get('committee_size', 'N/A')}")
             print(f"    Objective: {roster.get('objective_value', 'N/A'):.2f}")
             print(f"    Avg Correlation: {roster.get('correlation', {}).get('average', 'N/A'):.3f}")
             print(f"    Generated: {roster.get('generated_at', 'N/A')}")
-            return True
+            return agent_sync_success
         else:
             print(f"\n  ⚠ No committee roster found")
             print(f"    Run --draft to create committee")
@@ -350,12 +434,36 @@ class CommitteeManager:
         """Check local committee status when cloud is disabled."""
         if self.local_roster_path.exists():
             roster = self.load_roster()
+            
+            # Check agent files
+            members = roster.get('members', [])
+            if members:
+                print(f"\n  Agent Files ({len(members)} members):")
+                missing_count = 0
+                
+                for member in members:
+                    run_name = member.get('run_name')
+                    agent_id = member.get('agent_id')
+                    
+                    if not run_name or not agent_id:
+                        continue
+                    
+                    local_agent_path = get_agent_filepath(member, self.context_window_days)
+                    if not local_agent_path.exists():
+                        print(f"    ✗ Missing: {local_agent_path.name}")
+                        missing_count += 1
+                
+                if missing_count == 0:
+                    print(f"    ✓ All {len(members)} agent files present")
+                else:
+                    print(f"    ⚠ {missing_count} agent file(s) missing")
+            
             print(f"\n  Committee Status:")
             print(f"    Size: {roster.get('committee_size', 'N/A')}")
             print(f"    Objective: {roster.get('objective_value', 'N/A'):.2f}")
             print(f"    Avg Correlation: {roster.get('correlation', {}).get('average', 'N/A'):.3f}")
             print(f"    Generated: {roster.get('generated_at', 'N/A')}")
-            return True
+            return missing_count == 0 if members else True
         else:
             print(f"\n  ⚠ No committee roster found locally")
             print(f"    Run --draft to create committee")
