@@ -1166,85 +1166,10 @@ class ERLTrainer:
             print("="*60)
             self.load_checkpoint()
             
-            # Sync wandb step counter to match generation (0-indexed)
-            # After loading checkpoint, start_generation is set to checkpoint_gen + 1 (next generation to run)
-            # We need to set wandb's step to start_generation - 1 (last completed generation)
-            # so that the next log with step=start_generation will be accepted
-            if wandb.run is not None:
-                # #region debug log
-                import json
-                log_path = Path(".cursor/debug.log")
-                try:
-                    with open(log_path, "a") as f:
-                        log_entry = {
-                            "timestamp": time.time(),
-                            "location": "erl_trainer.py:1167",
-                            "message": "Before wandb.run.step assignment attempt",
-                            "data": {
-                                "start_generation": self.start_generation,
-                                "target_step": self.start_generation - 1,
-                                "wandb_run_exists": wandb.run is not None,
-                                "wandb_run_type": str(type(wandb.run)),
-                                "wandb_step_type": str(type(getattr(wandb.run, 'step', None))),
-                                "wandb_step_value": getattr(wandb.run, 'step', 'N/A'),
-                                "wandb_version": wandb.__version__ if hasattr(wandb, '__version__') else 'unknown'
-                            },
-                            "sessionId": "debug-session",
-                            "runId": "pre-fix",
-                            "hypothesisId": "A"
-                        }
-                        f.write(json.dumps(log_entry) + "\n")
-                except Exception as e:
-                    pass
-                # #endregion
-                
-                # Set wandb step to the last completed generation (start_generation - 1)
-                # This ensures the next log with step=start_generation will be accepted
-                try:
-                    wandb.run.step = self.start_generation - 1
-                    # #region debug log
-                    try:
-                        with open(log_path, "a") as f:
-                            log_entry = {
-                                "timestamp": time.time(),
-                                "location": "erl_trainer.py:1170",
-                                "message": "wandb.run.step assignment succeeded",
-                                "data": {
-                                    "assigned_step": self.start_generation - 1,
-                                    "current_step": getattr(wandb.run, 'step', None)
-                                },
-                                "sessionId": "debug-session",
-                                "runId": "pre-fix",
-                                "hypothesisId": "A"
-                            }
-                            f.write(json.dumps(log_entry) + "\n")
-                    except Exception as e:
-                        pass
-                    # #endregion
-                except AttributeError as e:
-                    # #region debug log
-                    try:
-                        with open(log_path, "a") as f:
-                            log_entry = {
-                                "timestamp": time.time(),
-                                "location": "erl_trainer.py:1170",
-                                "message": "wandb.run.step assignment failed",
-                                "data": {
-                                    "error_type": str(type(e).__name__),
-                                    "error_message": str(e),
-                                    "target_step": self.start_generation - 1,
-                                    "has_step_attr": hasattr(wandb.run, 'step'),
-                                    "step_is_property": isinstance(getattr(type(wandb.run), 'step', None), property) if hasattr(type(wandb.run), 'step') else False
-                                },
-                                "sessionId": "debug-session",
-                                "runId": "pre-fix",
-                                "hypothesisId": "A"
-                            }
-                            f.write(json.dumps(log_entry) + "\n")
-                    except Exception as e2:
-                        pass
-                    # #endregion
-                    raise
+            # Note: wandb.run.step is read-only in newer wandb versions and cannot be set directly.
+            # This is not needed anyway - all wandb.log() calls in this codebase already specify
+            # the step parameter explicitly (e.g., wandb.log(..., step=self.generation)),
+            # so step tracking will work correctly when resuming from checkpoint.
 
             # Refresh global50 entries after resume to get latest view from cloud
             print("\nRefreshing Global 50 entries...")
