@@ -402,15 +402,23 @@ def _run_validation_worker(args):
         # Reconstruct agent from state dict
         from models.ddpg_agent import DDPGAgent
         agent = DDPGAgent(agent_id=0)
+        # Use GPU if available (with fewer workers, GPU OOM is avoided)
+        # Each worker process gets its own GPU context, but with limited workers we stay within memory
+        target_device = Config.DEVICE  # Use GPU if available, CPU otherwise
+        agent.move_to_device(target_device, recreate_optimizers=False)
         agent.actor.load_state_dict(agent_state['actor'])
         agent.critic.load_state_dict(agent_state['critic'])
         agent.actor.eval()
         agent.critic.eval()
         _cache_agent(state_hash, agent)
     else:
-        # Ensure cached agent is in eval mode (safety check)
+        # Ensure cached agent is in eval mode
         agent.actor.eval()
         agent.critic.eval()
+        # Ensure cached agent is on correct device (may have been created with different device)
+        target_device = Config.DEVICE
+        if agent.device != target_device:
+            agent.move_to_device(target_device, recreate_optimizers=False)
 
     # OPTIMIZATION: Reuse worker's environment instead of creating new one
     env = _worker_env
@@ -4337,10 +4345,22 @@ class ERLTrainer:
         )
 
         # Execute validation in parallel
-        num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
+        # With GPU: Use fewer workers (GPU is fast, fewer workers needed, avoids OOM)
+        # Without GPU: Use more workers (CPU is slower, need more parallelism)
+        if torch.cuda.is_available():
+            # GPU available: Use 4-8 workers (GPU is fast, fewer workers = less memory contention)
+            # Each worker uses GPU, but with fewer workers we avoid OOM
+            gpu_workers = min(8, max(4, mp.cpu_count() // 8))  # 4-8 workers based on CPU count
+            num_workers = min(gpu_workers, len(tasks))  # Don't use more workers than tasks
+            device_note = "GPU"
+        else:
+            # CPU only: Use more workers (CPU is slower, need more parallelism)
+            num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
+            device_note = "CPU"
+        
         cache_hits = len(self.population) - len(tasks)
         print(f"Validating {len(tasks)} agents ({cache_hits} cached, {len(tasks)} fresh)")
-        print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs)")
+        print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs) on {device_note}")
 
         # CRITICAL: Set SUPPRESS_GPU_OUTPUT before spawning workers so child processes inherit it
         original_suppress_value = os.environ.get('SUPPRESS_GPU_OUTPUT', None)
@@ -6898,6 +6918,12 @@ class ERLTrainer:
                 fitness_scores, pop_stats = self.local_evaluator.evaluate_population()
             else:
                 fitness_scores, pop_stats = self.evaluate_population_parallel()
+
+            # CRITICAL FIX: Clear GPU cache after evaluation to free memory before validation
+            # Parallel evaluation workers may leave GPU memory allocated
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
             # Update resource tracker after evaluation
             self.resource_tracker.update()
