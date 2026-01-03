@@ -47,9 +47,14 @@ import tempfile
 
 # Project Imports
 from utils.config import Config
+from utils.device import setup_gpu_environment
 from data.loader import StockDataLoader
 from models.ddpg_agent import DDPGAgent
 from utils.cloud_sync import get_cloud_sync_from_env
+
+# Initialize GPU backend detection and set Config.GPU_BACKEND
+# This must be done before accessing Config.GPU_BACKEND
+Config.GPU_BACKEND = setup_gpu_environment(verbose=False)
 
 # --- Configuration ---
 GLOBAL50_BASE_DIR = Path("global50")
