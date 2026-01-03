@@ -435,6 +435,8 @@ class AgentEvaluator:
 
         print(f"\n{'='*70}")
         print(f"Evaluating: {agent_name}")
+        if is_maverick:
+            print(f"Maverick Mode: Expectancy gating requirement will be skipped")
         print(f"{'='*70}")
 
         result = {
@@ -478,7 +480,8 @@ class AgentEvaluator:
             result['success'] = True
 
             # Check if qualifies for Global 50 (now includes CV as 4th criterion)
-            if self.global_hof.should_promote(gauntlet_score, metrics['roi'], metrics['expectancy'], metrics['cv']):
+            # Mavericks skip expectancy gating requirement
+            if self.global_hof.should_promote(gauntlet_score, metrics['roi'], metrics['expectancy'], metrics['cv'], is_maverick=is_maverick):
                 result['qualified'] = True
                 print(f"\n   Agent QUALIFIES for Global 50!")
                 print(f"   Gauntlet Threshold: {self.global_hof.entry_threshold:.2f}")
@@ -522,19 +525,29 @@ class AgentEvaluator:
                     print(f"   WARNING: Promotion failed (concurrent update or maverick cap?)")
             else:
                 print(f"\n   Agent does not qualify for Global 50")
-                # Check individual criteria for detailed feedback (4/4 minimums required)
+                # Check individual criteria for detailed feedback
+                # Mavericks skip expectancy gating (3/3 minimums, 2/2 P25, 1/2 median)
                 passes_gauntlet_min = gauntlet_score > self.global_hof.entry_threshold
                 passes_roi_min = metrics['roi'] > self.global_hof.roi_threshold
-                passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold
+                passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold if not is_maverick else True  # Skip for mavericks
                 passes_cv_min = metrics['cv'] < self.global_hof.cv_threshold  # CV: lower is better
                 beats_gauntlet_p25 = gauntlet_score > self.global_hof.gauntlet_p25
                 beats_roi_p25 = metrics['roi'] > self.global_hof.roi_p25
-                beats_expectancy_p25 = metrics['expectancy'] > self.global_hof.expectancy_p25
-                count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
+                beats_expectancy_p25 = metrics['expectancy'] > self.global_hof.expectancy_p25 if not is_maverick else False  # Skip for mavericks
+                
+                # For mavericks: count only gauntlet and ROI (2 of 2). For regular: count all 3 (2 of 3)
+                metrics_for_p25 = [beats_gauntlet_p25, beats_roi_p25]
+                if not is_maverick:
+                    metrics_for_p25.append(beats_expectancy_p25)
+                count_above_p25 = sum(metrics_for_p25)
 
+                # For mavericks: 3/3 minimums (skip expectancy). For regular: 4/4 minimums
+                min_required = 3 if is_maverick else 4
                 count_above_min = sum([passes_gauntlet_min, passes_roi_min, passes_expectancy_min, passes_cv_min])
-                print(f"   Minimums ({count_above_min}/4, 4 required): Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗'} | CV {'✓' if passes_cv_min else '✗'}")
-                print(f"   P25 ({count_above_p25}/3, 2 required): Gauntlet {'✓' if beats_gauntlet_p25 else '✗'} | ROI {'✓' if beats_roi_p25 else '✗'} | Expectancy {'✓' if beats_expectancy_p25 else '✗'}")
+                maverick_note = " (mavericks skip expectancy)" if is_maverick else ""
+                print(f"   Minimums ({count_above_min}/{min_required}, {min_required} required{maverick_note}): Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗' if not is_maverick else 'N/A'} | CV {'✓' if passes_cv_min else '✗'}")
+                p25_required = "2/2" if is_maverick else "2/3"
+                print(f"   P25 ({count_above_p25}/{p25_required}, {p25_required.split('/')[0]} required{maverick_note}): Gauntlet {'✓' if beats_gauntlet_p25 else '✗'} | ROI {'✓' if beats_roi_p25 else '✗'} | Expectancy {'✓' if beats_expectancy_p25 else '✗' if not is_maverick else 'N/A'}")
 
         except Exception as e:
             print(f"\n   ERROR: {e}")
@@ -2352,8 +2365,11 @@ class AgentEvaluator:
         print(f"    P25:       Gauntlet={self.global_hof.gauntlet_p25:.2f}, ROI={self.global_hof.roi_p25:.2f}%, Expectancy={self.global_hof.expectancy_p25:.4f}")
         print(f"\n  Promotion Criteria:")
         print(f"    1. All 4 metrics must beat minimum thresholds (CV: lower is better)")
+        print(f"       Note: Mavericks skip expectancy minimum threshold (3/3 required)")
         print(f"    2. At least 2 of 3 metrics must beat 25th percentile")
+        print(f"       Note: For mavericks, this becomes 2 of 2 (gauntlet, ROI) - expectancy skipped")
         print(f"    3. At least 1 metric must beat median (50th percentile)")
+        print(f"       Note: For mavericks, this becomes 1 of 2 (gauntlet, ROI) - expectancy skipped")
 
         # Discover archived agents in cloud storage
         print(f"\n{'='*70}")
@@ -2416,8 +2432,11 @@ class AgentEvaluator:
         print(f"\nFilters applied:")
         print(f"  - Minimum archived ROI: {self.MIN_ROI_THRESHOLD}% (excluded {excluded_low_roi} agents)")
         print(f"  - Must beat all 4 minimum thresholds (Gauntlet, ROI, Expectancy, CV)")
+        print(f"    Note: Mavericks skip expectancy minimum threshold (3/3 required)")
         print(f"  - Must beat 2 of 3 metrics at P25 (Gauntlet, ROI, Expectancy)")
+        print(f"    Note: For mavericks, this becomes 2 of 2 (gauntlet, ROI) - expectancy skipped")
         print(f"  - Must beat 1 of 3 metrics at median (Gauntlet, ROI, Expectancy)")
+        print(f"    Note: For mavericks, this becomes 1 of 2 (gauntlet, ROI) - expectancy skipped")
         print(f"\nEstimated time: ~{len(candidates) * 2} minutes")
 
         while True:
@@ -2436,39 +2455,49 @@ class AgentEvaluator:
         # Tier 1: Remove median requirement - minimums (4/4) + 2/3 P25
         # Tier 2: Relax P25 to 1/3 - minimums (4/4) + 1/3 P25
         # Tier 3: Remove P25 requirement - minimums only (4/4)
-        def should_promote_with_tier(gauntlet_score: float, roi: float, expectancy: float, cv: float, tier: int) -> bool:
+        # Note: Mavericks skip expectancy gating requirement (3/3 minimums, 2/2 P25, 1/2 median)
+        def should_promote_with_tier(gauntlet_score: float, roi: float, expectancy: float, cv: float, tier: int, is_maverick: bool = False) -> bool:
             """Check promotion with tiered criteria relaxation."""
-            # Criterion 1: Must beat ALL 4 minimum thresholds (always required)
+            # Criterion 1: Must beat ALL 4 minimum thresholds (3 for mavericks - skip expectancy)
             if gauntlet_score <= self.global_hof.entry_threshold:
                 return False
             if roi <= self.global_hof.roi_threshold:
                 return False
-            if expectancy <= self.global_hof.expectancy_threshold:
+            # Mavericks skip expectancy minimum threshold check
+            if not is_maverick and expectancy <= self.global_hof.expectancy_threshold:
                 return False
             # CV check: lower is better, so agent CV must be < threshold
             if cv >= self.global_hof.cv_threshold:
                 return False
 
-            # Count P25 breaches
+            # Count P25 breaches (2 of 2 for mavericks, 2 of 3 for regular)
             beats_gauntlet_p25 = gauntlet_score > self.global_hof.gauntlet_p25
             beats_roi_p25 = roi > self.global_hof.roi_p25
-            beats_expectancy_p25 = expectancy > self.global_hof.expectancy_p25
-            count_above_p25 = sum([beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25])
+            beats_expectancy_p25 = expectancy > self.global_hof.expectancy_p25 if not is_maverick else False  # Skip for mavericks
+            # For mavericks: need 2 of 2 (gauntlet, ROI). For regular: need 2 of 3 (gauntlet, ROI, expectancy)
+            metrics_to_check_p25 = [beats_gauntlet_p25, beats_roi_p25]
+            if not is_maverick:
+                metrics_to_check_p25.append(beats_expectancy_p25)
+            count_above_p25 = sum(metrics_to_check_p25)
 
-            # Count median breaches
+            # Count median breaches (1 of 2 for mavericks, 1 of 3 for regular)
             beats_gauntlet_median = gauntlet_score > self.global_hof.gauntlet_median
             beats_roi_median = roi > self.global_hof.roi_median
-            beats_expectancy_median = expectancy > self.global_hof.expectancy_median
-            count_above_median = sum([beats_gauntlet_median, beats_roi_median, beats_expectancy_median])
+            beats_expectancy_median = expectancy > self.global_hof.expectancy_median if not is_maverick else False  # Skip for mavericks
+            # For mavericks: need 1 of 2 (gauntlet, ROI). For regular: need 1 of 3 (gauntlet, ROI, expectancy)
+            metrics_to_check_median = [beats_gauntlet_median, beats_roi_median]
+            if not is_maverick:
+                metrics_to_check_median.append(beats_expectancy_median)
+            count_above_median = sum(metrics_to_check_median)
 
             if tier == 0:
-                # Full criteria: 2/3 P25 + 1/3 median
+                # Full criteria: 2/3 P25 + 1/3 median (2/2 + 1/2 for mavericks)
                 return count_above_p25 >= 2 and count_above_median >= 1
             elif tier == 1:
-                # Remove median requirement: 2/3 P25 only
+                # Remove median requirement: 2/3 P25 only (2/2 for mavericks)
                 return count_above_p25 >= 2
             elif tier == 2:
-                # Relax P25 to 1/3: 1/3 P25 only
+                # Relax P25 to 1/3: 1/3 P25 only (1/2 for mavericks)
                 return count_above_p25 >= 1
             else:
                 # Tier 3+: minimums only (already passed above)
@@ -2576,8 +2605,9 @@ class AgentEvaluator:
                 new_score = ec['new_score']
                 metrics = ec['metrics']
 
-                # Check if qualifies at this tier
-                qualifies = should_promote_with_tier(new_score, metrics['roi'], metrics['expectancy'], metrics['cv'], tier)
+                # Check if qualifies at this tier (mavericks skip expectancy gating)
+                is_maverick = candidate.get('is_maverick', False)
+                qualifies = should_promote_with_tier(new_score, metrics['roi'], metrics['expectancy'], metrics['cv'], tier, is_maverick=is_maverick)
                 if qualifies:
                     qualifying_candidates.append(ec)
 
@@ -2597,11 +2627,19 @@ class AgentEvaluator:
                 metrics = ec['metrics']
                 agent = ec['agent']
 
-                print(f"\n  → {candidate['run_name']} (Agent {candidate['agent_id']})")
+                # Read is_maverick from archive metadata (if available)
+                is_maverick = candidate.get('is_maverick', False)
+                maverick_tag = " [M]" if is_maverick else ""
+                
+                print(f"\n  → {candidate['run_name']} (Agent {candidate['agent_id']}){maverick_tag}")
                 print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f}")
+                if is_maverick:
+                    print(f"    Note: Maverick agent - expectancy gating requirement is skipped")
 
-                # Attempt promotion - we bypass should_promote check since we did our own
+                # Attempt promotion - we bypass should_promote check since we did our own tiered check
                 # Temporarily set all thresholds (minimums, medians, P25) to -inf/+inf to allow promotion
+                # Note: The real qualification check was done via should_promote_with_tier() above,
+                # which properly handles maverick expectancy bypass
                 self.global_hof.entry_threshold = float('-inf')
                 self.global_hof.roi_threshold = float('-inf')
                 self.global_hof.expectancy_threshold = float('-inf')
@@ -2612,9 +2650,6 @@ class AgentEvaluator:
                 self.global_hof.gauntlet_p25 = float('-inf')
                 self.global_hof.roi_p25 = float('-inf')
                 self.global_hof.expectancy_p25 = float('-inf')
-
-                # Read is_maverick from archive metadata (if available)
-                is_maverick = candidate.get('is_maverick', False)
                 
                 promoted = self.global_hof.check_and_promote(
                     agent=agent,

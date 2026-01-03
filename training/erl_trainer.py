@@ -5264,7 +5264,8 @@ class ERLTrainer:
                             gauntlet_score,
                             gauntlet_results.get('roi', 0.0),
                             gauntlet_results.get('expectancy', 0.0),
-                            gauntlet_results.get('cv', 100.0)
+                            gauntlet_results.get('cv', 100.0),
+                            is_maverick=self.maverick_mode
                         ):
                             print(f"\n   ⓘ Agent may qualify for Global 50 (passes all promotion criteria)")
                             print(f"   Running consistency-aligned re-gauntlet for fair Global 50 comparison...")
@@ -5290,7 +5291,8 @@ class ERLTrainer:
                             g50_gauntlet_score,
                             g50_gauntlet_results.get('roi', 0.0),
                             g50_gauntlet_results.get('expectancy', 0.0),
-                            g50_gauntlet_results.get('cv', 100.0)
+                            g50_gauntlet_results.get('cv', 100.0),
+                            is_maverick=self.maverick_mode
                         )
                     
                     if g50_gauntlet_score is not None and should_promote_result:
