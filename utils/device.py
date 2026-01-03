@@ -137,11 +137,14 @@ def setup_gpu_environment(verbose: bool = False) -> str:
     import to detect the backend and configure torch-specific settings.
 
     Args:
-        verbose: If True, print configuration info
+        verbose: If True, print configuration info (unless SUPPRESS_GPU_OUTPUT env var is set)
 
     Returns:
         Backend name ("CUDA", "ROCm", or "CPU")
     """
+    # Check if output should be suppressed (e.g., in worker processes)
+    suppress_output = os.environ.get('SUPPRESS_GPU_OUTPUT', '0') == '1'
+    
     backend = get_gpu_backend()
 
     if backend == "ROCm":
@@ -152,7 +155,7 @@ def setup_gpu_environment(verbose: bool = False) -> str:
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
-        if verbose:
+        if verbose and not suppress_output:
             device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
             print(f"Configured environment for ROCm (AMD GPU)")
             print(f"  Device: {device_name}")
@@ -160,12 +163,12 @@ def setup_gpu_environment(verbose: bool = False) -> str:
     elif backend == "CUDA":
         # Ensure environment variable is set (should already be set before torch import)
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-        if verbose:
+        if verbose and not suppress_output:
             device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
             print(f"Configured environment for CUDA (NVIDIA GPU)")
             print(f"  Device: {device_name}")
     else:
-        if verbose:
+        if verbose and not suppress_output:
             print("No GPU detected, running on CPU")
 
     return backend
