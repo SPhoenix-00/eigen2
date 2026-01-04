@@ -53,6 +53,39 @@ class ReplayBuffer:
             next_state: Next state observation [context_days, num_columns, 9]
             done: Whether episode ended
         """
+        # ROOT CAUSE DEBUGGING: Check for NaN/Inf at the source
+        import numpy as np
+        corruption_detected = False
+        
+        if np.isnan(state).any() or np.isinf(state).any():
+            nan_count = np.isnan(state).sum()
+            inf_count = np.isinf(state).sum()
+            print(f"  [ROOT CAUSE] ❌ NaN/Inf detected in STATE when adding to replay buffer!")
+            print(f"    NaN: {nan_count}, Inf: {inf_count}, Shape: {state.shape}")
+            corruption_detected = True
+        
+        if np.isnan(action).any() or np.isinf(action).any():
+            nan_count = np.isnan(action).sum()
+            inf_count = np.isinf(action).sum()
+            print(f"  [ROOT CAUSE] ❌ NaN/Inf detected in ACTION when adding to replay buffer!")
+            print(f"    NaN: {nan_count}, Inf: {inf_count}, Shape: {action.shape}")
+            corruption_detected = True
+        
+        if np.isnan(reward) or np.isinf(reward):
+            print(f"  [ROOT CAUSE] ❌ NaN/Inf detected in REWARD when adding to replay buffer!")
+            print(f"    Reward value: {reward}")
+            corruption_detected = True
+        
+        if np.isnan(next_state).any() or np.isinf(next_state).any():
+            nan_count = np.isnan(next_state).sum()
+            inf_count = np.isinf(next_state).sum()
+            print(f"  [ROOT CAUSE] ❌ NaN/Inf detected in NEXT_STATE when adding to replay buffer!")
+            print(f"    NaN: {nan_count}, Inf: {inf_count}, Shape: {next_state.shape}")
+            corruption_detected = True
+        
+        if corruption_detected:
+            print(f"  [ROOT CAUSE] ⚠️  Transition #{self.total_added} contains corrupted data - this will cause training issues!")
+        
         transition = {
             'state': state,
             'action': action,
