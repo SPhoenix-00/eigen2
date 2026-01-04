@@ -3797,53 +3797,34 @@ class ERLTrainer:
                 actor_losses = []
                 critic_losses = []
 
-                # Multiple gradient steps per agent
-                for step in range(gradient_steps):
-                    # Gradient accumulation loop
-                    for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
-                        if gpu_backend == "ROCm" and agent_idx == 0 and step == 0 and accum_step == 0:
-                            print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Getting batch from DataLoader...")
-                        
-                        # Get next batch from DataLoader (already prefetched by workers)
-                        # This is FAST - batch is already in RAM, loaded asynchronously
-                        batch_cpu = next(self.batch_iterator)
-                        
-                        if gpu_backend == "ROCm" and agent_idx == 0 and step == 0 and accum_step == 0:
-                            print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Batch received from DataLoader")
-                            print(f"    Batch keys: {list(batch_cpu.keys())}")
-                            for k, v in batch_cpu.items():
-                                print(f"    {k}: shape={v.shape}, device={v.device}, contiguous={v.is_contiguous()}")
+                    # Multiple gradient steps per agent
+                    for step in range(gradient_steps):
+                        # Gradient accumulation loop
+                        for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                            # Get next batch from DataLoader (already prefetched by workers)
+                            # This is FAST - batch is already in RAM, loaded asynchronously
+                            batch_cpu = next(self.batch_iterator)
 
-                        # Move batch to GPU
-                        # For ROCm: use non_blocking=False to prevent memory access faults
-                        # CRITICAL: Ensure tensors are contiguous before transfer (ROCm requirement)
-                        use_non_blocking = (gpu_backend != "ROCm")
-                        
-                        try:
-                            if gpu_backend == "ROCm":
-                                if agent_idx == 0 and step == 0 and accum_step == 0:
-                                    print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Starting batch transfer to GPU...")
-                                
-                                # For ROCm: Ensure tensors are contiguous and copy before transfer
-                                # This prevents memory access faults from non-contiguous or shared memory tensors
-                                batch = {}
-                                for k, v in batch_cpu.items():
-                                    if agent_idx == 0 and step == 0 and accum_step == 0:
-                                        print(f"    [DEBUG] Processing {k}: shape={v.shape}, device={v.device}, contiguous={v.is_contiguous()}")
-                                    
-                                    # Ensure contiguous and copy if needed (breaks any shared memory references)
-                                    if not v.is_contiguous():
-                                        if agent_idx == 0 and step == 0 and accum_step == 0:
-                                            print(f"    [DEBUG] Making {k} contiguous...")
-                                        v = v.contiguous()
-                                    
-                                    # Create a fresh copy to break any shared memory or view references
-                                    if v.device.type == 'cpu':
-                                        if agent_idx == 0 and step == 0 and accum_step == 0:
-                                            print(f"    [DEBUG] Cloning {k} from CPU...")
-                                        v_copy = v.clone()
-                                    else:
-                                        v_copy = v
+                            # Move batch to GPU
+                            # For ROCm: use non_blocking=False to prevent memory access faults
+                            # CRITICAL: Ensure tensors are contiguous before transfer (ROCm requirement)
+                            use_non_blocking = (gpu_backend != "ROCm")
+                            
+                            try:
+                                if gpu_backend == "ROCm":
+                                    # For ROCm: Ensure tensors are contiguous and copy before transfer
+                                    # This prevents memory access faults from non-contiguous or shared memory tensors
+                                    batch = {}
+                                    for k, v in batch_cpu.items():
+                                        # Ensure contiguous and copy if needed (breaks any shared memory references)
+                                        if not v.is_contiguous():
+                                            v = v.contiguous()
+                                        
+                                        # Create a fresh copy to break any shared memory or view references
+                                        if v.device.type == 'cpu':
+                                            v_copy = v.clone()
+                                        else:
+                                            v_copy = v
                                     
                                     # CRITICAL: Check for NaN/Inf values before transfer (ROCm crashes on NaN)
                                     # Skip batches with excessive NaN/Inf values (corrupted data)
@@ -3892,20 +3873,11 @@ class ERLTrainer:
                                 
                                 # Check if batch was marked as invalid (corrupted)
                                 if batch is None:
-                                    print(f"  [SKIP] Agent {agent_idx}, Step {step}, Accum {accum_step}: Skipping corrupted batch")
                                     continue
                                 
-                                if agent_idx == 0 and step == 0 and accum_step == 0:
-                                    print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Batch transferred, synchronizing...")
-                                torch.cuda.synchronize()
-                                
-                                if agent_idx == 0 and step == 0 and accum_step == 0:
-                                    print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: GPU synchronized, batch ready")
-                                    for k, v in batch.items():
-                                        print(f"    {k}: shape={v.shape}, device={v.device}, contiguous={v.is_contiguous()}")
-                                        # Verify no NaN/Inf after transfer
-                                        if torch.isnan(v).any() or torch.isinf(v).any():
-                                            print(f"    [ERROR] {k} still contains NaN/Inf after transfer!")
+                                # For ROCm: Synchronize after batch transfer (critical for stability)
+                                if batch is not None:
+                                    torch.cuda.synchronize()
                             else:
                                 batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
                         except RuntimeError as e:
@@ -3920,27 +3892,16 @@ class ERLTrainer:
 
                         # CRITICAL FOR ROCm: Ensure networks are in correct mode before update
                         if gpu_backend == "ROCm":
-                            if agent_idx == 0 and step == 0 and accum_step == 0:
-                                print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Ensuring networks in training mode...")
                             agent.actor.train()
                             agent.critic.train()
-                            if agent_idx == 0 and step == 0 and accum_step == 0:
-                                print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Networks in training mode")
+                            torch.cuda.synchronize()
 
                         # Update with gradient accumulation
                         # Networks are already on GPU, no movement needed
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
                         
-                        if gpu_backend == "ROCm" and agent_idx == 0 and step == 0 and accum_step == 0:
-                            print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Calling agent.update()...")
-                            print(f"    Accumulate: {not is_last_accum}")
-                        
                         try:
                             critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
-                            
-                            if gpu_backend == "ROCm" and agent_idx == 0 and step == 0 and accum_step == 0:
-                                print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: agent.update() completed successfully")
-                                print(f"    Critic loss: {critic_loss}, Actor loss: {actor_loss}")
                         except Exception as e:
                             print(f"  [ERROR] Agent {agent_idx}, Step {step}, Accum {accum_step}: agent.update() failed!")
                             print(f"    Error: {e}")
