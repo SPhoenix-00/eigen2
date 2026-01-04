@@ -197,9 +197,12 @@ The `eigen_rocm` branch was experiencing persistent `Memory access fault by GPU 
 
 1. **ROCm Memory Access Faults**: Not just about NaN values - can be triggered by extreme values in attention mechanism
 2. **Network Movement**: ROCm doesn't tolerate moving networks between CPU/GPU - must stay on GPU permanently
-3. **Synchronous Operations**: ROCm requires explicit synchronization (`torch.cuda.synchronize()`) at critical points
-4. **Attention Mechanism**: ROCm's attention implementation has bugs with extreme input values
+3. **Synchronous Operations**: ROCm requires explicit synchronization, but excessive syncs kill performance - minimize to essential points only
+4. **Attention Mechanism**: ROCm's attention implementation has bugs with extreme input values - requires SymLog transformation and math attention fallback
 5. **Data Pipeline**: NaNs can originate from raw data and must be handled at source (environment)
+6. **Micro-batching**: Chunking large batches preserves mathematical properties (effective batch size) while preventing memory explosions
+7. **Performance vs. Stability**: Some overhead (chunking, math attention) is necessary for stability - acceptable trade-off
+8. **Synchronization Overhead**: Each `torch.cuda.synchronize()` blocks GPU parallelism - reducing from 6+ to 1 per update provides significant speedup
 
 ## Files Modified (Final State)
 
