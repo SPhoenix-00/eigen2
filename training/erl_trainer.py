@@ -3833,6 +3833,17 @@ class ERLTrainer:
                                     
                                     if agent_idx == 0 and step == 0 and accum_step == 0:
                                         print(f"    [DEBUG] Transferring {k} to GPU...")
+                                    
+                                    # CRITICAL: Check for NaN/Inf values before transfer (ROCm crashes on NaN)
+                                    if torch.isnan(v_copy).any() or torch.isinf(v_copy).any():
+                                        nan_count = torch.isnan(v_copy).sum().item()
+                                        inf_count = torch.isinf(v_copy).sum().item()
+                                        print(f"  [WARNING] Batch {k} contains NaN/Inf values! NaN: {nan_count}, Inf: {inf_count}")
+                                        print(f"  [WARNING] Replacing NaN/Inf with zeros to prevent ROCm crash...")
+                                        # Replace NaN and Inf with zeros
+                                        v_copy = torch.where(torch.isnan(v_copy) | torch.isinf(v_copy), 
+                                                             torch.zeros_like(v_copy), v_copy)
+                                    
                                     batch[k] = v_copy.to(Config.DEVICE, non_blocking=False)
                                 
                                 if agent_idx == 0 and step == 0 and accum_step == 0:
@@ -3843,6 +3854,9 @@ class ERLTrainer:
                                     print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: GPU synchronized, batch ready")
                                     for k, v in batch.items():
                                         print(f"    {k}: shape={v.shape}, device={v.device}, contiguous={v.is_contiguous()}")
+                                        # Verify no NaN/Inf after transfer
+                                        if torch.isnan(v).any() or torch.isinf(v).any():
+                                            print(f"    [ERROR] {k} still contains NaN/Inf after transfer!")
                             else:
                                 batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
                         except RuntimeError as e:

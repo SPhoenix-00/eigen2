@@ -296,6 +296,32 @@ class DDPGAgent:
         if self.use_rocm_mode and is_first_update:
             print(f"    [DEBUG] update(): dones transferred")
         
+        # CRITICAL FOR ROCm: Check for NaN/Inf values and replace them (ROCm crashes on NaN)
+        # This is a safety check in case NaN values slipped through from the DataLoader
+        for tensor_name, tensor in [('states', states), ('actions', actions), ('rewards', rewards), 
+                                    ('next_states', next_states), ('dones', dones)]:
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                nan_count = torch.isnan(tensor).sum().item()
+                inf_count = torch.isinf(tensor).sum().item()
+                print(f"    [WARNING] update(): {tensor_name} contains NaN/Inf! NaN: {nan_count}, Inf: {inf_count}")
+                print(f"    [WARNING] update(): Replacing NaN/Inf with zeros to prevent ROCm crash...")
+                # Replace NaN and Inf with zeros
+                if tensor_name == 'next_states':
+                    next_states = torch.where(torch.isnan(next_states) | torch.isinf(next_states), 
+                                            torch.zeros_like(next_states), next_states)
+                elif tensor_name == 'states':
+                    states = torch.where(torch.isnan(states) | torch.isinf(states), 
+                                        torch.zeros_like(states), states)
+                elif tensor_name == 'actions':
+                    actions = torch.where(torch.isnan(actions) | torch.isinf(actions), 
+                                         torch.zeros_like(actions), actions)
+                elif tensor_name == 'rewards':
+                    rewards = torch.where(torch.isnan(rewards) | torch.isinf(rewards), 
+                                         torch.zeros_like(rewards), rewards)
+                elif tensor_name == 'dones':
+                    dones = torch.where(torch.isnan(dones) | torch.isinf(dones), 
+                                       torch.zeros_like(dones), dones)
+        
         # For ROCm: Synchronize after tensor transfer to ensure data is ready
         if self.use_rocm_mode:
             if is_first_update:
