@@ -3875,9 +3875,7 @@ class ERLTrainer:
                                 if batch is None:
                                     continue
                                 
-                                # For ROCm: Synchronize after batch transfer (critical for stability)
-                                if batch is not None:
-                                    torch.cuda.synchronize()
+                                # Removed sync after batch transfer - non_blocking=False already provides sync
                             else:
                                 batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
                         except RuntimeError as e:
@@ -3894,7 +3892,7 @@ class ERLTrainer:
                         if gpu_backend == "ROCm":
                             agent.actor.train()
                             agent.critic.train()
-                            torch.cuda.synchronize()
+                            # Removed sync - train() is lightweight, no sync needed
 
                         # Update with gradient accumulation
                         # Networks are already on GPU, no movement needed
