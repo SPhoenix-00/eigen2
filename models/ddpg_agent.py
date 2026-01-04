@@ -532,11 +532,42 @@ class DDPGAgent:
         
         if self.use_rocm_mode and is_first_update:
             print(f"    [DEBUG] update(): Computing actor_actions with autocast...")
+            print(f"    [DEBUG] update(): Using micro-batching (chunk_size=32) for main actor")
+        
         with autocast(device_type='cuda'):
-            actor_actions = self.actor(states)
+            # CRITICAL ROCm FIX: Chunk the main actor forward pass to prevent memory access faults
+            # This preserves gradients - Autograd engine stitches the graph through torch.cat
+            if self.use_rocm_mode:
+                # Chunked execution for main actor (preserves gradients)
+                actor_actions = self._forward_chunked(self.actor, states, chunk_size=32)
+            else:
+                actor_actions = self.actor(states)
+            
             if self.use_rocm_mode and is_first_update:
                 print(f"    [DEBUG] update(): actor_actions computed, shape={actor_actions.shape}")
-            actor_loss = -self.critic(states, actor_actions).mean()
+            
+            # CRITICAL ROCm FIX: Also chunk the critic call that uses actor_actions
+            # We need to pass both states and new actor_actions to the critic in chunks
+            if self.use_rocm_mode:
+                # Chunked execution for critic with actor_actions (preserves gradients)
+                actor_loss_list = []
+                chunk_size = 32
+                
+                for i in range(0, states.shape[0], chunk_size):
+                    s_chunk = states[i:i + chunk_size]
+                    a_chunk = actor_actions[i:i + chunk_size]
+                    
+                    # Get Q-value for this chunk
+                    q_chunk = self.critic(s_chunk, a_chunk)
+                    actor_loss_list.append(q_chunk)
+                
+                # Combine and calculate mean loss
+                # Autograd will backpropagate through this 'cat' operation correctly
+                full_q_values = torch.cat(actor_loss_list, dim=0)
+                actor_loss = -full_q_values.mean()
+            else:
+                actor_loss = -self.critic(states, actor_actions).mean()
+            
             if self.use_rocm_mode and is_first_update:
                 print(f"    [DEBUG] update(): actor_loss computed, value={actor_loss.item()}")
         
