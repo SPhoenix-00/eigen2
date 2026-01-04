@@ -1334,8 +1334,8 @@ class ERLTrainer:
         if gpu_backend == "ROCm":
             # Direct data passing (pickling) - safer for ROCm
             return {
-                'data_array': self.data_loader.data,
-                'data_array_full': self.data_loader.data_full,
+                'data_array': self.data_loader.data_array,
+                'data_array_full': self.data_loader.data_array_full,
                 'dates': self.data_loader.dates,
                 'normalization_stats': self.normalization_stats,
                 'start_idx': start_idx,
