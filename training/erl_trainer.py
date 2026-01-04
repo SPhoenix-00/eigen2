@@ -1404,13 +1404,23 @@ class ERLTrainer:
             num_workers = Config.NUM_DATALOADER_WORKERS
             print(f"Creating DataLoader with {num_workers} background workers...")
 
+        # CRITICAL FIX for ROCm: Force num_workers=0
+        # ROCm/Docker shared memory handling is unstable with PyTorch DataLoader workers.
+        # It causes "Memory access fault by GPU node" and "psm_" errors when workers try
+        # to pass tensors back to the main process via shared memory.
+        # Running in the main process (num_workers=0) avoids shared memory entirely for this step.
+        from utils.device import get_gpu_backend
+        if get_gpu_backend() == "ROCm" and num_workers > 0:
+            print(f"  [ROCm] Forcing num_workers=0 to avoid shared memory crashes (Memory access fault)")
+            num_workers = 0
+
         # num_workers=0 runs in main process - different options required
         if num_workers == 0:
             self.replay_dataloader = DataLoader(
                 self.replay_buffer,
                 batch_size=None,  # Already batched by __iter__
                 num_workers=0,
-                pin_memory=True  # Faster GPU transfer
+                pin_memory=True  # Faster GPU transfer (safe in main process)
             )
         else:
             self.replay_dataloader = DataLoader(
