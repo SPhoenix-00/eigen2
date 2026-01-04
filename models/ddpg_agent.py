@@ -275,6 +275,13 @@ class DDPGAgent:
         # DEBUG: Track if this is the first update call
         is_first_update = (self.update_count == 0)
         
+        # Disable SymLog debug output after first update to reduce noise
+        if self.update_count == 1 and hasattr(self, '_debug_enabled') and self._debug_enabled:
+            if hasattr(self.actor_target, '_debug_rocm'):
+                self.actor_target._debug_rocm = False
+            if hasattr(self.actor, '_debug_rocm'):
+                self.actor._debug_rocm = False
+        
         if self.use_rocm_mode and is_first_update:
             print(f"    [DEBUG] update(): Agent {self.agent_id}, first update call")
             print(f"      Batch keys: {list(batch.keys())}")
