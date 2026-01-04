@@ -3422,9 +3422,29 @@ class ERLTrainer:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    # CRITICAL: For ROCm, synchronize to ensure all worker GPU operations are complete
+                    from utils.device import get_gpu_backend
+                    if get_gpu_backend() == "ROCm":
+                        torch.cuda.synchronize()
+                        # Extra cleanup for ROCm to ensure worker state is fully cleared
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
 
                 return (fitness_scores, aggregate_stats)
         finally:
+            # CRITICAL: Ensure ProcessPoolExecutor is fully shut down before continuing
+            # ROCm is sensitive to GPU state from worker processes
+            if torch.cuda.is_available():
+                from utils.device import get_gpu_backend
+                if get_gpu_backend() == "ROCm":
+                    # Wait a bit for worker processes to fully exit and release GPU resources
+                    import time
+                    time.sleep(0.5)  # Give workers time to fully shut down
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            
             # Restore original SUPPRESS_GPU_OUTPUT value (or remove if it wasn't set)
             if original_suppress_value is None:
                 os.environ.pop('SUPPRESS_GPU_OUTPUT', None)
