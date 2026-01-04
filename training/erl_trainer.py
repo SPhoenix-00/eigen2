@@ -3860,6 +3860,11 @@ class ERLTrainer:
                                     if batch is not None:
                                         batch[k] = v_copy.to(Config.DEVICE, non_blocking=False)
                                 
+                                # Check if batch was marked as invalid (corrupted)
+                                if batch is None:
+                                    print(f"  [SKIP] Agent {agent_idx}, Step {step}, Accum {accum_step}: Skipping corrupted batch")
+                                    continue
+                                
                                 if agent_idx == 0 and step == 0 and accum_step == 0:
                                     print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Batch transferred, synchronizing...")
                                 torch.cuda.synchronize()
@@ -3877,6 +3882,10 @@ class ERLTrainer:
                             print(f"  [Error] Batch transfer failed: {e}")
                             import traceback
                             traceback.print_exc()
+                            continue
+
+                        # Skip if batch was marked as invalid (corrupted)
+                        if batch is None:
                             continue
 
                         # CRITICAL FOR ROCm: Ensure networks are in correct mode before update
