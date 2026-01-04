@@ -3835,16 +3835,30 @@ class ERLTrainer:
                                         print(f"    [DEBUG] Transferring {k} to GPU...")
                                     
                                     # CRITICAL: Check for NaN/Inf values before transfer (ROCm crashes on NaN)
+                                    # Skip batches with excessive NaN/Inf values (corrupted data)
                                     if torch.isnan(v_copy).any() or torch.isinf(v_copy).any():
                                         nan_count = torch.isnan(v_copy).sum().item()
                                         inf_count = torch.isinf(v_copy).sum().item()
-                                        print(f"  [WARNING] Batch {k} contains NaN/Inf values! NaN: {nan_count}, Inf: {inf_count}")
-                                        print(f"  [WARNING] Replacing NaN/Inf with zeros to prevent ROCm crash...")
-                                        # Replace NaN and Inf with zeros
-                                        v_copy = torch.where(torch.isnan(v_copy) | torch.isinf(v_copy), 
-                                                             torch.zeros_like(v_copy), v_copy)
+                                        total_elements = v_copy.numel()
+                                        nan_ratio = nan_count / total_elements
+                                        
+                                        # If more than 1% of values are NaN/Inf, skip this batch entirely
+                                        # Replacing with zeros corrupts the batch and still causes crashes
+                                        if nan_ratio > 0.01:
+                                            print(f"  [ERROR] Batch {k} is corrupted! NaN: {nan_count} ({nan_ratio*100:.2f}%), Inf: {inf_count}")
+                                            print(f"  [ERROR] Skipping this batch to prevent ROCm crash...")
+                                            # Mark batch as invalid and skip
+                                            batch = None
+                                            break
+                                        else:
+                                            # Small amount of NaN/Inf - replace with zeros
+                                            print(f"  [WARNING] Batch {k} contains NaN/Inf values! NaN: {nan_count}, Inf: {inf_count}")
+                                            print(f"  [WARNING] Replacing NaN/Inf with zeros...")
+                                            v_copy = torch.where(torch.isnan(v_copy) | torch.isinf(v_copy), 
+                                                                 torch.zeros_like(v_copy), v_copy)
                                     
-                                    batch[k] = v_copy.to(Config.DEVICE, non_blocking=False)
+                                    if batch is not None:
+                                        batch[k] = v_copy.to(Config.DEVICE, non_blocking=False)
                                 
                                 if agent_idx == 0 and step == 0 and accum_step == 0:
                                     print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Batch transferred, synchronizing...")
