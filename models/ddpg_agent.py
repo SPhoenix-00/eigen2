@@ -358,6 +358,28 @@ class DDPGAgent:
             
             # Get next actions from target actor (already on GPU)
             # CRITICAL: This is where the memory access fault occurs
+            # ROCm workaround: Create a fresh contiguous copy to ensure proper memory layout
+            if self.use_rocm_mode:
+                # Ensure tensor is contiguous and create a fresh copy to avoid memory issues
+                if not next_states.is_contiguous():
+                    if is_first_update:
+                        print(f"    [DEBUG] update(): Making next_states contiguous...")
+                    next_states = next_states.contiguous()
+                    torch.cuda.synchronize()
+                
+                # Create a fresh copy to break any potential memory aliasing issues
+                if is_first_update:
+                    print(f"    [DEBUG] update(): Creating fresh copy of next_states for ROCm...")
+                next_states_copy = next_states.clone()
+                torch.cuda.synchronize()
+                
+                if is_first_update:
+                    print(f"    [DEBUG] update(): Fresh copy created, verifying...")
+                    print(f"      Copy shape: {next_states_copy.shape}, device: {next_states_copy.device}")
+                    print(f"      Copy contiguous: {next_states_copy.is_contiguous()}")
+                    print(f"      Copy has_nan: {torch.isnan(next_states_copy).any().item()}")
+                next_states = next_states_copy
+            
             try:
                 if self.use_rocm_mode and is_first_update:
                     print(f"    [DEBUG] update(): EXECUTING: next_actions = self.actor_target(next_states)")
