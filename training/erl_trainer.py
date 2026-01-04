@@ -1454,7 +1454,8 @@ class ERLTrainer:
             num_workers = Config.LOCAL_NUM_DATALOADER_WORKERS  # Should be 0 for local mode
             print(f"Creating DataLoader with {num_workers} workers (batch_size={Config.LOCAL_BATCH_SIZE} for local mode)...")
         else:
-            self.replay_buffer.training_batch_size = Config.BATCH_SIZE
+            # Use ROCm-specific batch size if on ROCm backend
+            self.replay_buffer.training_batch_size = Config.get_training_batch_size()
             num_workers = Config.NUM_DATALOADER_WORKERS
             print(f"Creating DataLoader with {num_workers} background workers...")
 
