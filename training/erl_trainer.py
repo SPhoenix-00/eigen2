@@ -3789,14 +3789,12 @@ class ERLTrainer:
             for agent_idx, agent in enumerate(tqdm(self.population, desc="Training agents")):
                 # CRITICAL FOR ROCm: Ensure networks are in training mode before first forward pass
                 # This prevents memory access faults from incorrect network state
-                if gpu_backend == "ROCm" and agent_idx == 0:
-                    print(f"  [DEBUG] Agent {agent_idx}: Setting networks to training mode...")
+                if gpu_backend == "ROCm":
                     agent.actor.train()
                     agent.critic.train()
                     agent.actor_target.eval()  # Target networks stay in eval mode
                     agent.critic_target.eval()
                     torch.cuda.synchronize()
-                    print(f"  [DEBUG] Agent {agent_idx}: Networks in correct mode, GPU synced")
                 
                 actor_losses = []
                 critic_losses = []
