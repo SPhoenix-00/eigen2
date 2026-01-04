@@ -5,6 +5,19 @@ Evolutionary Reinforcement Learning training loop
 
 import numpy as np
 import torch
+
+# --- ROCm STABILITY FIX (NUCLEAR OPTION) ---
+# FORCE STABILITY: Disable buggy ROCm attention kernels
+# This MUST be set immediately after torch import, before any other operations
+# The ROCm implementation of scaled_dot_product_attention has bugs in the
+# optimized C++ kernels (hip/sdp_utils.cpp) that cause memory access faults.
+# This forces PyTorch to use the pure Python/Math implementation of Attention,
+# which is slower but stable and doesn't crash.
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+# ---------------------------
+
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
@@ -26,23 +39,10 @@ from enum import Enum
 from dataclasses import dataclass
 from collections import OrderedDict
 
-# --- ROCm STABILITY FIX ---
-# Disable optimized attention kernels that are causing segfaults on ROCm.
-# The ROCm implementation of scaled_dot_product_attention has bugs in the
-# optimized C++ kernels (hip/sdp_utils.cpp) that cause memory access faults.
-# This forces PyTorch to use the pure Python/Math implementation of Attention,
-# which is slower but stable and doesn't crash.
-# 
-# This is applied globally and affects all attention operations in the codebase.
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_math_sdp(True)
-
-# Log this fix for visibility
+# Log ROCm fix for visibility (after device detection is available)
 from utils.device import get_gpu_backend
 if get_gpu_backend() == "ROCm":
     print("[ROCm] Disabled optimized attention kernels, using pure math implementation for stability")
-# ---------------------------
 
 # Maximum number of agents to cache per worker to prevent memory leaks
 # During evolution, agents mutate every generation, so old cache entries become stale
