@@ -3797,34 +3797,34 @@ class ERLTrainer:
                 actor_losses = []
                 critic_losses = []
 
-                    # Multiple gradient steps per agent
-                    for step in range(gradient_steps):
-                        # Gradient accumulation loop
-                        for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
-                            # Get next batch from DataLoader (already prefetched by workers)
-                            # This is FAST - batch is already in RAM, loaded asynchronously
-                            batch_cpu = next(self.batch_iterator)
+                # Multiple gradient steps per agent
+                for step in range(gradient_steps):
+                    # Gradient accumulation loop
+                    for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                        # Get next batch from DataLoader (already prefetched by workers)
+                        # This is FAST - batch is already in RAM, loaded asynchronously
+                        batch_cpu = next(self.batch_iterator)
 
-                            # Move batch to GPU
-                            # For ROCm: use non_blocking=False to prevent memory access faults
-                            # CRITICAL: Ensure tensors are contiguous before transfer (ROCm requirement)
-                            use_non_blocking = (gpu_backend != "ROCm")
-                            
-                            try:
-                                if gpu_backend == "ROCm":
-                                    # For ROCm: Ensure tensors are contiguous and copy before transfer
-                                    # This prevents memory access faults from non-contiguous or shared memory tensors
-                                    batch = {}
-                                    for k, v in batch_cpu.items():
-                                        # Ensure contiguous and copy if needed (breaks any shared memory references)
-                                        if not v.is_contiguous():
-                                            v = v.contiguous()
-                                        
-                                        # Create a fresh copy to break any shared memory or view references
-                                        if v.device.type == 'cpu':
-                                            v_copy = v.clone()
-                                        else:
-                                            v_copy = v
+                        # Move batch to GPU
+                        # For ROCm: use non_blocking=False to prevent memory access faults
+                        # CRITICAL: Ensure tensors are contiguous before transfer (ROCm requirement)
+                        use_non_blocking = (gpu_backend != "ROCm")
+                        
+                        try:
+                            if gpu_backend == "ROCm":
+                                # For ROCm: Ensure tensors are contiguous and copy before transfer
+                                # This prevents memory access faults from non-contiguous or shared memory tensors
+                                batch = {}
+                                for k, v in batch_cpu.items():
+                                    # Ensure contiguous and copy if needed (breaks any shared memory references)
+                                    if not v.is_contiguous():
+                                        v = v.contiguous()
+                                    
+                                    # Create a fresh copy to break any shared memory or view references
+                                    if v.device.type == 'cpu':
+                                        v_copy = v.clone()
+                                    else:
+                                        v_copy = v
                                     
                                     # CRITICAL: Check for NaN/Inf values before transfer (ROCm crashes on NaN)
                                     # Skip batches with excessive NaN/Inf values (corrupted data)
