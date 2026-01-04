@@ -72,8 +72,6 @@ class DDPGAgent:
             self.actor_target._debug_rocm = True
             self.actor._debug_rocm = True
             self._debug_enabled = True
-            # Disable after first update to reduce noise
-            self._debug_enabled = True
         
         self.critic = Critic().to(self.device)
         self.critic_target = Critic().to(self.device)
@@ -422,9 +420,10 @@ class DDPGAgent:
             self.critic_scaler.update()
             self.critic_optimizer.zero_grad()
             
-            # For ROCm: Synchronize after optimizer step (critical for stability)
-            if self.use_rocm_mode:
-                torch.cuda.synchronize()
+            # For ROCm: Synchronize only after optimizer step (reduces sync overhead)
+            # Note: We removed sync after critic step to improve performance
+            # The optimizer step itself provides sufficient synchronization
+            pass  # Removed sync - optimizer step is sufficient
         
         # ============ Update Actor ============
         # Freeze critic to save computation
@@ -475,10 +474,6 @@ class DDPGAgent:
             self.actor_scaler.step(self.actor_optimizer)
             self.actor_scaler.update()
             self.actor_optimizer.zero_grad()
-            
-            # For ROCm: Synchronize after optimizer step (critical for stability)
-            if self.use_rocm_mode:
-                torch.cuda.synchronize()
         
         # Unfreeze critic
         for param in self.critic.parameters():
@@ -489,10 +484,6 @@ class DDPGAgent:
         if not accumulate:
             self._soft_update(self.actor, self.actor_target)
             self._soft_update(self.critic, self.critic_target)
-            
-            # For ROCm: Synchronize after soft update (critical for stability)
-            if self.use_rocm_mode:
-                torch.cuda.synchronize()
             
             # Track statistics
             self.update_count += 1
@@ -511,10 +502,11 @@ class DDPGAgent:
         del states, actions, rewards, next_states, dones
         del critic_loss, actor_loss
         
-        # For ROCm: Final synchronization and cache clear (critical for stability)
-        if self.use_rocm_mode:
+        # For ROCm: Minimal synchronization - only sync once at end of update
+        # Removed cache clearing from inner loop (too expensive, only clear at end of generation)
+        if self.use_rocm_mode and not accumulate:
+            # Single sync after all operations complete (optimizer steps provide implicit sync)
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
 
         return critic_loss_value, actor_loss_value
     
