@@ -3645,7 +3645,22 @@ class ERLTrainer:
                         batch_cpu = next(self.batch_iterator)
 
                         # Move batch to GPU (fast transfer thanks to pin_memory)
-                        batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+                        try:
+                            # CRITICAL: Disable non_blocking for ROCm to prevent memory access faults
+                            if 'gpu_backend' not in locals():
+                                from utils.device import get_gpu_backend
+                                gpu_backend = get_gpu_backend()
+                            
+                            use_non_blocking = gpu_backend != "ROCm"
+                            
+                            batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
+                            
+                            # Extra synchronization for ROCm to ensure data is ready before use
+                            if gpu_backend == "ROCm":
+                                torch.cuda.synchronize()
+                        except RuntimeError as e:
+                            print(f"  [Error] Batch transfer failed: {e}")
+                            continue
 
                         # Update with gradient accumulation
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
