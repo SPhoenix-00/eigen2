@@ -3849,9 +3849,6 @@ class ERLTrainer:
                                     else:
                                         v_copy = v
                                     
-                                    if agent_idx == 0 and step == 0 and accum_step == 0:
-                                        print(f"    [DEBUG] Transferring {k} to GPU...")
-                                    
                                     # CRITICAL: Check for NaN/Inf values before transfer (ROCm crashes on NaN)
                                     # Skip batches with excessive NaN/Inf values (corrupted data)
                                     if torch.isnan(v_copy).any() or torch.isinf(v_copy).any():
@@ -3860,43 +3857,9 @@ class ERLTrainer:
                                         total_elements = v_copy.numel()
                                         nan_ratio = nan_count / total_elements
                                         
-                                        # DETAILED DEBUGGING: Identify which component is corrupted
-                                        # Force flush to ensure output appears (progress bars can suppress it)
-                                        import sys
-                                        print(f"\n  [ROOT CAUSE DEBUG] ========================================", flush=True)
-                                        print(f"  [ROOT CAUSE DEBUG] Corrupted tensor: {k}", flush=True)
-                                        print(f"  [ROOT CAUSE DEBUG] Shape: {v_copy.shape}", flush=True)
-                                        print(f"  [ROOT CAUSE DEBUG] NaN count: {nan_count} ({nan_ratio*100:.2f}%)", flush=True)
-                                        print(f"  [ROOT CAUSE DEBUG] Inf count: {inf_count}", flush=True)
-                                        print(f"  [ROOT CAUSE DEBUG] Total elements: {total_elements}", flush=True)
-                                        
-                                        # Show statistics of valid (non-NaN) values
-                                        try:
-                                            valid_mask = ~(torch.isnan(v_copy) | torch.isinf(v_copy))
-                                            if valid_mask.any():
-                                                valid_values = v_copy[valid_mask]
-                                                print(f"  [ROOT CAUSE DEBUG] Valid values - min: {valid_values.min().item():.6f}, max: {valid_values.max().item():.6f}, mean: {valid_values.mean().item():.6f}", flush=True)
-                                        except Exception as e:
-                                            print(f"  [ROOT CAUSE DEBUG] Error computing valid stats: {e}", flush=True)
-                                        
-                                        # Show where NaN values are located (first few indices) - only for first occurrence
-                                        if agent_idx == 0 and step == 0 and accum_step == 0:
-                                            try:
-                                                nan_mask = torch.isnan(v_copy)
-                                                if nan_mask.any():
-                                                    nan_indices = torch.nonzero(nan_mask, as_tuple=False)[:10]  # First 10 NaN locations
-                                                    print(f"  [ROOT CAUSE DEBUG] Sample NaN locations (first 10):", flush=True)
-                                                    for idx in nan_indices:
-                                                        idx_str = ', '.join(str(i.item()) for i in idx)
-                                                        print(f"    [{idx_str}]", flush=True)
-                                            except Exception as e:
-                                                print(f"  [ROOT CAUSE DEBUG] Error finding NaN locations: {e}", flush=True)
-                                        
-                                        # Check if this is states/next_states (most likely source)
-                                        if k in ['states', 'next_states']:
-                                            print(f"  [ROOT CAUSE DEBUG] ⚠️  STATE CORRUPTION DETECTED!", flush=True)
-                                            print(f"  [ROOT CAUSE DEBUG] This suggests the issue is in:", flush=True)
-                                            print(f"  [ROOT CAUSE DEBUG]   - Environment observation generation", flush=True)
+                                        # Log warning only for excessive corruption
+                                        if nan_ratio > 0.01:  # More than 1% NaN
+                                            print(f"  [WARNING] Tensor {k} has {nan_count} NaNs ({nan_ratio*100:.2f}%) - skipping batch", flush=True)
                                             print(f"  [ROOT CAUSE DEBUG]   - State normalization (dividing by zero variance)", flush=True)
                                             print(f"  [ROOT CAUSE DEBUG]   - Data preprocessing pipeline", flush=True)
                                             print(f"  [ROOT CAUSE DEBUG]   - DataLoader deserialization (pickle corruption)", flush=True)
