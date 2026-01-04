@@ -320,7 +320,37 @@ class TradingEnvironment(gym.Env):
 
         # CRITICAL FIX: Handle NaN values from raw data
         # Raw data contains ~13.84% NaN values which cause ROCm crashes
-        # Strategy: Forward-fill along time axis, then zero-fill any remaining NaNs
+        window = self._handle_nan_in_window(window)
+
+        # Legacy normalization step (now identity transform: mean=0, std=1)
+        # Instance Normalization is applied in FeatureExtractor instead
+        observation = (window - self.norm_stats['mean']) / self.norm_stats['std']
+
+        # Add MULTIPLICATIVE observation noise for regularization during training
+        # CRITICAL: With raw data, features have vastly different scales:
+        #   - Price: ~150.00
+        #   - RSI: ~50.00
+        #   - TRIX: ~0.05
+        # Additive noise would destroy small-scale signals (TRIX, MACD).
+        # Multiplicative noise applies relative perturbation (e.g., ±1%) to all features equally.
+        if self.is_training:
+            noise_pct = np.random.normal(0.0, Config.OBSERVATION_NOISE_STD, observation.shape)
+            observation = observation * (1.0 + noise_pct)
+
+        return observation.astype(np.float32)
+
+    def _handle_nan_in_window(self, window: np.ndarray) -> np.ndarray:
+        """
+        Handle NaN values in a data window by forward-filling and zero-filling.
+        
+        Args:
+            window: Array of shape [time_steps, num_columns, num_features]
+            
+        Returns:
+            Window with NaN values handled (forward-filled, then zero-filled)
+        """
+        window = window.copy()
+        
         if np.isnan(window).any():
             # Forward-fill along time axis (axis 0) for each column and feature
             # This preserves temporal continuity when possible
@@ -342,23 +372,8 @@ class TradingEnvironment(gym.Env):
             
             # Final safety check: zero-fill any remaining NaNs (shouldn't happen after forward-fill)
             window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Legacy normalization step (now identity transform: mean=0, std=1)
-        # Instance Normalization is applied in FeatureExtractor instead
-        observation = (window - self.norm_stats['mean']) / self.norm_stats['std']
-
-        # Add MULTIPLICATIVE observation noise for regularization during training
-        # CRITICAL: With raw data, features have vastly different scales:
-        #   - Price: ~150.00
-        #   - RSI: ~50.00
-        #   - TRIX: ~0.05
-        # Additive noise would destroy small-scale signals (TRIX, MACD).
-        # Multiplicative noise applies relative perturbation (e.g., ±1%) to all features equally.
-        if self.is_training:
-            noise_pct = np.random.normal(0.0, Config.OBSERVATION_NOISE_STD, observation.shape)
-            observation = observation * (1.0 + noise_pct)
-
-        return observation.astype(np.float32)
+        
+        return window
 
     def get_batch_observations(self, start_day_idx: int, count: int) -> np.ndarray:
         """
@@ -381,7 +396,11 @@ class TradingEnvironment(gym.Env):
         last_row = start_day_idx + count  # exclusive
 
         # 2. Single slice of raw data [total_days_needed, cols, feats]
-        data_slice = self.data_array[first_row:last_row]
+        data_slice = self.data_array[first_row:last_row].copy()  # Copy to allow NaN handling
+
+        # CRITICAL FIX: Handle NaN values before creating sliding windows
+        # Raw data contains ~13.84% NaN values which cause ROCm crashes
+        data_slice = self._handle_nan_in_window(data_slice)
 
         # 3. Create sliding windows (ZERO-COPY strided view)
         # Result shape: [count, cols, feats, context_window]
