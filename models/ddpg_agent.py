@@ -263,81 +263,167 @@ class DDPGAgent:
         Returns:
             Tuple of (critic_loss, actor_loss)
         """
+        # DEBUG: Track if this is the first update call
+        is_first_update = (self.update_count == 0)
+        
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Agent {self.agent_id}, first update call")
+            print(f"      Batch keys: {list(batch.keys())}")
+            for k, v in batch.items():
+                print(f"      {k}: shape={v.shape}, device={v.device}, contiguous={v.is_contiguous()}")
+        
         # CRITICAL FOR ROCm: Networks are already on GPU, never move them
         # Just ensure batch tensors are on the same device (GPU)
         # Use non_blocking=False for ROCm to prevent memory access faults
         transfer_mode = not self.use_rocm_mode  # non_blocking only for non-ROCm
         
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Transferring batch tensors to device {self.device}...")
+        
         states = batch['states'].to(self.device, non_blocking=transfer_mode)
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): states transferred")
         actions = batch['actions'].to(self.device, non_blocking=transfer_mode)
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): actions transferred")
         rewards = batch['rewards'].to(self.device, non_blocking=transfer_mode)
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): rewards transferred")
         next_states = batch['next_states'].to(self.device, non_blocking=transfer_mode)
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): next_states transferred")
         dones = batch['dones'].to(self.device, non_blocking=transfer_mode)
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): dones transferred")
         
         # For ROCm: Synchronize after tensor transfer to ensure data is ready
         if self.use_rocm_mode:
+            if is_first_update:
+                print(f"    [DEBUG] update(): Synchronizing GPU after tensor transfer...")
             torch.cuda.synchronize()
+            if is_first_update:
+                print(f"    [DEBUG] update(): GPU synchronized")
         
         # ============ Update Critic ============
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Starting critic update...")
+        
         with torch.no_grad():
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Computing next_actions from actor_target...")
             # Get next actions from target actor (already on GPU)
             next_actions = self.actor_target(next_states)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): next_actions computed, shape={next_actions.shape}")
             
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Computing target_q from critic_target...")
             # Get target Q-values (already on GPU)
             target_q = self.critic_target(next_states, next_actions)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): target_q computed, shape={target_q.shape}")
             
             # Compute target: r + gamma * Q_target(s', a')
             target_q = rewards + (1 - dones) * Config.GAMMA * target_q
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): target_q updated with rewards")
         
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Computing current_q with autocast...")
         # Use autocast for GPU (works on both CUDA and ROCm)
         with autocast(device_type='cuda'):
             current_q = self.critic(states, actions)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): current_q computed, shape={current_q.shape}")
             critic_loss = nn.MSELoss()(current_q, target_q)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): critic_loss computed, value={critic_loss.item()}")
         
         # Scale loss for gradient accumulation
         if accumulate:
             critic_loss = critic_loss / Config.GRADIENT_ACCUMULATION_STEPS
         
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Starting critic backward pass...")
         # Backward pass
         self.critic_scaler.scale(critic_loss).backward()
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Critic backward pass completed")
         
         # Only step if not accumulating
         if not accumulate:
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Clipping critic gradients...")
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Stepping critic optimizer...")
             self.critic_scaler.step(self.critic_optimizer)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Updating critic scaler...")
             self.critic_scaler.update()
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Zeroing critic gradients...")
             self.critic_optimizer.zero_grad()
             
             # For ROCm: Synchronize after optimizer step
             if self.use_rocm_mode:
+                if is_first_update:
+                    print(f"    [DEBUG] update(): Synchronizing GPU after critic optimizer step...")
                 torch.cuda.synchronize()
+                if is_first_update:
+                    print(f"    [DEBUG] update(): GPU synchronized after critic step")
         
         # ============ Update Actor ============
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Starting actor update...")
+        
         # Freeze critic to save computation
         for param in self.critic.parameters():
             param.requires_grad = False
         
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Computing actor_actions with autocast...")
         with autocast(device_type='cuda'):
             actor_actions = self.actor(states)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): actor_actions computed, shape={actor_actions.shape}")
             actor_loss = -self.critic(states, actor_actions).mean()
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): actor_loss computed, value={actor_loss.item()}")
         
         # Scale loss for gradient accumulation
         if accumulate:
             actor_loss = actor_loss / Config.GRADIENT_ACCUMULATION_STEPS
         
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Starting actor backward pass...")
         # Backward pass
         self.actor_scaler.scale(actor_loss).backward()
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Actor backward pass completed")
         
         # Only step if not accumulating
         if not accumulate:
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Clipping actor gradients...")
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Stepping actor optimizer...")
             self.actor_scaler.step(self.actor_optimizer)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Updating actor scaler...")
             self.actor_scaler.update()
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Zeroing actor gradients...")
             self.actor_optimizer.zero_grad()
             
             # For ROCm: Synchronize after optimizer step
             if self.use_rocm_mode:
+                if is_first_update:
+                    print(f"    [DEBUG] update(): Synchronizing GPU after actor optimizer step...")
                 torch.cuda.synchronize()
+                if is_first_update:
+                    print(f"    [DEBUG] update(): GPU synchronized after actor step")
         
         # Unfreeze critic
         for param in self.critic.parameters():
@@ -346,18 +432,31 @@ class DDPGAgent:
         # ============ Update Target Networks ============
         # Only update targets after actual optimizer step
         if not accumulate:
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Starting soft update of target networks...")
             self._soft_update(self.actor, self.actor_target)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): actor_target soft updated")
             self._soft_update(self.critic, self.critic_target)
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): critic_target soft updated")
             
             # For ROCm: Synchronize after soft update
             if self.use_rocm_mode:
+                if is_first_update:
+                    print(f"    [DEBUG] update(): Synchronizing GPU after soft update...")
                 torch.cuda.synchronize()
+                if is_first_update:
+                    print(f"    [DEBUG] update(): GPU synchronized after soft update")
             
             # Track statistics
             self.update_count += 1
             
             # Decay noise
             self.noise_scale = max(Config.MIN_NOISE, self.noise_scale * Config.NOISE_DECAY)
+            
+            if self.use_rocm_mode and is_first_update:
+                print(f"    [DEBUG] update(): Update complete! update_count={self.update_count}")
         
         # Store losses as Python floats before cleanup
         critic_loss_value = critic_loss.item() * (Config.GRADIENT_ACCUMULATION_STEPS if accumulate else 1)
@@ -366,14 +465,21 @@ class DDPGAgent:
         self.actor_loss_history.append(actor_loss_value)
         self.critic_loss_history.append(critic_loss_value)
 
+        if self.use_rocm_mode and is_first_update:
+            print(f"    [DEBUG] update(): Cleaning up tensors...")
+        
         # Explicitly delete batch tensors to free GPU memory immediately
         del states, actions, rewards, next_states, dones
         del critic_loss, actor_loss
         
         # For ROCm: Final synchronization and cache clear
         if self.use_rocm_mode:
+            if is_first_update:
+                print(f"    [DEBUG] update(): Final GPU synchronization and cache clear...")
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            if is_first_update:
+                print(f"    [DEBUG] update(): Cleanup complete, returning losses")
 
         return critic_loss_value, actor_loss_value
     

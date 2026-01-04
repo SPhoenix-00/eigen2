@@ -3772,11 +3772,13 @@ class ERLTrainer:
                 # CRITICAL FOR ROCm: Ensure networks are in training mode before first forward pass
                 # This prevents memory access faults from incorrect network state
                 if gpu_backend == "ROCm" and agent_idx == 0:
+                    print(f"  [DEBUG] Agent {agent_idx}: Setting networks to training mode...")
                     agent.actor.train()
                     agent.critic.train()
                     agent.actor_target.eval()  # Target networks stay in eval mode
                     agent.critic_target.eval()
                     torch.cuda.synchronize()
+                    print(f"  [DEBUG] Agent {agent_idx}: Networks in correct mode, GPU synced")
                 
                 actor_losses = []
                 critic_losses = []
@@ -3785,9 +3787,18 @@ class ERLTrainer:
                 for step in range(gradient_steps):
                     # Gradient accumulation loop
                     for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                        if gpu_backend == "ROCm" and agent_idx == 0 and step == 0 and accum_step == 0:
+                            print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Getting batch from DataLoader...")
+                        
                         # Get next batch from DataLoader (already prefetched by workers)
                         # This is FAST - batch is already in RAM, loaded asynchronously
                         batch_cpu = next(self.batch_iterator)
+                        
+                        if gpu_backend == "ROCm" and agent_idx == 0 and step == 0 and accum_step == 0:
+                            print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Batch received from DataLoader")
+                            print(f"    Batch keys: {list(batch_cpu.keys())}")
+                            for k, v in batch_cpu.items():
+                                print(f"    {k}: shape={v.shape}, device={v.device}, contiguous={v.is_contiguous()}")
 
                         # Move batch to GPU
                         # For ROCm: use non_blocking=False to prevent memory access faults
@@ -3796,32 +3807,79 @@ class ERLTrainer:
                         
                         try:
                             if gpu_backend == "ROCm":
+                                if agent_idx == 0 and step == 0 and accum_step == 0:
+                                    print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Starting batch transfer to GPU...")
+                                
                                 # For ROCm: Ensure tensors are contiguous and copy before transfer
                                 # This prevents memory access faults from non-contiguous or shared memory tensors
                                 batch = {}
                                 for k, v in batch_cpu.items():
+                                    if agent_idx == 0 and step == 0 and accum_step == 0:
+                                        print(f"    [DEBUG] Processing {k}: shape={v.shape}, device={v.device}, contiguous={v.is_contiguous()}")
+                                    
                                     # Ensure contiguous and copy if needed (breaks any shared memory references)
                                     if not v.is_contiguous():
+                                        if agent_idx == 0 and step == 0 and accum_step == 0:
+                                            print(f"    [DEBUG] Making {k} contiguous...")
                                         v = v.contiguous()
+                                    
                                     # Create a fresh copy to break any shared memory or view references
-                                    v_copy = v.clone() if v.device.type == 'cpu' else v
+                                    if v.device.type == 'cpu':
+                                        if agent_idx == 0 and step == 0 and accum_step == 0:
+                                            print(f"    [DEBUG] Cloning {k} from CPU...")
+                                        v_copy = v.clone()
+                                    else:
+                                        v_copy = v
+                                    
+                                    if agent_idx == 0 and step == 0 and accum_step == 0:
+                                        print(f"    [DEBUG] Transferring {k} to GPU...")
                                     batch[k] = v_copy.to(Config.DEVICE, non_blocking=False)
+                                
+                                if agent_idx == 0 and step == 0 and accum_step == 0:
+                                    print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Batch transferred, synchronizing...")
                                 torch.cuda.synchronize()
+                                
+                                if agent_idx == 0 and step == 0 and accum_step == 0:
+                                    print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: GPU synchronized, batch ready")
+                                    for k, v in batch.items():
+                                        print(f"    {k}: shape={v.shape}, device={v.device}, contiguous={v.is_contiguous()}")
                             else:
                                 batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
                         except RuntimeError as e:
                             print(f"  [Error] Batch transfer failed: {e}")
+                            import traceback
+                            traceback.print_exc()
                             continue
 
                         # CRITICAL FOR ROCm: Ensure networks are in correct mode before update
                         if gpu_backend == "ROCm":
+                            if agent_idx == 0 and step == 0 and accum_step == 0:
+                                print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Ensuring networks in training mode...")
                             agent.actor.train()
                             agent.critic.train()
+                            if agent_idx == 0 and step == 0 and accum_step == 0:
+                                print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Networks in training mode")
 
                         # Update with gradient accumulation
                         # Networks are already on GPU, no movement needed
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
-                        critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+                        
+                        if gpu_backend == "ROCm" and agent_idx == 0 and step == 0 and accum_step == 0:
+                            print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: Calling agent.update()...")
+                            print(f"    Accumulate: {not is_last_accum}")
+                        
+                        try:
+                            critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+                            
+                            if gpu_backend == "ROCm" and agent_idx == 0 and step == 0 and accum_step == 0:
+                                print(f"  [DEBUG] Agent {agent_idx}, Step {step}, Accum {accum_step}: agent.update() completed successfully")
+                                print(f"    Critic loss: {critic_loss}, Actor loss: {actor_loss}")
+                        except Exception as e:
+                            print(f"  [ERROR] Agent {agent_idx}, Step {step}, Accum {accum_step}: agent.update() failed!")
+                            print(f"    Error: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            raise
 
                         # Capture attention weights from actor (after forward pass in update)
                         # Only capture from first agent to avoid redundant logging
