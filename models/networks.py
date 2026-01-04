@@ -13,6 +13,29 @@ from torch.utils.checkpoint import checkpoint
 from utils.config import Config
 
 
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    """
+    Symmetric Logarithmic Transformation.
+    
+    Compresses extreme values logarithmically while preserving sign.
+    Formula: sign(x) * log(1 + |x|)
+    
+    This is stateless and handles any input range, making it perfect for:
+    - Preventing ROCm attention mechanism crashes (squashes extreme values)
+    - Handling non-stationary financial data (no global stats needed)
+    - Maintaining mathematical consistency between main and target networks
+    
+    Example: 33,000 -> ~10.4, -4,231 -> ~-8.4
+    
+    Args:
+        x: Input tensor of any shape
+        
+    Returns:
+        SymLog-transformed tensor (same shape)
+    """
+    return torch.sign(x) * torch.log(1 + torch.abs(x))
+
+
 class FeatureExtractor(nn.Module):
     """
     Extracts features from multi-column time-series data.
@@ -382,6 +405,11 @@ class Actor(nn.Module):
         """
         batch_size = state.shape[0]
 
+        # CRITICAL ROCm FIX: Apply SymLog transformation to squash extreme values
+        # This prevents ROCm attention mechanism crashes while maintaining mathematical consistency
+        # Applied to both main and target networks identically
+        state = symlog(state)
+
         # Extract features from all columns
         features = self.feature_extractor(state)
         # [batch, num_columns, lstm_output_size]
@@ -543,6 +571,11 @@ class Critic(nn.Module):
         Returns:
             Q-values: [batch, 1]
         """
+        # CRITICAL ROCm FIX: Apply SymLog transformation to squash extreme values
+        # This prevents ROCm attention mechanism crashes while maintaining mathematical consistency
+        # Applied to both main and target networks identically
+        state = symlog(state)
+        
         # Extract features
         features = self.feature_extractor(state)
 
