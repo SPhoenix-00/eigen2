@@ -8,17 +8,17 @@ When using `--maverick` mode, every breakthrough now explicitly attempts Global5
 
 ### Behavior
 
-- **Every breakthrough in Maverick mode** now runs a consistency-aligned re-gauntlet for Global50 evaluation
+- **Every breakthrough in Maverick mode** now explicitly attempts Global50 promotion using the existing gauntlet results
 - Previously, Global50 promotion was only attempted if the agent passed an initial qualification check
-- Now, all breakthroughs get a full Global50 evaluation attempt with detailed metrics
+- Now, all breakthroughs get a full Global50 evaluation attempt with detailed metrics using the same gauntlet that confirmed the breakthrough (no duplicate runs)
 
 ### Verbose Output
 
 When a breakthrough occurs in Maverick mode, you'll see:
 
-1. **Promotion Attempt Header**
+1. **Promotion Analysis Header**
    ```
-   🔥 MAVERICK MODE: Global50 Promotion Attempt
+   📊 MAVERICK MODE: Global50 Promotion Analysis
    ```
 
 2. **Agent Metrics Display**
@@ -57,11 +57,13 @@ When a breakthrough occurs in Maverick mode, you'll see:
 
 ```
 ============================================================
-🔥 MAVERICK MODE: Global50 Promotion Attempt
+⭐ BREAKTHROUGH CONFIRMED!
 ============================================================
-  Initial Gauntlet Score: 1250.50
-  Running consistency-aligned re-gauntlet for fair Global 50 comparison...
-   Consistency-aligned gauntlet score: 1248.30
+  Spike Score: 1300.00 (lucky)
+  Gauntlet Score: 1248.30 (robust)
+  Previous Baseline: 1200.00
+  New Baseline: 1248.30 (applied immediately)
+============================================================
 
 ============================================================
 📊 MAVERICK MODE: Global50 Promotion Analysis
@@ -107,9 +109,10 @@ When a breakthrough occurs in Maverick mode, you'll see:
 ### Files Modified
 
 1. **`training/erl_trainer.py`**
-   - Modified breakthrough confirmation logic to always run consistency-aligned re-gauntlet for Maverick mode
-   - Added comprehensive verbose metrics display section
+   - Modified breakthrough confirmation logic to use existing gauntlet results for Global50 promotion (no duplicate runs)
+   - Added comprehensive verbose metrics display section for Maverick mode
    - Enhanced promotion result display with detailed metrics
+   - Simplified logic to reuse the gauntlet that confirmed the breakthrough
 
 2. **`erl/global_hof.py`**
    - Enhanced `analyze_promotion()` method to always show detailed gate-by-gate analysis
@@ -135,8 +138,9 @@ The verbose Global50 promotion logging is automatic for all breakthroughs in Mav
 
 ## Benefits
 
-1. **Transparency**: Clear visibility into why an agent passes or fails Global50 promotion
-2. **Debugging**: Easy to identify which specific gate or metric is preventing promotion
-3. **Progress Tracking**: See how close agents are to meeting each threshold
-4. **Training Guidance**: Understand what metrics need improvement for future training
+1. **Efficiency**: Uses existing breakthrough gauntlet results - no duplicate gauntlet runs
+2. **Transparency**: Clear visibility into why an agent passes or fails Global50 promotion
+3. **Debugging**: Easy to identify which specific gate or metric is preventing promotion
+4. **Progress Tracking**: See how close agents are to meeting each threshold
+5. **Training Guidance**: Understand what metrics need improvement for future training
 
