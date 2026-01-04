@@ -4,6 +4,7 @@ Gym-style environment for stock trading with ERL
 """
 
 import numpy as np
+import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Dict, Tuple, Optional, List
