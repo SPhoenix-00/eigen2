@@ -3568,16 +3568,16 @@ class ERLTrainer:
                 actor_losses = []
                 critic_losses = []
 
-                    # Multiple gradient steps per agent
-                    for step in range(gradient_steps):
-                        # Gradient accumulation loop
-                        for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
-                            # Get next batch from DataLoader (already prefetched by workers)
-                            # This is FAST - batch is already in RAM, loaded asynchronously
-                            batch_cpu = next(self.batch_iterator)
+                # Multiple gradient steps per agent
+                for step in range(gradient_steps):
+                    # Gradient accumulation loop
+                    for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                        # Get next batch from DataLoader (already prefetched by workers)
+                        # This is FAST - batch is already in RAM, loaded asynchronously
+                        batch_cpu = next(self.batch_iterator)
 
-                            # Move batch to GPU (fast transfer thanks to pin_memory when available)
-                            batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+                        # Move batch to GPU (fast transfer thanks to pin_memory when available)
+                        batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
 
                         # Update with gradient accumulation
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
