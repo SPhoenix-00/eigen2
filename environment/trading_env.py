@@ -303,15 +303,44 @@ class TradingEnvironment(gym.Env):
         to prevent overfitting. This encourages the agent to learn robust,
         generalized patterns rather than memorizing exact values.
 
+        CRITICAL FIX: Handle NaN values from raw data by forward-filling and zero-filling.
+        NaN values in raw data (~13.84%) cause ROCm memory access faults during training.
+        Forward-fill preserves temporal continuity, zero-fill handles leading NaNs.
+
         Returns:
             Array of shape [context_window_days, num_columns, 5_features]
-            Contains raw nominal data (actual prices, raw indicators)
+            Contains raw nominal data (actual prices, raw indicators) with NaN values handled
         """
         start_idx = self.current_idx - Config.CONTEXT_WINDOW_DAYS + 1
         end_idx = self.current_idx + 1
 
         # Extract window
-        window = self.data_array[start_idx:end_idx, :, :]
+        window = self.data_array[start_idx:end_idx, :, :].copy()
+
+        # CRITICAL FIX: Handle NaN values from raw data
+        # Raw data contains ~13.84% NaN values which cause ROCm crashes
+        # Strategy: Forward-fill along time axis, then zero-fill any remaining NaNs
+        if np.isnan(window).any():
+            # Forward-fill along time axis (axis 0) for each column and feature
+            # This preserves temporal continuity when possible
+            for col_idx in range(window.shape[1]):
+                for feat_idx in range(window.shape[2]):
+                    col_feat_slice = window[:, col_idx, feat_idx]
+                    # Forward-fill: propagate last valid value forward
+                    mask = ~np.isnan(col_feat_slice)
+                    if mask.any():
+                        # Find first valid value to use as fill value for leading NaNs
+                        first_valid_idx = np.where(mask)[0][0]
+                        first_valid_val = col_feat_slice[first_valid_idx]
+                        # Forward-fill from first valid value
+                        col_feat_slice = pd.Series(col_feat_slice).fillna(method='ffill').fillna(first_valid_val).values
+                    else:
+                        # All NaN - fill with zeros
+                        col_feat_slice = np.zeros_like(col_feat_slice)
+                    window[:, col_idx, feat_idx] = col_feat_slice
+            
+            # Final safety check: zero-fill any remaining NaNs (shouldn't happen after forward-fill)
+            window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Legacy normalization step (now identity transform: mean=0, std=1)
         # Instance Normalization is applied in FeatureExtractor instead
