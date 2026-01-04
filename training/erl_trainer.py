@@ -3843,47 +3843,57 @@ class ERLTrainer:
                                         nan_ratio = nan_count / total_elements
                                         
                                         # DETAILED DEBUGGING: Identify which component is corrupted
-                                        print(f"\n  [ROOT CAUSE DEBUG] ========================================")
-                                        print(f"  [ROOT CAUSE DEBUG] Corrupted tensor: {k}")
-                                        print(f"  [ROOT CAUSE DEBUG] Shape: {v_copy.shape}")
-                                        print(f"  [ROOT CAUSE DEBUG] NaN count: {nan_count} ({nan_ratio*100:.2f}%)")
-                                        print(f"  [ROOT CAUSE DEBUG] Inf count: {inf_count}")
-                                        print(f"  [ROOT CAUSE DEBUG] Total elements: {total_elements}")
+                                        # Force flush to ensure output appears (progress bars can suppress it)
+                                        import sys
+                                        print(f"\n  [ROOT CAUSE DEBUG] ========================================", flush=True)
+                                        print(f"  [ROOT CAUSE DEBUG] Corrupted tensor: {k}", flush=True)
+                                        print(f"  [ROOT CAUSE DEBUG] Shape: {v_copy.shape}", flush=True)
+                                        print(f"  [ROOT CAUSE DEBUG] NaN count: {nan_count} ({nan_ratio*100:.2f}%)", flush=True)
+                                        print(f"  [ROOT CAUSE DEBUG] Inf count: {inf_count}", flush=True)
+                                        print(f"  [ROOT CAUSE DEBUG] Total elements: {total_elements}", flush=True)
                                         
                                         # Show statistics of valid (non-NaN) values
-                                        valid_mask = ~(torch.isnan(v_copy) | torch.isinf(v_copy))
-                                        if valid_mask.any():
-                                            valid_values = v_copy[valid_mask]
-                                            print(f"  [ROOT CAUSE DEBUG] Valid values - min: {valid_values.min().item():.6f}, max: {valid_values.max().item():.6f}, mean: {valid_values.mean().item():.6f}")
+                                        try:
+                                            valid_mask = ~(torch.isnan(v_copy) | torch.isinf(v_copy))
+                                            if valid_mask.any():
+                                                valid_values = v_copy[valid_mask]
+                                                print(f"  [ROOT CAUSE DEBUG] Valid values - min: {valid_values.min().item():.6f}, max: {valid_values.max().item():.6f}, mean: {valid_values.mean().item():.6f}", flush=True)
+                                        except Exception as e:
+                                            print(f"  [ROOT CAUSE DEBUG] Error computing valid stats: {e}", flush=True)
                                         
-                                        # Show where NaN values are located (first few indices)
-                                        nan_mask = torch.isnan(v_copy)
-                                        if nan_mask.any():
-                                            nan_indices = torch.nonzero(nan_mask, as_tuple=False)[:10]  # First 10 NaN locations
-                                            print(f"  [ROOT CAUSE DEBUG] Sample NaN locations (first 10):")
-                                            for idx in nan_indices:
-                                                idx_str = ', '.join(str(i.item()) for i in idx)
-                                                print(f"    [{idx_str}]")
+                                        # Show where NaN values are located (first few indices) - only for first occurrence
+                                        if agent_idx == 0 and step == 0 and accum_step == 0:
+                                            try:
+                                                nan_mask = torch.isnan(v_copy)
+                                                if nan_mask.any():
+                                                    nan_indices = torch.nonzero(nan_mask, as_tuple=False)[:10]  # First 10 NaN locations
+                                                    print(f"  [ROOT CAUSE DEBUG] Sample NaN locations (first 10):", flush=True)
+                                                    for idx in nan_indices:
+                                                        idx_str = ', '.join(str(i.item()) for i in idx)
+                                                        print(f"    [{idx_str}]", flush=True)
+                                            except Exception as e:
+                                                print(f"  [ROOT CAUSE DEBUG] Error finding NaN locations: {e}", flush=True)
                                         
                                         # Check if this is states/next_states (most likely source)
                                         if k in ['states', 'next_states']:
-                                            print(f"  [ROOT CAUSE DEBUG] ⚠️  STATE CORRUPTION DETECTED!")
-                                            print(f"  [ROOT CAUSE DEBUG] This suggests the issue is in:")
-                                            print(f"  [ROOT CAUSE DEBUG]   - Environment observation generation")
-                                            print(f"  [ROOT CAUSE DEBUG]   - State normalization (dividing by zero variance)")
-                                            print(f"  [ROOT CAUSE DEBUG]   - Data preprocessing pipeline")
+                                            print(f"  [ROOT CAUSE DEBUG] ⚠️  STATE CORRUPTION DETECTED!", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG] This suggests the issue is in:", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG]   - Environment observation generation", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG]   - State normalization (dividing by zero variance)", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG]   - Data preprocessing pipeline", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG]   - DataLoader deserialization (pickle corruption)", flush=True)
                                         elif k == 'actions':
-                                            print(f"  [ROOT CAUSE DEBUG] ⚠️  ACTION CORRUPTION DETECTED!")
-                                            print(f"  [ROOT CAUSE DEBUG] This suggests the issue is in:")
-                                            print(f"  [ROOT CAUSE DEBUG]   - Agent network output (exploding gradients)")
-                                            print(f"  [ROOT CAUSE DEBUG]   - Action normalization/clipping")
+                                            print(f"  [ROOT CAUSE DEBUG] ⚠️  ACTION CORRUPTION DETECTED!", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG] This suggests the issue is in:", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG]   - Agent network output (exploding gradients)", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG]   - Action normalization/clipping", flush=True)
                                         elif k == 'rewards':
-                                            print(f"  [ROOT CAUSE DEBUG] ⚠️  REWARD CORRUPTION DETECTED!")
-                                            print(f"  [ROOT CAUSE DEBUG] This suggests the issue is in:")
-                                            print(f"  [ROOT CAUSE DEBUG]   - Reward function (division by zero)")
-                                            print(f"  [ROOT CAUSE DEBUG]   - Reward calculation edge cases")
+                                            print(f"  [ROOT CAUSE DEBUG] ⚠️  REWARD CORRUPTION DETECTED!", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG] This suggests the issue is in:", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG]   - Reward function (division by zero)", flush=True)
+                                            print(f"  [ROOT CAUSE DEBUG]   - Reward calculation edge cases", flush=True)
                                         
-                                        print(f"  [ROOT CAUSE DEBUG] ========================================\n")
+                                        print(f"  [ROOT CAUSE DEBUG] ========================================\n", flush=True)
                                         
                                         # If more than 1% of values are NaN/Inf, skip this batch entirely
                                         # Replacing with zeros corrupts the batch and still causes crashes
