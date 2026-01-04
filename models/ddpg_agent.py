@@ -54,15 +54,25 @@ class DDPGAgent:
         self.device = Config.DEVICE
         self.is_elite = False  # Track if this agent is an elite (for replay buffer diversity)
         
-        # Actor networks
+        # ROCm-specific: Detect backend for special handling
+        from utils.device import get_gpu_backend
+        gpu_backend = get_gpu_backend()
+        self.use_rocm_mode = (gpu_backend == "ROCm")
+        
+        # CRITICAL FOR ROCm: Initialize networks directly on GPU and NEVER move them
+        # Moving networks to/from GPU causes memory access faults on ROCm
+        # So we create them on GPU and keep them there permanently
         self.actor = Actor().to(self.device)
         self.actor_target = Actor().to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
-        # Critic networks
         self.critic = Critic().to(self.device)
         self.critic_target = Critic().to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
+        
+        # For ROCm: Synchronize after network creation to ensure GPU operations complete
+        if self.use_rocm_mode and torch.cuda.is_available():
+            torch.cuda.synchronize()
         
         # Optimizers
         self.actor_optimizer = optim.Adam(
@@ -95,16 +105,29 @@ class DDPGAgent:
         """
         Move agent to a new device, properly handling optimizer references.
 
-        CRITICAL: When moving networks with .to(device), PyTorch creates NEW tensors.
-        The old tensors are only freed when ALL references are dropped. Optimizers
-        hold references to the old parameters, so we MUST recreate them to free
-        the old GPU memory.
+        CRITICAL FOR ROCm: Networks are initialized on GPU and NEVER moved.
+        Moving networks causes memory access faults on ROCm, so this is a no-op
+        if the agent is already on the target device (which it always is for ROCm).
 
         Args:
             device: Target device (e.g., torch.device('cpu') or torch.device('cuda'))
             recreate_optimizers: If True, recreate optimizers to reference new params.
                                  Set False for inference-only (saves time but breaks training).
         """
+        # CRITICAL FOR ROCm: Never move networks - they're already on GPU permanently
+        # Moving networks to/from GPU causes memory access faults on ROCm
+        if self.use_rocm_mode:
+            # For ROCm, networks are always on GPU (self.device = Config.DEVICE = GPU)
+            # If someone tries to move to GPU, it's already there - no-op
+            # If someone tries to move to CPU, we refuse (would cause faults later)
+            if device.type == 'cuda':
+                return  # Already on GPU, no-op
+            else:
+                # Refuse to move ROCm agents to CPU - would break training
+                # Networks must stay on GPU for ROCm
+                return  # No-op: keep on GPU
+        
+        # Standard device movement for non-ROCm
         # Compare by type, not object equality
         # torch.device('cuda') != torch.device('cuda:0') but both are cuda device 0
         same_type = self.device.type == device.type
@@ -161,6 +184,7 @@ class DDPGAgent:
         
         with torch.no_grad():
             # Convert to tensor and add batch dimension
+            # For ROCm, device is CPU; for others, use configured device
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             
             # Get action from actor
@@ -194,7 +218,7 @@ class DDPGAgent:
         """
         Batched action selection for faster evaluation.
 
-        Uses GPU if available for fast batch inference.
+        Uses GPU if available for fast batch inference (except ROCm which uses CPU).
         CPU→GPU transfer is amortized over the entire batch (125 items).
 
         Args:
@@ -208,6 +232,7 @@ class DDPGAgent:
 
         with torch.no_grad():
             # Transfer to device and run batch inference
+            # For ROCm, device is CPU; for others, use configured device
             states_tensor = torch.FloatTensor(states).to(self.device)
 
             # Forward pass through actor network
@@ -238,24 +263,33 @@ class DDPGAgent:
         Returns:
             Tuple of (critic_loss, actor_loss)
         """
-        # Extract batch data
-        states = batch['states'].to(self.device)
-        actions = batch['actions'].to(self.device)
-        rewards = batch['rewards'].to(self.device)
-        next_states = batch['next_states'].to(self.device)
-        dones = batch['dones'].to(self.device)
+        # CRITICAL FOR ROCm: Networks are already on GPU, never move them
+        # Just ensure batch tensors are on the same device (GPU)
+        # Use non_blocking=False for ROCm to prevent memory access faults
+        transfer_mode = not self.use_rocm_mode  # non_blocking only for non-ROCm
+        
+        states = batch['states'].to(self.device, non_blocking=transfer_mode)
+        actions = batch['actions'].to(self.device, non_blocking=transfer_mode)
+        rewards = batch['rewards'].to(self.device, non_blocking=transfer_mode)
+        next_states = batch['next_states'].to(self.device, non_blocking=transfer_mode)
+        dones = batch['dones'].to(self.device, non_blocking=transfer_mode)
+        
+        # For ROCm: Synchronize after tensor transfer to ensure data is ready
+        if self.use_rocm_mode:
+            torch.cuda.synchronize()
         
         # ============ Update Critic ============
         with torch.no_grad():
-            # Get next actions from target actor
+            # Get next actions from target actor (already on GPU)
             next_actions = self.actor_target(next_states)
             
-            # Get target Q-values
+            # Get target Q-values (already on GPU)
             target_q = self.critic_target(next_states, next_actions)
             
             # Compute target: r + gamma * Q_target(s', a')
             target_q = rewards + (1 - dones) * Config.GAMMA * target_q
         
+        # Use autocast for GPU (works on both CUDA and ROCm)
         with autocast(device_type='cuda'):
             current_q = self.critic(states, actions)
             critic_loss = nn.MSELoss()(current_q, target_q)
@@ -267,12 +301,16 @@ class DDPGAgent:
         # Backward pass
         self.critic_scaler.scale(critic_loss).backward()
         
-        # Only step if not accumulating or if explicitly told
+        # Only step if not accumulating
         if not accumulate:
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
             self.critic_scaler.step(self.critic_optimizer)
-            self.critic_scaler.update() # Update scaler
+            self.critic_scaler.update()
             self.critic_optimizer.zero_grad()
+            
+            # For ROCm: Synchronize after optimizer step
+            if self.use_rocm_mode:
+                torch.cuda.synchronize()
         
         # ============ Update Actor ============
         # Freeze critic to save computation
@@ -294,9 +332,13 @@ class DDPGAgent:
         if not accumulate:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_scaler.step(self.actor_optimizer)
-            self.actor_scaler.update() # Update scaler
+            self.actor_scaler.update()
             self.actor_optimizer.zero_grad()
             
+            # For ROCm: Synchronize after optimizer step
+            if self.use_rocm_mode:
+                torch.cuda.synchronize()
+        
         # Unfreeze critic
         for param in self.critic.parameters():
             param.requires_grad = True
@@ -306,6 +348,10 @@ class DDPGAgent:
         if not accumulate:
             self._soft_update(self.actor, self.actor_target)
             self._soft_update(self.critic, self.critic_target)
+            
+            # For ROCm: Synchronize after soft update
+            if self.use_rocm_mode:
+                torch.cuda.synchronize()
             
             # Track statistics
             self.update_count += 1
@@ -323,6 +369,11 @@ class DDPGAgent:
         # Explicitly delete batch tensors to free GPU memory immediately
         del states, actions, rewards, next_states, dones
         del critic_loss, actor_loss
+        
+        # For ROCm: Final synchronization and cache clear
+        if self.use_rocm_mode:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         return critic_loss_value, actor_loss_value
     

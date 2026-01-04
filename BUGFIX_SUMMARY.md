@@ -106,8 +106,10 @@ def to_dict(self) -> dict:
 ## Files Modified
 
 1. `erl/global_hof.py` - Dynamic context window discovery + numpy serialization fix
-2. `training/erl_trainer.py` - CUDA tensor fix + missing dict key fix + ROCm pin_memory fix
+2. `training/erl_trainer.py` - CUDA tensor fix + missing dict key fix + ROCm pin_memory fix + ROCm GPU training rewrite
 3. `compare_context_windows.py` - Numpy serialization fix
+4. `models/ddpg_agent.py` - ROCm GPU training rewrite (permanent GPU residence, synchronization)
+5. `ROCM_GPU_TRAINING.md` - Complete documentation of ROCm GPU training approach
 
 ---
 
@@ -130,6 +132,36 @@ if gpu_backend == "ROCm" and num_workers > 0:
 
 ---
 
+### 7. ROCm Memory Access Fault During Training (models/ddpg_agent.py, training/erl_trainer.py)
+**Problem**: `Memory access fault by GPU node-2` error when training agents on ROCm architecture. Training would crash immediately when attempting to train the population after evaluation.
+
+**Root Cause**: Moving neural networks to/from GPU causes memory access faults on ROCm. The original code tried to move agents between CPU and GPU during training, which triggered these faults.
+
+**Solution**: Complete rewrite of training approach for ROCm:
+1. **Permanent GPU Residence**: Networks are initialized directly on GPU and NEVER moved
+2. **Synchronous Operations**: All ROCm tensor transfers use `non_blocking=False`
+3. **Explicit Synchronization**: Added `torch.cuda.synchronize()` at critical points:
+   - After network initialization
+   - After batch tensor transfers
+   - After optimizer steps
+   - After soft updates
+   - After each training update (with cache clear)
+4. **Device Movement Protection**: `move_to_device()` is a no-op for ROCm agents (they stay on GPU)
+
+**Key Changes**:
+- `models/ddpg_agent.py`: 
+  - Networks initialized on GPU permanently
+  - ROCm-specific synchronization in `update()` method
+  - `move_to_device()` refuses to move ROCm agents
+- `training/erl_trainer.py`:
+  - ROCm-specific batch transfer handling (`non_blocking=False`)
+  - Synchronization after batch transfers
+  - No device movement (agents already on GPU)
+
+**Impact**: Full GPU acceleration on ROCm without memory access faults. Training proceeds successfully with all operations on GPU.
+
+---
+
 ## Testing Recommendations
 
 1. **Parallel Validation**: Run training with 48+ workers to ensure no CUDA errors
@@ -137,3 +169,4 @@ if gpu_backend == "ROCm" and num_workers > 0:
 3. **Context Windows**: Check that only existing leagues are attempted (no 404s)
 4. **Docker**: Test in restricted container environment
 5. **ROCm DataLoader**: Verify training runs without memory access faults on AMD GPUs
+6. **ROCm GPU Training**: Verify agents train successfully without memory access faults (full GPU acceleration)

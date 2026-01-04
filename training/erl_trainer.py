@@ -3569,7 +3569,7 @@ class ERLTrainer:
         # Config.LOCAL_BATCH_SIZE (256) × 117 = 29,952 sequences - saturates GPU compute
 
         if self.local_mode and torch.cuda.is_available():
-            # Batched GPU training for local mode
+            # Batched GPU training for local mode (non-ROCm)
             # Uses move_to_device() to properly handle optimizer references and free GPU memory
             num_batches = (len(self.population) + LOCAL_TRAINING_BATCH_SIZE - 1) // LOCAL_TRAINING_BATCH_SIZE
             cpu_device = torch.device('cpu')
@@ -3586,7 +3586,9 @@ class ERLTrainer:
                 batch_end = min(batch_start + LOCAL_TRAINING_BATCH_SIZE, len(self.population))
                 batch_agents = self.population[batch_start:batch_end]
 
-                # Move batch of agents to GPU (with optimizer recreation)
+                # CRITICAL FOR ROCm: Agents are already on GPU, never move them
+                # move_to_device() is a no-op for ROCm agents (they stay on GPU)
+                # For non-ROCm, move to GPU if needed
                 for agent in batch_agents:
                     agent.move_to_device(Config.DEVICE, recreate_optimizers=True)
 
@@ -3599,7 +3601,17 @@ class ERLTrainer:
                         for accum_step in range(local_accumulation_steps):
                             # Use DataLoader iterator (has async prefetching)
                             batch_cpu = next(self.batch_iterator)
-                            batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+                            
+                            # For ROCm: use non_blocking=False to prevent memory access faults
+                            from utils.device import get_gpu_backend
+                            gpu_backend = get_gpu_backend()
+                            use_non_blocking = (gpu_backend != "ROCm")
+                            
+                            batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
+                            
+                            # For ROCm: Synchronize after batch transfer
+                            if gpu_backend == "ROCm":
+                                torch.cuda.synchronize()
 
                             is_last_accum = (accum_step == local_accumulation_steps - 1)
                             critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
@@ -3629,9 +3641,11 @@ class ERLTrainer:
                     agent.move_to_device(cpu_device, recreate_optimizers=True)
 
                 torch.cuda.empty_cache()
-
+        
         else:
-            # Original code path for distributed mode or CPU-only
+            # Standard training path for distributed mode
+            # CRITICAL FOR ROCm: Agents are already on GPU (never moved)
+            # Just train them directly without any device movement
             for agent in tqdm(self.population, desc="Training agents"):
                 actor_losses = []
                 critic_losses = []
@@ -3644,18 +3658,16 @@ class ERLTrainer:
                         # This is FAST - batch is already in RAM, loaded asynchronously
                         batch_cpu = next(self.batch_iterator)
 
-                        # Move batch to GPU (fast transfer thanks to pin_memory)
+                        # Move batch to GPU
+                        # For ROCm: use non_blocking=False to prevent memory access faults
+                        from utils.device import get_gpu_backend
+                        gpu_backend = get_gpu_backend()
+                        use_non_blocking = (gpu_backend != "ROCm")
+                        
                         try:
-                            # CRITICAL: Disable non_blocking for ROCm to prevent memory access faults
-                            if 'gpu_backend' not in locals():
-                                from utils.device import get_gpu_backend
-                                gpu_backend = get_gpu_backend()
-                            
-                            use_non_blocking = gpu_backend != "ROCm"
-                            
                             batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
                             
-                            # Extra synchronization for ROCm to ensure data is ready before use
+                            # For ROCm: Synchronize after batch transfer
                             if gpu_backend == "ROCm":
                                 torch.cuda.synchronize()
                         except RuntimeError as e:
@@ -3663,6 +3675,7 @@ class ERLTrainer:
                             continue
 
                         # Update with gradient accumulation
+                        # Networks are already on GPU, no movement needed
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
                         critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
 
