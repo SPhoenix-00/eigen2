@@ -487,31 +487,18 @@ class DDPGAgent:
         # ============ Update Target Networks ============
         # Only update targets after actual optimizer step
         if not accumulate:
-            if self.use_rocm_mode and is_first_update:
-                print(f"    [DEBUG] update(): Starting soft update of target networks...")
             self._soft_update(self.actor, self.actor_target)
-            if self.use_rocm_mode and is_first_update:
-                print(f"    [DEBUG] update(): actor_target soft updated")
             self._soft_update(self.critic, self.critic_target)
-            if self.use_rocm_mode and is_first_update:
-                print(f"    [DEBUG] update(): critic_target soft updated")
             
-            # For ROCm: Synchronize after soft update
+            # For ROCm: Synchronize after soft update (critical for stability)
             if self.use_rocm_mode:
-                if is_first_update:
-                    print(f"    [DEBUG] update(): Synchronizing GPU after soft update...")
                 torch.cuda.synchronize()
-                if is_first_update:
-                    print(f"    [DEBUG] update(): GPU synchronized after soft update")
             
             # Track statistics
             self.update_count += 1
             
             # Decay noise
             self.noise_scale = max(Config.MIN_NOISE, self.noise_scale * Config.NOISE_DECAY)
-            
-            if self.use_rocm_mode and is_first_update:
-                print(f"    [DEBUG] update(): Update complete! update_count={self.update_count}")
         
         # Store losses as Python floats before cleanup
         critic_loss_value = critic_loss.item() * (Config.GRADIENT_ACCUMULATION_STEPS if accumulate else 1)
@@ -519,22 +506,15 @@ class DDPGAgent:
 
         self.actor_loss_history.append(actor_loss_value)
         self.critic_loss_history.append(critic_loss_value)
-
-        if self.use_rocm_mode and is_first_update:
-            print(f"    [DEBUG] update(): Cleaning up tensors...")
         
         # Explicitly delete batch tensors to free GPU memory immediately
         del states, actions, rewards, next_states, dones
         del critic_loss, actor_loss
         
-        # For ROCm: Final synchronization and cache clear
+        # For ROCm: Final synchronization and cache clear (critical for stability)
         if self.use_rocm_mode:
-            if is_first_update:
-                print(f"    [DEBUG] update(): Final GPU synchronization and cache clear...")
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-            if is_first_update:
-                print(f"    [DEBUG] update(): Cleanup complete, returning losses")
 
         return critic_loss_value, actor_loss_value
     
