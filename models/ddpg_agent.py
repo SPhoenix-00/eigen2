@@ -66,10 +66,14 @@ class DDPGAgent:
         self.actor_target = Actor().to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
-        # Enable debug output for ROCm on first update
+        # Enable debug output for ROCm on first training update only
+        # (disabled during eval/validation to reduce noise)
         if self.use_rocm_mode:
             self.actor_target._debug_rocm = True
             self.actor._debug_rocm = True
+            self._debug_enabled = True
+            # Disable after first update to reduce noise
+            self._debug_enabled = True
         
         self.critic = Critic().to(self.device)
         self.critic_target = Critic().to(self.device)
