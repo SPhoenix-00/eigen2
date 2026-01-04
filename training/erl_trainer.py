@@ -1324,20 +1324,44 @@ class ERLTrainer:
         Returns:
             Dict with shared memory references and other config
         """
-        return {
-            # Shared memory references (no serialization needed)
-            **self._shm_metadata,
-            # Small data that must be pickled (but fast)
-            'dates': self.data_loader.dates,
-            'normalization_stats': self.normalization_stats,
-            'start_idx': start_idx,
-            'end_idx': end_idx,
-            'trading_end_idx': trading_end_idx,
-            'is_training': is_training,
-            'consistency_mode': self.consistency_mode,
-            'gauntlet_mode': gauntlet_mode,
-            'maverick_mode': self.maverick_mode
-        }
+        # CRITICAL FIX: ROCm has issues with shared memory cleanup/unlinking in Docker
+        # When shared memory is used for parallel evaluation, it leaves the GPU driver in an unstable state,
+        # causing "Memory access fault" errors in the subsequent training phase.
+        # Solution: Skip shared memory optimization for ROCm and fallback to pickling (safer).
+        from utils.device import get_gpu_backend
+        gpu_backend = get_gpu_backend()
+        
+        if gpu_backend == "ROCm":
+            # Direct data passing (pickling) - safer for ROCm
+            return {
+                'data_array': self.data_loader.data,
+                'data_array_full': self.data_loader.data_full,
+                'dates': self.data_loader.dates,
+                'normalization_stats': self.normalization_stats,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'trading_end_idx': trading_end_idx,
+                'is_training': is_training,
+                'consistency_mode': self.consistency_mode,
+                'gauntlet_mode': gauntlet_mode,
+                'maverick_mode': self.maverick_mode
+            }
+        else:
+            # Shared memory optimization (standard for CUDA/CPU)
+            return {
+                # Shared memory references (no serialization needed)
+                **self._shm_metadata,
+                # Small data that must be pickled (but fast)
+                'dates': self.data_loader.dates,
+                'normalization_stats': self.normalization_stats,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'trading_end_idx': trading_end_idx,
+                'is_training': is_training,
+                'consistency_mode': self.consistency_mode,
+                'gauntlet_mode': gauntlet_mode,
+                'maverick_mode': self.maverick_mode
+            }
 
     def _create_dataloader(self):
         """
@@ -1380,35 +1404,20 @@ class ERLTrainer:
             num_workers = Config.NUM_DATALOADER_WORKERS
             print(f"Creating DataLoader with {num_workers} background workers...")
 
-        # CRITICAL FIX: ROCm has fundamental issues with DataLoader and GPU memory operations
-        # DataLoader workers AND pin_memory cause "Memory access fault by GPU node" errors on ROCm.
-        # This appears to be a ROCm limitation with multiprocessing and memory pinning.
-        # Solution: Force num_workers=0 AND disable pin_memory for ROCm
-        from utils.device import get_gpu_backend
-        gpu_backend = get_gpu_backend()
-        original_num_workers = num_workers
-        use_pin_memory = True
-        if gpu_backend == "ROCm":
-            if num_workers > 0:
-                num_workers = 0
-                print(f"  [ROCm] Forcing num_workers=0 (ROCm compatibility - workers cause memory access faults)")
-            use_pin_memory = False
-            print(f"  [ROCm] Disabling pin_memory (ROCm compatibility - causes memory access faults)")
-
         # num_workers=0 runs in main process - different options required
         if num_workers == 0:
             self.replay_dataloader = DataLoader(
                 self.replay_buffer,
                 batch_size=None,  # Already batched by __iter__
                 num_workers=0,
-                pin_memory=use_pin_memory  # Faster GPU transfer (safe for ROCm in main process)
+                pin_memory=True  # Faster GPU transfer
             )
         else:
             self.replay_dataloader = DataLoader(
                 self.replay_buffer,
                 batch_size=None,  # Already batched by __iter__
                 num_workers=num_workers,
-                pin_memory=use_pin_memory,  # Disabled for ROCm to prevent memory access faults
+                pin_memory=True,  # Faster GPU transfer
                 prefetch_factor=2,  # Each worker prefetches 2 batches ahead
                 persistent_workers=True  # Keep workers alive between epochs
             )
@@ -3573,13 +3582,7 @@ class ERLTrainer:
                         for accum_step in range(local_accumulation_steps):
                             # Use DataLoader iterator (has async prefetching)
                             batch_cpu = next(self.batch_iterator)
-                            # CRITICAL: Disable non_blocking for ROCm to prevent memory access faults
-                            use_non_blocking = gpu_backend != "ROCm" if 'gpu_backend' in locals() else True
-                            if 'gpu_backend' not in locals():
-                                from utils.device import get_gpu_backend
-                                gpu_backend = get_gpu_backend()
-                                use_non_blocking = gpu_backend != "ROCm"
-                            batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
+                            batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
 
                             is_last_accum = (accum_step == local_accumulation_steps - 1)
                             critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
@@ -3624,13 +3627,8 @@ class ERLTrainer:
                         # This is FAST - batch is already in RAM, loaded asynchronously
                         batch_cpu = next(self.batch_iterator)
 
-                        # Move batch to GPU (fast transfer thanks to pin_memory when available)
-                        # CRITICAL: Disable non_blocking for ROCm to prevent memory access faults
-                        if 'gpu_backend' not in locals():
-                            from utils.device import get_gpu_backend
-                            gpu_backend = get_gpu_backend()
-                        use_non_blocking = gpu_backend != "ROCm"
-                        batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
+                        # Move batch to GPU (fast transfer thanks to pin_memory)
+                        batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
 
                         # Update with gradient accumulation
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
