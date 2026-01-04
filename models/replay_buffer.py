@@ -813,6 +813,36 @@ class OnDiskReplayBuffer(IterableDataset):
             print(f"ERROR stacking transitions: {e}")
             return None
 
+        # ROOT CAUSE DEBUGGING: Check for NaN/Inf after deserialization (DataLoader sampling)
+        # This catches corruption introduced during pickle loading
+        # Only log first occurrence to avoid spam
+        import os
+        if not hasattr(self, '_nan_check_logged'):
+            self._nan_check_logged = False
+        
+        if not self._nan_check_logged:
+            corruption_detected = False
+            if np.isnan(states).any() or np.isinf(states).any():
+                nan_count = np.isnan(states).sum()
+                inf_count = np.isinf(states).sum()
+                print(f"  [ROOT CAUSE] ❌ NaN/Inf detected in STATES after DataLoader deserialization!", flush=True)
+                print(f"    NaN: {nan_count}, Inf: {inf_count}, Shape: {states.shape}", flush=True)
+                print(f"    ⚠️  This suggests corruption during pickle loading/deserialization!", flush=True)
+                corruption_detected = True
+            
+            if np.isnan(next_states).any() or np.isinf(next_states).any():
+                nan_count = np.isnan(next_states).sum()
+                inf_count = np.isinf(next_states).sum()
+                print(f"  [ROOT CAUSE] ❌ NaN/Inf detected in NEXT_STATES after DataLoader deserialization!", flush=True)
+                print(f"    NaN: {nan_count}, Inf: {inf_count}, Shape: {next_states.shape}", flush=True)
+                print(f"    ⚠️  This suggests corruption during pickle loading/deserialization!", flush=True)
+                corruption_detected = True
+            
+            if corruption_detected:
+                print(f"  [ROOT CAUSE] ⚠️  Batch sampled from DataLoader contains corrupted data!", flush=True)
+                print(f"  [ROOT CAUSE] This indicates the issue is in pickle deserialization, not source data!", flush=True)
+                self._nan_check_logged = True  # Only log once
+
         # Convert to PyTorch tensors (on CPU in worker processes)
         return {
             'states': torch.FloatTensor(states),
