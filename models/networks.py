@@ -33,7 +33,10 @@ def symlog(x: torch.Tensor) -> torch.Tensor:
     Returns:
         SymLog-transformed tensor (same shape)
     """
-    return torch.sign(x) * torch.log(1 + torch.abs(x))
+    # Use clamp to prevent numerical issues with very large values
+    # Clamp abs(x) to prevent overflow in log(1 + |x|)
+    x_abs = torch.clamp(torch.abs(x), max=1e10)  # Prevent overflow
+    return torch.sign(x) * torch.log(1 + x_abs)
 
 
 class FeatureExtractor(nn.Module):
