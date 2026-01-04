@@ -343,35 +343,42 @@ class TradingEnvironment(gym.Env):
         """
         Handle NaN values in a data window by forward-filling and zero-filling.
         
+        OPTIMIZED: Uses vectorized operations instead of nested loops for performance.
+        
         Args:
             window: Array of shape [time_steps, num_columns, num_features]
             
         Returns:
             Window with NaN values handled (forward-filled, then zero-filled)
         """
+        if not np.isnan(window).any():
+            return window
+        
         window = window.copy()
         
-        if np.isnan(window).any():
-            # Forward-fill along time axis (axis 0) for each column and feature
-            # This preserves temporal continuity when possible
-            for col_idx in range(window.shape[1]):
-                for feat_idx in range(window.shape[2]):
-                    col_feat_slice = window[:, col_idx, feat_idx]
-                    # Forward-fill: propagate last valid value forward
-                    mask = ~np.isnan(col_feat_slice)
-                    if mask.any():
-                        # Find first valid value to use as fill value for leading NaNs
-                        first_valid_idx = np.where(mask)[0][0]
-                        first_valid_val = col_feat_slice[first_valid_idx]
-                        # Forward-fill from first valid value (using modern pandas API)
-                        col_feat_slice = pd.Series(col_feat_slice).ffill().fillna(first_valid_val).values
-                    else:
-                        # All NaN - fill with zeros
-                        col_feat_slice = np.zeros_like(col_feat_slice)
-                    window[:, col_idx, feat_idx] = col_feat_slice
-            
-            # Final safety check: zero-fill any remaining NaNs (shouldn't happen after forward-fill)
-            window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
+        # Vectorized forward-fill along time axis (axis 0)
+        # Reshape to [time_steps, num_columns * num_features] for vectorized processing
+        original_shape = window.shape
+        window_2d = window.reshape(original_shape[0], -1)
+        
+        # Forward-fill using pandas (much faster than manual loops)
+        # Process all columns/features at once
+        df = pd.DataFrame(window_2d)
+        df = df.ffill()  # Forward-fill along time axis
+        
+        # Fill leading NaNs with first valid value (or zero if all NaN)
+        for col in df.columns:
+            if df[col].isna().all():
+                df[col] = 0.0
+            elif df[col].isna().any():
+                first_valid = df[col].dropna().iloc[0] if not df[col].dropna().empty else 0.0
+                df[col] = df[col].fillna(first_valid)
+        
+        window_2d = df.values
+        window = window_2d.reshape(original_shape)
+        
+        # Final safety check: zero-fill any remaining NaNs (shouldn't happen after forward-fill)
+        window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
         
         return window
 
