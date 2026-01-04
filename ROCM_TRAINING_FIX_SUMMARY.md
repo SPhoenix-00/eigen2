@@ -138,7 +138,7 @@ The `eigen_rocm` branch was experiencing persistent `Memory access fault by GPU 
 
 ---
 
-### Phase 8: Final Fix - Input Normalization for ROCm Attention
+### Phase 8: Final Fix - SymLog Transformation and Micro-batching
 
 **Problem**: Memory access fault persisted even with:
 - No NaN values
@@ -151,19 +151,45 @@ The `eigen_rocm` branch was experiencing persistent `Memory access fault by GPU 
 - Real data has extreme values (min=-4215, max=33528)
 - ROCm's `scaled_dot_product_attention` has known issues with extreme values
 - Warning: "Torch was not compiled with memory efficient attention" suggests ROCm-specific attention bug
+- Even with SymLog transformation, large batches (160) still cause kernel crashes
 
-**Solution**: 
-- Normalize `next_states` per (column, feature) before `actor_target` forward pass
-- Clamp normalized values to [-10, 10] for attention stability
-- Applied only for ROCm and only for target network forward pass
+**Solution**: Multi-layered approach combining three fixes:
+
+1. **SymLog Transformation**:
+   - Stateless symmetric logarithmic transformation: `sign(x) * log(1 + |x|)`
+   - Applied at the start of both `Actor.forward()` and `Critic.forward()`
+   - Compresses extreme values (e.g., 33,800 → ~10.4) while preserving sign
+   - Mathematically consistent between main and target networks
+
+2. **Forced Math Attention**:
+   - Disabled optimized ROCm attention kernels globally
+   - Forces PyTorch to use pure math implementation
+   - Added at top of `training/erl_trainer.py`:
+     ```python
+     torch.backends.cuda.enable_flash_sdp(False)
+     torch.backends.cuda.enable_mem_efficient_sdp(False)
+     torch.backends.cuda.enable_math_sdp(True)
+     ```
+
+3. **Micro-batching (Chunking)**:
+   - Split large batches (160) into smaller chunks (32) for physical processing
+   - Applied to all network forward passes:
+     - `actor_target` (target network, no_grad)
+     - `critic_target` (target network, no_grad)
+     - `critic` (main network, with gradients)
+     - `actor` (main network, with gradients)
+   - Preserves gradients through `torch.cat()` operations
+   - Mathematically identical to full batch (effective batch size = 160)
 
 **Files Modified**:
-- `models/ddpg_agent.py`: Input normalization before attention forward pass
+- `models/networks.py`: Added `symlog()` function, applied in `Actor.forward()` and `Critic.forward()`
+- `training/erl_trainer.py`: Global attention kernel disabling
+- `models/ddpg_agent.py`: `_forward_chunked()` helper method, applied to all forward passes
 
 **Rationale**: 
-- Attention mechanism is sensitive to input value ranges on ROCm
-- Normalization ensures values are in safe range for `scaled_dot_product_attention`
-- Only affects target network (used for computing target Q-values), minimal impact on training
+- SymLog handles extreme values without requiring global statistics (perfect for non-stationary financial data)
+- Math attention bypasses buggy ROCm kernels
+- Micro-batching prevents memory explosion in attention layers while preserving batch size mathematically
 
 ---
 
