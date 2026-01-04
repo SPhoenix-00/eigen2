@@ -7200,13 +7200,12 @@ class ERLTrainer:
                 # Create dummy fitness scores and stats for first generation
                 fitness_scores = [0.0] * len(self.population)
                 pop_stats = {
-                    'mean_fitness': 0.0,
-                    'max_fitness': 0.0,
-                    'min_fitness': 0.0,
-                    'std_fitness': 0.0,
-                    'mean_roi': 0.0,
-                    'mean_win_rate': 0.0,
-                    'total_trades': 0
+                    'total_trades': 0,
+                    'avg_trades_per_agent': 0.0,
+                    'total_wins': 0,
+                    'total_losses': 0,
+                    'avg_win_rate': 0.0,
+                    'agents_with_positive_fitness': 0,
                 }
             elif self.local_mode:
                 fitness_scores, pop_stats = self.local_evaluator.evaluate_population()
