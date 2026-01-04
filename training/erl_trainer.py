@@ -3446,6 +3446,16 @@ class ERLTrainer:
             print(f"Buffer not ready: {len(self.replay_buffer)} / {min_size}")
             return
 
+        # CRITICAL: Clear GPU memory and state before starting training
+        # This ensures any leftover state from parallel evaluation workers is cleared
+        # ROCm is particularly sensitive to GPU memory state between multiprocessing operations
+        if torch.cuda.is_available():
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            # Synchronize to ensure all GPU operations are complete
+            torch.cuda.synchronize()
+        
         # Initialize batch iterator if not already created
         if self.batch_iterator is None:
             print("Starting DataLoader workers for async batch prefetching...")
