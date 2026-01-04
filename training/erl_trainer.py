@@ -3579,6 +3579,66 @@ class ERLTrainer:
             gpu_mem = torch.cuda.memory_allocated() / 1024**3
             gpu_reserved = torch.cuda.memory_reserved() / 1024**3
             print(f"  [GPU] Memory at training start: {gpu_mem:.2f} GB allocated, {gpu_reserved:.2f} GB reserved")
+        
+        # CRITICAL FOR ROCm: Warm-up and verify first agent before training
+        # This initializes GPU memory state properly and verifies everything works
+        # Prevents memory access faults on first real forward pass
+        if gpu_backend == "ROCm" and torch.cuda.is_available() and len(self.population) > 0:
+            print(f"  [ROCm] Verifying GPU setup with first agent...")
+            first_agent = self.population[0]
+            try:
+                # Ensure networks are in correct mode
+                first_agent.actor.train()
+                first_agent.critic.train()
+                first_agent.actor_target.eval()
+                first_agent.critic_target.eval()
+                
+                # Verify all networks are on GPU
+                assert next(first_agent.actor.parameters()).device.type == 'cuda', "Actor not on GPU"
+                assert next(first_agent.critic.parameters()).device.type == 'cuda', "Critic not on GPU"
+                
+                # Create dummy batch with correct shapes (don't consume real batch)
+                batch_size = min(Config.BATCH_SIZE, 8)  # Smaller batch for warm-up
+                dummy_batch = {
+                    'states': torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL, device=Config.DEVICE, dtype=torch.float32),
+                    'actions': torch.randn(batch_size, Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM, device=Config.DEVICE, dtype=torch.float32),
+                    'rewards': torch.randn(batch_size, 1, device=Config.DEVICE, dtype=torch.float32),
+                    'next_states': torch.randn(batch_size, Config.CONTEXT_WINDOW_DAYS, Config.TOTAL_COLUMNS, Config.FEATURES_PER_CELL, device=Config.DEVICE, dtype=torch.float32),
+                    'dones': torch.zeros(batch_size, 1, device=Config.DEVICE, dtype=torch.float32)
+                }
+                torch.cuda.synchronize()
+                
+                # Dummy forward pass through both networks (no gradients)
+                # This "warms up" the GPU memory layout and prevents access faults
+                with torch.no_grad():
+                    _ = first_agent.actor(dummy_batch['states'])
+                    torch.cuda.synchronize()
+                    _ = first_agent.critic(dummy_batch['states'], dummy_batch['actions'])
+                    torch.cuda.synchronize()
+                    _ = first_agent.actor_target(dummy_batch['next_states'])
+                    torch.cuda.synchronize()
+                    _ = first_agent.critic_target(dummy_batch['next_states'], dummy_batch['actions'])
+                    torch.cuda.synchronize()
+                
+                # Test a full update cycle (with gradients) to ensure optimizers work
+                import torch.nn as nn
+                first_agent.actor.zero_grad()
+                first_agent.critic.zero_grad()
+                with torch.enable_grad():
+                    test_loss = nn.MSELoss()(first_agent.critic(dummy_batch['states'], dummy_batch['actions']), dummy_batch['rewards'])
+                    test_loss.backward()
+                    torch.cuda.synchronize()
+                    first_agent.critic_optimizer.step()
+                    torch.cuda.synchronize()
+                
+                torch.cuda.empty_cache()
+                del dummy_batch, test_loss
+                print(f"  [ROCm] GPU verification complete - ready for training")
+            except Exception as e:
+                print(f"  [ROCm] ERROR: GPU verification failed: {e}")
+                import traceback
+                traceback.print_exc()
+                raise  # Don't continue if verification fails - we'll hit the same error in training
 
         # Use reduced gradient steps during stabilization phase or multi-mode for faster iteration
         # Normal: 32 steps × 192 batch = 6,144 samples (full exploration)
@@ -3682,7 +3742,16 @@ class ERLTrainer:
             # Standard training path for distributed mode
             # CRITICAL FOR ROCm: Agents are already on GPU (never moved)
             # Just train them directly without any device movement
-            for agent in tqdm(self.population, desc="Training agents"):
+            for agent_idx, agent in enumerate(tqdm(self.population, desc="Training agents")):
+                # CRITICAL FOR ROCm: Ensure networks are in training mode before first forward pass
+                # This prevents memory access faults from incorrect network state
+                if gpu_backend == "ROCm" and agent_idx == 0:
+                    agent.actor.train()
+                    agent.critic.train()
+                    agent.actor_target.eval()  # Target networks stay in eval mode
+                    agent.critic_target.eval()
+                    torch.cuda.synchronize()
+                
                 actor_losses = []
                 critic_losses = []
 
@@ -3696,8 +3765,6 @@ class ERLTrainer:
 
                         # Move batch to GPU
                         # For ROCm: use non_blocking=False to prevent memory access faults
-                        from utils.device import get_gpu_backend
-                        gpu_backend = get_gpu_backend()
                         use_non_blocking = (gpu_backend != "ROCm")
                         
                         try:
@@ -3709,6 +3776,11 @@ class ERLTrainer:
                         except RuntimeError as e:
                             print(f"  [Error] Batch transfer failed: {e}")
                             continue
+
+                        # CRITICAL FOR ROCm: Ensure networks are in correct mode before update
+                        if gpu_backend == "ROCm":
+                            agent.actor.train()
+                            agent.critic.train()
 
                         # Update with gradient accumulation
                         # Networks are already on GPU, no movement needed
