@@ -405,11 +405,20 @@ class DDPGAgent:
                 print(f"    [DEBUG] update(): next_states memory address: {next_states.data_ptr()}")
             
             # Get next actions from target actor (already on GPU)
-            # NOTE: Attention is disabled for ROCm in Config, so this should work without crashes
+            # CRITICAL ROCm FIX: Use micro-batching to prevent memory access faults
+            # Process large batches in chunks to avoid ROCm attention kernel crashes
+            # Mathematically identical to full batch, but physically processes in smaller chunks
             try:
                 if self.use_rocm_mode and is_first_update:
-                    print(f"    [DEBUG] update(): EXECUTING: next_actions = self.actor_target(next_states)")
-                next_actions = self.actor_target(next_states)
+                    print(f"    [DEBUG] update(): EXECUTING: next_actions = self._forward_chunked(actor_target, next_states)")
+                    print(f"    [DEBUG] update(): Using micro-batching (chunk_size=32) for ROCm stability")
+                
+                # Use chunked forward pass for actor_target to prevent ROCm crashes
+                if self.use_rocm_mode:
+                    next_actions = self._forward_chunked(self.actor_target, next_states, chunk_size=32)
+                else:
+                    next_actions = self.actor_target(next_states)
+                
                 if self.use_rocm_mode and is_first_update:
                     print(f"    [DEBUG] update(): actor_target forward pass SUCCESS, shape={next_actions.shape}")
                     torch.cuda.synchronize()
@@ -424,8 +433,20 @@ class DDPGAgent:
             
             if self.use_rocm_mode and is_first_update:
                 print(f"    [DEBUG] update(): Computing target_q from critic_target...")
+            
             # Get target Q-values (already on GPU)
-            target_q = self.critic_target(next_states, next_actions)
+            # CRITICAL ROCm FIX: Also chunk the critic_target forward pass
+            if self.use_rocm_mode:
+                # Chunking Critic Target explicitly (takes 2 args: states and actions)
+                next_q_values_list = []
+                chunk_size = 32
+                for i in range(0, next_states.shape[0], chunk_size):
+                    s_chunk = next_states[i:i+chunk_size]
+                    a_chunk = next_actions[i:i+chunk_size]
+                    next_q_values_list.append(self.critic_target(s_chunk, a_chunk))
+                target_q = torch.cat(next_q_values_list, dim=0)
+            else:
+                target_q = self.critic_target(next_states, next_actions)
             if self.use_rocm_mode and is_first_update:
                 print(f"    [DEBUG] update(): target_q computed, shape={target_q.shape}")
             
