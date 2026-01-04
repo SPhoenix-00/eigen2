@@ -1380,19 +1380,20 @@ class ERLTrainer:
             num_workers = Config.NUM_DATALOADER_WORKERS
             print(f"Creating DataLoader with {num_workers} background workers...")
 
-        # CRITICAL FIX: ROCm has fundamental issues with DataLoader multiprocessing workers
-        # DataLoader workers cause "Memory access fault by GPU node" errors on ROCm,
-        # even with pin_memory=False. This appears to be a ROCm multiprocessing limitation.
-        # Solution: Force num_workers=0 for ROCm (run in main process where ROCm works fine)
+        # CRITICAL FIX: ROCm has fundamental issues with DataLoader and GPU memory operations
+        # DataLoader workers AND pin_memory cause "Memory access fault by GPU node" errors on ROCm.
+        # This appears to be a ROCm limitation with multiprocessing and memory pinning.
+        # Solution: Force num_workers=0 AND disable pin_memory for ROCm
         from utils.device import get_gpu_backend
         gpu_backend = get_gpu_backend()
         original_num_workers = num_workers
-        if gpu_backend == "ROCm" and num_workers > 0:
-            num_workers = 0
-            print(f"  [ROCm] Forcing num_workers=0 (ROCm compatibility - workers cause memory access faults)")
-        
         use_pin_memory = True
-        # pin_memory is safe for ROCm when num_workers=0 (main process)
+        if gpu_backend == "ROCm":
+            if num_workers > 0:
+                num_workers = 0
+                print(f"  [ROCm] Forcing num_workers=0 (ROCm compatibility - workers cause memory access faults)")
+            use_pin_memory = False
+            print(f"  [ROCm] Disabling pin_memory (ROCm compatibility - causes memory access faults)")
 
         # num_workers=0 runs in main process - different options required
         if num_workers == 0:
