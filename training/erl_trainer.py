@@ -3718,13 +3718,22 @@ class ERLTrainer:
                             # For ROCm: use non_blocking=False to prevent memory access faults
                             from utils.device import get_gpu_backend
                             gpu_backend = get_gpu_backend()
-                            use_non_blocking = (gpu_backend != "ROCm")
                             
-                            batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
-                            
-                            # For ROCm: Synchronize after batch transfer
                             if gpu_backend == "ROCm":
+                                # For ROCm: Ensure tensors are contiguous and copy before transfer
+                                # This prevents memory access faults from non-contiguous or shared memory tensors
+                                batch = {}
+                                for k, v in batch_cpu.items():
+                                    # Ensure contiguous and copy if needed (breaks any shared memory references)
+                                    if not v.is_contiguous():
+                                        v = v.contiguous()
+                                    # Create a fresh copy to break any shared memory or view references
+                                    v_copy = v.clone() if v.device.type == 'cpu' else v
+                                    batch[k] = v_copy.to(Config.DEVICE, non_blocking=False)
                                 torch.cuda.synchronize()
+                            else:
+                                use_non_blocking = True
+                                batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
 
                             is_last_accum = (accum_step == local_accumulation_steps - 1)
                             critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
@@ -3782,14 +3791,24 @@ class ERLTrainer:
 
                         # Move batch to GPU
                         # For ROCm: use non_blocking=False to prevent memory access faults
+                        # CRITICAL: Ensure tensors are contiguous before transfer (ROCm requirement)
                         use_non_blocking = (gpu_backend != "ROCm")
                         
                         try:
-                            batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
-                            
-                            # For ROCm: Synchronize after batch transfer
                             if gpu_backend == "ROCm":
+                                # For ROCm: Ensure tensors are contiguous and copy before transfer
+                                # This prevents memory access faults from non-contiguous or shared memory tensors
+                                batch = {}
+                                for k, v in batch_cpu.items():
+                                    # Ensure contiguous and copy if needed (breaks any shared memory references)
+                                    if not v.is_contiguous():
+                                        v = v.contiguous()
+                                    # Create a fresh copy to break any shared memory or view references
+                                    v_copy = v.clone() if v.device.type == 'cpu' else v
+                                    batch[k] = v_copy.to(Config.DEVICE, non_blocking=False)
                                 torch.cuda.synchronize()
+                            else:
+                                batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
                         except RuntimeError as e:
                             print(f"  [Error] Batch transfer failed: {e}")
                             continue
