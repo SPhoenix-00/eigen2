@@ -1597,16 +1597,6 @@ class ERLTrainer:
 
         # Execute in parallel
         num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
-        
-        # CRITICAL FIX for ROCm: Reduce worker count to avoid pickling bottleneck
-        from utils.device import get_gpu_backend
-        gpu_backend = get_gpu_backend()
-        if gpu_backend == "ROCm":
-            rocm_max_workers = 8  # Reduced from 48 to avoid pickling bottleneck
-            if num_workers > rocm_max_workers:
-                print(f"  [ROCm] Reducing workers from {num_workers} to {rocm_max_workers} to avoid pickling bottleneck")
-                num_workers = rocm_max_workers
-        
         print(f"  Using {num_workers} parallel workers for {len(tasks)} tasks")
 
         fitness_by_agent = [[] for _ in range(len(loaded_agents))]
@@ -2468,15 +2458,6 @@ class ERLTrainer:
 
         # Execute in parallel
         num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
-        
-        # CRITICAL FIX for ROCm: Reduce worker count to avoid pickling bottleneck
-        from utils.device import get_gpu_backend
-        gpu_backend = get_gpu_backend()
-        if gpu_backend == "ROCm":
-            rocm_max_workers = 8  # Reduced from 48 to avoid pickling bottleneck
-            if num_workers > rocm_max_workers:
-                print(f"  [ROCm] Reducing workers from {num_workers} to {rocm_max_workers} to avoid pickling bottleneck")
-                num_workers = rocm_max_workers
 
         slice_fitness_scores = []
 
@@ -3321,19 +3302,6 @@ class ERLTrainer:
         # Execute in parallel
         # Use all available cores (leave 1 for OS), with configurable safety cap
         num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
-        
-        # CRITICAL FIX for ROCm: Reduce worker count to avoid pickling bottleneck
-        # ROCm doesn't use shared memory, so large arrays must be pickled to each worker.
-        # With 48 workers, this creates a massive serialization bottleneck during initialization.
-        # Reducing to 8 workers significantly speeds up initialization while still providing parallelism.
-        from utils.device import get_gpu_backend
-        gpu_backend = get_gpu_backend()
-        if gpu_backend == "ROCm":
-            rocm_max_workers = 8  # Reduced from 48 to avoid pickling bottleneck
-            if num_workers > rocm_max_workers:
-                print(f"  [ROCm] Reducing workers from {num_workers} to {rocm_max_workers} to avoid pickling bottleneck")
-                num_workers = rocm_max_workers
-        
         print(f"Using {num_workers} parallel workers (out of {mp.cpu_count()} vCPUs)")
 
         fitness_by_agent = [[] for _ in range(len(self.population))]
@@ -3351,6 +3319,9 @@ class ERLTrainer:
         # Use initializer to pass env_config once per worker (not once per task)
         # This significantly reduces serialization overhead, especially in consistency mode
         # where we have 160 tasks (32 agents x 5 episodes) vs 96 in normal mode
+        print(f"Initializing {num_workers} worker processes...")
+        if gpu_backend == "ROCm":
+            print(f"  [ROCm] This may take a moment - workers are receiving large data arrays via pickling")
         try:
             with ProcessPoolExecutor(
                 max_workers=num_workers,
@@ -3358,6 +3329,7 @@ class ERLTrainer:
                 initializer=_init_worker,
                 initargs=(env_config,)
             ) as executor:
+                print(f"✓ Worker processes initialized, submitting {len(tasks)} evaluation tasks...")
                 # Submit all tasks
                 futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
