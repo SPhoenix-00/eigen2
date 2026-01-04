@@ -123,22 +123,7 @@ class Config:
     # Replay buffer
     BUFFER_SIZE = 1500000  # Maximum buffer size
     BATCH_SIZE = 160
-    # CRITICAL ROCm FIX: Reduce batch size for ROCm to prevent memory explosion
-    # Large batches (160) with 4D input tensors cause memory access faults in attention
-    # This is automatically adjusted based on GPU backend
-    ROCM_BATCH_SIZE = 32  # Reduced batch size for ROCm stability
     LOCAL_BATCH_SIZE = 64  # Batch size for local mode training
-    
-    @classmethod
-    def get_training_batch_size(cls):
-        """Get appropriate batch size based on GPU backend."""
-        try:
-            from utils.device import get_gpu_backend
-            if get_gpu_backend() == "ROCm":
-                return cls.ROCM_BATCH_SIZE
-        except Exception:
-            pass
-        return cls.BATCH_SIZE
     LOCAL_GRADIENT_ACCUMULATION_STEPS = 1  # No accumulation in local mode - each step = 1 disk read (vs 16x with accumulation)
     LOCAL_NUM_DATALOADER_WORKERS = 0  # Run in main process - Windows/WSL multiprocessing overhead is massive for 64-item batches
     LOCAL_POPULATION_SIZE = 32  # Smaller population for local mode (vs 96 for distributed)

@@ -1454,14 +1454,9 @@ class ERLTrainer:
             num_workers = Config.LOCAL_NUM_DATALOADER_WORKERS  # Should be 0 for local mode
             print(f"Creating DataLoader with {num_workers} workers (batch_size={Config.LOCAL_BATCH_SIZE} for local mode)...")
         else:
-            # Use ROCm-specific batch size if on ROCm backend
-            batch_size = Config.get_training_batch_size()
-            self.replay_buffer.training_batch_size = batch_size
+            self.replay_buffer.training_batch_size = Config.BATCH_SIZE
             num_workers = Config.NUM_DATALOADER_WORKERS
-            if batch_size != Config.BATCH_SIZE:
-                print(f"Creating DataLoader with {num_workers} background workers (batch_size={batch_size} for {get_gpu_backend()} backend, reduced from {Config.BATCH_SIZE})...")
-            else:
-                print(f"Creating DataLoader with {num_workers} background workers (batch_size={batch_size})...")
+            print(f"Creating DataLoader with {num_workers} background workers...")
 
         # CRITICAL FIX for ROCm: Force num_workers=0 and pin_memory=False
         # ROCm/Docker shared memory handling is unstable with PyTorch DataLoader workers (psm_ errors).
