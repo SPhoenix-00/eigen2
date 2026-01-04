@@ -7207,19 +7207,7 @@ class ERLTrainer:
 
             # 1. Evaluate population (collect experiences)
             # Use LocalEvaluator in local mode for CPU-optimized execution with in-memory transitions
-            # Skip evaluation for generation 0 - no benefit from evaluating untrained agents
-            if gen == 0:
-                # Create dummy fitness scores and stats for first generation
-                fitness_scores = [0.0] * len(self.population)
-                pop_stats = {
-                    'total_trades': 0,
-                    'avg_trades_per_agent': 0.0,
-                    'total_wins': 0,
-                    'total_losses': 0,
-                    'avg_win_rate': 0.0,
-                    'agents_with_positive_fitness': 0,
-                }
-            elif self.local_mode:
+            if self.local_mode:
                 fitness_scores, pop_stats = self.local_evaluator.evaluate_population()
             else:
                 fitness_scores, pop_stats = self.evaluate_population_parallel()
@@ -7310,24 +7298,7 @@ class ERLTrainer:
 
             # Validate entire population
             # Use LocalEvaluator in local mode for CPU-optimized validation
-            # Skip validation for generation 0 - no benefit from validating untrained agents
-            if gen == 0:
-                # Create dummy validation results for first generation
-                all_val_results = []
-                for agent_idx in range(len(self.population)):
-                    all_val_results.append({
-                        'fitness': 0.0,
-                        'fitness_mean': 0.0,
-                        'fitness_min': 0.0,
-                        'roi': 0.0,
-                        'win_rate': 0.0,
-                        'num_trades': 0,
-                        'expectancy': 0.0,
-                        'raw_pnl': 0.0,
-                        'total_trades': 0,
-                        'quality_count': 0
-                    })
-            elif self.local_mode:
+            if self.local_mode:
                 all_val_results = self.local_evaluator.validate_population(quality_threshold=quality_threshold)
             else:
                 all_val_results = self.validate_population_parallel(quality_threshold=quality_threshold)
