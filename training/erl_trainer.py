@@ -3237,166 +3237,166 @@ class ERLTrainer:
                 initializer=_init_worker,
                 initargs=(env_config,)
             ) as executor:
-            # Submit all tasks
-            futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
+                # Submit all tasks
+                futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
 
-            # Collect results as they complete
-            # Track at agent level (not slice level) for cleaner progress display
-            completed_tasks = 0
-            completed_agents = set()
-            pbar = tqdm(total=len(self.population), desc="Evaluating agents")
-            for future in as_completed(futures):
-                task_idx = futures[future]
-                agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
+                # Collect results as they complete
+                # Track at agent level (not slice level) for cleaner progress display
+                completed_tasks = 0
+                completed_agents = set()
+                pbar = tqdm(total=len(self.population), desc="Evaluating agents")
+                for future in as_completed(futures):
+                    task_idx = futures[future]
+                    agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
 
-                try:
-                    # raw_fitness is the sum of rewards from env (good for RL, bad for Evolution)
-                    raw_fitness, episode_info, transition_file_paths = future.result(timeout=300)  # 5 min timeout
+                    try:
+                        # raw_fitness is the sum of rewards from env (good for RL, bad for Evolution)
+                        raw_fitness, episode_info, transition_file_paths = future.result(timeout=300)  # 5 min timeout
 
-                    # Calculate Structural Fitness for Evolution
-                    triad_fitness = self.calculate_triad_fitness(episode_info)
+                        # Calculate Structural Fitness for Evolution
+                        triad_fitness = self.calculate_triad_fitness(episode_info)
 
-                    # Store triad_fitness instead of raw_fitness
-                    fitness_by_agent[agent_idx].append((triad_fitness, episode_info))
+                        # Store triad_fitness instead of raw_fitness
+                        fitness_by_agent[agent_idx].append((triad_fitness, episode_info))
 
-                    # Collect transition file paths from exploratory agents
-                    if transition_file_paths:
-                        all_transition_file_paths.extend(transition_file_paths)
+                        # Collect transition file paths from exploratory agents
+                        if transition_file_paths:
+                            all_transition_file_paths.extend(transition_file_paths)
 
-                    completed_tasks += 1
+                        completed_tasks += 1
 
-                except TimeoutError:
-                    print(f"\n⚠ Worker TIMEOUT for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)})")
-                    print(f"  This may indicate a deadlock or infinite loop in worker process")
-                    # Use penalty fitness for failed episodes
-                    fitness_by_agent[agent_idx].append((-10000.0, {
-                        'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
-                    }))
-                    completed_tasks += 1
-                except Exception as e:
-                    print(f"\n⚠ Worker EXCEPTION for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)}): {e}")
-                    import traceback
-                    traceback.print_exc()
-                    import sys
-                    sys.stdout.flush()  # Force flush to ensure error is logged
-                    # Use penalty fitness for failed episodes
-                    fitness_by_agent[agent_idx].append((-10000.0, {
-                        'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
-                    }))
-                    completed_tasks += 1
+                    except TimeoutError:
+                        print(f"\n⚠ Worker TIMEOUT for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)})")
+                        print(f"  This may indicate a deadlock or infinite loop in worker process")
+                        # Use penalty fitness for failed episodes
+                        fitness_by_agent[agent_idx].append((-10000.0, {
+                            'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
+                        }))
+                        completed_tasks += 1
+                    except Exception as e:
+                        print(f"\n⚠ Worker EXCEPTION for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)}): {e}")
+                        import traceback
+                        traceback.print_exc()
+                        import sys
+                        sys.stdout.flush()  # Force flush to ensure error is logged
+                        # Use penalty fitness for failed episodes
+                        fitness_by_agent[agent_idx].append((-10000.0, {
+                            'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
+                        }))
+                        completed_tasks += 1
 
-                # Update progress bar when an agent completes all its slices
-                if len(fitness_by_agent[agent_idx]) == num_episodes and agent_idx not in completed_agents:
-                    completed_agents.add(agent_idx)
-                    pbar.update(1)
+                    # Update progress bar when an agent completes all its slices
+                    if len(fitness_by_agent[agent_idx]) == num_episodes and agent_idx not in completed_agents:
+                        completed_agents.add(agent_idx)
+                        pbar.update(1)
 
-            pbar.close()
+                pbar.close()
 
-            # Aggregate results (same logic as sequential version)
-            fitness_scores = []
-            all_episode_stats = []
+                # Aggregate results (same logic as sequential version)
+                fitness_scores = []
+                all_episode_stats = []
 
-            for agent_slices in fitness_by_agent:
-                slice_fitness = [f for f, _ in agent_slices]
-                slice_stats = [info for _, info in agent_slices]
+                for agent_slices in fitness_by_agent:
+                    slice_fitness = [f for f, _ in agent_slices]
+                    slice_stats = [info for _, info in agent_slices]
 
-                # Calculate fitness using appropriate aggregator
-                if self.multi_mode:
-                    final_fitness = self._calculate_penalized_median_fitness(slice_fitness)
+                    # Calculate fitness using appropriate aggregator
+                    if self.multi_mode:
+                        final_fitness = self._calculate_penalized_median_fitness(slice_fitness)
+                    else:
+                        final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
+                    fitness_scores.append(final_fitness)
+
+                    # Aggregate stats for this agent
+                    all_episode_stats.append(self._aggregate_agent_stats(slice_stats))
+
+                # Ensure fitness_scores are all plain floats
+                fitness_scores = [float(f) for f in fitness_scores]
+
+                # Clean up large data structures before buffer operations
+                del fitness_by_agent
+                import gc
+                gc.collect()
+
+                # Add transition file paths to replay buffer (transitions already written to disk by workers!)
+                print(f"\n--- Adding {len(all_transition_file_paths)} transitions to replay buffer ---")
+                print(f"  Current buffer size: {len(self.replay_buffer)}/{self.replay_buffer.capacity}")
+                if all_transition_file_paths:
+                    # Transitions were written to disk during parallel evaluation - just add paths to buffer
+                    print(f"  Transitions already written to disk by workers (parallel I/O)")
+
+                    # CRITICAL FIX: Reset if buffer IS full OR WILL overflow during this update
+                    # We must catch the specific generation where we cross the threshold (e.g. 967k -> 1.04M)
+                    # The previous fix checked if buffer was already full, but failed to account for
+                    # the generation where the buffer becomes full for the first time.
+                    current_size = len(self.replay_buffer.buffer)
+                    num_new = len(all_transition_file_paths)
+                    capacity = self.replay_buffer.capacity
+
+                    # Reset if we are about to drop files (overflow) OR if we are already at capacity
+                    should_reset_workers = (current_size + num_new > capacity) or (current_size >= capacity)
+
+                    # CRITICAL: Collect old paths that will be evicted so we can delete them from disk
+                    # When appending to a bounded deque, oldest entries are automatically removed,
+                    # but the FILES remain on disk unless we explicitly delete them
+                    num_to_evict = max(0, current_size + num_new - capacity)
+                    old_paths_to_delete = []
+                    if num_to_evict > 0:
+                        old_paths_to_delete = [self.replay_buffer.buffer[i] for i in range(num_to_evict)]
+
+                    for file_path in all_transition_file_paths:
+                        self.replay_buffer.buffer.append(file_path)
+
+                    # Delete evicted files from disk to prevent unbounded disk growth
+                    if old_paths_to_delete:
+                        deleted_count = 0
+                        external_deleted = 0
+                        for old_path in old_paths_to_delete:
+                            try:
+                                # Check if from external source (migration cleanup)
+                                if self.replay_buffer._is_from_external_source(old_path):
+                                    os.remove(old_path)
+                                    self.replay_buffer.migrated_count += 1
+                                    external_deleted += 1
+                                else:
+                                    os.remove(old_path)
+                                deleted_count += 1
+                            except OSError:
+                                pass  # File might already be gone
+                        if external_deleted > 0:
+                            print(f"  Migration cleanup: {external_deleted} external files deleted")
+                        print(f"  Disk cleanup: deleted {deleted_count} evicted transition files")
+
+                    # Update total_added counter
+                    self.replay_buffer.total_added = file_id_counter
+                    
+                    # CRITICAL FIX: Update total_transitions counter
+                    # Each file contains exactly 1 transition (written by workers)
+                    num_new_transitions = len(all_transition_file_paths)
+                    num_evicted_transitions = len(old_paths_to_delete) if old_paths_to_delete else 0
+                    self.replay_buffer.total_transitions += num_new_transitions - num_evicted_transitions
+
+                    # Force DataLoader reset to ensure workers drop references to files we just pushed out
+                    if should_reset_workers:
+                        print("  Buffer rotation detected: Resetting DataLoader workers to refresh file references...")
+                        self._create_dataloader()
+                        print("  ✓ DataLoader reset complete")
+
+                    print(f"  ✓ Buffer updated: {len(self.replay_buffer)} transitions")
                 else:
-                    final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
-                fitness_scores.append(final_fitness)
+                    print("  No transitions collected this generation")
 
-                # Aggregate stats for this agent
-                all_episode_stats.append(self._aggregate_agent_stats(slice_stats))
+                # Aggregate statistics across all agents
+                aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
 
-            # Ensure fitness_scores are all plain floats
-            fitness_scores = [float(f) for f in fitness_scores]
+                # Clean up
+                del all_episode_stats
+                del all_transition_file_paths
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            # Clean up large data structures before buffer operations
-            del fitness_by_agent
-            import gc
-            gc.collect()
-
-            # Add transition file paths to replay buffer (transitions already written to disk by workers!)
-            print(f"\n--- Adding {len(all_transition_file_paths)} transitions to replay buffer ---")
-            print(f"  Current buffer size: {len(self.replay_buffer)}/{self.replay_buffer.capacity}")
-            if all_transition_file_paths:
-                # Transitions were written to disk during parallel evaluation - just add paths to buffer
-                print(f"  Transitions already written to disk by workers (parallel I/O)")
-
-                # CRITICAL FIX: Reset if buffer IS full OR WILL overflow during this update
-                # We must catch the specific generation where we cross the threshold (e.g. 967k -> 1.04M)
-                # The previous fix checked if buffer was already full, but failed to account for
-                # the generation where the buffer becomes full for the first time.
-                current_size = len(self.replay_buffer.buffer)
-                num_new = len(all_transition_file_paths)
-                capacity = self.replay_buffer.capacity
-
-                # Reset if we are about to drop files (overflow) OR if we are already at capacity
-                should_reset_workers = (current_size + num_new > capacity) or (current_size >= capacity)
-
-                # CRITICAL: Collect old paths that will be evicted so we can delete them from disk
-                # When appending to a bounded deque, oldest entries are automatically removed,
-                # but the FILES remain on disk unless we explicitly delete them
-                num_to_evict = max(0, current_size + num_new - capacity)
-                old_paths_to_delete = []
-                if num_to_evict > 0:
-                    old_paths_to_delete = [self.replay_buffer.buffer[i] for i in range(num_to_evict)]
-
-                for file_path in all_transition_file_paths:
-                    self.replay_buffer.buffer.append(file_path)
-
-                # Delete evicted files from disk to prevent unbounded disk growth
-                if old_paths_to_delete:
-                    deleted_count = 0
-                    external_deleted = 0
-                    for old_path in old_paths_to_delete:
-                        try:
-                            # Check if from external source (migration cleanup)
-                            if self.replay_buffer._is_from_external_source(old_path):
-                                os.remove(old_path)
-                                self.replay_buffer.migrated_count += 1
-                                external_deleted += 1
-                            else:
-                                os.remove(old_path)
-                            deleted_count += 1
-                        except OSError:
-                            pass  # File might already be gone
-                    if external_deleted > 0:
-                        print(f"  Migration cleanup: {external_deleted} external files deleted")
-                    print(f"  Disk cleanup: deleted {deleted_count} evicted transition files")
-
-                # Update total_added counter
-                self.replay_buffer.total_added = file_id_counter
-                
-                # CRITICAL FIX: Update total_transitions counter
-                # Each file contains exactly 1 transition (written by workers)
-                num_new_transitions = len(all_transition_file_paths)
-                num_evicted_transitions = len(old_paths_to_delete) if old_paths_to_delete else 0
-                self.replay_buffer.total_transitions += num_new_transitions - num_evicted_transitions
-
-                # Force DataLoader reset to ensure workers drop references to files we just pushed out
-                if should_reset_workers:
-                    print("  Buffer rotation detected: Resetting DataLoader workers to refresh file references...")
-                    self._create_dataloader()
-                    print("  ✓ DataLoader reset complete")
-
-                print(f"  ✓ Buffer updated: {len(self.replay_buffer)} transitions")
-            else:
-                print("  No transitions collected this generation")
-
-            # Aggregate statistics across all agents
-            aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
-
-            # Clean up
-            del all_episode_stats
-            del all_transition_file_paths
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            return (fitness_scores, aggregate_stats)
+                return (fitness_scores, aggregate_stats)
         finally:
             # Restore original SUPPRESS_GPU_OUTPUT value (or remove if it wasn't set)
             if original_suppress_value is None:
