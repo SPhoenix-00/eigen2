@@ -7193,10 +7193,8 @@ class ERLTrainer:
 
             # 1. Evaluate population (collect experiences)
             # Use LocalEvaluator in local mode for CPU-optimized execution with in-memory transitions
-            # SKIP FIRST GENERATION FOR TESTING: Skip eval/validation to get to training faster
-            skip_first_gen = (gen == 0)
-            if skip_first_gen:
-                print(f"\n[TESTING] Skipping evaluation and validation for Generation 1 to test training...")
+            # Skip evaluation for generation 0 - no benefit from evaluating untrained agents
+            if gen == 0:
                 # Create dummy fitness scores and stats for first generation
                 fitness_scores = [0.0] * len(self.population)
                 pop_stats = {
@@ -7298,9 +7296,8 @@ class ERLTrainer:
 
             # Validate entire population
             # Use LocalEvaluator in local mode for CPU-optimized validation
-            # SKIP FIRST GENERATION FOR TESTING: Skip validation to get to training faster
-            if skip_first_gen:
-                print(f"[TESTING] Skipping validation for Generation 1...")
+            # Skip validation for generation 0 - no benefit from validating untrained agents
+            if gen == 0:
                 # Create dummy validation results for first generation
                 all_val_results = []
                 for agent_idx in range(len(self.population)):
