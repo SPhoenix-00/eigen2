@@ -457,9 +457,31 @@ class DDPGAgent:
         
         if self.use_rocm_mode and is_first_update:
             print(f"    [DEBUG] update(): Computing current_q with autocast...")
+            print(f"    [DEBUG] update(): Using micro-batching (chunk_size=32) for main critic")
+        
         # Use autocast for GPU (works on both CUDA and ROCm)
         with autocast(device_type='cuda'):
-            current_q = self.critic(states, actions)
+            # CRITICAL ROCm FIX: Chunk the main critic forward pass to prevent memory access faults
+            # This preserves gradients - Autograd engine stitches the graph through torch.cat
+            if self.use_rocm_mode:
+                # Chunked execution for main critic (preserves gradients)
+                current_q_list = []
+                chunk_size = 32
+                
+                for i in range(0, states.shape[0], chunk_size):
+                    # Slice the batch
+                    s_chunk = states[i:i + chunk_size]
+                    a_chunk = actions[i:i + chunk_size]
+                    
+                    # Run forward pass (Gradients are automatically tracked!)
+                    q_chunk = self.critic(s_chunk, a_chunk)
+                    current_q_list.append(q_chunk)
+                
+                # Stitch results together
+                # Autograd will backpropagate through this 'cat' operation correctly
+                current_q = torch.cat(current_q_list, dim=0)
+            else:
+                current_q = self.critic(states, actions)
             if self.use_rocm_mode and is_first_update:
                 print(f"    [DEBUG] update(): current_q computed, shape={current_q.shape}")
             critic_loss = nn.MSELoss()(current_q, target_q)
