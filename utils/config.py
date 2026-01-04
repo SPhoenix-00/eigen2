@@ -97,8 +97,28 @@ class Config:
     LSTM_BIDIRECTIONAL = True
     
     # Attention
+    # CRITICAL ROCm FIX: Disable attention for ROCm due to memory access faults
+    # ROCm's scaled_dot_product_attention has bugs that cause crashes
+    # This is automatically set based on GPU backend detection
     USE_ATTENTION = True
     ATTENTION_HEADS = 8
+    
+    @classmethod
+    def _disable_attention_for_rocm(cls):
+        """Disable attention mechanism for ROCm backend to avoid memory access faults."""
+        try:
+            from utils.device import get_gpu_backend
+            gpu_backend = get_gpu_backend()
+            if gpu_backend == "ROCm":
+                cls.USE_ATTENTION = False
+                print(f"[Config] Attention disabled for ROCm backend (memory access fault workaround)")
+        except Exception:
+            pass  # If detection fails, keep default (attention enabled)
+    
+    @classmethod
+    def initialize(cls):
+        """Initialize configuration, including ROCm-specific settings."""
+        cls._disable_attention_for_rocm()
     
     # Actor network
     ACTOR_HIDDEN_DIMS = [256, 128, 64]
@@ -333,6 +353,10 @@ class Config:
             return False
         return True
 
+
+# Initialize ROCm-specific settings when module is imported
+# This must happen before networks are created
+Config._disable_attention_for_rocm()
 
 if __name__ == "__main__":
     Config.display()

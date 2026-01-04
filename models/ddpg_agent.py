@@ -357,46 +357,7 @@ class DDPGAgent:
                 print(f"    [DEBUG] update(): next_states memory address: {next_states.data_ptr()}")
             
             # Get next actions from target actor (already on GPU)
-            # CRITICAL: This is where the memory access fault occurs
-            # ROCm workaround: Normalize and clamp values to prevent attention mechanism bugs
-            if self.use_rocm_mode:
-                if is_first_update:
-                    print(f"    [DEBUG] update(): ROCm workaround: Normalizing input for attention stability...")
-                
-                # CRITICAL ROCm FIX: The attention mechanism (scaled_dot_product_attention) 
-                # has known issues on ROCm with extreme values. Normalize the input to a safe range.
-                # Store original for debugging
-                next_states_orig = next_states
-                
-                # Compute per-feature statistics (across batch and time, but per column/feature)
-                # Shape: [batch, time, columns, features] -> normalize across batch and time
-                batch_size, time_steps, num_cols, num_features = next_states.shape
-                next_states_flat = next_states.view(-1, num_cols, num_features)  # [batch*time, cols, features]
-                
-                # Compute mean and std per (column, feature) across all batches and time steps
-                mean = next_states_flat.mean(dim=0, keepdim=True)  # [1, cols, features]
-                std = next_states_flat.std(dim=0, keepdim=True) + 1e-8  # [1, cols, features]
-                
-                # Normalize: (x - mean) / std, then clamp to [-10, 10] for attention stability
-                next_states_normalized = (next_states_flat - mean) / std
-                next_states_normalized = torch.clamp(next_states_normalized, min=-10.0, max=10.0)
-                
-                # Reshape back to original shape
-                next_states = next_states_normalized.view(batch_size, time_steps, num_cols, num_features)
-                torch.cuda.synchronize()
-                
-                # Verify the normalized tensor
-                if is_first_update:
-                    print(f"    [DEBUG] update(): Input normalized for ROCm:")
-                    print(f"      Original range: [{next_states_orig.min().item():.2f}, {next_states_orig.max().item():.2f}]")
-                    print(f"      Normalized range: [{next_states.min().item():.2f}, {next_states.max().item():.2f}]")
-                    print(f"      shape: {next_states.shape}, device: {next_states.device}")
-                    print(f"      contiguous: {next_states.is_contiguous()}")
-                    print(f"      has_nan: {torch.isnan(next_states).any().item()}")
-                
-                del next_states_orig, next_states_flat, mean, std, next_states_normalized
-                torch.cuda.synchronize()
-            
+            # NOTE: Attention is disabled for ROCm in Config, so this should work without crashes
             try:
                 if self.use_rocm_mode and is_first_update:
                     print(f"    [DEBUG] update(): EXECUTING: next_actions = self.actor_target(next_states)")
