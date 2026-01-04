@@ -363,8 +363,8 @@ class TradingEnvironment(gym.Env):
                         # Find first valid value to use as fill value for leading NaNs
                         first_valid_idx = np.where(mask)[0][0]
                         first_valid_val = col_feat_slice[first_valid_idx]
-                        # Forward-fill from first valid value
-                        col_feat_slice = pd.Series(col_feat_slice).fillna(method='ffill').fillna(first_valid_val).values
+                        # Forward-fill from first valid value (using modern pandas API)
+                        col_feat_slice = pd.Series(col_feat_slice).ffill().fillna(first_valid_val).values
                     else:
                         # All NaN - fill with zeros
                         col_feat_slice = np.zeros_like(col_feat_slice)
