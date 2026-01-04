@@ -106,8 +106,29 @@ def to_dict(self) -> dict:
 ## Files Modified
 
 1. `erl/global_hof.py` - Dynamic context window discovery + numpy serialization fix
-2. `training/erl_trainer.py` - CUDA tensor fix + missing dict key fix
+2. `training/erl_trainer.py` - CUDA tensor fix + missing dict key fix + ROCm pin_memory fix
 3. `compare_context_windows.py` - Numpy serialization fix
+
+---
+
+### 6. ROCm Memory Access Fault with DataLoader pin_memory (training/erl_trainer.py:1383-1410)
+**Problem**: `Memory access fault by GPU node-2` error when using DataLoader with `pin_memory=True` and multiprocessing workers on ROCm.
+
+**Root Cause**: ROCm's `pin_memory` implementation has compatibility issues with DataLoader multiprocessing workers. When workers try to pin memory, they access GPU memory without proper context, causing memory access faults.
+
+**Solution**: Detect ROCm backend and disable `pin_memory` when `num_workers > 0`, but keep it enabled for `num_workers=0` (main process):
+```python
+from utils.device import get_gpu_backend
+gpu_backend = get_gpu_backend()
+use_pin_memory = True
+if gpu_backend == "ROCm" and num_workers > 0:
+    use_pin_memory = False
+    print(f"  [ROCm] Disabling pin_memory for DataLoader workers (ROCm compatibility)")
+```
+
+**Impact**: Prevents memory access faults on ROCm while maintaining performance for CUDA and single-process scenarios.
+
+---
 
 ## Testing Recommendations
 
@@ -115,3 +136,4 @@ def to_dict(self) -> dict:
 2. **Global HOF**: Promote agent to Global50 to test JSON serialization
 3. **Context Windows**: Check that only existing leagues are attempted (no 404s)
 4. **Docker**: Test in restricted container environment
+5. **ROCm DataLoader**: Verify training runs without memory access faults on AMD GPUs

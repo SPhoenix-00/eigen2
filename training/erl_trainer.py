@@ -262,11 +262,22 @@ def _run_episode_worker(args):
         # Reconstruct agent from state dict (agents with CUDA tensors are not picklable)
         from models.ddpg_agent import DDPGAgent
         agent = DDPGAgent(agent_id=0)
+        # Use GPU if available (with parallel workers, each process gets its own GPU context)
+        target_device = Config.DEVICE  # Use GPU if available, CPU otherwise
+        agent.move_to_device(target_device, recreate_optimizers=False)
         agent.actor.load_state_dict(agent_state['actor'])
         agent.critic.load_state_dict(agent_state['critic'])
         agent.actor.eval()
         agent.critic.eval()
         _cache_agent(state_hash, agent)
+    else:
+        # Ensure cached agent is in eval mode
+        agent.actor.eval()
+        agent.critic.eval()
+        # Ensure cached agent is on correct device (may have been created with different device)
+        # move_to_device handles device comparison internally and returns early if already on target device
+        target_device = Config.DEVICE
+        agent.move_to_device(target_device, recreate_optimizers=False)
 
     # OPTIMIZATION: Reuse worker's environment instead of creating new one
     env = _worker_env
@@ -1369,23 +1380,35 @@ class ERLTrainer:
             num_workers = Config.NUM_DATALOADER_WORKERS
             print(f"Creating DataLoader with {num_workers} background workers...")
 
+        # CRITICAL FIX: ROCm has issues with pin_memory in multiprocessing contexts
+        # When DataLoader workers (num_workers > 0) try to pin memory with ROCm,
+        # it causes "Memory access fault by GPU node" errors.
+        # Solution: Disable pin_memory for ROCm when using workers, but keep it for num_workers=0
+        from utils.device import get_gpu_backend
+        gpu_backend = get_gpu_backend()
+        use_pin_memory = True
+        if gpu_backend == "ROCm" and num_workers > 0:
+            use_pin_memory = False
+            print(f"  [ROCm] Disabling pin_memory for DataLoader workers (ROCm compatibility)")
+
         # num_workers=0 runs in main process - different options required
         if num_workers == 0:
             self.replay_dataloader = DataLoader(
                 self.replay_buffer,
                 batch_size=None,  # Already batched by __iter__
                 num_workers=0,
-                pin_memory=True  # Faster GPU transfer
+                pin_memory=use_pin_memory  # Faster GPU transfer (safe for ROCm in main process)
             )
         else:
             self.replay_dataloader = DataLoader(
                 self.replay_buffer,
                 batch_size=None,  # Already batched by __iter__
                 num_workers=num_workers,
-                pin_memory=True,  # Faster GPU transfer
+                pin_memory=use_pin_memory,  # Disabled for ROCm to prevent memory access faults
                 prefetch_factor=2,  # Each worker prefetches 2 batches ahead
                 persistent_workers=True  # Keep workers alive between epochs
             )
+        
         # Reset iterator when creating new DataLoader
         self.batch_iterator = None
 
@@ -3545,16 +3568,16 @@ class ERLTrainer:
                 actor_losses = []
                 critic_losses = []
 
-                # Multiple gradient steps per agent
-                for step in range(gradient_steps):
-                    # Gradient accumulation loop
-                    for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
-                        # Get next batch from DataLoader (already prefetched by workers)
-                        # This is FAST - batch is already in RAM, loaded asynchronously
-                        batch_cpu = next(self.batch_iterator)
+                    # Multiple gradient steps per agent
+                    for step in range(gradient_steps):
+                        # Gradient accumulation loop
+                        for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
+                            # Get next batch from DataLoader (already prefetched by workers)
+                            # This is FAST - batch is already in RAM, loaded asynchronously
+                            batch_cpu = next(self.batch_iterator)
 
-                        # Move batch to GPU (fast transfer thanks to pin_memory)
-                        batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+                            # Move batch to GPU (fast transfer thanks to pin_memory when available)
+                            batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
 
                         # Update with gradient accumulation
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
