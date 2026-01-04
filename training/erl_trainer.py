@@ -5267,57 +5267,14 @@ class ERLTrainer:
                         self.breakthrough_history.append(breakthrough_event)
 
                     # GLOBAL 50: Attempt to promote agent to Global Hall of Fame
-                    # All promotions use consistency-aligned gauntlet scores for fair comparison
+                    # Use the existing gauntlet results from the breakthrough validation
                     # MAVERICK MODE: Always attempt promotion for every breakthrough with verbose metrics
-                    if self.consistency_mode:
-                        # Already in consistency mode - use existing gauntlet results
-                        g50_gauntlet_score = gauntlet_score
-                        g50_gauntlet_results = gauntlet_results
-                    else:
-                        # Normal mode: Check if agent might qualify, then run consistency-aligned re-gauntlet
-                        # MAVERICK MODE: Always run consistency-aligned re-gauntlet for every breakthrough
-                        g50_gauntlet_score = None
-                        g50_gauntlet_results = None
+                    g50_gauntlet_score = gauntlet_score
+                    g50_gauntlet_results = gauntlet_results
 
-                        should_run_g50_gauntlet = False
-                        if self.maverick_mode and self.global_hof.enabled:
-                            # MAVERICK MODE: Always attempt Global50 promotion for every breakthrough
-                            print(f"\n{'='*60}")
-                            print(f"🔥 MAVERICK MODE: Global50 Promotion Attempt")
-                            print(f"{'='*60}")
-                            print(f"  Initial Gauntlet Score: {gauntlet_score:.2f}")
-                            print(f"  Running consistency-aligned re-gauntlet for fair Global 50 comparison...")
-                            should_run_g50_gauntlet = True
-                        elif self.global_hof.enabled and self.global_hof.should_promote(
-                            gauntlet_score,
-                            gauntlet_results.get('roi', 0.0),
-                            gauntlet_results.get('expectancy', 0.0),
-                            gauntlet_results.get('cv', 100.0),
-                            is_maverick=self.maverick_mode
-                        ):
-                            print(f"\n   ⓘ Agent may qualify for Global 50 (passes all promotion criteria)")
-                            print(f"   Running consistency-aligned re-gauntlet for fair Global 50 comparison...")
-                            should_run_g50_gauntlet = True
-
-                        if should_run_g50_gauntlet:
-                            # Temporarily enable consistency mode on eval_env
-                            self.eval_env.set_consistency_mode(True)
-                            try:
-                                g50_gauntlet_results = self.run_gauntlet_validation(self.breakthrough_candidate.agent)
-                                g50_gauntlet_score = g50_gauntlet_results['gauntlet_score']
-                                print(f"   Consistency-aligned gauntlet score: {g50_gauntlet_score:.2f}")
-                            finally:
-                                # Always reset consistency mode back to False
-                                self.eval_env.set_consistency_mode(False)
-                        elif not self.maverick_mode:
-                            # Only show this for non-maverick mode (maverick mode always attempts)
-                            print(f"   ⓘ Agent gauntlet score: {gauntlet_score:.2f}")
-                            if self.global_hof.enabled:
-                                print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p25: {self.global_hof.gauntlet_p25:.2f}")
-
-                    # Attempt promotion if we have a consistency-aligned score
+                    # Check if agent qualifies for promotion
                     should_promote_result = False
-                    if g50_gauntlet_score is not None:
+                    if self.global_hof.enabled:
                         should_promote_result = self.global_hof.should_promote(
                             g50_gauntlet_score,
                             g50_gauntlet_results.get('roi', 0.0),
@@ -5326,8 +5283,8 @@ class ERLTrainer:
                             is_maverick=self.maverick_mode
                         )
                     
-                    # MAVERICK MODE: Always show verbose metrics analysis
-                    if self.maverick_mode and g50_gauntlet_score is not None:
+                    # MAVERICK MODE: Always show verbose metrics analysis for every breakthrough
+                    if self.maverick_mode and self.global_hof.enabled:
                         print(f"\n{'='*60}")
                         print(f"📊 MAVERICK MODE: Global50 Promotion Analysis")
                         print(f"{'='*60}")
@@ -5363,7 +5320,8 @@ class ERLTrainer:
                             print(f"\n  ❌ FAILED: Agent does not qualify for Global50 promotion")
                         print(f"{'='*60}")
                     
-                    if g50_gauntlet_score is not None and should_promote_result:
+                    # Attempt promotion if agent qualifies
+                    if self.global_hof.enabled and should_promote_result:
                         agent_to_admit = self.breakthrough_candidate.agent
                         agent_roi = g50_gauntlet_results['roi']
                         agent_expectancy = g50_gauntlet_results['expectancy']
@@ -5412,13 +5370,13 @@ class ERLTrainer:
                                 print(f"\n  ⏳ Maverick goal not yet achieved (rank #{rank} > #{Config.MAVERICK_TARGET_RANK})")
                                 print(f"  Training continues...")
                             print(f"{'='*60}\n")
-                    elif g50_gauntlet_score is not None and self.maverick_mode:
-                        # Agent passed gauntlet but didn't qualify for promotion (already shown verbose analysis above)
+                    elif self.maverick_mode and self.global_hof.enabled:
+                        # Agent passed gauntlet but didn't qualify for promotion (verbose analysis already shown above)
                         print(f"\n  ⏳ Training continues to find agent that reaches rank <= #{Config.MAVERICK_TARGET_RANK}")
-                    elif g50_gauntlet_score is None and self.maverick_mode:
-                        # This shouldn't happen in maverick mode, but handle gracefully
-                        print(f"\n  ⚠️  WARNING: Maverick mode but no consistency-aligned gauntlet score available")
-                        print(f"  Global50 promotion not attempted")
+                    elif self.global_hof.enabled and not should_promote_result:
+                        # Non-maverick mode: agent didn't qualify (brief message)
+                        print(f"   ⓘ Agent gauntlet score: {gauntlet_score:.2f}")
+                        print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p25: {self.global_hof.gauntlet_p25:.2f}")
 
                     # Log to wandb
                     wandb.log({
