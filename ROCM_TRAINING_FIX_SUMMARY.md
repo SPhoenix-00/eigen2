@@ -204,24 +204,32 @@ The `eigen_rocm` branch was experiencing persistent `Memory access fault by GPU 
 ## Files Modified (Final State)
 
 1. **`models/ddpg_agent.py`**:
-   - GPU-only network initialization
-   - ROCm-specific synchronization
-   - Input normalization before attention forward pass
-   - Extensive debug logging
+   - GPU-only network initialization (networks never moved)
+   - ROCm-specific synchronization (minimal, only at end of update)
+   - Micro-batching (`_forward_chunked()`) for all network forward passes
+   - SymLog debug output (disabled after first update)
+   - Performance optimizations (reduced syncs, removed cache clearing)
 
 2. **`training/erl_trainer.py`**:
+   - Global ROCm attention fix (forced math attention at top of file)
    - ROCm-specific DataLoader configuration (`num_workers=0`, `pin_memory=False`)
    - GPU warm-up phase
    - Batch contiguity and cloning for ROCm
    - Time-travel batching for evaluation
    - NaN detection and batch skipping
    - Reduced worker count for ROCm evaluation
+   - Performance optimizations (removed unnecessary syncs)
 
-3. **`environment/trading_env.py`**:
+3. **`models/networks.py`**:
+   - `symlog()` function for symmetric logarithmic transformation
+   - Applied SymLog at start of `Actor.forward()` and `Critic.forward()`
+   - SymLog debug output (conditional on `_debug_rocm` flag)
+
+4. **`environment/trading_env.py`**:
    - `_handle_nan_in_window()` method with vectorized NumPy operations
    - Applied to `_get_observation()` and `get_batch_observations()`
 
-4. **`models/replay_buffer.py`**:
+5. **`models/replay_buffer.py`**:
    - Source validation in `add()` method
    - Deserialization validation in `sample()` method
 
