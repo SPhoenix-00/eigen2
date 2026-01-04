@@ -261,6 +261,38 @@ class DDPGAgent:
         self.actor.train()
         return actions
 
+    def _forward_chunked(self, network, states, chunk_size=32):
+        """
+        Splits a large batch into smaller chunks to prevent ROCm kernel crashes.
+        Mathematically identical to running the full batch at once.
+        
+        Args:
+            network: The network to run forward pass on (Actor or Critic)
+            states: Input states tensor [batch, ...]
+            chunk_size: Size of each chunk (default 32 for ROCm stability)
+            
+        Returns:
+            Output tensor with same batch dimension as input
+        """
+        # If batch is small enough, just run it normally
+        if states.shape[0] <= chunk_size:
+            return network(states)
+        
+        outputs = []
+        # Iterate through the batch in chunks
+        for i in range(0, states.shape[0], chunk_size):
+            # Slice the batch
+            batch_chunk = states[i:i + chunk_size]
+            
+            # Run forward pass on the chunk
+            # Note: This keeps the graph connected for Main Actor,
+            # and works fine for Target Actor (no_grad) too.
+            chunk_output = network(batch_chunk)
+            outputs.append(chunk_output)
+            
+        # Stitch the results back together
+        return torch.cat(outputs, dim=0)
+
     def update(self, batch: dict, accumulate: bool = False) -> Tuple[float, float]:
         """
         Update actor and critic networks using a batch of experiences.
