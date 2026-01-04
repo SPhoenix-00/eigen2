@@ -343,7 +343,8 @@ class TradingEnvironment(gym.Env):
         """
         Handle NaN values in a data window by forward-filling and zero-filling.
         
-        OPTIMIZED: Uses vectorized operations instead of nested loops for performance.
+        OPTIMIZED: Uses pure numpy vectorized operations for maximum performance.
+        Avoids pandas overhead for better speed during frequent calls.
         
         Args:
             window: Array of shape [time_steps, num_columns, num_features]
@@ -355,26 +356,44 @@ class TradingEnvironment(gym.Env):
             return window
         
         window = window.copy()
-        
-        # Vectorized forward-fill along time axis (axis 0)
-        # Reshape to [time_steps, num_columns * num_features] for vectorized processing
         original_shape = window.shape
+        
+        # Reshape to 2D for vectorized processing
         window_2d = window.reshape(original_shape[0], -1)
         
-        # Forward-fill using pandas (much faster than manual loops)
-        # Process all columns/features at once
-        df = pd.DataFrame(window_2d)
-        df = df.ffill()  # Forward-fill along time axis
+        # Pure numpy forward-fill along time axis (axis 0)
+        # This is much faster than pandas for this use case
+        mask = ~np.isnan(window_2d)
         
-        # Fill leading NaNs with first valid value (or zero if all NaN)
-        for col in df.columns:
-            if df[col].isna().all():
-                df[col] = 0.0
-            elif df[col].isna().any():
-                first_valid = df[col].dropna().iloc[0] if not df[col].dropna().empty else 0.0
-                df[col] = df[col].fillna(first_valid)
+        # Find first valid value for each column (for leading NaNs)
+        first_valid_idx = np.argmax(mask, axis=0)
+        first_valid_mask = mask[first_valid_idx, np.arange(window_2d.shape[1])]
+        first_valid_values = window_2d[first_valid_idx, np.arange(window_2d.shape[1])]
+        first_valid_values = np.where(first_valid_mask, first_valid_values, 0.0)
         
-        window_2d = df.values
+        # Forward-fill: for each column, propagate values forward
+        for col_idx in range(window_2d.shape[1]):
+            col_data = window_2d[:, col_idx]
+            nan_mask = np.isnan(col_data)
+            
+            if nan_mask.any():
+                # Forward-fill using numpy
+                idx = np.where(~nan_mask, np.arange(len(col_data)), 0)
+                idx = np.maximum.accumulate(idx)
+                col_data = col_data[idx]
+                
+                # Fill any remaining leading NaNs with first valid value
+                if np.isnan(col_data[0]):
+                    col_data[0] = first_valid_values[col_idx]
+                # Forward-fill again to propagate the first value
+                nan_mask = np.isnan(col_data)
+                if nan_mask.any():
+                    idx = np.where(~nan_mask, np.arange(len(col_data)), 0)
+                    idx = np.maximum.accumulate(idx)
+                    col_data = col_data[idx]
+                
+                window_2d[:, col_idx] = col_data
+        
         window = window_2d.reshape(original_shape)
         
         # Final safety check: zero-fill any remaining NaNs (shouldn't happen after forward-fill)
