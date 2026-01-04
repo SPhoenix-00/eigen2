@@ -39,10 +39,8 @@ from enum import Enum
 from dataclasses import dataclass
 from collections import OrderedDict
 
-# Log ROCm fix for visibility (after device detection is available)
-from utils.device import get_gpu_backend
-if get_gpu_backend() == "ROCm":
-    print("[ROCm] Disabled optimized attention kernels, using pure math implementation for stability")
+# ROCm attention fix is applied globally above (lines 16-18)
+# No need to log - it's a silent fix for stability
 
 # Maximum number of agents to cache per worker to prevent memory leaks
 # During evolution, agents mutate every generation, so old cache entries become stale
