@@ -408,7 +408,15 @@ class Actor(nn.Module):
         # CRITICAL ROCm FIX: Apply SymLog transformation to squash extreme values
         # This prevents ROCm attention mechanism crashes while maintaining mathematical consistency
         # Applied to both main and target networks identically
+        # Debug: Log original values for ROCm
+        if hasattr(self, '_debug_rocm') and self._debug_rocm:
+            print(f"    [SymLog] Actor input: min={state.min().item():.2f}, max={state.max().item():.2f}, mean={state.mean().item():.2f}")
+        
         state = symlog(state)
+        
+        # Debug: Log transformed values for ROCm
+        if hasattr(self, '_debug_rocm') and self._debug_rocm:
+            print(f"    [SymLog] Actor output: min={state.min().item():.2f}, max={state.max().item():.2f}, mean={state.mean().item():.2f}")
 
         # Extract features from all columns
         features = self.feature_extractor(state)

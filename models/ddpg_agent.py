@@ -66,6 +66,11 @@ class DDPGAgent:
         self.actor_target = Actor().to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
+        # Enable debug output for ROCm on first update
+        if self.use_rocm_mode:
+            self.actor_target._debug_rocm = True
+            self.actor._debug_rocm = True
+        
         self.critic = Critic().to(self.device)
         self.critic_target = Critic().to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
