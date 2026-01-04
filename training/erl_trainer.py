@@ -3449,12 +3449,20 @@ class ERLTrainer:
         # CRITICAL: Clear GPU memory and state before starting training
         # This ensures any leftover state from parallel evaluation workers is cleared
         # ROCm is particularly sensitive to GPU memory state between multiprocessing operations
+        from utils.device import get_gpu_backend
+        gpu_backend = get_gpu_backend()
         if torch.cuda.is_available():
             import gc
             gc.collect()
             torch.cuda.empty_cache()
             # Synchronize to ensure all GPU operations are complete
             torch.cuda.synchronize()
+            # For ROCm, add extra cleanup to ensure worker state is fully cleared
+            if gpu_backend == "ROCm":
+                # Force another round of cleanup for ROCm
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
         
         # Initialize batch iterator if not already created
         if self.batch_iterator is None:
@@ -3545,7 +3553,13 @@ class ERLTrainer:
                         for accum_step in range(local_accumulation_steps):
                             # Use DataLoader iterator (has async prefetching)
                             batch_cpu = next(self.batch_iterator)
-                            batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+                            # CRITICAL: Disable non_blocking for ROCm to prevent memory access faults
+                            use_non_blocking = gpu_backend != "ROCm" if 'gpu_backend' in locals() else True
+                            if 'gpu_backend' not in locals():
+                                from utils.device import get_gpu_backend
+                                gpu_backend = get_gpu_backend()
+                                use_non_blocking = gpu_backend != "ROCm"
+                            batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
 
                             is_last_accum = (accum_step == local_accumulation_steps - 1)
                             critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
@@ -3591,7 +3605,12 @@ class ERLTrainer:
                         batch_cpu = next(self.batch_iterator)
 
                         # Move batch to GPU (fast transfer thanks to pin_memory when available)
-                        batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+                        # CRITICAL: Disable non_blocking for ROCm to prevent memory access faults
+                        if 'gpu_backend' not in locals():
+                            from utils.device import get_gpu_backend
+                            gpu_backend = get_gpu_backend()
+                        use_non_blocking = gpu_backend != "ROCm"
+                        batch = {k: v.to(Config.DEVICE, non_blocking=use_non_blocking) for k, v in batch_cpu.items()}
 
                         # Update with gradient accumulation
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
