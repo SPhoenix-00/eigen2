@@ -307,14 +307,46 @@ class DDPGAgent:
         # ============ Update Critic ============
         if self.use_rocm_mode and is_first_update:
             print(f"    [DEBUG] update(): Starting critic update...")
+            print(f"    [DEBUG] update(): next_states properties:")
+            print(f"      shape={next_states.shape}, device={next_states.device}, dtype={next_states.dtype}")
+            print(f"      contiguous={next_states.is_contiguous()}, requires_grad={next_states.requires_grad}")
+            print(f"      has_nan={torch.isnan(next_states).any().item()}, has_inf={torch.isinf(next_states).any().item()}")
+            print(f"      min={next_states.min().item():.6f}, max={next_states.max().item():.6f}, mean={next_states.mean().item():.6f}")
+            print(f"    [DEBUG] update(): actor_target properties:")
+            print(f"      device={next(iter(self.actor_target.parameters())).device}")
+            print(f"      training mode={self.actor_target.training}")
+            # Ensure actor_target is in eval mode (should be, but verify)
+            if self.actor_target.training:
+                print(f"    [DEBUG] update(): WARNING: actor_target is in training mode, setting to eval...")
+                self.actor_target.eval()
+                torch.cuda.synchronize()
         
         with torch.no_grad():
             if self.use_rocm_mode and is_first_update:
-                print(f"    [DEBUG] update(): Computing next_actions from actor_target...")
+                print(f"    [DEBUG] update(): Entering torch.no_grad() context...")
+                print(f"    [DEBUG] update(): About to call actor_target(next_states)...")
+                print(f"    [DEBUG] update(): Synchronizing GPU before forward pass...")
+                torch.cuda.synchronize()
+                print(f"    [DEBUG] update(): GPU synchronized, calling actor_target...")
+                print(f"    [DEBUG] update(): next_states memory address: {next_states.data_ptr()}")
+            
             # Get next actions from target actor (already on GPU)
-            next_actions = self.actor_target(next_states)
-            if self.use_rocm_mode and is_first_update:
-                print(f"    [DEBUG] update(): next_actions computed, shape={next_actions.shape}")
+            # CRITICAL: This is where the memory access fault occurs
+            try:
+                if self.use_rocm_mode and is_first_update:
+                    print(f"    [DEBUG] update(): EXECUTING: next_actions = self.actor_target(next_states)")
+                next_actions = self.actor_target(next_states)
+                if self.use_rocm_mode and is_first_update:
+                    print(f"    [DEBUG] update(): actor_target forward pass SUCCESS, shape={next_actions.shape}")
+                    torch.cuda.synchronize()
+                    print(f"    [DEBUG] update(): GPU synchronized after actor_target")
+            except Exception as e:
+                if self.use_rocm_mode and is_first_update:
+                    print(f"    [ERROR] update(): actor_target forward pass FAILED: {e}")
+                    print(f"    [ERROR] update(): Exception type: {type(e).__name__}")
+                    import traceback
+                    traceback.print_exc()
+                raise
             
             if self.use_rocm_mode and is_first_update:
                 print(f"    [DEBUG] update(): Computing target_q from critic_target...")
