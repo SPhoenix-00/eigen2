@@ -4373,51 +4373,51 @@ class ERLTrainer:
                 initializer=_init_worker,
                 initargs=(env_config,)
             ) as executor:
-            # Submit all validation tasks
-            future_to_idx = {
-                executor.submit(_run_validation_worker, task): agent_info
-                for task, agent_info in zip(tasks, agent_indices_to_validate)
-            }
+                # Submit all validation tasks
+                future_to_idx = {
+                    executor.submit(_run_validation_worker, task): agent_info
+                    for task, agent_info in zip(tasks, agent_indices_to_validate)
+                }
 
-            # Collect results as they complete
-            for future in tqdm(
-                as_completed(future_to_idx),
-                total=len(tasks),
-                desc="Validating (parallel)",
-                disable=False
-            ):
-                idx, agent_hash, cache_key = future_to_idx[future]
+                # Collect results as they complete
+                for future in tqdm(
+                    as_completed(future_to_idx),
+                    total=len(tasks),
+                    desc="Validating (parallel)",
+                    disable=False
+                ):
+                    idx, agent_hash, cache_key = future_to_idx[future]
 
-                try:
-                    val_results = future.result()
+                    try:
+                        val_results = future.result()
 
-                    # Store results
-                    validation_results[idx] = val_results
+                        # Store results
+                        validation_results[idx] = val_results
 
-                    # Update cache
-                    self.validation_cache[cache_key] = val_results
+                        # Update cache
+                        self.validation_cache[cache_key] = val_results
 
-                    # Keep cache bounded
-                    if len(self.validation_cache) > 100:
-                        oldest_key = next(iter(self.validation_cache))
-                        del self.validation_cache[oldest_key]
+                        # Keep cache bounded
+                        if len(self.validation_cache) > 100:
+                            oldest_key = next(iter(self.validation_cache))
+                            del self.validation_cache[oldest_key]
 
-                except Exception as e:
-                    print(f"\n⚠ Validation failed for agent {idx}: {e}")
-                    # Return empty results for failed validation
-                    validation_results[idx] = {
-                        'fitness': -1000.0,
-                        'fitness_mean': -1000.0,
-                        'fitness_min': -1000.0,
-                        'roi': 0.0,
-                        'total_trades': 0,
-                        'win_rate': 0.0,
-                        'quality_count': 0,
-                        'quality_roi': 0.0,
-                        'sample_trade': None
-                    }
+                    except Exception as e:
+                        print(f"\n⚠ Validation failed for agent {idx}: {e}")
+                        # Return empty results for failed validation
+                        validation_results[idx] = {
+                            'fitness': -1000.0,
+                            'fitness_mean': -1000.0,
+                            'fitness_min': -1000.0,
+                            'roi': 0.0,
+                            'total_trades': 0,
+                            'win_rate': 0.0,
+                            'quality_count': 0,
+                            'quality_roi': 0.0,
+                            'sample_trade': None
+                        }
 
-            return validation_results
+                return validation_results
         finally:
             # Restore original SUPPRESS_GPU_OUTPUT value (or remove if it wasn't set)
             if original_suppress_value is None:
