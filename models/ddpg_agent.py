@@ -98,10 +98,11 @@ class DDPGAgent:
                 if not is_worker_process and hasattr(torch, 'compile'):
                     # Check if Triton is available (required for torch.compile on GPU)
                     # On ROCm, Triton is not available, so compilation will fail
+                    triton_available = False
                     try:
-                        import triton
+                        import triton  # type: ignore
                         triton_available = True
-                    except ImportError:
+                    except (ImportError, ModuleNotFoundError):
                         triton_available = False
                     
                     # Only compile if Triton is available (CUDA) and not ROCm
