@@ -339,11 +339,36 @@ class DDPGAgent:
             # Slice the batch
             batch_chunk = states[i:i + chunk_size]
             
+            # CRITICAL FIX: Validate chunk before processing
+            # MIOpen (ROCm) requires all dimensions > 0, especially batch size
+            # Empty chunks or chunks with invalid dimensions cause miopenStatusBadParm
+            if batch_chunk.shape[0] == 0:
+                # Skip empty chunks (shouldn't happen, but safety check)
+                continue
+            
+            # Ensure all dimensions are valid
+            if len(batch_chunk.shape) < 2 or any(dim == 0 for dim in batch_chunk.shape):
+                # Invalid chunk dimensions - skip to avoid MIOpen error
+                continue
+            
             # Run forward pass on the chunk
             # Note: This keeps the graph connected for Main Actor,
             # and works fine for Target Actor (no_grad) too.
             chunk_output = network(batch_chunk)
             outputs.append(chunk_output)
+        
+        # CRITICAL: Ensure we have outputs before concatenating
+        if not outputs:
+            # If all chunks were invalid, return zeros with correct shape
+            # This should never happen, but prevents crash
+            dummy_input = states[:1]  # Single sample to get output shape
+            dummy_output = network(dummy_input)
+            # Create zeros with correct shape for full batch
+            return torch.zeros(
+                (states.shape[0],) + dummy_output.shape[1:],
+                device=states.device,
+                dtype=dummy_output.dtype
+            )
             
         # Stitch the results back together
         return torch.cat(outputs, dim=0)
