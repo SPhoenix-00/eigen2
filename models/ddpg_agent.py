@@ -351,6 +351,11 @@ class DDPGAgent:
                 # Invalid chunk dimensions - skip to avoid MIOpen error
                 continue
             
+            # CRITICAL: Ensure chunk is contiguous for MIOpen
+            # Slicing can create non-contiguous views which MIOpen doesn't handle well
+            if not batch_chunk.is_contiguous():
+                batch_chunk = batch_chunk.contiguous()
+            
             # Run forward pass on the chunk
             # Note: This keeps the graph connected for Main Actor,
             # and works fine for Target Actor (no_grad) too.
