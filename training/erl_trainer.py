@@ -233,6 +233,30 @@ def _cache_agent(state_hash, agent):
     _worker_agent_cache[state_hash] = agent
 
 
+def _strip_compile_prefix(state_dict):
+    """
+    Strip '_orig_mod.' prefix from state_dict keys if present.
+    
+    torch.compile() wraps models and adds '_orig_mod.' prefix to all keys.
+    When loading into uncompiled models (worker processes), we need to strip this prefix.
+    
+    Args:
+        state_dict: Dictionary with potentially prefixed keys
+        
+    Returns:
+        Dictionary with '_orig_mod.' prefix removed from keys
+    """
+    stripped = {}
+    for k, v in state_dict.items():
+        if k.startswith('_orig_mod.'):
+            # Remove '_orig_mod.' prefix
+            new_key = k[len('_orig_mod.'):]
+            stripped[new_key] = v
+        else:
+            stripped[k] = v
+    return stripped
+
+
 def _get_cached_agent(state_hash):
     """
     Retrieve an agent from cache, updating LRU order if found.
@@ -3296,9 +3320,15 @@ class ERLTrainer:
         tasks = []
         for agent_idx, agent in enumerate(self.population):
             # Extract agent state (CPU tensors only)
+            # CRITICAL FIX: Strip '_orig_mod.' prefix from compiled model state_dict keys
+            # Compiled models (main process) have '_orig_mod.' prefix, but uncompiled models
+            # (worker processes) don't, so we need to strip it for compatibility
+            actor_state = {k: v.cpu() for k, v in agent.actor.state_dict().items()}
+            critic_state = {k: v.cpu() for k, v in agent.critic.state_dict().items()}
+            
             agent_state = {
-                'actor': {k: v.cpu() for k, v in agent.actor.state_dict().items()},
-                'critic': {k: v.cpu() for k, v in agent.critic.state_dict().items()}
+                'actor': _strip_compile_prefix(actor_state),
+                'critic': _strip_compile_prefix(critic_state)
             }
 
             for slice_idx in range(num_episodes):  # num_episodes slices per agent
@@ -4633,9 +4663,15 @@ class ERLTrainer:
             else:
                 # Cache miss - need to validate this agent
                 # Extract agent state (CPU tensors only to avoid CUDA sharing issues)
+                # CRITICAL FIX: Strip '_orig_mod.' prefix from compiled model state_dict keys
+                # Compiled models (main process) have '_orig_mod.' prefix, but uncompiled models
+                # (worker processes) don't, so we need to strip it for compatibility
+                actor_state = {k: v.cpu() for k, v in agent.actor.state_dict().items()}
+                critic_state = {k: v.cpu() for k, v in agent.critic.state_dict().items()}
+                
                 agent_state = {
-                    'actor': {k: v.cpu() for k, v in agent.actor.state_dict().items()},
-                    'critic': {k: v.cpu() for k, v in agent.critic.state_dict().items()}
+                    'actor': _strip_compile_prefix(actor_state),
+                    'critic': _strip_compile_prefix(critic_state)
                 }
 
                 # Create unique seed for this validation task
