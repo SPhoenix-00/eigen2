@@ -82,7 +82,9 @@ class DDPGAgent:
             torch.cuda.synchronize()
             
             # OPTIMIZATION: Try to compile networks for ROCm if torch.compile is available
-            # This can provide 20-30% speedup on ROCm
+            # NOTE: torch.compile() requires Triton, which is not available on ROCm.
+            # Triton is a GPU kernel compiler primarily for CUDA. On ROCm, compilation will fail
+            # with "Cannot find a working triton installation", so we skip compilation for ROCm.
             # CRITICAL: Only compile in main process, not in worker processes
             # Compiled models cannot be pickled, which breaks multiprocessing
             try:
@@ -91,19 +93,29 @@ class DDPGAgent:
                 import multiprocessing as mp
                 is_worker_process = mp.current_process().name != 'MainProcess'
                 
-                # Only compile if not in worker process and torch.compile is available
+                # Skip compilation for ROCm (Triton not available) and worker processes
+                # Only compile if not in worker process, not ROCm, and torch.compile is available
                 if not is_worker_process and hasattr(torch, 'compile'):
-                    # Compile networks for better performance
-                    # Use 'reduce-overhead' mode for training (balances compilation time vs speedup)
-                    self.actor = torch.compile(self.actor, mode='reduce-overhead', fullgraph=False)
-                    self.critic = torch.compile(self.critic, mode='reduce-overhead', fullgraph=False)
-                    # Target networks are used less frequently, so compile with default mode
-                    self.actor_target = torch.compile(self.actor_target, mode='default', fullgraph=False)
-                    self.critic_target = torch.compile(self.critic_target, mode='default', fullgraph=False)
+                    # Check if Triton is available (required for torch.compile on GPU)
+                    # On ROCm, Triton is not available, so compilation will fail
+                    try:
+                        import triton
+                        triton_available = True
+                    except ImportError:
+                        triton_available = False
+                    
+                    # Only compile if Triton is available (CUDA) and not ROCm
+                    if triton_available and not self.use_rocm_mode:
+                        # Compile networks for better performance
+                        # Use 'reduce-overhead' mode for training (balances compilation time vs speedup)
+                        self.actor = torch.compile(self.actor, mode='reduce-overhead', fullgraph=False)
+                        self.critic = torch.compile(self.critic, mode='reduce-overhead', fullgraph=False)
+                        # Target networks are used less frequently, so compile with default mode
+                        self.actor_target = torch.compile(self.actor_target, mode='default', fullgraph=False)
+                        self.critic_target = torch.compile(self.critic_target, mode='default', fullgraph=False)
             except Exception as e:
-                # Fallback to uncompiled if compilation fails or in worker process
-                # This is expected on some ROCm versions, if torch.compile isn't available,
-                # or if we're in a worker process (where compilation would break pickling)
+                # Fallback to uncompiled if compilation fails, in worker process, or ROCm
+                # This is expected on ROCm (no Triton), some CUDA versions, or in worker processes
                 pass
         
         # Optimizers
