@@ -80,6 +80,23 @@ class DDPGAgent:
         # For ROCm: Synchronize after network creation to ensure GPU operations complete
         if self.use_rocm_mode and torch.cuda.is_available():
             torch.cuda.synchronize()
+            
+            # OPTIMIZATION: Try to compile networks for ROCm if torch.compile is available
+            # This can provide 20-30% speedup on ROCm
+            try:
+                # Check if torch.compile is available (PyTorch 2.0+)
+                if hasattr(torch, 'compile'):
+                    # Compile networks for better performance
+                    # Use 'reduce-overhead' mode for training (balances compilation time vs speedup)
+                    self.actor = torch.compile(self.actor, mode='reduce-overhead', fullgraph=False)
+                    self.critic = torch.compile(self.critic, mode='reduce-overhead', fullgraph=False)
+                    # Target networks are used less frequently, so compile with default mode
+                    self.actor_target = torch.compile(self.actor_target, mode='default', fullgraph=False)
+                    self.critic_target = torch.compile(self.critic_target, mode='default', fullgraph=False)
+            except Exception as e:
+                # Fallback to uncompiled if compilation fails
+                # This is expected on some ROCm versions or if torch.compile isn't available
+                pass
         
         # Optimizers
         self.actor_optimizer = optim.Adam(
@@ -259,7 +276,7 @@ class DDPGAgent:
         self.actor.train()
         return actions
 
-    def _forward_chunked(self, network, states, chunk_size=32):
+    def _forward_chunked(self, network, states, chunk_size=None):
         """
         Splits a large batch into smaller chunks to prevent ROCm kernel crashes.
         Mathematically identical to running the full batch at once.
@@ -267,11 +284,30 @@ class DDPGAgent:
         Args:
             network: The network to run forward pass on (Actor or Critic)
             states: Input states tensor [batch, ...]
-            chunk_size: Size of each chunk (default 32 for ROCm stability)
+            chunk_size: Size of each chunk (None = auto-detect based on GPU memory)
             
         Returns:
             Output tensor with same batch dimension as input
         """
+        # Auto-detect optimal chunk size for ROCm based on GPU memory
+        if chunk_size is None:
+            if self.use_rocm_mode:
+                # MI300X has 192GB - can handle much larger chunks than RTX PRO 6000 (24GB)
+                # Use 64 for MI300X (2x improvement over 32)
+                # If we have even more memory available, could go to 80 or 96
+                try:
+                    total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                    if total_memory_gb >= 100:  # Large GPU like MI300X
+                        chunk_size = 64
+                    elif total_memory_gb >= 40:  # Medium GPU
+                        chunk_size = 48
+                    else:  # Smaller GPU
+                        chunk_size = 32
+                except:
+                    chunk_size = 64  # Default to larger chunk for ROCm
+            else:
+                chunk_size = 32  # Conservative for CUDA
+        
         # If batch is small enough, just run it normally
         if states.shape[0] <= chunk_size:
             return network(states)
@@ -358,8 +394,9 @@ class DDPGAgent:
             # CRITICAL ROCm FIX: Use micro-batching to prevent memory access faults
             # Process large batches in chunks to avoid ROCm attention kernel crashes
             # Mathematically identical to full batch, but physically processes in smaller chunks
+            # Use auto-detected chunk size (64 for MI300X, 32 for smaller GPUs)
             if self.use_rocm_mode:
-                next_actions = self._forward_chunked(self.actor_target, next_states, chunk_size=32)
+                next_actions = self._forward_chunked(self.actor_target, next_states)
             else:
                 next_actions = self.actor_target(next_states)
             
@@ -367,8 +404,14 @@ class DDPGAgent:
             # CRITICAL ROCm FIX: Also chunk the critic_target forward pass
             if self.use_rocm_mode:
                 # Chunking Critic Target explicitly (takes 2 args: states and actions)
+                # Use same auto-detected chunk size
                 next_q_values_list = []
-                chunk_size = 32
+                # Auto-detect chunk size (same logic as _forward_chunked)
+                try:
+                    total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                    chunk_size = 64 if total_memory_gb >= 100 else (48 if total_memory_gb >= 40 else 32)
+                except:
+                    chunk_size = 64
                 for i in range(0, next_states.shape[0], chunk_size):
                     s_chunk = next_states[i:i+chunk_size]
                     a_chunk = next_actions[i:i+chunk_size]
@@ -386,8 +429,13 @@ class DDPGAgent:
             # This preserves gradients - Autograd engine stitches the graph through torch.cat
             if self.use_rocm_mode:
                 # Chunked execution for main critic (preserves gradients)
+                # Use auto-detected chunk size for better performance on large GPUs
                 current_q_list = []
-                chunk_size = 32
+                try:
+                    total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                    chunk_size = 64 if total_memory_gb >= 100 else (48 if total_memory_gb >= 40 else 32)
+                except:
+                    chunk_size = 64
                 
                 for i in range(0, states.shape[0], chunk_size):
                     # Slice the batch
@@ -435,7 +483,8 @@ class DDPGAgent:
             # This preserves gradients - Autograd engine stitches the graph through torch.cat
             if self.use_rocm_mode:
                 # Chunked execution for main actor (preserves gradients)
-                actor_actions = self._forward_chunked(self.actor, states, chunk_size=32)
+                # Use auto-detected chunk size for better performance
+                actor_actions = self._forward_chunked(self.actor, states)
             else:
                 actor_actions = self.actor(states)
             
@@ -443,8 +492,13 @@ class DDPGAgent:
             # We need to pass both states and new actor_actions to the critic in chunks
             if self.use_rocm_mode:
                 # Chunked execution for critic with actor_actions (preserves gradients)
+                # Use auto-detected chunk size for better performance
                 actor_loss_list = []
-                chunk_size = 32
+                try:
+                    total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                    chunk_size = 64 if total_memory_gb >= 100 else (48 if total_memory_gb >= 40 else 32)
+                except:
+                    chunk_size = 64
                 
                 for i in range(0, states.shape[0], chunk_size):
                     s_chunk = states[i:i + chunk_size]

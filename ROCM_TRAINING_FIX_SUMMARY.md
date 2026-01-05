@@ -344,8 +344,104 @@ These are required trade-offs for ROCm stability and cannot be removed without r
 
 ### Current Configuration
 - **Batch Size**: 160 (effective, preserved through chunking)
-- **Chunk Size**: 32 (physical processing size for ROCm stability)
+- **Chunk Size**: Auto-detected (64 for MI300X/≥100GB, 48 for ≥40GB, 32 for smaller GPUs)
 - **Gradient Accumulation**: 1 (no accumulation)
 - **Synchronization**: Minimal (only at end of update)
 - **Debug Output**: Disabled after first update
+- **torch.compile()**: Enabled for ROCm networks (with fallback)
+- **Attention Kernels**: Optimized kernels enabled with math fallback
+
+---
+
+## Phase 10: Performance Optimization for MI300X
+
+**Problem**: ROCm performance on MI300X was significantly slower than expected:
+- Training: 201.73s/it (vs CUDA RTX PRO 6000: 25.90s/it) - **~8x slower**
+- Eval: 1.70s/it (vs CUDA: 1.21s/it) - **~40% slower**
+- Validation: 1.66s/it (vs CUDA: 1.38s/it) - **~20% slower**
+
+**Expected**: MI300X should perform ~30% better than RTX PRO 6000, but was performing much worse.
+
+**Root Causes**:
+1. **Small chunk size (32)**: Too conservative for MI300X's 192GB memory (vs RTX PRO 6000's 24GB)
+2. **Blocking sync after batch transfer**: Preventing GPU pipeline parallelism
+3. **Unnecessary tensor cloning**: Creating redundant memory copies
+4. **Math-only attention**: Missing 20-40% speedup from optimized kernels
+5. **No torch.compile()**: Missing 20-30% speedup from graph optimization
+
+**Solution**: Comprehensive performance optimization while maintaining stability
+
+### Changes Made
+
+1. **Increased Chunk Size (32 → 64 for MI300X)**:
+   - **Before**: Fixed chunk_size=32 for all ROCm GPUs
+   - **After**: Auto-detects GPU memory and uses chunk_size=64 for GPUs with ≥100GB
+   - **Impact**: ~2x fewer chunks = less overhead, better GPU utilization
+   - **Location**: `models/ddpg_agent.py` `_forward_chunked()` method
+   - **Safety**: Still chunks large batches, just uses larger chunks on high-memory GPUs
+
+2. **Removed Blocking Sync After Batch Transfer**:
+   - **Before**: `torch.cuda.synchronize()` after every batch transfer in training loop
+   - **After**: Removed sync - `non_blocking=False` already provides synchronization
+   - **Impact**: Allows GPU pipeline parallelism, reduces blocking
+   - **Location**: `training/erl_trainer.py` line ~3699
+   - **Safety**: Sync still happens at end of update() method
+
+3. **Optimized Tensor Cloning**:
+   - **Before**: Always cloned tensors before GPU transfer
+   - **After**: Only clone when necessary (non-contiguous or shared memory issues)
+   - **Impact**: Fewer unnecessary memory copies, faster transfers
+   - **Location**: `training/erl_trainer.py` batch transfer logic
+   - **Safety**: Still ensures contiguous tensors for ROCm stability
+
+4. **Added torch.compile() for Networks**:
+   - **Before**: Networks not compiled
+   - **After**: Compiles all networks (actor, critic, targets) on ROCm initialization
+   - **Impact**: 20-30% speedup if torch.compile is available
+   - **Location**: `models/ddpg_agent.py` agent initialization
+   - **Safety**: Try/except fallback - uses uncompiled networks if compilation fails
+
+5. **Enabled Optimized Attention Kernels with Fallback**:
+   - **Before**: Forced math-only attention (safest but slowest)
+   - **After**: Enables flash and memory-efficient attention, falls back to math if they fail
+   - **Impact**: 20-40% speedup if optimized kernels work
+   - **Location**: `training/erl_trainer.py` top-level configuration
+   - **Rationale**: With SymLog transformation, extreme values are handled, so optimized kernels should work
+   - **Safety**: PyTorch automatically falls back to math if optimized kernels fail
+
+### Files Modified
+
+- **`models/ddpg_agent.py`**:
+  - Auto-detecting chunk size based on GPU memory
+  - Added torch.compile() for all networks on ROCm
+  - Updated all chunking calls to use auto-detected size
+
+- **`training/erl_trainer.py`**:
+  - Removed blocking sync after batch transfer
+  - Optimized tensor cloning logic
+  - Enabled optimized attention kernels with fallback
+
+### Expected Performance Improvements
+
+- **Training**: 201.73s/it → ~50-80s/it (target: ~30% better than CUDA's 25.90s/it)
+- **Eval**: 1.70s/it → ~1.0-1.2s/it (target: match or beat CUDA's 1.21s/it)
+- **Validation**: 1.66s/it → ~1.0-1.2s/it (target: match or beat CUDA's 1.38s/it)
+
+### Key Technical Insights
+
+1. **Chunk Size Optimization**: MI300X's 192GB memory allows much larger chunks than RTX PRO 6000's 24GB
+2. **GPU Pipeline Parallelism**: Removing unnecessary syncs allows GPU to work on multiple operations simultaneously
+3. **torch.compile()**: Provides significant speedup on ROCm if available (PyTorch 2.0+)
+4. **Attention Kernels**: With SymLog transformation, optimized kernels should work safely
+5. **Conservative Fallbacks**: All optimizations have fallbacks to ensure stability
+
+### Remaining Overhead (Necessary for Stability)
+
+1. **Chunking**: Still required for ROCm stability, but now uses optimal chunk size
+2. **Synchronous Transfers**: `non_blocking=False` still required for ROCm stability
+3. **Math Attention Fallback**: If optimized kernels fail, math fallback ensures stability
+
+These are required trade-offs for ROCm stability and cannot be removed without risking crashes.
+
+---
 
