@@ -83,9 +83,16 @@ class DDPGAgent:
             
             # OPTIMIZATION: Try to compile networks for ROCm if torch.compile is available
             # This can provide 20-30% speedup on ROCm
+            # CRITICAL: Only compile in main process, not in worker processes
+            # Compiled models cannot be pickled, which breaks multiprocessing
             try:
-                # Check if torch.compile is available (PyTorch 2.0+)
-                if hasattr(torch, 'compile'):
+                # Check if we're in a multiprocessing worker process
+                # Worker processes should not compile (causes pickling issues)
+                import multiprocessing as mp
+                is_worker_process = mp.current_process().name != 'MainProcess'
+                
+                # Only compile if not in worker process and torch.compile is available
+                if not is_worker_process and hasattr(torch, 'compile'):
                     # Compile networks for better performance
                     # Use 'reduce-overhead' mode for training (balances compilation time vs speedup)
                     self.actor = torch.compile(self.actor, mode='reduce-overhead', fullgraph=False)
@@ -94,8 +101,9 @@ class DDPGAgent:
                     self.actor_target = torch.compile(self.actor_target, mode='default', fullgraph=False)
                     self.critic_target = torch.compile(self.critic_target, mode='default', fullgraph=False)
             except Exception as e:
-                # Fallback to uncompiled if compilation fails
-                # This is expected on some ROCm versions or if torch.compile isn't available
+                # Fallback to uncompiled if compilation fails or in worker process
+                # This is expected on some ROCm versions, if torch.compile isn't available,
+                # or if we're in a worker process (where compilation would break pickling)
                 pass
         
         # Optimizers
