@@ -618,49 +618,49 @@ class GlobalHallOfFame:
         if failures:
             return False, reasons
 
-        # Criterion 2: At least 2 of 3 metrics must beat 25th percentile (2 of 2 for mavericks - skip expectancy)
+        # Criterion 2: At least 2 of 3 metrics must beat 25th percentile
+        # For mavericks: expectancy is "given" (always passes), so need 2 of 3 (gauntlet, ROI, expectancy given)
+        # For regular: need 2 of 3 (gauntlet, ROI, expectancy)
         beats_gauntlet_p25 = gauntlet_score > self.gauntlet_p25
         beats_roi_p25 = roi > self.roi_p25
-        beats_expectancy_p25 = expectancy > self.expectancy_p25 if not is_maverick else False  # Skip for mavericks
-        # For mavericks: need 2 of 2 (gauntlet, ROI). For regular: need 2 of 3 (gauntlet, ROI, expectancy)
-        metrics_to_check = [beats_gauntlet_p25, beats_roi_p25]
-        if not is_maverick:
-            metrics_to_check.append(beats_expectancy_p25)
+        beats_expectancy_p25 = expectancy > self.expectancy_p25 if not is_maverick else True  # Given for mavericks
+        # Count all 3 metrics (expectancy is given for mavericks)
+        metrics_to_check = [beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25]
         count_above_p25 = sum(metrics_to_check)
-        required_p25 = 2 if is_maverick else 2  # Still need 2, but from 2 metrics instead of 3
+        required_p25 = 2  # Need 2 of 3 for both mavericks and regular
         
-        metric_count = "2/2" if is_maverick else "2/3"
+        metric_count = "2/3" if is_maverick else "2/3"  # Mavericks: 2 of 3 (with expectancy given), Regular: 2 of 3
         reasons.append(f"\nGate 2: p25 Criterion (Need {metric_count} to pass):")
         reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > p25 ({self.gauntlet_p25:.2f}) {'✅' if beats_gauntlet_p25 else '❌'}")
         reasons.append(f"  - ROI: {roi:.2f}% > p25 ({self.roi_p25:.2f}%) {'✅' if beats_roi_p25 else '❌'}")
         if not is_maverick:
             reasons.append(f"  - Expectancy: {expectancy:.4f} > p25 ({self.expectancy_p25:.4f}) {'✅' if beats_expectancy_p25 else '❌'}")
         else:
-            reasons.append(f"  - Expectancy: SKIPPED (Maverick mode)")
+            reasons.append(f"  - Expectancy: GIVEN (Maverick mode) ✅")
         reasons.append(f"  Result: {count_above_p25}/{required_p25} passed {'✅' if count_above_p25 >= required_p25 else '❌'}")
         
         if count_above_p25 < required_p25:
             return False, reasons
 
-        # Criterion 3: At least 1 metric must beat median (50th percentile) (1 of 2 for mavericks - skip expectancy)
+        # Criterion 3: At least 1 metric must beat median (50th percentile)
+        # For mavericks: expectancy is "given" (always passes), so need 1 of 3 (gauntlet, ROI, expectancy given)
+        # For regular: need 1 of 3 (gauntlet, ROI, expectancy)
         beats_gauntlet_median = gauntlet_score > self.gauntlet_median
         beats_roi_median = roi > self.roi_median
-        beats_expectancy_median = expectancy > self.expectancy_median if not is_maverick else False  # Skip for mavericks
-        # For mavericks: need 1 of 2 (gauntlet, ROI). For regular: need 1 of 3 (gauntlet, ROI, expectancy)
-        metrics_to_check_median = [beats_gauntlet_median, beats_roi_median]
-        if not is_maverick:
-            metrics_to_check_median.append(beats_expectancy_median)
+        beats_expectancy_median = expectancy > self.expectancy_median if not is_maverick else True  # Given for mavericks
+        # Count all 3 metrics (expectancy is given for mavericks)
+        metrics_to_check_median = [beats_gauntlet_median, beats_roi_median, beats_expectancy_median]
         count_above_median = sum(metrics_to_check_median)
         required_median = 1  # Always need at least 1
         
-        metric_count = "1/2" if is_maverick else "1/3"
+        metric_count = "1/3" if is_maverick else "1/3"  # Mavericks: 1 of 3 (with expectancy given), Regular: 1 of 3
         reasons.append(f"\nGate 3: Median Criterion (Need {metric_count} to pass):")
         reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > Median ({self.gauntlet_median:.2f}) {'✅' if beats_gauntlet_median else '❌'}")
         reasons.append(f"  - ROI: {roi:.2f}% > Median ({self.roi_median:.2f}%) {'✅' if beats_roi_median else '❌'}")
         if not is_maverick:
             reasons.append(f"  - Expectancy: {expectancy:.4f} > Median ({self.expectancy_median:.4f}) {'✅' if beats_expectancy_median else '❌'}")
         else:
-            reasons.append(f"  - Expectancy: SKIPPED (Maverick mode)")
+            reasons.append(f"  - Expectancy: GIVEN (Maverick mode) ✅")
         reasons.append(f"  Result: {count_above_median}/{required_median} passed {'✅' if count_above_median >= required_median else '❌'}")
         
         if count_above_median < required_median:

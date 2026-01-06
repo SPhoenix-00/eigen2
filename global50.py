@@ -531,28 +531,29 @@ class AgentEvaluator:
             else:
                 print(f"\n   Agent does not qualify for Global 50")
                 # Check individual criteria for detailed feedback
-                # Mavericks skip expectancy gating (3/3 minimums, 2/2 P25, 1/2 median)
+                # Mavericks skip expectancy gating - expectancy is "given" (always passes) for both minimums and P25
                 passes_gauntlet_min = gauntlet_score > self.global_hof.entry_threshold
                 passes_roi_min = metrics['roi'] > self.global_hof.roi_threshold
-                passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold if not is_maverick else True  # Skip for mavericks
+                passes_expectancy_min = metrics['expectancy'] > self.global_hof.expectancy_threshold if not is_maverick else True  # Given for mavericks
                 passes_cv_min = metrics['cv'] < self.global_hof.cv_threshold  # CV: lower is better
                 beats_gauntlet_p25 = gauntlet_score > self.global_hof.gauntlet_p25
                 beats_roi_p25 = metrics['roi'] > self.global_hof.roi_p25
-                beats_expectancy_p25 = metrics['expectancy'] > self.global_hof.expectancy_p25 if not is_maverick else False  # Skip for mavericks
+                beats_expectancy_p25 = metrics['expectancy'] > self.global_hof.expectancy_p25 if not is_maverick else True  # Given for mavericks
                 
-                # For mavericks: count only gauntlet and ROI (2 of 2). For regular: count all 3 (2 of 3)
-                metrics_for_p25 = [beats_gauntlet_p25, beats_roi_p25]
-                if not is_maverick:
-                    metrics_for_p25.append(beats_expectancy_p25)
+                # For mavericks: count gauntlet, ROI, and expectancy (given as True) = 3 metrics, need 2 of 3
+                # For regular: count all 3 (gauntlet, ROI, expectancy), need 2 of 3
+                metrics_for_p25 = [beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25]
                 count_above_p25 = sum(metrics_for_p25)
 
-                # For mavericks: 3/3 minimums (skip expectancy). For regular: 4/4 minimums
+                # For mavericks: 3/4 minimums (gauntlet, ROI, CV, expectancy given) - need 3, but expectancy is given
+                # For regular: 4/4 minimums (gauntlet, ROI, expectancy, CV)
                 min_required = 3 if is_maverick else 4
+                # Count: gauntlet, ROI, expectancy (given for mavericks), CV
                 count_above_min = sum([passes_gauntlet_min, passes_roi_min, passes_expectancy_min, passes_cv_min])
                 maverick_note = " (mavericks skip expectancy)" if is_maverick else ""
-                print(f"   Minimums ({count_above_min}/{min_required}, {min_required} required{maverick_note}): Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗' if not is_maverick else 'N/A'} | CV {'✓' if passes_cv_min else '✗'}")
-                p25_required = "2/2" if is_maverick else "2/3"
-                print(f"   P25 ({count_above_p25}/{p25_required}, {p25_required.split('/')[0]} required{maverick_note}): Gauntlet {'✓' if beats_gauntlet_p25 else '✗'} | ROI {'✓' if beats_roi_p25 else '✗'} | Expectancy {'✓' if beats_expectancy_p25 else '✗' if not is_maverick else 'N/A'}")
+                print(f"   Minimums ({count_above_min}/{min_required}, {min_required} required{maverick_note}): Gauntlet {'✓' if passes_gauntlet_min else '✗'} | ROI {'✓' if passes_roi_min else '✗'} | Expectancy {'✓' if passes_expectancy_min else '✗' if not is_maverick else '✓ (given)'} | CV {'✓' if passes_cv_min else '✗'}")
+                p25_required = "2/3" if is_maverick else "2/3"  # Mavericks: 2 of 3 (with expectancy given), Regular: 2 of 3
+                print(f"   P25 ({count_above_p25}/{p25_required}, {p25_required.split('/')[0]} required{maverick_note}): Gauntlet {'✓' if beats_gauntlet_p25 else '✗'} | ROI {'✓' if beats_roi_p25 else '✗'} | Expectancy {'✓' if beats_expectancy_p25 else '✗' if not is_maverick else '✓ (given)'}")
 
         except Exception as e:
             print(f"\n   ERROR: {e}")
