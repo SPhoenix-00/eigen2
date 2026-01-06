@@ -791,6 +791,19 @@ class GlobalHallOfFame:
                 is_maverick=is_maverick
             )
 
+            # Show current Maverick status if this is a Maverick
+            if is_maverick:
+                current_mavericks = [e for e in self.entries if e.is_maverick]
+                current_mavericks.sort(key=lambda e: e.gauntlet_score, reverse=True)
+                current_maverick_count = len(current_mavericks)
+                print(f"\n  Maverick Status: {current_maverick_count}/{self.MAVERICK_CAP} Mavericks in Global 50")
+                if current_maverick_count > 0:
+                    print(f"  Current Maverick Ranks (by score):")
+                    for i, m in enumerate(current_mavericks, 1):
+                        overall_rank = self.entries.index(m) + 1
+                        print(f"    #{i} Maverick: {m.run_name}_{m.agent_id} (Score: {m.gauntlet_score:.2f}, Overall Rank: #{overall_rank})")
+                print(f"  New Maverick Score: {gauntlet_score:.2f}")
+
             # Merge: Add new agent to candidate pool
             candidates = self.entries + [new_entry]
 
@@ -803,6 +816,18 @@ class GlobalHallOfFame:
             final_list = []
             maverick_count = 0
             dropouts = []
+            new_entry_maverick_rank = None  # Rank among Mavericks (1-based)
+
+            # Calculate new entry's rank among Mavericks before processing
+            if is_maverick:
+                all_mavericks = [e for e in candidates if e.is_maverick]
+                all_mavericks.sort(key=lambda e: e.gauntlet_score, reverse=True)
+                for i, m in enumerate(all_mavericks, 1):
+                    if m == new_entry:
+                        new_entry_maverick_rank = i
+                        break
+                if new_entry_maverick_rank is not None:
+                    print(f"  New Maverick would rank #{new_entry_maverick_rank} among {len(all_mavericks)} Mavericks")
 
             for entry in candidates:
                 if len(final_list) >= self.CAPACITY:
@@ -816,12 +841,7 @@ class GlobalHallOfFame:
                         maverick_count += 1
                     else:
                         # Maverick cap hit: This Maverick is rejected
-                        # Check if this is the new entry
-                        if entry == new_entry:
-                            print(f"  ⚠ Agent qualified by score but rejected by Maverick Cap (Max {self.MAVERICK_CAP}).")
-                            print(f"{'='*60}\n")
-                            return False, -1
-                        # Otherwise skip this Maverick (it's an existing one being displaced)
+                        # (Don't print here - we'll check at the end if new_entry made it)
                         dropouts.append(entry)
                 else:
                     # Normal agents are always accepted (subject to capacity)
@@ -829,8 +849,21 @@ class GlobalHallOfFame:
 
             # Check if our new entry survived the cut
             if new_entry not in final_list:
-                print(f"  ⚠ Agent did not make the final cut (score too low or capacity reached).")
-                print(f"{'='*60}\n")
+                if is_maverick:
+                    # Check if it was rejected due to Maverick cap
+                    all_mavericks_in_final = [e for e in final_list if e.is_maverick]
+                    if len(all_mavericks_in_final) >= self.MAVERICK_CAP:
+                        print(f"\n  ❌ REJECTED: Maverick Cap reached ({self.MAVERICK_CAP}/{self.MAVERICK_CAP})")
+                        if new_entry_maverick_rank is not None:
+                            print(f"  New Maverick rank #{new_entry_maverick_rank} is too low to displace existing Mavericks")
+                            print(f"  Lowest Maverick in Global 50: Score {min(m.gauntlet_score for m in all_mavericks_in_final):.2f}")
+                        print(f"{'='*60}\n")
+                    else:
+                        print(f"\n  ❌ REJECTED: Agent did not make the final cut (score too low)")
+                        print(f"{'='*60}\n")
+                else:
+                    print(f"\n  ❌ REJECTED: Agent did not make the final cut (score too low or capacity reached)")
+                    print(f"{'='*60}\n")
                 return False, -1
 
             # Identify dropouts from original entries (not including the new entry if it failed)
@@ -870,19 +903,30 @@ class GlobalHallOfFame:
 
             # Report
             new_rank = self.entries.index(new_entry) + 1
-            print(f"✓ Agent promoted to Global 50!")
-            print(f"  Rank: #{new_rank}")
+            print(f"\n  ✅ PROMOTED: Agent entered Global 50!")
+            print(f"  Overall Rank: #{new_rank}")
             print(f"  Score: {gauntlet_score:.2f}")
-            print(f"  Run: {self.run_name}")
+            print(f"  Run: {entry_run_name}")
             if is_maverick:
-                print(f"  Type: Maverick (Count: {maverick_count}/{self.MAVERICK_CAP})")
+                # Calculate Maverick rank
+                mavericks_in_final = [e for e in self.entries if e.is_maverick]
+                mavericks_in_final.sort(key=lambda e: e.gauntlet_score, reverse=True)
+                maverick_rank = mavericks_in_final.index(new_entry) + 1
+                print(f"  Maverick Rank: #{maverick_rank} of {len(mavericks_in_final)} (Count: {maverick_count}/{self.MAVERICK_CAP})")
+                # Check if any Mavericks were displaced
+                displaced_mavericks = [d for d in dropouts if d.is_maverick]
+                if displaced_mavericks:
+                    print(f"  Displaced {len(displaced_mavericks)} lower-ranked Maverick(s)")
+                    for dm in displaced_mavericks:
+                        print(f"    - {dm.run_name}_{dm.agent_id} (Score: {dm.gauntlet_score:.2f})")
             if not suppress_threshold_output:
-                print(f"  New Threshold: {self.entry_threshold:.2f}")
+                print(f"  New Entry Threshold: {self.entry_threshold:.2f}")
 
             if dropouts:
+                print(f"\n  Retired Agents ({len(dropouts)}):")
                 for dropout in dropouts:
                     dropout_type = " [M]" if dropout.is_maverick else ""
-                    print(f"  ⤵ Retired: {dropout.run_name}{dropout_type} (Score: {dropout.gauntlet_score:.2f})")
+                    print(f"    ⤵ {dropout.run_name}_{dropout.agent_id}{dropout_type} (Score: {dropout.gauntlet_score:.2f})")
 
             print(f"{'='*60}\n")
 

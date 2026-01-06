@@ -496,7 +496,7 @@ class AgentEvaluator:
                 print(f"   Attempting promotion...")
 
                 # Attempt promotion
-                promoted = self.global_hof.check_and_promote(
+                promoted, rank = self.global_hof.check_and_promote(
                     agent=agent,
                     gauntlet_score=gauntlet_score,
                     generation=generation,
@@ -510,10 +510,11 @@ class AgentEvaluator:
                 )
 
                 result['promoted'] = promoted
+                result['rank'] = rank
 
-                if promoted:
-                    print(f"   SUCCESS: Agent promoted to Global 50!")
-                else:
+                # Note: Detailed promotion status is already printed by check_and_promote()
+                # Don't print redundant success/failure messages here
+                if not promoted:
                     # Store agent and metrics for potential archiving (if maverick cap reached)
                     if is_maverick:
                         result['agent'] = agent
@@ -527,7 +528,6 @@ class AgentEvaluator:
                             'win_ratio': metrics['win_ratio'],
                             'total_trades': metrics['total_trades']
                         }
-                    print(f"   WARNING: Promotion failed (concurrent update or maverick cap?)")
             else:
                 print(f"\n   Agent does not qualify for Global 50")
                 # Check individual criteria for detailed feedback
@@ -2657,7 +2657,7 @@ class AgentEvaluator:
                 self.global_hof.roi_p25 = float('-inf')
                 self.global_hof.expectancy_p25 = float('-inf')
                 
-                promoted = self.global_hof.check_and_promote(
+                promoted, rank = self.global_hof.check_and_promote(
                     agent=agent,
                     gauntlet_score=new_score,
                     generation=candidate.get('generation', 0),
