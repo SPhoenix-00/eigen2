@@ -546,10 +546,16 @@ class TradingEnvironment(gym.Env):
                     base_reward = scaled_coefficient * net_gain_pct
                     self.num_wins += 1
                 else:
-                    # LOSS: Apply magnification only in consistency mode
+                    # LOSS: Apply magnification based on mode
                     # Consistency mode: 1.5x magnification (focus on reducing drawdowns)
-                    # Normal/Maverick mode: 1.0x (treat losses equally to gains)
-                    loss_multiplier = Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0
+                    # Maverick mode: 1.2x magnification (moderate loss sensitivity)
+                    # Normal mode: 1.0x (treat losses equally to gains)
+                    if self.consistency_mode:
+                        loss_multiplier = Config.CONSISTENCY_LOSS_MULTIPLIER
+                    elif self.maverick_mode:
+                        loss_multiplier = Config.MAVERICK_LOSS_MULTIPLIER
+                    else:
+                        loss_multiplier = 1.0
                     base_reward = scaled_coefficient * net_gain_pct * loss_multiplier
                     self.num_losses += 1
 

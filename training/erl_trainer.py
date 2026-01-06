@@ -2743,64 +2743,50 @@ class ERLTrainer:
         total_inv = stats.get('total_investment', 0.0)
         roi_pct = (raw_pnl / total_inv * 100) if total_inv > 0 else 0.0
 
-        # MAVERICK MODE: FOMO/ROI-First scoring
+        # MAVERICK MODE: Triad 2.0-inspired scoring with FOMO penalty
         if self.maverick_mode:
             # Get peak capital employed (more accurate than total_investment for efficiency)
             peak_capital = stats.get('peak_capital_employed', total_inv)
             if peak_capital <= 0:
                 peak_capital = total_inv if total_inv > 0 else 1.0
 
-            # Calculate Expectancy explicitly
-            # Expectancy = (Win Rate * Avg Win) - (Loss Rate * Avg Loss)
-            avg_win = 0.0
-            avg_loss = 0.0
-            if closed_trades:
-                wins = [t.get('gain_pct', 0) for t in closed_trades if t.get('gain_pct', 0) >= 0]
-                losses = [abs(t.get('gain_pct', 0)) for t in closed_trades if t.get('gain_pct', 0) < 0]
-                if wins:
-                    avg_win = sum(wins) / len(wins)
-                if losses:
-                    avg_loss = sum(losses) / len(losses)
-            
-            loss_rate = 1.0 - win_rate
-            expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+            # Calculate ROI based on peak capital (true capital efficiency)
+            roi_pct = (raw_pnl / peak_capital * 100) if peak_capital > 0 else 0.0
 
-            # 1. Base Score: ROI Efficiency + WR Boost
-            # (Raw PnL / Peak Capital Employed) * log10(Peak Capital + 10) * win_rate^4
-            roi_efficiency = (raw_pnl / peak_capital) * 100.0 if peak_capital > 0 else 0.0
+            # ROI Expansion Mode: Apply power law (** 1.5) for super-linear scaling
+            # Sign preservation: apply power to absolute value, then restore sign
+            if roi_pct >= 0:
+                roi_score = (roi_pct ** 1.5)
+            else:
+                roi_score = -(abs(roi_pct) ** 1.5)
+
+            # Volume Scalar: log10(Peak Capital + 10)
             volume_scalar = math.log10(peak_capital + 10)
-            
-            # Massive boost for high WR (convex function)
-            # WR 0.50 -> 0.0625 multiplier
-            # WR 0.60 -> 0.1296 multiplier (2x boost)
-            # WR 0.70 -> 0.2401 multiplier (4x boost)
-            win_rate_multiplier = win_rate ** 4
-            
-            base_score = roi_efficiency * volume_scalar * win_rate_multiplier
 
-            # 2. Expectancy Bonus
-            # Add raw expectancy score (scaled to match ROI magnitude)
-            # e.g., Expectancy 0.5% -> +10 points
-            expectancy_score = expectancy * 20.0
+            # Calculate Fitness
+            if roi_score > 0:
+                # --- WINNING SCENARIO ---
+                # Base Score: ROI^1.5 * log10(Peak Capital + 10)
+                base_score = roi_score * volume_scalar
 
-            # 3. FOMO Penalty (Relative Performance)
+                # Boost: (1 + WR^4) - massive boost for high win rates
+                win_rate_boost = (1.0 + (win_rate ** 4))
+                
+                fitness = base_score * win_rate_boost
+            else:
+                # --- LOSING SCENARIO ---
+                # Pure Pain: ROI^1.5 * log10(Peak Capital + 10)
+                # Penalized by ROI magnitude
+                fitness = roi_score * volume_scalar
+
+            # FOMO Penalty (Relative Performance) - fitness only, not per trade
             # Get market return from stats (Col 44 = S&P 500 proxy)
             market_return = stats.get('market_return_pct', 0.0)
             alpha_gap = market_return - roi_pct
             fomo_penalty = max(0.0, alpha_gap) * 10.0
 
-            # 4. Fear Factor (Limited Ratchet)
-            # Gentle non-linear drag on losses: 2.0 * (num_losses ^ 1.2)
-            fear_factor = 2.0 * (num_losses ** 1.2) if num_losses > 0 else 0.0
-            
-            # 5. WR Gate / Penalty
-            # Severe penalty for WR < 60% to force quality
-            wr_penalty = 0.0
-            if win_rate < 0.60:
-                wr_penalty = (0.60 - win_rate) * 100.0  # e.g., 55% WR -> 5.0 penalty
-
-            # Final Maverick Fitness
-            fitness = base_score + expectancy_score - fomo_penalty - fear_factor - wr_penalty
+            # Final Maverick Fitness: Apply FOMO penalty
+            fitness = fitness - fomo_penalty
 
             return float(fitness)
 

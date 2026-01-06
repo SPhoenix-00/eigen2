@@ -25,8 +25,13 @@ EFFICIENCY GATING:
     This ensures only efficient agents (high ROI per dollar) get high scores.
 
 MAVERICK MODE:
-    Maverick agents [M] are trained with aggressive reward functions (FOMO, ROI-First)
-    and are tracked separately. They can break committee inaction but must still
+    Maverick agents [M] are trained with aggressive reward functions:
+    - Triad 2.0-inspired fitness (ROI^1.5 * log10(Peak Capital + 10), boosted by (1+WR^4))
+    - 1.2x loss multiplier (per trade rewards)
+    - 0.3% hurdle rate (50% of normal)
+    - No forced exit penalty
+    - FOMO penalty in fitness (fitness only, not per trade)
+    Mavericks are tracked separately and can break committee inaction but must still
     meet efficiency standards to enter Global 50.
 
 Usage:
