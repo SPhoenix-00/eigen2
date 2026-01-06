@@ -36,8 +36,15 @@ The --mirror command synchronizes both committee metadata and agent files:
 USAGE:
   python committee.py --verify-only   # Check data split only
   python committee.py --draft         # Phase 1: Select committee from Global50
+  python committee.py --draft --maverick  # Phase 1: Force exactly one maverick in committee
   python committee.py --validate      # Phase 2: Validate on holdout slices
   python committee.py --mirror        # Sync roster, correlation, and agent files
+
+MAVERICK REQUIREMENT:
+The --maverick flag (used with --draft or --draft-deep) enforces exactly one maverick
+agent in the committee. This ensures the committee has a signal generator for --multi mode.
+The optimization process filters all combinations to only consider those with exactly
+one maverick, and refinement preserves this constraint.
 """
 
 import os
@@ -968,7 +975,7 @@ def committee_objective(indices: tuple, entries: list, corr_matrix: np.ndarray) 
 
 # --- Optimization ---
 
-def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
+def optimize_committee(entries: list, corr_matrix: np.ndarray, require_maverick: bool = False) -> dict:
     """
     Find optimal committee using incremental exhaustive search.
 
@@ -977,6 +984,11 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
     2. Exhaustive search for best COMMITTEE_SIZE combination
     3. Expand pool by 1 agent, re-optimize
     4. Stop after COMMITTEE_EARLY_STOP consecutive non-improvements
+
+    Args:
+        entries: List of Global50 entry dicts
+        corr_matrix: Full NxN correlation matrix
+        require_maverick: If True, only consider combinations with at least one maverick
 
     Returns:
         Dict with best committee info
@@ -989,6 +1001,22 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
     valid_entries = [i for i in range(len(entries))
                      if corr_matrix[i, i] == 1.0]  # Valid entries have self-correlation = 1
 
+    # Filter to mavericks if required
+    if require_maverick:
+        valid_mavericks = [i for i in valid_entries if entries[i].get('is_maverick', False)]
+        valid_non_mavericks = [i for i in valid_entries if not entries[i].get('is_maverick', False)]
+        if not valid_mavericks:
+            print(f"❌ No valid maverick agents available for committee selection!")
+            return None
+        if len(valid_entries) < committee_size:
+            print(f"❌ Not enough valid agents ({len(valid_entries)}) for committee of {committee_size}")
+            return None
+        # Check if we can form a committee with exactly one maverick
+        if len(valid_non_mavericks) < committee_size - 1:
+            print(f"❌ Not enough non-maverick agents to form committee with exactly one maverick!")
+            print(f"   Need at least {committee_size - 1} non-mavericks, have {len(valid_non_mavericks)}")
+            return None
+
     if len(valid_entries) < committee_size:
         print(f"❌ Not enough valid agents ({len(valid_entries)}) for committee of {committee_size}")
         return None
@@ -1000,6 +1028,9 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
     print(f"  Initial Pool: top {initial_pool} agents")
     print(f"  Early Stop: {early_stop} consecutive non-improvements")
     print(f"  Valid Agents: {len(valid_entries)}")
+    if require_maverick:
+        valid_mavericks = [i for i in valid_entries if entries[i].get('is_maverick', False)]
+        print(f"  Maverick Requirement: Exactly 1 maverick required ({len(valid_mavericks)} available)")
 
     best_committee = None
     best_objective = float('-inf')
@@ -1025,6 +1056,12 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray) -> dict:
         improved = False
 
         for combo in combinations(pool, committee_size):
+            # Skip if maverick required and combo doesn't have exactly one maverick
+            if require_maverick:
+                maverick_count = sum(1 for i in combo if entries[i].get('is_maverick', False))
+                if maverick_count != 1:
+                    continue
+
             obj, score_sum, avg_corr, max_corr = committee_objective(
                 combo, entries, corr_matrix
             )
@@ -1231,8 +1268,9 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
 
 
 def automatic_correlation_refinement(committee_indices: tuple, entries: list,
-                                      corr_matrix: np.ndarray,
-                                      max_iterations: int = 50) -> tuple:
+                                     corr_matrix: np.ndarray,
+                                     max_iterations: int = 50,
+                                     require_maverick: bool = False) -> tuple:
     """
     Automated refinement: iteratively swap to improve both objective and max_corr.
 
@@ -1248,6 +1286,7 @@ def automatic_correlation_refinement(committee_indices: tuple, entries: list,
         entries: Full list of Global50 entries
         corr_matrix: Full NxN correlation matrix
         max_iterations: Safety limit on number of swap iterations
+        require_maverick: If True, ensure at least one maverick remains after each swap
 
     Returns:
         Final committee indices after all swaps
@@ -1290,6 +1329,10 @@ def automatic_correlation_refinement(committee_indices: tuple, entries: list,
 
         # Build remaining committee (without the dropped agent)
         remaining = [idx for idx in current_indices if idx != drop_idx]
+        
+        # Check maverick counts for require_maverick enforcement
+        dropped_is_maverick = entries[drop_idx].get('is_maverick', False)
+        remaining_maverick_count = sum(1 for idx in remaining if entries[idx].get('is_maverick', False))
 
         # Test all valid candidates
         improving_candidates = []
@@ -1301,6 +1344,14 @@ def automatic_correlation_refinement(committee_indices: tuple, entries: list,
 
             # Create new committee with swap
             new_indices = tuple(sorted(remaining + [candidate_idx]))
+            
+            # Enforce exactly one maverick if required
+            if require_maverick:
+                candidate_is_maverick = entries[candidate_idx].get('is_maverick', False)
+                new_maverick_count = remaining_maverick_count + (1 if candidate_is_maverick else 0)
+                # Must have exactly one maverick after swap
+                if new_maverick_count != 1:
+                    continue
 
             # Calculate metrics for this swap
             new_obj, new_score_sum, new_avg_corr, new_max_corr = committee_objective(
@@ -2499,7 +2550,7 @@ def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
 
 # --- Phase 1: Draft Day ---
 
-def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool = False):
+def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool = False, require_maverick: bool = False):
     """
     Phase 1: Select committee from Global50 using coefficient correlation optimization.
 
@@ -2512,6 +2563,7 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
         stats: Normalization statistics
         holdout_info: Holdout period information
         deep: If True, use automatic deep refinement instead of interactive refinement
+        require_maverick: If True, force at least one maverick agent in the committee
     """
     print("\n" + "="*60)
     print("PHASE 1: DRAFT DAY (Global50 Selection)")
@@ -2531,6 +2583,15 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
         print(f"    {i+1}. {e['run_name']}_{e['agent_id']}{maverick_tag}: "
               f"score={e['gauntlet_score']:.2f}, roi={e.get('roi', 0):.2f}%")
 
+    # Check maverick availability if required
+    if require_maverick:
+        maverick_entries = [i for i, e in enumerate(entries) if e.get('is_maverick', False)]
+        if not maverick_entries:
+            print(f"\n❌ No maverick agents found in Global50!")
+            print(f"   Use fix_global50.py --set-maverick to mark agents as mavericks first.")
+            return None
+        print(f"\n  ✓ Maverick requirement enabled: Exactly 1 maverick required ({len(maverick_entries)} available in Global50)")
+
     # 2. Prepare VALIDATION data for correlation calculation (NOT holdout - prevents data leakage)
     val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
     print(f"\n  Validation tensor shape: {val_tensor.shape}")
@@ -2542,21 +2603,32 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
     )
 
     # 4. Optimize committee selection
-    result = optimize_committee(entries, corr_matrix)
+    result = optimize_committee(entries, corr_matrix, require_maverick=require_maverick)
 
     if result is None:
         print("❌ Optimization failed")
         return None
 
     # 4b. Correlation refinement pass
+    # Pass maverick requirement to refinement functions
     if deep:
         refined_indices = automatic_correlation_refinement(
-            result['committee_indices'], entries, corr_matrix
+            result['committee_indices'], entries, corr_matrix,
+            require_maverick=require_maverick
         )
     else:
+        # Interactive refinement doesn't have maverick protection yet, so verify after
         refined_indices = interactive_correlation_refinement(
             result['committee_indices'], entries, corr_matrix
         )
+    
+    # Verify maverick requirement is still met after refinement
+    if require_maverick:
+        maverick_count = sum(1 for i in refined_indices if entries[i].get('is_maverick', False))
+        if maverick_count != 1:
+            print(f"\n⚠ WARNING: Refinement changed maverick count to {maverick_count} (required: exactly 1)!")
+            print(f"   Reverting to pre-refinement committee to preserve maverick requirement.")
+            refined_indices = result['committee_indices']
 
     # Recalculate metrics after refinement
     final_obj, final_score_sum, final_avg_corr, final_max_corr = committee_objective(
@@ -2651,13 +2723,17 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
     print(f"    Maverick members: {maverick_count}")
     print(f"    Non-maverick members: {len(roster_data['members']) - maverick_count}")
     
-    if maverick_count == 0:
+    if require_maverick and maverick_count != 1:
+        print(f"\n  ⚠ WARNING: Maverick count is {maverick_count} (required: exactly 1)!")
+        print(f"    This should not happen - please report this issue.")
+    elif not require_maverick and maverick_count == 0:
         print(f"\n  ⚠ WARNING: No maverick agents selected in committee!")
         print(f"    --multi mode requires at least one maverick agent.")
         print(f"    Options:")
-        print(f"      1. Use fix_global50.py --set-maverick to mark agents as mavericks in Global50")
-        print(f"      2. Re-run --draft to select a committee with mavericks")
-        print(f"      3. Use committee.py --update-maverick-flags after setting flags in Global50")
+        print(f"      1. Use --draft --maverick to force exactly one maverick")
+        print(f"      2. Use fix_global50.py --set-maverick to mark agents as mavericks in Global50")
+        print(f"      3. Re-run --draft to select a committee with mavericks")
+        print(f"      4. Use committee.py --update-maverick-flags after setting flags in Global50")
     elif maverick_count > Config.MAVERICK_CAP:
         print(f"\n  ⚠ WARNING: {maverick_count} mavericks selected (exceeds cap of {Config.MAVERICK_CAP})")
         print(f"    This may cause issues with Global50 promotion (Highlander Rule)")
@@ -3101,6 +3177,8 @@ if __name__ == "__main__":
                         help='Run Phase 1: Draft committee from Global50')
     parser.add_argument('--draft-deep', action='store_true',
                         help='Run Phase 1 with automatic deep refinement (no manual swaps)')
+    parser.add_argument('--maverick', action='store_true',
+                        help='Force exactly one maverick agent in committee (use with --draft or --draft-deep)')
     parser.add_argument('--validate', action='store_true',
                         help='Run Phase 2: Validate on holdout slices')
     parser.add_argument('--verify-only', action='store_true',
@@ -3126,6 +3204,7 @@ if __name__ == "__main__":
         print("\nOptions:")
         print("  --draft              Run Phase 1: Draft committee from Global50 (interactive refinement)")
         print("  --draft-deep         Run Phase 1 with automatic deep refinement (no manual swaps)")
+        print("  --maverick           Force exactly one maverick agent in committee (use with --draft or --draft-deep)")
         print("  --validate           Run Phase 2: Validate committee on holdout slices")
         print("  --verify-only        Verify data split without running")
         print("  --mirror             Check cloud sync status, download missing files")
@@ -3179,8 +3258,14 @@ if __name__ == "__main__":
         print("\n✓ Verification complete.")
         exit(0)
 
+    # Validate --maverick is used with draft
+    if args.maverick and not (args.draft or args.draft_deep):
+        print("❌ --maverick must be used with --draft or --draft-deep")
+        exit(1)
+
     if args.draft or args.draft_deep:
-        roster = run_draft(manager, loader, stats, holdout_info, deep=args.draft_deep)
+        roster = run_draft(manager, loader, stats, holdout_info, 
+                          deep=args.draft_deep, require_maverick=args.maverick)
 
         # Auto-run validation after draft if requested
         if roster and args.validate:
