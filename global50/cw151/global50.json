@@ -4,6 +4,45 @@
   },
   "entries": [
     {
+      "agent_id": 1,
+      "run_name": "fresh-music-245",
+      "gauntlet_score": 5255.464324188957,
+      "generation": 56,
+      "roi": 5.7410078048706055,
+      "expectancy": 1.4115528540979998,
+      "cv": 1.9874379621866463,
+      "quality_ratio": 0.06489201406328478,
+      "win_ratio": 0.5447513812154696,
+      "total_trades": 9955,
+      "is_maverick": true
+    },
+    {
+      "agent_id": 28,
+      "run_name": "fresh-music-245",
+      "gauntlet_score": 4801.375028449471,
+      "generation": 183,
+      "roi": 5.373092174530029,
+      "expectancy": 1.451198291805048,
+      "cv": 1.889716491041934,
+      "quality_ratio": 0.0581570239647047,
+      "win_ratio": 0.5446706106487517,
+      "total_trades": 9973,
+      "is_maverick": true
+    },
+    {
+      "agent_id": 16,
+      "run_name": "fresh-music-245",
+      "gauntlet_score": 3097.114343397693,
+      "generation": 170,
+      "roi": 5.374239921569824,
+      "expectancy": 1.3952667597887247,
+      "cv": 2.016130419957637,
+      "quality_ratio": 0.07244631747943006,
+      "win_ratio": 0.5344170178607265,
+      "total_trades": 9966,
+      "is_maverick": true
+    },
+    {
       "agent_id": 55,
       "run_name": "pleasant-water-209",
       "gauntlet_score": -20.85588010153098,
@@ -613,48 +652,9 @@
       "win_ratio": 0.7939609236234458,
       "total_trades": 563,
       "is_maverick": false
-    },
-    {
-      "agent_id": 2,
-      "run_name": "zany-pyramid-197",
-      "gauntlet_score": -151.58999527423958,
-      "generation": 4,
-      "roi": 11.973969459533691,
-      "expectancy": 9.127713950682585,
-      "cv": 2.731950507650655,
-      "quality_ratio": 0.3515981735159817,
-      "win_ratio": 0.860730593607306,
-      "total_trades": 438,
-      "is_maverick": false
-    },
-    {
-      "agent_id": 51,
-      "run_name": "vocal-cosmos-191",
-      "gauntlet_score": -156.2222952182551,
-      "generation": 0,
-      "roi": 6.252510070800781,
-      "expectancy": 4.717754364013672,
-      "cv": 6.122880293672267,
-      "quality_ratio": 0.29283489096573206,
-      "win_ratio": 0.6728971962616822,
-      "total_trades": 321,
-      "is_maverick": false
-    },
-    {
-      "agent_id": 65,
-      "run_name": "lively-silence-205",
-      "gauntlet_score": -160.45618403514158,
-      "generation": 0,
-      "roi": 7.600444793701172,
-      "expectancy": 6.545922693632357,
-      "cv": 3.038247492180064,
-      "quality_ratio": 0.2791762013729977,
-      "win_ratio": 0.7231121281464531,
-      "total_trades": 437,
-      "is_maverick": false
     }
   ],
   "capacity": 50,
   "version": "1.0",
-  "last_updated": "2026-01-02T05:33:56.875954Z"
+  "last_updated": "2026-01-06T07:20:44.275953Z"
 }
