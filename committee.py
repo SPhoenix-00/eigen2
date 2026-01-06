@@ -512,6 +512,45 @@ class CommitteeManager:
 
 # --- Helper Functions ---
 
+def sanitize_date_for_filename(date_value) -> str:
+    """
+    Sanitize a date value for use in filenames.
+    
+    Converts dates to a safe filename format by:
+    - Converting to string if needed
+    - Replacing slashes with dashes
+    - Replacing spaces with underscores
+    - Removing any other invalid filename characters
+    
+    Args:
+        date_value: Date value (string, datetime, Timestamp, etc.)
+        
+    Returns:
+        Sanitized date string safe for filenames
+    """
+    import pandas as pd
+    from datetime import datetime
+    
+    # Convert to string representation
+    if isinstance(date_value, str):
+        date_str = date_value
+    elif isinstance(date_value, (pd.Timestamp, datetime)):
+        # Format as DD-MM-YY for consistency
+        date_str = date_value.strftime('%d-%m-%y')
+    else:
+        # Try to convert to string
+        date_str = str(date_value)
+    
+    # Replace slashes with dashes (common date format issue)
+    date_str = date_str.replace('/', '-')
+    # Replace spaces with underscores
+    date_str = date_str.replace(' ', '_')
+    # Remove any colons (from datetime strings)
+    date_str = date_str.replace(':', '-')
+    
+    return date_str
+
+
 def convert_numpy_types(obj):
     """
     Recursively convert numpy types to native Python types for JSON serialization.
@@ -2138,7 +2177,10 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         # Save closed trades to CSV and upload to cloud
         closed_trades = metrics.get('closed_trades', [])
         if closed_trades:
-            csv_filename = f"committee_slice_{s}_{slice_type}_{start_date}_to_{end_date}.csv"
+            # Sanitize dates for filename (replace slashes with dashes)
+            start_date_safe = sanitize_date_for_filename(start_date)
+            end_date_safe = sanitize_date_for_filename(end_date)
+            csv_filename = f"committee_slice_{s}_{slice_type}_{start_date_safe}_to_{end_date_safe}.csv"
             csv_path = manager.local_committee_dir / csv_filename
 
             # Write CSV with explicit column ordering for readability
@@ -3101,8 +3143,10 @@ def run_simulation(manager: CommitteeManager, loader, stats, context_window_days
     # Save trades to CSV
     closed_trades = metrics.get('closed_trades', [])
     if closed_trades:
-        # Generate unique filename with simulation date range (trading period)
-        csv_filename = f"simulation_{actual_first_display.replace('-', '')}_to_{actual_last_trading_display.replace('-', '')}.csv"
+        # Sanitize dates for filename (ensure no slashes or invalid characters)
+        first_date_safe = sanitize_date_for_filename(actual_first_display).replace('-', '')
+        last_date_safe = sanitize_date_for_filename(actual_last_trading_display).replace('-', '')
+        csv_filename = f"simulation_{first_date_safe}_to_{last_date_safe}.csv"
         csv_path = manager.local_committee_dir / csv_filename
 
         import csv
