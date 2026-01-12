@@ -2889,20 +2889,46 @@ class ERLTrainer:
                 # Last resort: keep original order (slices are already chronological)
                 pass
         
+        # Track cumulative capital and PnL for accurate equity curve
+        # Use actual coefficient and prices (same as raw PnL calculation)
+        cumulative_investment = 0.0
+        cumulative_pnl = 0.0
+        virtual_equity = 1.0
+        peak_equity = 1.0
+        max_drawdown = 0.0
+        
         for trade in all_slices_trades:
-            # Assume 10% position size for calculation safety
-            # (Mavericks trade frequently, so we simulate turnover)
-            pct_change = trade['gain_pct'] / 100.0
+            # Use actual coefficient and prices (same as raw_pnl calculation)
+            coefficient = trade.get('coefficient', 0.0)
+            entry_price = trade.get('entry_price', 0.0)
+            exit_price = trade.get('exit_price', 0.0)
             
-            # Impact on equity (simplified model)
-            virtual_equity *= (1.0 + (pct_change * 0.1))
-            
-            if virtual_equity > peak_equity:
-                peak_equity = virtual_equity
-            
-            dd = (peak_equity - virtual_equity) / peak_equity
-            if dd > max_drawdown:
-                max_drawdown = dd
+            # Calculate actual investment and PnL (matching raw_pnl calculation)
+            shares = int(coefficient) if coefficient > 0 else 0
+            if shares > 0 and entry_price > 0 and exit_price > 0:
+                investment = entry_price * shares
+                pnl = (exit_price - entry_price) * shares
+                
+                cumulative_investment += investment
+                cumulative_pnl += pnl
+                
+                # Update virtual equity based on cumulative ROI
+                # This represents the portfolio value as a multiple of starting capital
+                if cumulative_investment > 0:
+                    # ROI as decimal (e.g., 0.10 for 10%)
+                    roi_decimal = cumulative_pnl / cumulative_investment
+                    # Virtual equity = 1.0 + cumulative ROI
+                    virtual_equity = 1.0 + roi_decimal
+                else:
+                    virtual_equity = 1.0
+                
+                # Track peak equity and drawdown
+                if virtual_equity > peak_equity:
+                    peak_equity = virtual_equity
+                
+                dd = (peak_equity - virtual_equity) / peak_equity if peak_equity > 0 else 0.0
+                if dd > max_drawdown:
+                    max_drawdown = dd
 
         # Total ROI over the "Holographic" period
         holographic_roi = (virtual_equity - 1.0) * 100.0
