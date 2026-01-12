@@ -2712,9 +2712,9 @@ class ERLTrainer:
 
         # 1. Handle Inactivity
         if total_trades == 0:
-            # MAVERICK MODE: Massive penalty for inaction - forces market engagement
+            # MAVERICK MODE: Moderate penalty for inaction - encourages market engagement without forcing suicide
             if self.maverick_mode:
-                return -5000.0 + stats.get('max_coefficient_during_episode', 0)
+                return -50.0 + stats.get('max_coefficient_during_episode', 0)
 
             # In consistency mode during stabilization/gauntlet, use soft penalty
             # (tactical no-trade in a slice is acceptable, not a ghost indicator)
@@ -2769,8 +2769,8 @@ class ERLTrainer:
                 # Base Score: ROI^1.5 * log10(Peak Capital + 10)
                 base_score = roi_score * volume_scalar
 
-                # Boost: (1 + WR^4) - massive boost for high win rates
-                win_rate_boost = (1.0 + (win_rate ** 4))
+                # Boost: (1 + WR^2) - moderate boost for high win rates
+                win_rate_boost = (1.0 + (win_rate ** 2))
                 
                 fitness = base_score * win_rate_boost
             else:
@@ -2825,6 +2825,86 @@ class ERLTrainer:
             fitness = roi_score * volume_scalar * 10.0
 
         return float(fitness)
+
+    def calculate_holographic_fitness(self, all_slices_trades: List[Dict]) -> float:
+        """
+        HOLOGRAPHIC SCORING (The Maverick Fix):
+        Instead of averaging the scores of independent slices, we combine ALL trades 
+        from all slices into a single 'Virtual Equity Curve'.
+        
+        This forces the agent to internalize that a -50% drawdown in Slice B 
+        mathematically destroys the +100% gain in Slice A.
+        
+        Args:
+            all_slices_trades: List of all closed trade dictionaries from all validation slices
+        
+        Returns:
+            Holographic fitness score (float)
+        """
+        if not all_slices_trades:
+            # If maverick mode, moderate penalty for inaction (consistent with triad_fitness)
+            return -50.0 if self.maverick_mode else -10.0
+
+        # 1. Aggregate Stats
+        total_trades = len(all_slices_trades)
+        wins = [t['gain_pct'] for t in all_slices_trades if t['gain_pct'] > 0]
+        losses = [t['gain_pct'] for t in all_slices_trades if t['gain_pct'] <= 0]
+        
+        win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
+        
+        # 2. Calculate Compounded ROI (The Reality Check)
+        # We simulate a portfolio that runs through Slice 1, then Slice 2, etc.
+        # This penalizes volatility naturally.
+        virtual_equity = 1.0
+        peak_equity = 1.0
+        max_drawdown = 0.0
+        
+        # Sort trades by entry date if possible, otherwise random shuffle approximates mixing regimes
+        # For true holographic scoring, we simply iterate through the aggregated list
+        for trade in all_slices_trades:
+            # Assume 10% position size for calculation safety
+            # (Mavericks trade frequently, so we simulate turnover)
+            pct_change = trade['gain_pct'] / 100.0
+            
+            # Impact on equity (simplified model)
+            virtual_equity *= (1.0 + (pct_change * 0.1))
+            
+            if virtual_equity > peak_equity:
+                peak_equity = virtual_equity
+            
+            dd = (peak_equity - virtual_equity) / peak_equity
+            if dd > max_drawdown:
+                max_drawdown = dd
+
+        # Total ROI over the "Holographic" period
+        holographic_roi = (virtual_equity - 1.0) * 100.0
+        
+        # 3. Apply Maverick Scoring to the HOLOGRAPHIC result
+        if self.maverick_mode:
+            # ROI Expansion
+            if holographic_roi >= 0:
+                roi_score = (holographic_roi ** 1.5)
+            else:
+                roi_score = -(abs(holographic_roi) ** 1.5)
+            
+            # Win Rate Boost (Applied to the aggregate)
+            # We strictly enforce WR > 40% for Mavericks to avoid "Lotto" agents
+            if win_rate < 0.40:
+                roi_score = roi_score * 0.1  # Massive penalty for low WR
+                
+            # Use win_rate ** 2 (consistent with triad_fitness fix)
+            win_rate_boost = (1.0 + (win_rate ** 2))
+            
+            fitness = roi_score * win_rate_boost
+            
+            # Penalize Max Drawdown heavily (This is the weave!)
+            # If the combined slices resulted in >30% DD, crush the score.
+            if max_drawdown > 0.30:
+                fitness = fitness * 0.5
+                
+            return float(fitness)
+            
+        return float(holographic_roi)
 
     def _calculate_pessimistic_fitness(self, slice_fitness_scores: List[float]) -> float:
         """
@@ -2957,6 +3037,9 @@ class ERLTrainer:
             # Evaluate agent on multiple random training slices
             slice_fitness_scores = []
             slice_episode_stats = []
+            
+            # NEW: Collector for Holographic Scoring (Mavericks only)
+            all_slices_closed_trades = []
 
             for _ in range(num_episodes):
                 # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
@@ -2983,14 +3066,22 @@ class ERLTrainer:
                     transition_collector=transition_collector  # Collect transitions in local mode
                 )
 
+                # Collect trades for Holographic view (Mavericks only)
+                if self.maverick_mode and 'closed_trades' in episode_info and episode_info['closed_trades']:
+                    all_slices_closed_trades.extend(episode_info['closed_trades'])
+
                 # Calculate Structural Fitness for Evolution
                 triad_fitness = self.calculate_triad_fitness(episode_info)
 
                 slice_fitness_scores.append(triad_fitness)
                 slice_episode_stats.append(episode_info)
 
-            # Calculate fitness using appropriate aggregator
-            if self.multi_mode:
+            # --- SCORING SELECTION ---
+            if self.maverick_mode:
+                # USE HOLOGRAPHIC FITNESS FOR MAVERICKS
+                # This weaves the slices together into one "career"
+                final_fitness = self.calculate_holographic_fitness(all_slices_closed_trades)
+            elif self.multi_mode:
                 final_fitness = self._calculate_penalized_median_fitness(slice_fitness_scores)
             else:
                 final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
@@ -3178,8 +3269,17 @@ class ERLTrainer:
                 slice_fitness = [f for f, _ in agent_slices]
                 slice_stats = [info for _, info in agent_slices]
 
-                # Calculate fitness using appropriate aggregator
-                if self.multi_mode:
+                # --- SCORING SELECTION ---
+                if self.maverick_mode:
+                    # USE HOLOGRAPHIC FITNESS FOR MAVERICKS
+                    # Collect all closed trades from all slices for this agent
+                    all_slices_closed_trades = []
+                    for episode_info in slice_stats:
+                        if 'closed_trades' in episode_info and episode_info['closed_trades']:
+                            all_slices_closed_trades.extend(episode_info['closed_trades'])
+                    # This weaves the slices together into one "career"
+                    final_fitness = self.calculate_holographic_fitness(all_slices_closed_trades)
+                elif self.multi_mode:
                     final_fitness = self._calculate_penalized_median_fitness(slice_fitness)
                 else:
                     final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
