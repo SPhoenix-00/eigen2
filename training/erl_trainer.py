@@ -2847,6 +2847,12 @@ class ERLTrainer:
 
         # 1. Aggregate Stats
         total_trades = len(all_slices_trades)
+        
+        # Require minimum trade count for statistical significance
+        # An agent with too few trades could score well by luck alone
+        if total_trades < 50:
+            return -100.0  # Heavy penalty for insufficient sample size
+        
         wins = [t['gain_pct'] for t in all_slices_trades if t['gain_pct'] > 0]
         losses = [t['gain_pct'] for t in all_slices_trades if t['gain_pct'] <= 0]
         
