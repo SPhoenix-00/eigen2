@@ -2889,35 +2889,93 @@ class ERLTrainer:
                 # Last resort: keep original order (slices are already chronological)
                 pass
         
-        # Track cumulative capital and PnL for accurate equity curve
-        # Use actual coefficient and prices (same as raw PnL calculation)
-        cumulative_investment = 0.0
-        cumulative_pnl = 0.0
+        # Day-by-day simulation to handle overlapping positions from different slices
+        # This properly accounts for concurrent capital requirements
+        from collections import defaultdict
+        from datetime import datetime, timedelta
+        
+        # Group trades by entry_date and exit_date for day-by-day processing
+        trades_by_entry_date = defaultdict(list)
+        trades_by_exit_date = defaultdict(list)
+        
+        for trade in all_slices_trades:
+            entry_date_str = trade.get('entry_date', '')
+            exit_date_str = trade.get('exit_date', '') or trade.get('day', '')
+            
+            # Parse dates if available
+            try:
+                if entry_date_str:
+                    entry_date = datetime.strptime(entry_date_str, '%Y-%m-%d')
+                    trades_by_entry_date[entry_date].append(trade)
+                if exit_date_str:
+                    exit_date = datetime.strptime(exit_date_str, '%Y-%m-%d')
+                    trades_by_exit_date[exit_date].append(trade)
+            except (ValueError, TypeError):
+                # If date parsing fails, skip this trade for day-by-day simulation
+                # Fall back to sequential processing below
+                pass
+        
+        # Track open positions and day-by-day equity
+        open_positions = {}  # stock_id -> {'entry_price': float, 'shares': int, 'entry_date': datetime}
         virtual_equity = 1.0
         peak_equity = 1.0
         max_drawdown = 0.0
+        cumulative_pnl = 0.0
+        peak_capital_employed = 0.0
         
-        for trade in all_slices_trades:
-            # Use actual coefficient and prices (same as raw_pnl calculation)
-            coefficient = trade.get('coefficient', 0.0)
-            entry_price = trade.get('entry_price', 0.0)
-            exit_price = trade.get('exit_price', 0.0)
-            
-            # Calculate actual investment and PnL (matching raw_pnl calculation)
-            shares = int(coefficient) if coefficient > 0 else 0
-            if shares > 0 and entry_price > 0 and exit_price > 0:
-                investment = entry_price * shares
-                pnl = (exit_price - entry_price) * shares
+        # Get all unique dates (entry and exit dates combined)
+        all_dates = set(trades_by_entry_date.keys()) | set(trades_by_exit_date.keys())
+        
+        if all_dates:
+            # Process day-by-day in chronological order
+            for current_date in sorted(all_dates):
+                # Process exits first (close positions before opening new ones)
+                if current_date in trades_by_exit_date:
+                    for trade in trades_by_exit_date[current_date]:
+                        stock_id = trade.get('stock_id')
+                        if stock_id is not None and stock_id in open_positions:
+                            position = open_positions[stock_id]
+                            exit_price = trade.get('exit_price', 0.0)
+                            entry_price = position['entry_price']
+                            shares = position['shares']
+                            
+                            if exit_price > 0 and entry_price > 0 and shares > 0:
+                                # Calculate PnL for this position
+                                pnl = (exit_price - entry_price) * shares
+                                cumulative_pnl += pnl
+                                
+                                # Release capital
+                                del open_positions[stock_id]
                 
-                cumulative_investment += investment
-                cumulative_pnl += pnl
+                # Process entries (open new positions)
+                if current_date in trades_by_entry_date:
+                    for trade in trades_by_entry_date[current_date]:
+                        coefficient = trade.get('coefficient', 0.0)
+                        entry_price = trade.get('entry_price', 0.0)
+                        stock_id = trade.get('stock_id')
+                        
+                        shares = int(coefficient) if coefficient > 0 else 0
+                        if shares > 0 and entry_price > 0 and stock_id is not None:
+                            # Track open position
+                            open_positions[stock_id] = {
+                                'entry_price': entry_price,
+                                'shares': shares,
+                                'entry_date': current_date
+                            }
                 
-                # Update virtual equity based on cumulative ROI
-                # This represents the portfolio value as a multiple of starting capital
-                if cumulative_investment > 0:
-                    # ROI as decimal (e.g., 0.10 for 10%)
-                    roi_decimal = cumulative_pnl / cumulative_investment
-                    # Virtual equity = 1.0 + cumulative ROI
+                # Calculate current capital employed (sum of all open positions)
+                current_capital_employed = sum(
+                    pos['entry_price'] * pos['shares']
+                    for pos in open_positions.values()
+                )
+                
+                if current_capital_employed > peak_capital_employed:
+                    peak_capital_employed = current_capital_employed
+                
+                # Update virtual equity based on cumulative PnL and peak capital
+                # This represents portfolio value accounting for concurrent positions
+                if peak_capital_employed > 0:
+                    roi_decimal = cumulative_pnl / peak_capital_employed
                     virtual_equity = 1.0 + roi_decimal
                 else:
                     virtual_equity = 1.0
@@ -2929,6 +2987,37 @@ class ERLTrainer:
                 dd = (peak_equity - virtual_equity) / peak_equity if peak_equity > 0 else 0.0
                 if dd > max_drawdown:
                     max_drawdown = dd
+        else:
+            # Fallback: If date parsing failed for all trades, use sequential model
+            # This handles cases where dates are missing or in unexpected format
+            cumulative_investment = 0.0
+            cumulative_pnl = 0.0
+            
+            for trade in all_slices_trades:
+                coefficient = trade.get('coefficient', 0.0)
+                entry_price = trade.get('entry_price', 0.0)
+                exit_price = trade.get('exit_price', 0.0)
+                
+                shares = int(coefficient) if coefficient > 0 else 0
+                if shares > 0 and entry_price > 0 and exit_price > 0:
+                    investment = entry_price * shares
+                    pnl = (exit_price - entry_price) * shares
+                    
+                    cumulative_investment += investment
+                    cumulative_pnl += pnl
+                    
+                    if cumulative_investment > 0:
+                        roi_decimal = cumulative_pnl / cumulative_investment
+                        virtual_equity = 1.0 + roi_decimal
+                    else:
+                        virtual_equity = 1.0
+                    
+                    if virtual_equity > peak_equity:
+                        peak_equity = virtual_equity
+                    
+                    dd = (peak_equity - virtual_equity) / peak_equity if peak_equity > 0 else 0.0
+                    if dd > max_drawdown:
+                        max_drawdown = dd
 
         # Total ROI over the "Holographic" period
         holographic_roi = (virtual_equity - 1.0) * 100.0
@@ -2942,11 +3031,8 @@ class ERLTrainer:
                 roi_score = -(abs(holographic_roi) ** 1.5)
             
             # Win Rate Boost (Applied to the aggregate)
-            # We strictly enforce WR > 40% for Mavericks to avoid "Lotto" agents
-            if win_rate < 0.40:
-                roi_score = roi_score * 0.1  # Massive penalty for low WR
-                
             # Use win_rate ** 2 (consistent with triad_fitness fix)
+            # No minimum WR threshold - training will naturally select for winners
             win_rate_boost = (1.0 + (win_rate ** 2))
             
             fitness = roi_score * win_rate_boost
