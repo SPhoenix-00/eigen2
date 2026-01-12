@@ -3037,10 +3037,13 @@ class ERLTrainer:
             
             fitness = roi_score * win_rate_boost
             
-            # Penalize Max Drawdown heavily (This is the weave!)
-            # If the combined slices resulted in >30% DD, crush the score.
+            # Graduated drawdown penalty (scales with severity)
+            # Penalizes high drawdowns progressively: 30% DD = 0.5x, 50% DD = 0.1x
             if max_drawdown > 0.30:
-                fitness = fitness * 0.5
+                # Scale penalty: 30% DD = 0.5x, 50% DD = 0.1x
+                # Linear interpolation: penalty decreases from 0.5 to 0.1 as DD increases from 30% to 50%
+                dd_penalty = max(0.1, 0.5 - (max_drawdown - 0.30) * 2.0)
+                fitness = fitness * dd_penalty
                 
             return float(fitness)
             
