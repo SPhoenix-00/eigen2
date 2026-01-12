@@ -2859,8 +2859,36 @@ class ERLTrainer:
         peak_equity = 1.0
         max_drawdown = 0.0
         
-        # Sort trades by entry date if possible, otherwise random shuffle approximates mixing regimes
-        # For true holographic scoring, we simply iterate through the aggregated list
+        # Sort trades by entry date for accurate chronological equity curve
+        from datetime import datetime
+        try:
+            def get_sort_key(t):
+                entry_date = t.get('entry_date', '')
+                if isinstance(entry_date, str) and entry_date:
+                    try:
+                        return datetime.strptime(entry_date, '%Y-%m-%d')
+                    except ValueError:
+                        return datetime.min
+                return datetime.min
+            
+            all_slices_trades.sort(key=get_sort_key)
+        except (TypeError, KeyError):
+            # Fallback: if entry_date not available or unparseable, use exit_date
+            try:
+                def get_sort_key_exit(t):
+                    exit_date = t.get('exit_date', '') or t.get('day', '')
+                    if isinstance(exit_date, str) and exit_date:
+                        try:
+                            return datetime.strptime(exit_date, '%Y-%m-%d')
+                        except ValueError:
+                            return datetime.min
+                    return datetime.min
+                
+                all_slices_trades.sort(key=get_sort_key_exit)
+            except (TypeError, KeyError, ValueError):
+                # Last resort: keep original order (slices are already chronological)
+                pass
+        
         for trade in all_slices_trades:
             # Assume 10% position size for calculation safety
             # (Mavericks trade frequently, so we simulate turnover)
