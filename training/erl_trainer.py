@@ -2828,228 +2828,98 @@ class ERLTrainer:
 
     def calculate_holographic_fitness(self, all_slices_trades: List[Dict]) -> float:
         """
-        HOLOGRAPHIC SCORING (The Maverick Fix):
-        Instead of averaging the scores of independent slices, we combine ALL trades 
-        from all slices into a single 'Virtual Equity Curve'.
-        
-        This forces the agent to internalize that a -50% drawdown in Slice B 
-        mathematically destroys the +100% gain in Slice A.
-        
-        Args:
-            all_slices_trades: List of all closed trade dictionaries from all validation slices
-        
-        Returns:
-            Holographic fitness score (float)
+        HOLOGRAPHIC SCORING:
+        Stitches trades from all slices into a single 'Virtual Equity Curve'
+        to penalize volatility (Drawdown) effectively.
         """
+        # 1. Safety Checks
         if not all_slices_trades:
-            # If maverick mode, moderate penalty for inaction (consistent with triad_fitness)
-            return -50.0 if self.maverick_mode else -10.0
-
-        # 1. Aggregate Stats
+            # Maverick penalty for inaction (forces them to trade)
+            return -5000.0 if self.maverick_mode else -10.0
+            
         total_trades = len(all_slices_trades)
         
-        # Require minimum trade count for statistical significance
-        # An agent with too few trades could score well by luck alone
-        if total_trades < 50:
-            return -100.0  # Heavy penalty for insufficient sample size
-        
-        wins = [t['gain_pct'] for t in all_slices_trades if t['gain_pct'] > 0]
-        losses = [t['gain_pct'] for t in all_slices_trades if t['gain_pct'] <= 0]
-        
-        win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
-        
-        # 2. Calculate Compounded ROI (The Reality Check)
-        # We simulate a portfolio that runs through Slice 1, then Slice 2, etc.
-        # This penalizes volatility naturally.
-        virtual_equity = 1.0
-        peak_equity = 1.0
-        max_drawdown = 0.0
-        
-        # Sort trades by entry date for accurate chronological equity curve
+        # 2. Sort trades chronologically (Crucial for correct Drawdown calc)
+        # We try to sort by entry_date to simulate the real timeline
         from datetime import datetime
         try:
             def get_sort_key(t):
-                entry_date = t.get('entry_date', '')
-                if isinstance(entry_date, str) and entry_date:
+                d_str = t.get('entry_date') or t.get('day') or t.get('exit_date')
+                if isinstance(d_str, str) and d_str:
                     try:
-                        return datetime.strptime(entry_date, '%Y-%m-%d')
+                        return datetime.strptime(d_str, '%Y-%m-%d')
                     except ValueError:
-                        return datetime.min
+                        pass
                 return datetime.min
-            
             all_slices_trades.sort(key=get_sort_key)
-        except (TypeError, KeyError):
-            # Fallback: if entry_date not available or unparseable, use exit_date
-            try:
-                def get_sort_key_exit(t):
-                    exit_date = t.get('exit_date', '') or t.get('day', '')
-                    if isinstance(exit_date, str) and exit_date:
-                        try:
-                            return datetime.strptime(exit_date, '%Y-%m-%d')
-                        except ValueError:
-                            return datetime.min
-                    return datetime.min
-                
-                all_slices_trades.sort(key=get_sort_key_exit)
-            except (TypeError, KeyError, ValueError):
-                # Last resort: keep original order (slices are already chronological)
-                pass
-        
-        # Day-by-day simulation to handle overlapping positions from different slices
-        # This properly accounts for concurrent capital requirements
-        from collections import defaultdict
-        from datetime import datetime, timedelta
-        
-        # Group trades by entry_date and exit_date for day-by-day processing
-        trades_by_entry_date = defaultdict(list)
-        trades_by_exit_date = defaultdict(list)
-        
-        for trade in all_slices_trades:
-            entry_date_str = trade.get('entry_date', '')
-            exit_date_str = trade.get('exit_date', '') or trade.get('day', '')
+        except Exception:
+            pass # Fallback to list order if dates missing
             
-            # Parse dates if available
-            try:
-                if entry_date_str:
-                    entry_date = datetime.strptime(entry_date_str, '%Y-%m-%d')
-                    trades_by_entry_date[entry_date].append(trade)
-                if exit_date_str:
-                    exit_date = datetime.strptime(exit_date_str, '%Y-%m-%d')
-                    trades_by_exit_date[exit_date].append(trade)
-            except (ValueError, TypeError):
-                # If date parsing fails, skip this trade for day-by-day simulation
-                # Fall back to sequential processing below
-                pass
-        
-        # Track open positions and day-by-day equity
-        open_positions = {}  # stock_id -> {'entry_price': float, 'shares': int, 'entry_date': datetime}
+        # 3. Calculate Virtual Equity Curve & Stats
         virtual_equity = 1.0
         peak_equity = 1.0
         max_drawdown = 0.0
-        cumulative_pnl = 0.0
-        peak_capital_employed = 0.0
         
-        # Get all unique dates (entry and exit dates combined)
-        all_dates = set(trades_by_entry_date.keys()) | set(trades_by_exit_date.keys())
+        wins = 0
         
-        if all_dates:
-            # Process day-by-day in chronological order
-            for current_date in sorted(all_dates):
-                # Process exits first (close positions before opening new ones)
-                if current_date in trades_by_exit_date:
-                    for trade in trades_by_exit_date[current_date]:
-                        stock_id = trade.get('stock_id')
-                        if stock_id is not None and stock_id in open_positions:
-                            position = open_positions[stock_id]
-                            exit_price = trade.get('exit_price', 0.0)
-                            entry_price = position['entry_price']
-                            shares = position['shares']
-                            
-                            if exit_price > 0 and entry_price > 0 and shares > 0:
-                                # Calculate PnL for this position
-                                pnl = (exit_price - entry_price) * shares
-                                cumulative_pnl += pnl
-                                
-                                # Release capital
-                                del open_positions[stock_id]
+        
+        for trade in all_slices_trades:
+            # Respect your logic: 0.9 coeff = 0 shares = Agent opted out
+            # We only score trades that actually happened (shares > 0)
+            shares = int(trade.get('coefficient', 0))
+            if shares == 0:
+                continue
+
+            # Calculate raw PnL for this specific trade
+            entry_price = trade.get('entry_price', 0.0)
+            exit_price = trade.get('exit_price', 0.0)
+            
+            if entry_price > 0:
+                raw_roi = (exit_price - entry_price) / entry_price
                 
-                # Process entries (open new positions)
-                if current_date in trades_by_entry_date:
-                    for trade in trades_by_entry_date[current_date]:
-                        coefficient = trade.get('coefficient', 0.0)
-                        entry_price = trade.get('entry_price', 0.0)
-                        stock_id = trade.get('stock_id')
-                        
-                        shares = int(coefficient) if coefficient > 0 else 0
-                        if shares > 0 and entry_price > 0 and stock_id is not None:
-                            # Track open position
-                            open_positions[stock_id] = {
-                                'entry_price': entry_price,
-                                'shares': shares,
-                                'entry_date': current_date
-                            }
+                # Update Virtual Equity
+                # We assume a fixed fractional bet size (e.g., 10% of equity per trade)
+                # to normalize the impact regardless of the raw share count
+                virtual_equity *= (1.0 + (raw_roi * 0.1))
                 
-                # Calculate current capital employed (sum of all open positions)
-                current_capital_employed = sum(
-                    pos['entry_price'] * pos['shares']
-                    for pos in open_positions.values()
-                )
-                
-                if current_capital_employed > peak_capital_employed:
-                    peak_capital_employed = current_capital_employed
-                
-                # Update virtual equity based on cumulative PnL and peak capital
-                # This represents portfolio value accounting for concurrent positions
-                if peak_capital_employed > 0:
-                    roi_decimal = cumulative_pnl / peak_capital_employed
-                    virtual_equity = 1.0 + roi_decimal
-                else:
-                    virtual_equity = 1.0
-                
-                # Track peak equity and drawdown
+                # Update High Water Mark
                 if virtual_equity > peak_equity:
                     peak_equity = virtual_equity
                 
-                dd = (peak_equity - virtual_equity) / peak_equity if peak_equity > 0 else 0.0
-                if dd > max_drawdown:
-                    max_drawdown = dd
-        else:
-            # Fallback: If date parsing failed for all trades, use sequential model
-            # This handles cases where dates are missing or in unexpected format
-            cumulative_investment = 0.0
-            cumulative_pnl = 0.0
-            
-            for trade in all_slices_trades:
-                coefficient = trade.get('coefficient', 0.0)
-                entry_price = trade.get('entry_price', 0.0)
-                exit_price = trade.get('exit_price', 0.0)
-                
-                shares = int(coefficient) if coefficient > 0 else 0
-                if shares > 0 and entry_price > 0 and exit_price > 0:
-                    investment = entry_price * shares
-                    pnl = (exit_price - entry_price) * shares
+                # Calculate Drawdown
+                current_dd = (peak_equity - virtual_equity) / peak_equity
+                if current_dd > max_drawdown:
+                    max_drawdown = current_dd
                     
-                    cumulative_investment += investment
-                    cumulative_pnl += pnl
-                    
-                    if cumulative_investment > 0:
-                        roi_decimal = cumulative_pnl / cumulative_investment
-                        virtual_equity = 1.0 + roi_decimal
-                    else:
-                        virtual_equity = 1.0
-                    
-                    if virtual_equity > peak_equity:
-                        peak_equity = virtual_equity
-                    
-                    dd = (peak_equity - virtual_equity) / peak_equity if peak_equity > 0 else 0.0
-                    if dd > max_drawdown:
-                        max_drawdown = dd
+                if raw_roi > 0:
+                    wins += 1
 
-        # Total ROI over the "Holographic" period
+        # 4. Calculate Final Metrics
         holographic_roi = (virtual_equity - 1.0) * 100.0
+        win_rate = wins / total_trades if total_trades > 0 else 0.0
         
-        # 3. Apply Maverick Scoring to the HOLOGRAPHIC result
+        # 5. Maverick Scoring
         if self.maverick_mode:
-            # ROI Expansion
+            # Base Score: ROI^1.5 (Aggressive reward for high returns)
+            # Preserve sign
             if holographic_roi >= 0:
                 roi_score = (holographic_roi ** 1.5)
             else:
                 roi_score = -(abs(holographic_roi) ** 1.5)
             
-            # Win Rate Boost (Applied to the aggregate)
-            # Use win_rate ** 2 (consistent with triad_fitness fix)
-            # No minimum WR threshold - training will naturally select for winners
+            # Win Rate Boost: (1 + WR^2)
+            # We use ^2 instead of ^4 to avoid over-rewarding lucky streaks
             win_rate_boost = (1.0 + (win_rate ** 2))
             
             fitness = roi_score * win_rate_boost
             
-            # Graduated drawdown penalty (scales with severity)
-            # Penalizes high drawdowns progressively: 30% DD = 0.5x, 50% DD = 0.1x
-            if max_drawdown > 0.30:
-                # Scale penalty: 30% DD = 0.5x, 50% DD = 0.1x
-                # Linear interpolation: penalty decreases from 0.5 to 0.1 as DD increases from 30% to 50%
-                dd_penalty = max(0.1, 0.5 - (max_drawdown - 0.30) * 2.0)
-                fitness = fitness * dd_penalty
+            # --- THE DRAWDOWN PENALTY ---
+            # This is the proxy for the Gauntlet's StdDev penalty.
+            if max_drawdown > 0.10:
+                # Penalty starts at 10% DD.
+                # Formula: 1.0 - (Excess_DD * 2.5)
+                penalty_factor = max(0.1, 1.0 - (max_drawdown - 0.10) * 2.5)
+                fitness *= penalty_factor
                 
             return float(fitness)
             
