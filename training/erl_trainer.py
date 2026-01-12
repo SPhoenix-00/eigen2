@@ -4212,12 +4212,18 @@ class ERLTrainer:
         # Extract fitness scores from all 10 slices
         fitness_scores = [result['fitness'] for result in slice_results]
 
-        # Weighted aggregation: emphasize worst-case performance to reward consistency
-        # 60% weight on worst slice, 40% weight on average
-        # This forces agents to raise their "floor" rather than just their "ceiling"
-        mean_score = np.mean(fitness_scores)
-        min_score = np.min(fitness_scores)
-        validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
+        # --- SCORING SELECTION ---
+        if self.maverick_mode:
+            # USE HOLOGRAPHIC FITNESS FOR MAVERICKS
+            # This weaves the slices together into one "career" (consistent with training)
+            validation_fitness = self.calculate_holographic_fitness(all_closed_trades)
+        else:
+            # Weighted aggregation: emphasize worst-case performance to reward consistency
+            # 60% weight on worst slice, 40% weight on average
+            # This forces agents to raise their "floor" rather than just their "ceiling"
+            mean_score = np.mean(fitness_scores)
+            min_score = np.min(fitness_scores)
+            validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
 
         # Select one sample trade (first trade from all validation slices, if any)
         sample_trade = all_closed_trades[0] if all_closed_trades else None
