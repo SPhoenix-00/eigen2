@@ -584,12 +584,56 @@ class AgentEvaluator:
         if len(agent_files) == 0:
             return []
 
+        # Load current Global 50 state (always, not just for mavericks)
+        if self.global_hof.enabled:
+            self.global_hof._download_global_ledger()
+            self.global_hof._load_local_ledger()
+            self.global_hof._update_entry_threshold()
+
+        # For --agent-dir, we need to apply normal promotion guidelines even when not full.
+        # When Global 50 is not full, _update_entry_threshold sets thresholds to -inf,
+        # which would accept any agent. Instead, we compute thresholds from the existing
+        # population to maintain quality standards.
+        #
+        # We define a helper function to recompute thresholds after each promotion,
+        # since check_and_promote internally calls _update_entry_threshold which resets to -inf.
+        def recompute_thresholds_from_population():
+            """Recompute thresholds from existing population (used during --agent-dir)."""
+            if len(self.global_hof.entries) == 0:
+                return  # No entries, can't compute thresholds
+            if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
+                return  # Full, normal thresholds apply
+
+            gauntlet_scores = [e.gauntlet_score for e in self.global_hof.entries]
+            roi_values = [e.roi for e in self.global_hof.entries]
+            expectancy_values = [e.expectancy for e in self.global_hof.entries]
+            cv_values = [e.cv for e in self.global_hof.entries]
+
+            # Override the -inf/+inf thresholds with actual population statistics
+            self.global_hof.entry_threshold = min(gauntlet_scores)
+            self.global_hof.roi_threshold = min(roi_values)
+            self.global_hof.expectancy_threshold = min(expectancy_values)
+            # CV threshold = max CV in population (worst allowed volatility, lower is better)
+            self.global_hof.cv_threshold = max(cv_values)
+
+            self.global_hof.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
+            self.global_hof.roi_median = float(np.percentile(roi_values, 50))
+            self.global_hof.expectancy_median = float(np.percentile(expectancy_values, 50))
+
+            self.global_hof.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
+            self.global_hof.roi_p25 = float(np.percentile(roi_values, 25))
+            self.global_hof.expectancy_p25 = float(np.percentile(expectancy_values, 25))
+
+        # Apply threshold recomputation if Global 50 is not full
+        if self.global_hof.enabled:
+            current_size = len(self.global_hof.entries)
+            if current_size > 0 and current_size < self.global_hof.CAPACITY:
+                recompute_thresholds_from_population()
+                print(f"\n⚠ Global 50 not full ({current_size}/{self.global_hof.CAPACITY}) - applying normal promotion thresholds from existing population")
+
         # Check current maverick count if evaluating mavericks
         current_maverick_count = 0
         if is_maverick and self.global_hof.enabled:
-            # Re-download to get latest state
-            self.global_hof._download_global_ledger()
-            self.global_hof._load_local_ledger()
             current_maverick_count = sum(1 for e in self.global_hof.entries if e.is_maverick)
             remaining_slots = self.global_hof.MAVERICK_CAP - current_maverick_count
             print(f"\nCurrent Maverick count in Global 50: {current_maverick_count}/{self.global_hof.MAVERICK_CAP}")
@@ -610,11 +654,17 @@ class AgentEvaluator:
         print(f"{'='*70}")
 
         for i, agent_path in enumerate(agent_files, 1):
-            # Check maverick cap before evaluating
-            if is_maverick and self.global_hof.enabled:
-                # Re-check current count (may have changed if previous agent was promoted)
+            # Reload ledger before each evaluation to get latest state
+            if self.global_hof.enabled:
                 self.global_hof._download_global_ledger()
                 self.global_hof._load_local_ledger()
+                # Recompute thresholds if not full (check_and_promote may have reset them to -inf)
+                current_size = len(self.global_hof.entries)
+                if current_size > 0 and current_size < self.global_hof.CAPACITY:
+                    recompute_thresholds_from_population()
+
+            # Check maverick cap before evaluating
+            if is_maverick and self.global_hof.enabled:
                 current_maverick_count = sum(1 for e in self.global_hof.entries if e.is_maverick)
                 
                 if current_maverick_count >= self.global_hof.MAVERICK_CAP:
@@ -627,6 +677,14 @@ class AgentEvaluator:
 
             result = self.evaluate_agent(agent_path, generation=i, is_maverick=is_maverick)
             results.append(result)
+            
+            # If agent was promoted, reload ledger and recompute thresholds
+            if result.get('promoted', False) and self.global_hof.enabled:
+                self.global_hof._download_global_ledger()
+                self.global_hof._load_local_ledger()
+                current_size = len(self.global_hof.entries)
+                if current_size > 0 and current_size < self.global_hof.CAPACITY:
+                    recompute_thresholds_from_population()
             
             # Track maverick promotions
             if is_maverick and result.get('promoted', False):
