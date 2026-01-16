@@ -1731,7 +1731,7 @@ class AgentEvaluator:
                 score_symbol = "↑" if score_change > 0 else "↓" if score_change < 0 else "="
                 
                 print(f"  Old Score: {entry.gauntlet_score:.2f} → New Score: {new_score:.2f} ({score_symbol} {abs(score_change):.2f})")
-                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f}% | CV: {metrics['cv']:.3f}")
+                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.2f} | CV: {metrics['cv']:.3f}")
                 print(f"  Trades: {metrics['total_trades']} | Quality: {metrics['quality_ratio']:.3f} | Win: {metrics['win_ratio']:.3f}")
 
                 results.append({

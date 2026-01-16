@@ -2813,8 +2813,8 @@ class ERLTrainer:
                 gap_score = (calc_gap(t_score[0], curr_score)*3.0 + calc_gap(t_score[1], curr_score)*1.5 + calc_gap(t_score[2], curr_score))
                 gap_roi   = (calc_gap(t_roi[0], curr_roi)*3.0     + calc_gap(t_roi[1], curr_roi)*1.5     + calc_gap(t_roi[2], curr_roi))
                 
-                # Expectancy is small decimal, scale gap up (x100 to match scale of ROI)
-                gap_exp   = (calc_gap(t_exp[0], curr_exp)*300.0   + calc_gap(t_exp[1], curr_exp)*150.0   + calc_gap(t_exp[2], curr_exp)*100.0)
+                # Expectancy is 0-10 metric (similar scale to ROI which is 0-50%), use same weights as ROI
+                gap_exp   = (calc_gap(t_exp[0], curr_exp)*3.0     + calc_gap(t_exp[1], curr_exp)*1.5     + calc_gap(t_exp[2], curr_exp))
 
                 proximity_penalty = (gap_score * 0.5) + (gap_roi * 1.0) + (gap_exp * 1.0)
                 fitness -= proximity_penalty
@@ -4076,6 +4076,9 @@ class ERLTrainer:
 
         Expectancy = (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
 
+        Note: Expectancy is a unitless metric between 0-10 (NOT a percentage).
+        Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
+
         - If Expectancy > 0: The agent has a mathematical edge
         - If Expectancy trends up: The agent is becoming a sharper trader
         - If Expectancy is flat but PnL is up: The agent is just trading more (scaling), not getting smarter
@@ -4084,7 +4087,7 @@ class ERLTrainer:
             closed_trades: List of closed trade dictionaries with 'gain_pct' field
 
         Returns:
-            Expectancy value (float)
+            Expectancy value (float, 0-10 range)
         """
         if not closed_trades:
             return 0.0
@@ -4626,7 +4629,7 @@ class ERLTrainer:
         print(f"  Win Rate:          {global_win_rate:>11.1%}")
         print(f"  Total Trades:      {total_trades:>12}")
         print(f"  Quality Trades:    {quality_count:>12}")
-        print(f"  Expectancy:        {expectancy:>11.2f}%")
+        print(f"  Expectancy:        {expectancy:>11.2f}")
         print(f"{'='*70}")
 
         # Reset gauntlet mode after validation

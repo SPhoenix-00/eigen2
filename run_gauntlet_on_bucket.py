@@ -329,7 +329,7 @@ class GauntletRunner:
         print(f"  Total Trades:      {total_trades:>12}")
         print(f"  Quality Trades:    {quality_count:>12}  (>= {quality_threshold}% gain)")
         print(f"  Quality Ratio:     {quality_ratio:>12.3f}")
-        print(f"  Expectancy:        {expectancy:>11.2f}%")
+        print(f"  Expectancy:        {expectancy:>11.2f}")
         print(f"{'='*70}")
 
         # Reset gauntlet mode
