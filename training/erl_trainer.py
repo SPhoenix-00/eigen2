@@ -2766,14 +2766,14 @@ class ERLTrainer:
             volume_scalar = min(raw_vol_scalar, 4.3)
 
             # C. Expectancy^2 (Precision Reward)
-            # Scale up (x100) before squaring so small decimals don't vanish.
-            # 1% expectancy -> 1.0 -> 1.0 score
-            # 5% expectancy -> 5.0 -> 25.0 score
-            exp_scaled = expectancy * 100.0
-            if exp_scaled >= 0:
-                exp_score = (exp_scaled ** 2)
+            # Expectancy is already in percentage (from gain_pct which is percentage).
+            # 1% expectancy -> 1.0 score -> 1.1x boost
+            # 5% expectancy -> 25.0 score -> 3.5x boost
+            # Anything below 1% expectancy should be penalized (squared amplifies negative)
+            if expectancy >= 0:
+                exp_score = (expectancy ** 2)
             else:
-                exp_score = -(abs(exp_scaled) ** 2)
+                exp_score = -(abs(expectancy) ** 2)
 
             # D. Base Fitness
             if roi_score > 0:
@@ -2927,12 +2927,14 @@ class ERLTrainer:
                 roi_score = -(abs(holographic_roi) ** 1.5)
             
             # B. Expectancy^2 Reward (The Sniper Fix)
-            # Scale up (x100) before squaring
-            exp_scaled = expectancy * 100.0
-            if exp_scaled >= 0:
-                exp_score = (exp_scaled ** 2)
+            # Expectancy is already in percentage (avg_win/avg_loss converted from raw_roi).
+            # 1% expectancy -> 1.0 score -> 1.1x boost
+            # 5% expectancy -> 25.0 score -> 3.5x boost
+            # Anything below 1% expectancy should be penalized (squared amplifies negative)
+            if expectancy >= 0:
+                exp_score = (expectancy ** 2)
             else:
-                exp_score = -(abs(exp_scaled) ** 2)
+                exp_score = -(abs(expectancy) ** 2)
 
             # C. Volume Scalar (Implied)
             # In holographic mode, volume is implied by the equity curve length.
