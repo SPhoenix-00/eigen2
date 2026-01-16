@@ -2695,29 +2695,16 @@ class ERLTrainer:
 
     def calculate_triad_fitness(self, stats: Dict) -> float:
         """
-        Triad 2.0: Stabilized Fitness Function
-        Base = Signed ROI * Log(Volume)
-        If Positive: Boosted by WR and QR
-        If Negative: Penalized by Inconsistency
-
-        MAVERICK MODE: FOMO/ROI-First scoring with WR Gate.
-        Formula: Base Score + Expectancy Bonus - FOMO Penalty - Fear Factor - WR Penalty
-        - Base Score: (Raw PnL / Peak Capital) * log10(Peak Capital + 10) * WR^4
-        - Expectancy Bonus: Expectancy * 20.0
-        - FOMO Penalty: max(0, Market Return - Agent ROI) * 10.0
-        - Fear Factor: 2.0 * (num_losses ^ 1.2)
-        - WR Penalty: max(0, 0.60 - WR) * 100.0 (Forces WR > 60%)
+        Triad 3.0: Maverick Selectivity & Gradient Update
         """
         total_trades = stats.get('num_trades', 0)
-
+        
         # 1. Handle Inactivity
         if total_trades == 0:
-            # MAVERICK MODE: Moderate penalty for inaction - encourages market engagement without forcing suicide
             if self.maverick_mode:
                 return -50.0 + stats.get('max_coefficient_during_episode', 0)
-
+            
             # In consistency mode during stabilization/gauntlet, use soft penalty
-            # (tactical no-trade in a slice is acceptable, not a ghost indicator)
             if self.consistency_mode and self.breakthrough_state in (BreakthroughState.STABILIZATION, BreakthroughState.GAUNTLET):
                 penalty = Config.ZERO_TRADES_PENALTY_GAUNTLET
             elif self.consistency_mode:
@@ -2728,72 +2715,114 @@ class ERLTrainer:
 
         # 2. Calculate Core Metrics
         win_rate = stats.get('win_rate', 0.0) # 0.0 to 1.0
-        num_losses = stats.get('num_losses', 0)
-
-        # Calculate Quality Ratio (QR): ratio of trades beating the HoF median ROI threshold
-        # This is dynamically updated each generation to reflect the rising bar of excellence
+        
+        # Calculate Quality Ratio (QR)
         closed_trades = stats.get('closed_trades', [])
         if closed_trades:
-            quality_count = sum(1 for t in closed_trades if t.get('gain_pct', 0) >= self.quality_threshold)
+            # Safely handle quality_threshold if not strictly defined
+            q_thresh = getattr(self, 'quality_threshold', 1.0) 
+            quality_count = sum(1 for t in closed_trades if t.get('gain_pct', 0) >= q_thresh)
             qr = quality_count / total_trades
         else:
             qr = 0.0
 
         raw_pnl = stats.get('raw_pnl', 0.0)
         total_inv = stats.get('total_investment', 0.0)
-        roi_pct = (raw_pnl / total_inv * 100) if total_inv > 0 else 0.0
+        
+        # Calculate Expectancy (The "Precision" Metric) for gradient use
+        # Expectancy = (Win% * AvgWin%) - (Loss% * AvgLoss%)
+        if closed_trades:
+            wins = [t['gain_pct'] for t in closed_trades if t['gain_pct'] > 0]
+            losses = [abs(t['gain_pct']) for t in closed_trades if t['gain_pct'] <= 0]
+            
+            avg_win = np.mean(wins) if wins else 0.0
+            avg_loss = np.mean(losses) if losses else 0.0
+            
+            wr_calc = len(wins) / len(closed_trades)
+            lr_calc = 1.0 - wr_calc
+            expectancy = (wr_calc * avg_win) - (lr_calc * avg_loss)
+        else:
+            expectancy = 0.0
 
-        # MAVERICK MODE: Triad 2.0-inspired scoring with FOMO penalty
+        # --- MAVERICK MODE: Triad 3.0 scoring with Gradient ---
         if self.maverick_mode:
-            # Get peak capital employed (more accurate than total_investment for efficiency)
+            # Get peak capital employed
             peak_capital = stats.get('peak_capital_employed', total_inv)
             if peak_capital <= 0:
                 peak_capital = total_inv if total_inv > 0 else 1.0
 
-            # Calculate ROI based on peak capital (true capital efficiency)
+            # Calculate ROI based on peak capital
             roi_pct = (raw_pnl / peak_capital * 100) if peak_capital > 0 else 0.0
 
-            # ROI Expansion Mode: Apply power law (** 1.5) for super-linear scaling
-            # Sign preservation: apply power to absolute value, then restore sign
+            # A. ROI Score (Power Law)
             if roi_pct >= 0:
                 roi_score = (roi_pct ** 1.5)
             else:
                 roi_score = -(abs(roi_pct) ** 1.5)
 
-            # Volume Scalar: log10(Peak Capital + 10)
-            volume_scalar = math.log10(peak_capital + 10)
+            # B. CLAMPED Volume Scalar (20k Limit)
+            # log10(20k) approx 4.3. Clamp to stop "lucky whales"
+            raw_vol_scalar = math.log10(peak_capital + 10)
+            volume_scalar = min(raw_vol_scalar, 4.3)
 
-            # Calculate Fitness
-            if roi_score > 0:
-                # --- WINNING SCENARIO ---
-                # Base Score: ROI^1.5 * log10(Peak Capital + 10)
-                base_score = roi_score * volume_scalar
-
-                # Boost: (1 + WR^2) - moderate boost for high win rates
-                win_rate_boost = (1.0 + (win_rate ** 2))
-                
-                fitness = base_score * win_rate_boost
+            # C. Expectancy^2 (Precision Reward)
+            # Scale up (x100) before squaring so small decimals don't vanish.
+            # 1% expectancy -> 1.0 -> 1.0 score
+            # 5% expectancy -> 5.0 -> 25.0 score
+            exp_scaled = expectancy * 100.0
+            if exp_scaled >= 0:
+                exp_score = (exp_scaled ** 2)
             else:
-                # --- LOSING SCENARIO ---
-                # Pure Pain: ROI^1.5 * log10(Peak Capital + 10)
-                # Penalized by ROI magnitude
-                fitness = roi_score * volume_scalar
+                exp_score = -(abs(exp_scaled) ** 2)
 
-            # FOMO Penalty (Relative Performance) - fitness only, not per trade
-            # Get market return from stats (Col 44 = S&P 500 proxy)
+            # D. Base Fitness
+            if roi_score > 0:
+                # Win Scenario: Boost by Expectancy
+                # Multiplier (1 + 0.1 * exp_score) implies:
+                # exp=1% (score 1) -> 1.1x boost
+                # exp=5% (score 25) -> 3.5x boost
+                fitness = roi_score * volume_scalar * (1.0 + (exp_score * 0.1))
+            else:
+                # Loss Scenario: Expectancy failure amplifies pain
+                fitness = roi_score * volume_scalar + (exp_score * volume_scalar)
+
+            # E. FOMO Penalty (Dampened)
             market_return = stats.get('market_return_pct', 0.0)
             alpha_gap = market_return - roi_pct
-            fomo_penalty = max(0.0, alpha_gap) * 10.0
+            fomo_penalty = max(0.0, alpha_gap) * 5.0
+            fitness -= fomo_penalty
 
-            # Final Maverick Fitness: Apply FOMO penalty
-            fitness = fitness - fomo_penalty
+            # F. Global 50 Proximity Gradient
+            # Pull agent towards admissibility thresholds
+            if hasattr(self, 'global_hof') and self.global_hof.enabled and self.global_hof.entry_threshold > -999:
+                t_score = [self.global_hof.entry_threshold, self.global_hof.gauntlet_p25, self.global_hof.gauntlet_median]
+                t_roi   = [self.global_hof.roi_threshold,   self.global_hof.roi_p25,      self.global_hof.roi_median]
+                t_exp   = [self.global_hof.expectancy_threshold, self.global_hof.expectancy_p25, self.global_hof.expectancy_median]
+
+                curr_score = fitness 
+                curr_roi = roi_pct
+                curr_exp = expectancy
+
+                def calc_gap(target, current):
+                    return max(0.0, target - current)
+
+                # Weights: Entry=3.0, p25=1.5, Median=1.0
+                gap_score = (calc_gap(t_score[0], curr_score)*3.0 + calc_gap(t_score[1], curr_score)*1.5 + calc_gap(t_score[2], curr_score))
+                gap_roi   = (calc_gap(t_roi[0], curr_roi)*3.0     + calc_gap(t_roi[1], curr_roi)*1.5     + calc_gap(t_roi[2], curr_roi))
+                
+                # Expectancy is small decimal, scale gap up (x100 to match scale of ROI)
+                gap_exp   = (calc_gap(t_exp[0], curr_exp)*300.0   + calc_gap(t_exp[1], curr_exp)*150.0   + calc_gap(t_exp[2], curr_exp)*100.0)
+
+                proximity_penalty = (gap_score * 0.5) + (gap_roi * 1.0) + (gap_exp * 1.0)
+                fitness -= proximity_penalty
 
             return float(fitness)
 
-        # NORMAL/CONSISTENCY MODE: Standard Triad scoring
+        # --- NORMAL/CONSISTENCY MODE: Standard Triad scoring ---
+        # Calculate ROI for normal/consistency mode
+        roi_pct = (raw_pnl / total_inv * 100) if total_inv > 0 else 0.0
+        
         # ROI Expansion Mode: Uncap ROI and apply super-linear scaling
-        # Power law (** 1.1) makes high ROI disproportionately valuable
-        # Sign preservation: apply power to absolute value, then restore sign
         if roi_pct >= 0:
             roi_score = (roi_pct ** 1.1)
         else:
@@ -2805,23 +2834,13 @@ class ERLTrainer:
 
         # 4. Calculate Fitness
         if roi_score > 0:
-            # --- WINNING SCENARIO ---
-            # Base Score: ROI * Volume
+            # Win Scenario
             base_score = roi_score * volume_scalar
-
-            # Boosters: Reward High WR and High QR
-            # We use (1 + x) so we don't punish a 50% WR by halving the score
-            # WR^2 is kept as a bonus multiplier to reward the "Unicorn" 70%+ behavior
             consistency_bonus = (1.0 + (win_rate ** 2))
             conviction_bonus = (1.0 + qr)
-
             fitness = base_score * consistency_bonus * conviction_bonus * 10.0
-
         else:
-            # --- LOSING SCENARIO ---
-            # Pure Pain: ROI * Volume
-            # We multiply by (2.0 - win_rate) to punish "consistent losers" less than "gamblers"
-            # Actually, simpler is better: Just strict penalization of negative ROI.
+            # Loss Scenario
             fitness = roi_score * volume_scalar * 10.0
 
         return float(fitness)
@@ -4177,6 +4196,10 @@ class ERLTrainer:
         # Extract fitness scores from all 10 slices
         fitness_scores = [result['fitness'] for result in slice_results]
 
+        # Calculate mean and min scores for debugging (always needed in return dict)
+        mean_score = np.mean(fitness_scores)
+        min_score = np.min(fitness_scores)
+
         # --- SCORING SELECTION ---
         if self.maverick_mode:
             # USE HOLOGRAPHIC FITNESS FOR MAVERICKS
@@ -4186,8 +4209,6 @@ class ERLTrainer:
             # Weighted aggregation: emphasize worst-case performance to reward consistency
             # 60% weight on worst slice, 40% weight on average
             # This forces agents to raise their "floor" rather than just their "ceiling"
-            mean_score = np.mean(fitness_scores)
-            min_score = np.min(fitness_scores)
             validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
 
         # Select one sample trade (first trade from all validation slices, if any)
@@ -5419,7 +5440,7 @@ class ERLTrainer:
                         print(f"\n  Global50 Thresholds:")
                         print(f"    Gauntlet Entry: {self.global_hof.entry_threshold:.2f} | p25: {self.global_hof.gauntlet_p25:.2f} | Median: {self.global_hof.gauntlet_median:.2f}")
                         print(f"    ROI Entry: {self.global_hof.roi_threshold:.2f}% | p25: {self.global_hof.roi_p25:.2f}% | Median: {self.global_hof.roi_median:.2f}%")
-                        print(f"    CV Entry: {self.global_hof.cv_threshold:.2f} (max) | (Mavericks skip expectancy requirement)")
+                        print(f"    CV Entry: {self.global_hof.cv_threshold:.2f} (max)")
                         
                         print(f"\n  Promotion Criteria Analysis:")
                         for r in reasons:
