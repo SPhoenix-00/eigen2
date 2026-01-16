@@ -45,8 +45,21 @@ Agents were optimizing for volume rather than performance, leading to:
 
 ## Implementation Details
 
-### File Modified
+### Files Modified
 - `training/erl_trainer.py` - `calculate_triad_fitness()` method
+- `training/erl_trainer.py` - `calculate_holographic_fitness()` method (CRITICAL FIX)
+
+### Critical Fix: Holographic Fitness Bypass
+
+**Issue Identified:** When `maverick_mode` is enabled, the code calculates `triad_fitness` (with Triad 3.0 logic), but then **overwrites** it with `calculate_holographic_fitness()` during population selection. The old holographic method lacked the volume clamp, expectancy², and G50 gradient logic.
+
+**Solution:** Updated `calculate_holographic_fitness()` to include all Triad 3.0 components:
+- Expectancy calculation from stitched trades
+- Expectancy² reward
+- Volume clamp (using trade count as proxy)
+- G50 proximity gradient
+
+This ensures Mavericks actually feel the new incentives during the most important phase: population selection.
 
 ### Key Changes
 
@@ -113,6 +126,15 @@ if hasattr(self, 'global_hof') and self.global_hof.enabled and self.global_hof.e
     proximity_penalty = (gap_score * 0.5) + (gap_roi * 1.0) + (gap_exp * 1.0)
     fitness -= proximity_penalty
 ```
+
+#### Holographic Mode Adaptations
+
+In `calculate_holographic_fitness()`, the Triad 3.0 logic is adapted for the virtual equity curve:
+
+- **Volume Proxy:** Uses `log10(total_trades + 10)` clamped at 4.3 (maps trade count to volume scalar)
+- **Expectancy Calculation:** Computed from winning/losing PnL arrays across all stitched trades
+- **G50 Gradient:** Focuses on score gap only (ROI/Expectancy gaps harder to map 1:1 in holographic mode)
+- **Drawdown Penalty:** Steeper penalty (5.0x multiplier) to act as "Gauntlet Proxy"
 
 ### Gradient Descent Concept
 

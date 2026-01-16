@@ -2848,8 +2848,8 @@ class ERLTrainer:
     def calculate_holographic_fitness(self, all_slices_trades: List[Dict]) -> float:
         """
         HOLOGRAPHIC SCORING:
-        Stitches trades from all slices into a single 'Virtual Equity Curve'
-        to penalize volatility (Drawdown) effectively.
+        Stitches trades from all slices into a single 'Virtual Equity Curve'.
+        Updated to include Triad 3.0 Logic: Expectancy^2, Volume Clamp, and G50 Gradient.
         """
         # 1. Safety Checks
         if not all_slices_trades:
@@ -2858,8 +2858,7 @@ class ERLTrainer:
             
         total_trades = len(all_slices_trades)
         
-        # 2. Sort trades chronologically (Crucial for correct Drawdown calc)
-        # We try to sort by entry_date to simulate the real timeline
+        # 2. Sort trades chronologically
         from datetime import datetime
         try:
             def get_sort_key(t):
@@ -2872,7 +2871,7 @@ class ERLTrainer:
                 return datetime.min
             all_slices_trades.sort(key=get_sort_key)
         except Exception:
-            pass # Fallback to list order if dates missing
+            pass 
             
         # 3. Calculate Virtual Equity Curve & Stats
         virtual_equity = 1.0
@@ -2880,66 +2879,100 @@ class ERLTrainer:
         max_drawdown = 0.0
         
         wins = 0
-        
+        winning_pnl = []
+        losing_pnl = []
         
         for trade in all_slices_trades:
-            # Respect your logic: 0.9 coeff = 0 shares = Agent opted out
-            # We only score trades that actually happened (shares > 0)
             shares = int(trade.get('coefficient', 0))
             if shares == 0:
                 continue
 
-            # Calculate raw PnL for this specific trade
             entry_price = trade.get('entry_price', 0.0)
             exit_price = trade.get('exit_price', 0.0)
             
             if entry_price > 0:
                 raw_roi = (exit_price - entry_price) / entry_price
                 
-                # Update Virtual Equity
-                # We assume a fixed fractional bet size (e.g., 10% of equity per trade)
-                # to normalize the impact regardless of the raw share count
+                # Update Virtual Equity (assumes fixed fractional betting)
                 virtual_equity *= (1.0 + (raw_roi * 0.1))
                 
-                # Update High Water Mark
                 if virtual_equity > peak_equity:
                     peak_equity = virtual_equity
                 
-                # Calculate Drawdown
                 current_dd = (peak_equity - virtual_equity) / peak_equity
                 if current_dd > max_drawdown:
                     max_drawdown = current_dd
                     
                 if raw_roi > 0:
                     wins += 1
+                    winning_pnl.append(raw_roi)
+                else:
+                    losing_pnl.append(abs(raw_roi))
 
         # 4. Calculate Final Metrics
         holographic_roi = (virtual_equity - 1.0) * 100.0
         win_rate = wins / total_trades if total_trades > 0 else 0.0
         
-        # 5. Maverick Scoring
+        # Calculate Expectancy (Triad 3.0 Requirement)
+        avg_win = np.mean(winning_pnl) * 100.0 if winning_pnl else 0.0
+        avg_loss = np.mean(losing_pnl) * 100.0 if losing_pnl else 0.0
+        expectancy = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
+        
+        # 5. Maverick Scoring (Triad 3.0)
         if self.maverick_mode:
-            # Base Score: ROI^1.5 (Aggressive reward for high returns)
-            # Preserve sign
+            # A. ROI Score
             if holographic_roi >= 0:
                 roi_score = (holographic_roi ** 1.5)
             else:
                 roi_score = -(abs(holographic_roi) ** 1.5)
             
-            # Win Rate Boost: (1 + WR^2)
-            # We use ^2 instead of ^4 to avoid over-rewarding lucky streaks
-            win_rate_boost = (1.0 + (win_rate ** 2))
+            # B. Expectancy^2 Reward (The Sniper Fix)
+            # Scale up (x100) before squaring
+            exp_scaled = expectancy * 100.0
+            if exp_scaled >= 0:
+                exp_score = (exp_scaled ** 2)
+            else:
+                exp_score = -(abs(exp_scaled) ** 2)
+
+            # C. Volume Scalar (Implied)
+            # In holographic mode, volume is implied by the equity curve length.
+            # We add a small bonus for sustaining the curve, but capped.
+            # We map trade count to a scalar similar to log volume.
+            # log10(100 trades) = 2.0. We clamp at 4.3 to match Triad.
+            volume_proxy = math.log10(total_trades + 10)
+            volume_scalar = min(volume_proxy, 4.3)
             
-            fitness = roi_score * win_rate_boost
+            # D. Base Fitness
+            # Combine ROI, Volume, and Expectancy
+            if roi_score > 0:
+                fitness = roi_score * volume_scalar * (1.0 + (exp_score * 0.1))
+            else:
+                fitness = roi_score * volume_scalar + (exp_score * volume_scalar)
             
-            # --- THE DRAWDOWN PENALTY ---
-            # This is the proxy for the Gauntlet's StdDev penalty.
+            # E. Drawdown Penalty (Specific to Holographic)
+            # Acts as the "Gauntlet Proxy"
             if max_drawdown > 0.10:
-                # Penalty starts at 10% DD.
-                # Formula: 1.0 - (Excess_DD * 2.5)
-                penalty_factor = max(0.1, 1.0 - (max_drawdown - 0.10) * 2.5)
+                penalty_factor = max(0.1, 1.0 - (max_drawdown - 0.10) * 5.0) # steeper penalty
                 fitness *= penalty_factor
+
+            # F. Global 50 Proximity Gradient
+            # Pull agent towards admissibility thresholds
+            if hasattr(self, 'global_hof') and self.global_hof.enabled and self.global_hof.entry_threshold > -999:
+                t_score = [self.global_hof.entry_threshold, self.global_hof.gauntlet_p25, self.global_hof.gauntlet_median]
                 
+                curr_score = fitness 
+                
+                # Calculate Weighted Gap for Score Only
+                # (ROI/Expectancy gaps are harder to map 1:1 in holographic mode, so we focus on Score)
+                def calc_gap(target, current):
+                    return max(0.0, target - current)
+
+                # Weights: Entry=3.0, p25=1.5, Median=1.0
+                gap_score = (calc_gap(t_score[0], curr_score)*3.0 + calc_gap(t_score[1], curr_score)*1.5 + calc_gap(t_score[2], curr_score))
+                
+                # Apply penalty
+                fitness -= gap_score * 0.5
+
             return float(fitness)
             
         return float(holographic_roi)
