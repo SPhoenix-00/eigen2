@@ -2731,6 +2731,8 @@ class ERLTrainer:
         
         # Calculate Expectancy (The "Precision" Metric) for gradient use
         # Expectancy = (Win% * AvgWin%) - (Loss% * AvgLoss%)
+        # Expectancy is a unitless metric between 0-10 (NOT a percentage).
+        # Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
         if closed_trades:
             wins = [t['gain_pct'] for t in closed_trades if t['gain_pct'] > 0]
             losses = [abs(t['gain_pct']) for t in closed_trades if t['gain_pct'] <= 0]
@@ -2766,10 +2768,11 @@ class ERLTrainer:
             volume_scalar = min(raw_vol_scalar, 4.3)
 
             # C. Expectancy^2 (Precision Reward)
-            # Expectancy is already in percentage (from gain_pct which is percentage).
-            # 1% expectancy -> 1.0 score -> 1.1x boost
-            # 5% expectancy -> 25.0 score -> 3.5x boost
-            # Anything below 1% expectancy should be penalized (squared amplifies negative)
+            # Expectancy is a unitless metric between 0-10 (NOT a percentage).
+            # Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
+            # 1.0 expectancy -> 1.0 score -> 1.1x boost
+            # 5.0 expectancy -> 25.0 score -> 3.5x boost
+            # Anything below 1.0 expectancy should be penalized (squared amplifies negative)
             if expectancy >= 0:
                 exp_score = (expectancy ** 2)
             else:
@@ -2927,10 +2930,11 @@ class ERLTrainer:
                 roi_score = -(abs(holographic_roi) ** 1.5)
             
             # B. Expectancy^2 Reward (The Sniper Fix)
-            # Expectancy is already in percentage (avg_win/avg_loss converted from raw_roi).
-            # 1% expectancy -> 1.0 score -> 1.1x boost
-            # 5% expectancy -> 25.0 score -> 3.5x boost
-            # Anything below 1% expectancy should be penalized (squared amplifies negative)
+            # Expectancy is a unitless metric between 0-10 (NOT a percentage).
+            # Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
+            # 1.0 expectancy -> 1.0 score -> 1.1x boost
+            # 5.0 expectancy -> 25.0 score -> 3.5x boost
+            # Anything below 1.0 expectancy should be penalized (squared amplifies negative)
             if expectancy >= 0:
                 exp_score = (expectancy ** 2)
             else:
