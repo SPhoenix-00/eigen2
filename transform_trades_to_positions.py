@@ -22,6 +22,8 @@ def parse_date(date_str: str) -> datetime:
     """Parse date string in various formats."""
     # Handle various date formats
     formats = [
+        "%m/%d/%Y",      # M/D/YYYY (e.g., '10/7/2022', '10/13/2022')
+        "%m/%d/%y",      # M/D/YY (e.g., '10/7/22')
         "%d-%m-%y",      # 02-01-24
         "%Y-%m-%d",      # 2024-01-02
         "%d/%m/%y",      # 02/01/24
