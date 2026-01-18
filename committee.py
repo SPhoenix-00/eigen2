@@ -883,7 +883,8 @@ def find_highest_correlation_pair(committee_indices: tuple, entries: list,
 
 def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: list,
                               corr_matrix: np.ndarray,
-                              optimize_for: str = 'objective') -> tuple:
+                              optimize_for: str = 'objective',
+                              preserve_maverick_type: bool = True) -> tuple:
     """
     Find the agent from the entire Global50 that best improves the committee
     when swapped in for the dropped agent.
@@ -894,6 +895,7 @@ def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: l
         entries: Full list of Global50 entries
         corr_matrix: Full NxN correlation matrix
         optimize_for: What to optimize - 'objective' (default) or 'max_corr'
+        preserve_maverick_type: If True, only swap mavericks with mavericks and non-mavericks with non-mavericks
 
     Returns:
         (best_candidate_idx, new_committee_indices, new_objective, new_score_sum,
@@ -901,6 +903,9 @@ def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: l
     """
     # Build remaining committee (without the dropped agent)
     remaining = [idx for idx in committee_indices if idx != drop_idx]
+
+    # Get maverick status of the agent being dropped
+    dropped_is_maverick = entries[drop_idx].get('is_maverick', False)
 
     best_candidate = None
     best_objective = float('-inf')
@@ -918,6 +923,12 @@ def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: l
         # Skip if already in committee
         if candidate_idx in committee_indices:
             continue
+
+        # Maverick constraint: only swap mavericks with mavericks, non-mavericks with non-mavericks
+        if preserve_maverick_type:
+            candidate_is_maverick = entries[candidate_idx].get('is_maverick', False)
+            if candidate_is_maverick != dropped_is_maverick:
+                continue  # Skip candidates with different maverick status
 
         # Create new committee with swap
         new_indices = tuple(sorted(remaining + [candidate_idx]))
@@ -1143,7 +1154,8 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray, require_maverick:
 
 
 def interactive_correlation_refinement(committee_indices: tuple, entries: list,
-                                         corr_matrix: np.ndarray) -> tuple:
+                                         corr_matrix: np.ndarray,
+                                         require_maverick: bool = False) -> tuple:
     """
     Interactive refinement pass: iteratively swap out high-correlation agents.
 
@@ -1154,10 +1166,14 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
     4. Show old vs new metrics, confirm swap
     5. Repeat until user declines a swap
 
+    IMPORTANT: Swaps preserve maverick type - mavericks only swap with mavericks,
+    non-mavericks only swap with non-mavericks. This maintains the maverick count.
+
     Args:
         committee_indices: Initial committee indices from optimization
         entries: Full list of Global50 entries
         corr_matrix: Full NxN correlation matrix
+        require_maverick: If True, ensure exactly one maverick remains after each swap
 
     Returns:
         Final committee indices after all swaps
@@ -1165,11 +1181,18 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
     current_indices = committee_indices
     swap_count = 0
 
+    # Track initial maverick count
+    initial_maverick_count = sum(1 for i in current_indices if entries[i].get('is_maverick', False))
+
     print(f"\n{'='*60}")
     print("PHASE 1b: CORRELATION REFINEMENT (Interactive)")
     print(f"{'='*60}")
     print("This pass allows you to iteratively reduce correlation by swapping agents.")
-    print("Press Enter for 'no' to skip, or type 'y' to swap.\n")
+    print("Press Enter for 'no' to skip, or type 'y' to swap.")
+    if require_maverick:
+        print(f"⚠ Maverick constraint: Exactly {initial_maverick_count} maverick(s) will be preserved.\n")
+    else:
+        print(f"ℹ Maverick type preservation: Swaps maintain maverick/non-maverick status.\n")
 
     while True:
         # Calculate current metrics
@@ -1187,15 +1210,18 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
             break
 
         # Find best replacement for OBJECTIVE (default)
+        # Preserve maverick type: only swap mavericks with mavericks, non-mavericks with non-mavericks
         (obj_candidate_idx, obj_new_indices, obj_new_obj, obj_new_score_sum,
          obj_new_avg_corr, obj_new_max_corr, obj_candidate_entry) = find_best_swap_candidate(
-            current_indices, drop_idx, entries, corr_matrix, optimize_for='objective'
+            current_indices, drop_idx, entries, corr_matrix, optimize_for='objective',
+            preserve_maverick_type=True
         )
 
         # Find best replacement for MAX CORRELATION reduction
         (corr_candidate_idx, corr_new_indices, corr_new_obj, corr_new_score_sum,
          corr_new_avg_corr, corr_new_max_corr, corr_candidate_entry) = find_best_swap_candidate(
-            current_indices, drop_idx, entries, corr_matrix, optimize_for='max_corr'
+            current_indices, drop_idx, entries, corr_matrix, optimize_for='max_corr',
+            preserve_maverick_type=True
         )
 
         if obj_candidate_idx is None and corr_candidate_idx is None:
@@ -1203,11 +1229,14 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
             break
 
         # Display the complete swap proposal upfront
+        drop_maverick_tag = " [M]" if drop_entry.get('is_maverick', False) else ""
+        keep_maverick_tag = " [M]" if keep_entry.get('is_maverick', False) else ""
+        
         print(f"\n  {'─'*56}")
         print(f"  HIGHEST CORRELATION PAIR:")
-        print(f"    Agent A: {drop_entry['run_name']}_{drop_entry['agent_id']} "
+        print(f"    Agent A: {drop_entry['run_name']}_{drop_entry['agent_id']}{drop_maverick_tag} "
               f"(fitness: {drop_entry['gauntlet_score']:.2f})")
-        print(f"    Agent B: {keep_entry['run_name']}_{keep_entry['agent_id']} "
+        print(f"    Agent B: {keep_entry['run_name']}_{keep_entry['agent_id']}{keep_maverick_tag} "
               f"(fitness: {keep_entry['gauntlet_score']:.2f})")
         print(f"    Correlation: {max_corr:.4f}")
 
@@ -1224,10 +1253,12 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
             new_max_corr = obj_new_max_corr
             candidate_entry = obj_candidate_entry
 
+            candidate_maverick_tag = " [M]" if candidate_entry.get('is_maverick', False) else ""
+            
             print(f"\n  PROPOSED SWAP:")
-            print(f"    OUT: {drop_entry['run_name']}_{drop_entry['agent_id']} "
+            print(f"    OUT: {drop_entry['run_name']}_{drop_entry['agent_id']}{drop_maverick_tag} "
                   f"(fitness: {drop_entry['gauntlet_score']:.2f})")
-            print(f"    IN:  {candidate_entry['run_name']}_{candidate_entry['agent_id']} "
+            print(f"    IN:  {candidate_entry['run_name']}_{candidate_entry['agent_id']}{candidate_maverick_tag} "
                   f"(fitness: {candidate_entry['gauntlet_score']:.2f})")
 
             new_agent_corr_with_kept = corr_matrix[candidate_idx, keep_idx]
@@ -1249,9 +1280,18 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
             confirm = input("    [y/N]: ").strip().lower()
 
             if confirm in ('y', 'yes'):
+                # Verify maverick count is preserved
+                new_maverick_count = sum(1 for i in new_indices if entries[i].get('is_maverick', False))
+                if require_maverick and new_maverick_count != initial_maverick_count:
+                    print(f"\n  ⚠ WARNING: Swap would change maverick count from {initial_maverick_count} to {new_maverick_count}!")
+                    print(f"     This should not happen with maverick type preservation. Rejecting swap.")
+                    continue
+                
                 current_indices = new_indices
                 swap_count += 1
                 print(f"\n  ✓ Swap #{swap_count} confirmed.")
+                if require_maverick:
+                    print(f"     Maverick count preserved: {new_maverick_count}")
             else:
                 print(f"\n  ✗ Swap cancelled. Keeping current composition.")
                 print(f"\n  ✓ Committee composition confirmed.")
@@ -1262,9 +1302,12 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
             print(f"    OUT: {drop_entry['run_name']}_{drop_entry['agent_id']} "
                   f"(fitness: {drop_entry['gauntlet_score']:.2f})")
 
+            obj_candidate_maverick_tag = " [M]" if obj_candidate_entry.get('is_maverick', False) else ""
+            corr_candidate_maverick_tag = " [M]" if corr_candidate_entry.get('is_maverick', False) else ""
+            
             # Option 1: Best for objective
             print(f"\n  [1] BEST FOR OBJECTIVE:")
-            print(f"      IN:  {obj_candidate_entry['run_name']}_{obj_candidate_entry['agent_id']} "
+            print(f"      IN:  {obj_candidate_entry['run_name']}_{obj_candidate_entry['agent_id']}{obj_candidate_maverick_tag} "
                   f"(fitness: {obj_candidate_entry['gauntlet_score']:.2f})")
             obj_corr_with_kept = corr_matrix[obj_candidate_idx, keep_idx]
             print(f"      Pair corr: {obj_corr_with_kept:.4f} (Δ{obj_corr_with_kept - max_corr:+.4f})")
@@ -1273,7 +1316,7 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
 
             # Option 2: Best for max correlation
             print(f"\n  [2] BEST FOR MAX CORRELATION:")
-            print(f"      IN:  {corr_candidate_entry['run_name']}_{corr_candidate_entry['agent_id']} "
+            print(f"      IN:  {corr_candidate_entry['run_name']}_{corr_candidate_entry['agent_id']}{corr_candidate_maverick_tag} "
                   f"(fitness: {corr_candidate_entry['gauntlet_score']:.2f})")
             corr_corr_with_kept = corr_matrix[corr_candidate_idx, keep_idx]
             print(f"      Pair corr: {corr_corr_with_kept:.4f} (Δ{corr_corr_with_kept - max_corr:+.4f})")
@@ -1284,13 +1327,31 @@ def interactive_correlation_refinement(committee_indices: tuple, entries: list,
             confirm = input("    [1/2/N]: ").strip().lower()
 
             if confirm == '1':
+                # Verify maverick count is preserved
+                new_maverick_count = sum(1 for i in obj_new_indices if entries[i].get('is_maverick', False))
+                if require_maverick and new_maverick_count != initial_maverick_count:
+                    print(f"\n  ⚠ WARNING: Swap would change maverick count from {initial_maverick_count} to {new_maverick_count}!")
+                    print(f"     This should not happen with maverick type preservation. Rejecting swap.")
+                    continue
+                
                 current_indices = obj_new_indices
                 swap_count += 1
                 print(f"\n  ✓ Swap #{swap_count} confirmed (objective-optimized).")
+                if require_maverick:
+                    print(f"     Maverick count preserved: {new_maverick_count}")
             elif confirm == '2':
+                # Verify maverick count is preserved
+                new_maverick_count = sum(1 for i in corr_new_indices if entries[i].get('is_maverick', False))
+                if require_maverick and new_maverick_count != initial_maverick_count:
+                    print(f"\n  ⚠ WARNING: Swap would change maverick count from {initial_maverick_count} to {new_maverick_count}!")
+                    print(f"     This should not happen with maverick type preservation. Rejecting swap.")
+                    continue
+                
                 current_indices = corr_new_indices
                 swap_count += 1
                 print(f"\n  ✓ Swap #{swap_count} confirmed (max-corr-optimized).")
+                if require_maverick:
+                    print(f"     Maverick count preserved: {new_maverick_count}")
             else:
                 print(f"\n  ✗ Swap cancelled. Keeping current composition.")
                 print(f"\n  ✓ Committee composition confirmed.")
@@ -1626,7 +1687,7 @@ class CommitteeAgent:
             # If quorum was met, credit quorum (even if conviction also triggered)
             # Only credit conviction for trades where quorum was NOT met (conviction "rescues")
             is_quorum_trade = is_quorum & stocks_to_count
-            is_conviction_only_trade = (~is_quorum) & stocks_to_count
+            is_conviction_only_trade = (~is_quorum) & is_conviction & stocks_to_count
 
             # Verify mathematical correctness: these should sum to total trades
             self.consensus_history['trades_by_quorum'] += int(np.sum(is_quorum_trade))
@@ -2208,9 +2269,9 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             try:
                 from transform_trades_to_positions import transform_trades_to_positions
 
-                # Parse slice dates for the full range
-                slice_start_dt = datetime.strptime(start_date, "%d-%m-%y")
-                slice_end_dt = datetime.strptime(end_date, "%d-%m-%y")
+                # Parse slice dates for the full range using flexible parser
+                slice_start_dt = parse_date_flexible(start_date)
+                slice_end_dt = parse_date_flexible(end_date)
 
                 transform_trades_to_positions(
                     str(csv_path), str(xlsx_path),
@@ -2625,14 +2686,28 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
         print(f"    {i+1}. {e['run_name']}_{e['agent_id']}{maverick_tag}: "
               f"score={e['gauntlet_score']:.2f}, roi={e.get('roi', 0):.2f}%")
 
-    # Check maverick availability if required
+    # Check maverick availability - default behavior: exactly one maverick if available
+    maverick_entries = [i for i, e in enumerate(entries) if e.get('is_maverick', False)]
+    
+    # Determine if we should enforce maverick constraint
+    # Default: enforce exactly one maverick if available, otherwise allow 0
+    # Explicit --maverick flag: always require exactly one (fail if none available)
+    should_enforce_maverick = False
     if require_maverick:
-        maverick_entries = [i for i, e in enumerate(entries) if e.get('is_maverick', False)]
+        # Explicit flag: must have at least one maverick
         if not maverick_entries:
             print(f"\n❌ No maverick agents found in Global50!")
             print(f"   Use fix_global50.py --set-maverick to mark agents as mavericks first.")
             return None
+        should_enforce_maverick = True
         print(f"\n  ✓ Maverick requirement enabled: Exactly 1 maverick required ({len(maverick_entries)} available in Global50)")
+    elif maverick_entries:
+        # Default behavior: if mavericks are available, enforce exactly one
+        should_enforce_maverick = True
+        print(f"\n  ✓ Default maverick constraint: Exactly 1 maverick required ({len(maverick_entries)} available in Global50)")
+    else:
+        # Edge case: no mavericks available, allow 0
+        print(f"\n  ⚠ No maverick agents found in Global50 (edge case: allowing 0 mavericks)")
 
     # 2. Prepare VALIDATION data for correlation calculation (NOT holdout - prevents data leakage)
     val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
@@ -2645,7 +2720,7 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
     )
 
     # 4. Optimize committee selection
-    result = optimize_committee(entries, corr_matrix, require_maverick=require_maverick)
+    result = optimize_committee(entries, corr_matrix, require_maverick=should_enforce_maverick)
 
     if result is None:
         print("❌ Optimization failed")
@@ -2656,16 +2731,17 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
     if deep:
         refined_indices = automatic_correlation_refinement(
             result['committee_indices'], entries, corr_matrix,
-            require_maverick=require_maverick
+            require_maverick=should_enforce_maverick
         )
     else:
-        # Interactive refinement doesn't have maverick protection yet, so verify after
+        # Interactive refinement with maverick type preservation
         refined_indices = interactive_correlation_refinement(
-            result['committee_indices'], entries, corr_matrix
+            result['committee_indices'], entries, corr_matrix,
+            require_maverick=should_enforce_maverick
         )
     
     # Verify maverick requirement is still met after refinement
-    if require_maverick:
+    if should_enforce_maverick:
         maverick_count = sum(1 for i in refined_indices if entries[i].get('is_maverick', False))
         if maverick_count != 1:
             print(f"\n⚠ WARNING: Refinement changed maverick count to {maverick_count} (required: exactly 1)!")
@@ -2759,23 +2835,25 @@ def run_draft(manager: CommitteeManager, loader, stats, holdout_info, deep: bool
         print(f"  {i+1}. {m['run_name']}_{m['agent_id']}{maverick_tag}: "
               f"score={m['gauntlet_score']:.2f}, roi={m['roi']:.2f}%")
     
-    # Warn if no mavericks selected (required for --multi mode)
+    # Warn if maverick constraint violated
     print(f"\n  Committee Summary:")
     print(f"    Total members: {len(roster_data['members'])}")
     print(f"    Maverick members: {maverick_count}")
     print(f"    Non-maverick members: {len(roster_data['members']) - maverick_count}")
     
-    if require_maverick and maverick_count != 1:
+    if should_enforce_maverick and maverick_count != 1:
         print(f"\n  ⚠ WARNING: Maverick count is {maverick_count} (required: exactly 1)!")
         print(f"    This should not happen - please report this issue.")
-    elif not require_maverick and maverick_count == 0:
-        print(f"\n  ⚠ WARNING: No maverick agents selected in committee!")
+    elif not should_enforce_maverick and maverick_count == 0:
+        # Edge case: no mavericks available in Global50, 0 is expected
+        print(f"\n  ℹ Note: No maverick agents in committee (none available in Global50)")
         print(f"    --multi mode requires at least one maverick agent.")
         print(f"    Options:")
-        print(f"      1. Use --draft --maverick to force exactly one maverick")
-        print(f"      2. Use fix_global50.py --set-maverick to mark agents as mavericks in Global50")
-        print(f"      3. Re-run --draft to select a committee with mavericks")
-        print(f"      4. Use committee.py --update-maverick-flags after setting flags in Global50")
+        print(f"      1. Use fix_global50.py --set-maverick to mark agents as mavericks in Global50")
+        print(f"      2. Re-run --draft after marking mavericks")
+    elif not should_enforce_maverick and maverick_count > 0:
+        # This shouldn't happen - if we're not enforcing, we shouldn't have mavericks
+        print(f"\n  ⚠ WARNING: Unexpected state: {maverick_count} mavericks selected but constraint was not enforced")
     elif maverick_count > Config.MAVERICK_CAP:
         print(f"\n  ⚠ WARNING: {maverick_count} mavericks selected (exceeds cap of {Config.MAVERICK_CAP})")
         print(f"    This may cause issues with Global50 promotion (Highlander Rule)")
@@ -2807,6 +2885,63 @@ def parse_date_input(date_str: str) -> datetime:
         return datetime.strptime(date_str, "%d-%m-%y")
     except ValueError:
         raise ValueError(f"Invalid date format '{date_str}'. Expected DD-MM-YY (e.g., 29-07-22)")
+
+
+def parse_date_flexible(date_value) -> datetime:
+    """
+    Parse date value in various formats (handles strings, datetime objects, Timestamps, etc.).
+    
+    Supports multiple date string formats:
+    - M/D/YYYY (e.g., '10/7/2022')
+    - M/D/YY (e.g., '10/7/22')
+    - DD-MM-YY (e.g., '07-10-22')
+    - YYYY-MM-DD (e.g., '2022-10-07')
+    - DD/MM/YY (e.g., '07/10/22')
+    - DD/MM/YYYY (e.g., '07/10/2022')
+    
+    Args:
+        date_value: Date value (string, datetime, Timestamp, etc.)
+        
+    Returns:
+        datetime object
+        
+    Raises:
+        ValueError if date cannot be parsed
+    """
+    import pandas as pd
+    
+    # If already a datetime object, return it
+    if isinstance(date_value, datetime):
+        return date_value
+    
+    # If pandas Timestamp, convert to datetime
+    if isinstance(date_value, pd.Timestamp):
+        return date_value.to_pydatetime()
+    
+    # Convert to string for parsing
+    date_str = str(date_value).strip()
+    
+    # Remove time component if present
+    if ' ' in date_str:
+        date_str = date_str.split()[0]
+    
+    # Try various date formats
+    formats = [
+        "%m/%d/%Y",      # M/D/YYYY (e.g., '10/7/2022')
+        "%m/%d/%y",      # M/D/YY (e.g., '10/7/22')
+        "%d-%m-%y",      # DD-MM-YY (e.g., '07-10-22')
+        "%Y-%m-%d",      # YYYY-MM-DD (e.g., '2022-10-07')
+        "%d/%m/%y",      # DD/MM/YY (e.g., '07/10/22')
+        "%d/%m/%Y",      # DD/MM/YYYY (e.g., '07/10/2022')
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    
+    raise ValueError(f"Cannot parse date: {date_value} (tried formats: {formats})")
 
 
 def find_date_index(loader, target_date: datetime) -> int:
