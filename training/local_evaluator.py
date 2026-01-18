@@ -24,6 +24,8 @@ import numpy as np
 import torch
 import threading
 import time
+import sys
+import platform
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 from dataclasses import dataclass
@@ -133,12 +135,34 @@ class LocalEvaluator:
                 self.target_device = torch.device('cpu')
                 print(f"LocalEvaluator: Falling back to CPU")
         else:
+            # Check if PyTorch is CPU-only build and provide helpful error message
+            torch_version = torch.__version__
+            is_cpu_only = '+cpu' in torch_version or (not hasattr(torch.version, 'cuda') or torch.version.cuda is None)
+            
+            if is_cpu_only:
+                print("\n" + "=" * 70)
+                print("[!] CUDA NOT AVAILABLE - PyTorch CPU-only build detected!")
+                print("=" * 70)
+                print(f"Current PyTorch version: {torch_version}")
+                print("\nPyTorch was installed without CUDA support (CPU-only build).")
+                print("To enable GPU acceleration, reinstall PyTorch with CUDA support:")
+                print("\nFor CUDA 11.8:")
+                print("  pip uninstall torch torchvision torchaudio")
+                print("  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118")
+                print("\nFor CUDA 12.1:")
+                print("  pip uninstall torch torchvision torchaudio")
+                print("  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121")
+                print("\nTo check your CUDA version, run: nvidia-smi")
+                print("=" * 70 + "\n")
+            
             self.target_device = torch.device('cpu')
             print(f"LocalEvaluator: Using CPU (CUDA not available)")
 
         # CPU optimization: Compile actor networks for faster inference (only when no GPU)
+        # NOTE: Disable compilation on Windows - requires Visual Studio Build Tools (cl.exe)
+        # Compilation errors occur during lazy compilation (first forward pass), not during torch.compile()
         self._compiled_actors = {}  # Cache of compiled actors by agent_id
-        self._use_compiled = (self.target_device.type == 'cpu')
+        self._use_compiled = (self.target_device.type == 'cpu' and platform.system() != 'Windows')
 
         # Pre-allocate transition buffer with REDUCED capacity to avoid RAM exhaustion
         # Old: 50,000 × 151 days × 117 cols × 5 features × 4 bytes × 2 = ~35GB (causes swapping!)
@@ -262,6 +286,9 @@ except Exception as e:
 
         torch.compile() provides 2-3x speedup on CPU by optimizing the computation graph.
         Compiled actors are cached per agent_id to avoid recompilation overhead.
+        
+        NOTE: On Windows, compilation requires Visual Studio Build Tools (cl.exe).
+        Compilation is disabled on Windows to avoid this requirement.
         """
         if not self._use_compiled:
             return agent.actor
@@ -406,8 +433,15 @@ except Exception as e:
 
                 # Process full batch through compiled model
                 states_tensor = torch.from_numpy(trading_states).float()
-                actions_tensor = compiled_actor(states_tensor)
-                trading_actions = actions_tensor.numpy()
+                
+                try:
+                    actions_tensor = compiled_actor(states_tensor)
+                    trading_actions = actions_tensor.numpy()
+                except Exception:
+                    # Fallback to uncompiled actor if lazy compilation fails (e.g., missing compiler on Windows)
+                    self._compiled_actors[agent.agent_id] = agent.actor
+                    actions_tensor = agent.actor(states_tensor)
+                    trading_actions = actions_tensor.numpy()
 
                 # Add noise if collecting transitions
                 if collect_transitions:
@@ -757,8 +791,16 @@ except Exception as e:
                 compiled_actor = self._get_compiled_actor(agent)
                 compiled_actor.eval()
                 states_tensor = torch.from_numpy(trading_states).float()
-                actions_tensor = compiled_actor(states_tensor)
-                trading_actions = actions_tensor.numpy()
+                
+                try:
+                    actions_tensor = compiled_actor(states_tensor)
+                    trading_actions = actions_tensor.numpy()
+                except Exception as e:
+                    # Fallback to uncompiled actor if lazy compilation fails
+                    self._compiled_actors[agent.agent_id] = agent.actor
+                    actions_tensor = agent.actor(states_tensor)
+                    trading_actions = actions_tensor.numpy()
+                
                 # Safety clip for coefficients (no noise for validation)
                 trading_actions[:, :, 0] = np.clip(trading_actions[:, :, 0], 0, 100)
             else:

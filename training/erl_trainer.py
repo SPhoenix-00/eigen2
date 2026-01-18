@@ -5446,6 +5446,29 @@ class ERLTrainer:
                     g50_gauntlet_score = gauntlet_score
                     g50_gauntlet_results = gauntlet_results
 
+                    # Recompute thresholds from population if Global 50 is not full
+                    # (When not full, _update_entry_threshold sets them to -inf, but we want actual values)
+                    if self.global_hof.enabled and len(self.global_hof.entries) > 0 and len(self.global_hof.entries) < self.global_hof.CAPACITY:
+                        gauntlet_scores = [e.gauntlet_score for e in self.global_hof.entries]
+                        roi_values = [e.roi for e in self.global_hof.entries]
+                        expectancy_values = [e.expectancy for e in self.global_hof.entries]
+                        cv_values = [e.cv for e in self.global_hof.entries]
+                        
+                        # Override the -inf/+inf thresholds with actual population statistics
+                        self.global_hof.entry_threshold = min(gauntlet_scores)
+                        self.global_hof.roi_threshold = min(roi_values)
+                        self.global_hof.expectancy_threshold = min(expectancy_values)
+                        # CV threshold = max CV in population (worst allowed volatility, lower is better)
+                        self.global_hof.cv_threshold = max(cv_values)
+                        
+                        self.global_hof.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
+                        self.global_hof.roi_median = float(np.percentile(roi_values, 50))
+                        self.global_hof.expectancy_median = float(np.percentile(expectancy_values, 50))
+                        
+                        self.global_hof.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
+                        self.global_hof.roi_p25 = float(np.percentile(roi_values, 25))
+                        self.global_hof.expectancy_p25 = float(np.percentile(expectancy_values, 25))
+
                     # Check if agent qualifies for promotion
                     should_promote_result = False
                     if self.global_hof.enabled:
@@ -7224,7 +7247,25 @@ class ERLTrainer:
                         print(f"  Treating as completed - advancing to next member")
                         print(f"{'='*60}")
 
-                        # Advance without recording a breakthrough (no baseline update)
+                        # Mark member as completed by setting breakthroughs to target (enables advancement)
+                        # This treats the stuck member as "completed" even if they didn't achieve 3 breakthroughs
+                        current_breakthroughs = self.member_breakthroughs[self.current_member_idx]
+                        if current_breakthroughs < Config.MULTI_TARGET_TURNOVERS:
+                            self.member_breakthroughs[self.current_member_idx] = Config.MULTI_TARGET_TURNOVERS
+                            print(f"  Marked member {self.current_member_idx} as completed "
+                                  f"({current_breakthroughs} -> {Config.MULTI_TARGET_TURNOVERS} breakthroughs)")
+                            
+                            # Update phase-specific turnover tracking
+                            if self.multi_phase == 'non_maverick':
+                                if self.current_member_idx in self.non_maverick_members:
+                                    list_idx = self.non_maverick_members.index(self.current_member_idx)
+                                    self.non_maverick_turnovers_per_agent[list_idx] = Config.MULTI_TARGET_TURNOVERS
+                            elif self.multi_phase == 'maverick':
+                                if self.current_member_idx in self.maverick_members:
+                                    list_idx = self.maverick_members.index(self.current_member_idx)
+                                    self.maverick_turnovers_per_agent[list_idx] = Config.MULTI_TARGET_TURNOVERS
+
+                        # Now advance to next member (will work because breakthroughs >= MULTI_TARGET_TURNOVERS)
                         self._advance_to_next_multi_member()
                         print(f"  [Skipping evolution - new member loaded after local optima]")
                         continue
