@@ -9,7 +9,7 @@ import re
 
 # --- Configuration ---
 INPUT_FILE = 'Eigen2_Master(GFIN)_05_skinny - MASTER.csv'
-OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_151025.pkl'
+OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_311225.pkl'
 OUTPUT_FILE_CSV = 'Eigen2_Master_PY_OUTPUT_151025_FOR_COMPARE.csv'
 
 # --- Index Map for Slicing (Step 2: ManipulateArrayString) ---
@@ -62,14 +62,29 @@ def rsi_u_ema7(current_day_data, history):
     prev_day_data = full_history[-2] # This is history[-1]
     
     # VBA: If CountChrInString(prevDay, ",") < 4 Then
-    if len(prev_day_data) < 5: 
+    # Fix: Handle None values in history (can occur when to_raw returns None)
+    if prev_day_data is None or len(prev_day_data) < 5: 
         # Calculate 7-day SMA
-        rsi_u_vals = [rsi_u(full_history[j], full_history[j-1]) for j in range(1, 8)]
-        v_calc = np.mean(rsi_u_vals)
+        # Fix: Filter out None values from history before calculating RSI_U
+        rsi_u_vals = [rsi_u(full_history[j], full_history[j-1]) for j in range(1, 8) 
+                      if full_history[j] is not None and full_history[j-1] is not None]
+        # Filter out nan values as well
+        rsi_u_vals = [v for v in rsi_u_vals if v is not None and not np.isnan(v)]
+        v_calc = np.mean(rsi_u_vals) if rsi_u_vals else None
     else:
         # Calculate EMA
         rsi_u_ema_prev = prev_day_data[4] # Get previous RSI_U_EMA7
-        v_calc = rsi_u_ema_prev + (2 / 8) * (rsi_u_0 - rsi_u_ema_prev)
+        # Fix: Check if rsi_u_ema_prev is None (can happen if previous calculation failed)
+        if rsi_u_ema_prev is None or np.isnan(rsi_u_ema_prev):
+            # Fall back to SMA calculation
+            # Fix: Filter out None values from history before calculating RSI_U
+            rsi_u_vals = [rsi_u(full_history[j], full_history[j-1]) for j in range(1, 8) 
+                          if full_history[j] is not None and full_history[j-1] is not None]
+            # Filter out nan values as well
+            rsi_u_vals = [v for v in rsi_u_vals if v is not None and not np.isnan(v)]
+            v_calc = np.mean(rsi_u_vals) if rsi_u_vals else None
+        else:
+            v_calc = rsi_u_ema_prev + (2 / 8) * (rsi_u_0 - rsi_u_ema_prev)
     
     return current_day_data + [v_calc]
 
@@ -80,14 +95,29 @@ def rsi_d_ema7(current_day_data, history):
     prev_day_data = full_history[-2]
     
     # VBA: If CountChrInString(prevDay, ",") < 5 Then
-    if len(prev_day_data) < 6: # Note: VBA index is < 5, so we check < 6
+    # Fix: Handle None values in history (can occur when to_raw returns None)
+    if prev_day_data is None or len(prev_day_data) < 6: # Note: VBA index is < 5, so we check < 6
         # Calculate 7-day SMA
-        rsi_d_vals = [rsi_d(full_history[j], full_history[j-1]) for j in range(1, 8)]
-        v_calc = np.mean(rsi_d_vals)
+        # Fix: Filter out None values from history before calculating RSI_D
+        rsi_d_vals = [rsi_d(full_history[j], full_history[j-1]) for j in range(1, 8) 
+                      if full_history[j] is not None and full_history[j-1] is not None]
+        # Filter out nan values as well
+        rsi_d_vals = [v for v in rsi_d_vals if v is not None and not np.isnan(v)]
+        v_calc = np.mean(rsi_d_vals) if rsi_d_vals else None
     else:
         # Calculate EMA
         rsi_d_ema_prev = prev_day_data[5] # Get previous RSI_D_EMA7
-        v_calc = rsi_d_ema_prev + (2 / 8) * (rsi_d_0 - rsi_d_ema_prev)
+        # Fix: Check if rsi_d_ema_prev is None (can happen if previous calculation failed)
+        if rsi_d_ema_prev is None or np.isnan(rsi_d_ema_prev):
+            # Fall back to SMA calculation
+            # Fix: Filter out None values from history before calculating RSI_D
+            rsi_d_vals = [rsi_d(full_history[j], full_history[j-1]) for j in range(1, 8) 
+                          if full_history[j] is not None and full_history[j-1] is not None]
+            # Filter out nan values as well
+            rsi_d_vals = [v for v in rsi_d_vals if v is not None and not np.isnan(v)]
+            v_calc = np.mean(rsi_d_vals) if rsi_d_vals else None
+        else:
+            v_calc = rsi_d_ema_prev + (2 / 8) * (rsi_d_0 - rsi_d_ema_prev)
     
     return current_day_data + [v_calc]
 
@@ -98,8 +128,16 @@ def run_rsi(current_day_data, history):
         current_day_data = rsi_u_ema7(current_day_data, history)
         current_day_data = rsi_d_ema7(current_day_data, history)
     
+    # Fix: Check bounds before accessing indices
+    if len(current_day_data) < 6:
+        return current_day_data + [None]
+    
     curr_rsi_u_ema7 = current_day_data[4]
     curr_rsi_d_ema7 = current_day_data[5]
+    
+    # Fix: Handle None values
+    if curr_rsi_u_ema7 is None or curr_rsi_d_ema7 is None or np.isnan(curr_rsi_u_ema7) or np.isnan(curr_rsi_d_ema7):
+        return current_day_data + [None]
     
     if (curr_rsi_u_ema7 + curr_rsi_d_ema7) == 0:
         v_calc = 0
@@ -114,14 +152,26 @@ def run_ema12(current_day_data, history):
     prev_day_data = full_history[-2]
     
     # VBA: If commaTest < 7 Then
-    if len(prev_day_data) < 8:
+    # Fix: Handle None values in history (can occur when to_raw returns None)
+    if prev_day_data is None or len(prev_day_data) < 8:
         # Calculate 12-day SMA of Close
-        v_calc = np.mean([get_close(day) for day in full_history])
+        # Fix: Filter out None/nan values
+        close_vals = [get_close(day) for day in full_history if day is not None]
+        close_vals = [v for v in close_vals if v is not None and not np.isnan(v)]
+        v_calc = np.mean(close_vals) if close_vals else None
     else:
         # Calculate EMA
         curr_close = get_close(current_day_data)
         ema_prev = prev_day_data[7] # Get previous EMA12
-        v_calc = (curr_close - ema_prev) * (2 / 13) + ema_prev
+        # Fix: Check if ema_prev is None (can happen if previous calculation failed)
+        if ema_prev is None or np.isnan(ema_prev):
+            # Fall back to SMA calculation
+            # Fix: Filter out None/nan values
+            close_vals = [get_close(day) for day in full_history if day is not None]
+            close_vals = [v for v in close_vals if v is not None and not np.isnan(v)]
+            v_calc = np.mean(close_vals) if close_vals else None
+        else:
+            v_calc = (curr_close - ema_prev) * (2 / 13) + ema_prev
         
     return current_day_data + [v_calc]
 
@@ -129,20 +179,39 @@ def run_ema26_init(current_day_data, history):
     """Calculates initial SMA for EMA26. history is 25 days before."""
     full_history = history + [current_day_data] # 26 days total
     # Calculate 26-day SMA of Close
-    v_calc = np.mean([get_close(day) for day in full_history])
+    # Fix: Filter out None/nan values
+    close_vals = [get_close(day) for day in full_history if day is not None]
+    close_vals = [v for v in close_vals if v is not None and not np.isnan(v)]
+    v_calc = np.mean(close_vals) if close_vals else None
     return current_day_data + [v_calc]
 
 def run_ema26(current_day_data, prev_day_data):
     """Appends EMA26. Assumes EMA26_init was already run."""
+    # Fix: Handle None values (defensive check)
+    if prev_day_data is None or len(prev_day_data) < 9:
+        # Can't calculate EMA without previous value, return current with None
+        return current_day_data + [None]
     curr_close = get_close(current_day_data)
     ema_prev = prev_day_data[8] # Get previous EMA26
+    # Fix: Check if ema_prev is None (can happen if previous calculation failed)
+    if ema_prev is None or np.isnan(ema_prev):
+        return current_day_data + [None]
     v_calc = (curr_close - ema_prev) * (2 / 27) + ema_prev
     return current_day_data + [v_calc]
 
 def run_macd(current_day_data):
     """Appends MACD."""
+    # Fix: Check bounds before accessing indices
+    if len(current_day_data) < 9:
+        return current_day_data + [None]
+    
     curr_ema12 = current_day_data[7]
     curr_ema26 = current_day_data[8]
+    
+    # Fix: Handle None values
+    if curr_ema12 is None or curr_ema26 is None or np.isnan(curr_ema12) or np.isnan(curr_ema26):
+        return current_day_data + [None]
+    
     v_calc = curr_ema12 - curr_ema26
     return current_day_data + [v_calc]
 
@@ -152,14 +221,29 @@ def run_macd_signal(current_day_data, history):
     prev_day_data = full_history[-2]
     
     # VBA: If commaTest < 10 Then
-    if len(prev_day_data) < 11:
+    # Fix: Handle None values in history (can occur when to_raw returns None)
+    if prev_day_data is None or len(prev_day_data) < 11:
         # Calculate 9-day SMA of MACD
-        v_calc = np.mean([day[9] for day in full_history]) # Get MACD (index 9)
+        # Fix: Filter out None values from the extracted MACD values
+        macd_vals = [day[9] for day in full_history if day is not None and len(day) > 9 and day[9] is not None and not np.isnan(day[9])]
+        v_calc = np.mean(macd_vals) if macd_vals else None
     else:
         # Calculate EMA
-        curr_macd = current_day_data[9]
-        signal_prev = prev_day_data[10] # Get previous MACD_Signal
-        v_calc = (curr_macd - signal_prev) * (2 / 10) + signal_prev
+        # Fix: Check bounds before accessing index
+        if len(current_day_data) < 10:
+            # Fall back to SMA calculation
+            macd_vals = [day[9] for day in full_history if day is not None and len(day) > 9 and day[9] is not None and not np.isnan(day[9])]
+            v_calc = np.mean(macd_vals) if macd_vals else None
+        else:
+            curr_macd = current_day_data[9]
+            signal_prev = prev_day_data[10] # Get previous MACD_Signal
+            # Fix: Check if curr_macd or signal_prev is None (can happen if previous calculation failed)
+            if curr_macd is None or np.isnan(curr_macd) or signal_prev is None or np.isnan(signal_prev):
+                # Fall back to SMA calculation
+                macd_vals = [day[9] for day in full_history if day is not None and len(day) > 9 and day[9] is not None and not np.isnan(day[9])]
+                v_calc = np.mean(macd_vals) if macd_vals else None
+            else:
+                v_calc = (curr_macd - signal_prev) * (2 / 10) + signal_prev
     
     return current_day_data + [v_calc]
 
@@ -169,14 +253,29 @@ def run_ema12ema(current_day_data, history):
     prev_day_data = full_history[-2]
 
     # VBA: If commaTest < 11 Then
-    if len(prev_day_data) < 12:
+    # Fix: Handle None values in history (can occur when to_raw returns None)
+    if prev_day_data is None or len(prev_day_data) < 12:
         # Calculate 12-day SMA of EMA12
-        v_calc = np.mean([day[7] for day in full_history]) # Get EMA12 (index 7)
+        # Fix: Filter out None values from the extracted EMA12 values
+        ema12_vals = [day[7] for day in full_history if day is not None and len(day) > 7 and day[7] is not None and not np.isnan(day[7])]
+        v_calc = np.mean(ema12_vals) if ema12_vals else None
     else:
         # Calculate EMA
-        curr_ema12 = current_day_data[7]
-        ema12ema_prev = prev_day_data[11] # Get previous EMA12EMA
-        v_calc = (curr_ema12 - ema12ema_prev) * (2 / 13) + ema12ema_prev
+        # Fix: Check bounds before accessing index
+        if len(current_day_data) < 8:
+            # Fall back to SMA calculation
+            ema12_vals = [day[7] for day in full_history if day is not None and len(day) > 7 and day[7] is not None and not np.isnan(day[7])]
+            v_calc = np.mean(ema12_vals) if ema12_vals else None
+        else:
+            curr_ema12 = current_day_data[7]
+            ema12ema_prev = prev_day_data[11] # Get previous EMA12EMA
+            # Fix: Check if curr_ema12 or ema12ema_prev is None (can happen if previous calculation failed)
+            if curr_ema12 is None or np.isnan(curr_ema12) or ema12ema_prev is None or np.isnan(ema12ema_prev):
+                # Fall back to SMA calculation
+                ema12_vals = [day[7] for day in full_history if day is not None and len(day) > 7 and day[7] is not None and not np.isnan(day[7])]
+                v_calc = np.mean(ema12_vals) if ema12_vals else None
+            else:
+                v_calc = (curr_ema12 - ema12ema_prev) * (2 / 13) + ema12ema_prev
         
     return current_day_data + [v_calc]
 
@@ -186,36 +285,74 @@ def run_ema12emaema(current_day_data, history):
     prev_day_data = full_history[-2]
     
     # VBA: If commaTest < 12 Then
-    if len(prev_day_data) < 13:
+    # Fix: Handle None values in history (can occur when to_raw returns None)
+    if prev_day_data is None or len(prev_day_data) < 13:
         # Calculate 12-day SMA of EMA12EMA
-        v_calc = np.mean([day[11] for day in full_history]) # Get EMA12EMA (index 11)
+        # Fix: Filter out None values from the extracted EMA12EMA values
+        ema12ema_vals = [day[11] for day in full_history if day is not None and len(day) > 11 and day[11] is not None and not np.isnan(day[11])]
+        v_calc = np.mean(ema12ema_vals) if ema12ema_vals else None
     else:
         # Calculate EMA
-        curr_ema12ema = current_day_data[11]
-        ema12emaema_prev = prev_day_data[12] # Get previous EMA12EMAEMA
-        v_calc = (curr_ema12ema - ema12emaema_prev) * (2 / 13) + ema12emaema_prev
+        # Fix: Check bounds before accessing index
+        if len(current_day_data) < 12:
+            # Fall back to SMA calculation
+            ema12ema_vals = [day[11] for day in full_history if day is not None and len(day) > 11 and day[11] is not None and not np.isnan(day[11])]
+            v_calc = np.mean(ema12ema_vals) if ema12ema_vals else None
+        else:
+            curr_ema12ema = current_day_data[11]
+            ema12emaema_prev = prev_day_data[12] # Get previous EMA12EMAEMA
+            # Fix: Check if curr_ema12ema or ema12emaema_prev is None (can happen if previous calculation failed)
+            if curr_ema12ema is None or np.isnan(curr_ema12ema) or ema12emaema_prev is None or np.isnan(ema12emaema_prev):
+                # Fall back to SMA calculation
+                ema12ema_vals = [day[11] for day in full_history if day is not None and len(day) > 11 and day[11] is not None and not np.isnan(day[11])]
+                v_calc = np.mean(ema12ema_vals) if ema12ema_vals else None
+            else:
+                v_calc = (curr_ema12ema - ema12emaema_prev) * (2 / 13) + ema12emaema_prev
         
     return current_day_data + [v_calc]
 
 def run_trix(current_day_data, prev_day_data):
     """Appends Trix."""
+    # Fix: Handle None values (defensive check)
+    if prev_day_data is None or len(prev_day_data) < 13:
+        # Can't calculate Trix without previous value, return current with None
+        return current_day_data + [None]
+    # Fix: Check bounds before accessing index
+    if len(current_day_data) < 13:
+        return current_day_data + [None]
+    
     ema_curr = current_day_data[12] # EMA12EMAEMA
     ema_prev = prev_day_data[12] # EMA12EMAEMA
+    # Fix: Check if ema_prev is None (can happen if previous calculation failed)
+    if ema_curr is None or ema_prev is None or np.isnan(ema_curr) or np.isnan(ema_prev) or ema_prev == 0:
+        return current_day_data + [None]
     
-    v_calc = 100 * (ema_curr / ema_prev - 1) if ema_prev != 0 else 0
+    v_calc = 100 * (ema_curr / ema_prev - 1)
     return current_day_data + [v_calc]
 
 def run_x20dma(current_day_data, history):
     """Appends x20DMA. history is 19 days before current."""
     full_history = history + [current_day_data] # 20 days total
     # Calculate 20-day SMA of Close
-    v_calc = np.mean([get_close(day) for day in full_history])
+    # Fix: Filter out None/nan values
+    close_vals = [get_close(day) for day in full_history if day is not None]
+    close_vals = [v for v in close_vals if v is not None and not np.isnan(v)]
+    v_calc = np.mean(close_vals) if close_vals else None
     return current_day_data + [v_calc]
 
 def run_xdiffdma(current_day_data):
     """Appends xDiffDMA."""
+    # Fix: Check bounds before accessing index
+    if len(current_day_data) < 15:
+        return current_day_data + [None]
+    
     curr_close = get_close(current_day_data)
     dma_curr = current_day_data[14] # x20DMA
+    
+    # Fix: Handle None values
+    if dma_curr is None or np.isnan(dma_curr) or np.isnan(curr_close):
+        return current_day_data + [None]
+    
     v_calc = curr_close - dma_curr
     return current_day_data + [v_calc]
 
@@ -286,6 +423,8 @@ def process_dataframe(df):
         # VBA: For i = 27 To 3922
         for i in range(26, num_rows):
             if col_data[i] is None: continue
+            # Fix: Skip if previous day data is None (can occur when to_raw returns None)
+            if col_data[i-1] is None: continue
             col_data[i] = run_ema26(col_data[i], col_data[i-1])
         # VBA: Array cleanup (i = 1 To 25)
         for i in range(25):
@@ -334,6 +473,8 @@ def process_dataframe(df):
         # VBA: For i = 35 To 3922
         for i in range(34, num_rows):
             if col_data[i] is None: continue
+            # Fix: Skip if previous day data is None (can occur when to_raw returns None)
+            if col_data[i-1] is None: continue
             col_data[i] = run_trix(col_data[i], col_data[i-1])
         # VBA: Array cleanup (i = 1 To 34)
         for i in range(34):
@@ -551,8 +692,8 @@ def update_config_files(new_filename):
             content = f.read()
         
         # Update OUTPUT_FILE_PKL
-        pattern = r"OUTPUT_FILE_PKL = '[^']+'"
-        replacement = f"OUTPUT_FILE_PKL = '{new_basename}'"
+        pattern = r"OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_311225.pkl']+'"
+        replacement = f"OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_311225.pkl'"
         new_content = re.sub(pattern, replacement, content)
         
         if new_content != content:
@@ -645,11 +786,13 @@ def generate_output_filename(base_filename, date=None):
 def append_mode(production_file, new_data_file, *, update_config=False, allow_overlap=False):
     """
     Append mode: Process new raw data and append to existing production dataset.
-    Uses last 50 rows from production as history for proper indicator calculation.
-    History provides warm-up for EMAs (need 34 minimum) plus overlap for validation.
+    Uses last 150 rows from production as history for proper indicator calculation.
+    History provides warm-up for EMAs (need 34 minimum) plus extra rows for full convergence.
+    Since history is converted to raw OHLC, all indicators must recalculate from scratch.
+    EMAs need additional rows beyond the minimum to fully converge to stable values.
     """
-    HISTORY_ROWS = 50  # History rows: 34 minimum + 16 overlap for validation
-    VBA_CALC_RAMP_UP_ROWS = 34  # Ramp-up rows to skip
+    HISTORY_ROWS = 150  # History rows: 34 minimum + 116 extra for full EMA convergence
+    VBA_CALC_RAMP_UP_ROWS = 34  # Ramp-up rows to skip (minimum required)
     
     print("="*60)
     print("APPEND MODE")
@@ -668,7 +811,7 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
         print(f"Error: Production dataset has only {len(df_production)} rows, but {HISTORY_ROWS} rows are required for history.")
         return
     
-    # Extract last 100 rows for history
+    # Extract last HISTORY_ROWS rows for history
     df_history = df_production.iloc[-HISTORY_ROWS:].copy()
     print(f"Extracted last {HISTORY_ROWS} rows for history")
     
@@ -739,8 +882,9 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
         print("Append mode requires a date-like index.")
         return
 
-    prod_last_ts = prod_index_ts.iloc[-1]
-    new_first_ts = new_index_ts.iloc[0]
+    # Fix: DatetimeIndex doesn't have .iloc, use direct indexing instead
+    prod_last_ts = prod_index_ts[-1]  # Changed from .iloc[-1]
+    new_first_ts = new_index_ts[0]    # Changed from .iloc[0]
 
     if new_first_ts <= prod_last_ts:
         print(f"\n⚠️  WARNING: New data does not start strictly after production.")
@@ -819,8 +963,8 @@ def append_mode(production_file, new_data_file, *, update_config=False, allow_ov
     
     # Extract only the new rows
     # FIX: We have HISTORY_ROWS (100) which serves as the warm-up period.
-    # Therefore, the indicators are stable by the time we hit the first new row.
-    # We do NOT need to discard the first 34 rows of the new data.
+    # This ensures all indicators (especially EMAs) are fully converged by the time
+    # we hit the first new row. We do NOT need to discard the first 34 rows of the new data.
     
     new_data_indices = list(df_new_lists.index)
     
