@@ -148,6 +148,31 @@ def to_dict(self) -> dict:
 
 ---
 
+### 8. Multi-Mode Stuck Detection Not Advancing Members (training/erl_trainer.py:7240-7271)
+**Problem**: When stuck detection triggered (20 generations without improvement), it called `_advance_to_next_multi_member()` but didn't increment the breakthrough count. Since the function only advances when `breakthroughs >= 3`, members with 0, 1, or 2 breakthroughs would remain stuck indefinitely.
+
+**Root Cause**: 
+- Stuck detection detected local optima after 20 generations without improvement
+- It attempted to advance to the next member by calling `_advance_to_next_multi_member()`
+- However, `_advance_to_next_multi_member()` checks if `current_breakthroughs >= MULTI_TARGET_TURNOVERS` (3) before advancing
+- Without incrementing the breakthrough count, members with < 3 breakthroughs would never advance
+
+**Solution**: 
+When stuck detection triggers, mark the member as "completed" by:
+1. Setting their breakthrough count to `MULTI_TARGET_TURNOVERS` (3) if it's currently less
+2. Updating phase-specific turnover tracking (`non_maverick_turnovers_per_agent` or `maverick_turnovers_per_agent`)
+3. Then calling `_advance_to_next_multi_member()`, which now sees the member as complete and advances properly
+
+**Impact**: 
+- Stuck members are now properly advanced to the next member instead of remaining stuck indefinitely
+- Prevents infinite loops when a member can't achieve improvements
+- Maintains the intended behavior: treat stuck members as "completed" and move on
+
+**Files Modified**:
+- `training/erl_trainer.py` - Lines 7240-7271: Stuck detection now marks members as completed before advancing
+
+---
+
 ## Testing Recommendations
 
 1. **Parallel Validation**: Run training with 48+ workers to ensure no CUDA errors
