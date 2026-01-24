@@ -189,6 +189,13 @@ def main():
                  'disk writes to avoid I/O thrashing on local NVMe drives. Recommended for '
                  'Windows or when parallel workers cause slowdowns.'
         )
+        parser.add_argument(
+            '--force-maverick',
+            action='store_true',
+            help='[DEBUG] Skip non-maverick phase and start directly in maverick phase. '
+                 'Useful for testing maverick phase transitions without waiting for all '
+                 'non-maverick agents to complete. Requires --multi mode.'
+        )
         args = parser.parse_args()
         # --------------------------------
 
@@ -274,6 +281,11 @@ def main():
             print(f"  Consistency mode auto-enabled")
             print(f"  Target: {Config.SINGLE_TARGET_BREAKTHROUGHS} breakthroughs of 5% each")
 
+        # Validate --force-maverick requires --multi
+        if args.force_maverick and not args.multi:
+            print(f"\n❌ ERROR: --force-maverick requires --multi mode")
+            sys.exit(1)
+
         # Validate --multi mode (committee roster must exist)
         if args.multi:
             from committee import CommitteeManager
@@ -302,6 +314,8 @@ def main():
             print(f"  Training mode: Sequential (one member at a time)")
             print(f"  Target turnovers: {Config.MULTI_TARGET_TURNOVERS}")
             print(f"  Consistency mode: AUTO-ENABLED")
+            if args.force_maverick:
+                print(f"  ⚠ FORCE-MAVERICK: Skipping non-maverick phase (DEBUG MODE)")
 
         # NOTE: Seed will be set AFTER wandb init in ERLTrainer to ensure unique seeds per run
         # This prevents parallel runs from having identical behavior
@@ -386,7 +400,8 @@ def main():
             multi_mode=args.multi,
             multi_roster=getattr(args, 'multi_roster', None),
             maverick_mode=args.maverick,
-            local_mode=args.local
+            local_mode=args.local,
+            force_maverick=getattr(args, 'force_maverick', False)
         )
 
         # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---

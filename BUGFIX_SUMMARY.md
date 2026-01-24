@@ -173,6 +173,33 @@ When stuck detection triggers, mark the member as "completed" by:
 
 ---
 
+### 9. Multi-Mode Early Exit on Maverick Goal Achievement (training/erl_trainer.py:7079-7090, 5777-5782)
+**Problem**: When running `--multi --force-maverick`, training exited early after a maverick agent achieved rank ≤ 20 in Global50, instead of continuing to train for the target 3 turnovers per agent.
+
+**Root Cause**: 
+- The maverick goal achievement check (line 7080) was causing an early exit regardless of mode
+- In `--multi` mode, the goal is to train each maverick agent for 3 turnovers (breakthroughs) each, regardless of rank achievement
+- The check didn't consider `multi_mode`, so it would exit after the first maverick goal achievement
+
+**Solution**: 
+1. Modified the maverick goal check to skip early exit when in `multi_mode`:
+   - Added `and not self.multi_mode` condition to the exit check
+   - Added an `elif` branch for `multi_mode` that celebrates the achievement but continues training
+2. Updated the earlier message (line 5782) to be conditional:
+   - In `multi_mode`: "Training continues in multi-mode to reach target turnovers..."
+   - Otherwise: "Training will stop at end of this generation"
+
+**Impact**: 
+- `--multi` mode now correctly continues training until each maverick agent completes 3 turnovers
+- Standalone maverick mode still exits early when goal is achieved (preserves original behavior)
+- Users can now run `--multi --force-maverick` and get the full training cycle
+
+**Files Modified**:
+- `training/erl_trainer.py` - Lines 7079-7103: Conditional maverick goal exit check based on `multi_mode`
+- `training/erl_trainer.py` - Lines 5777-5785: Conditional message based on `multi_mode`
+
+---
+
 ## Testing Recommendations
 
 1. **Parallel Validation**: Run training with 48+ workers to ensure no CUDA errors

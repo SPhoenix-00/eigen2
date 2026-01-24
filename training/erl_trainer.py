@@ -604,7 +604,7 @@ class ERLTrainer:
                  consistency_mode: bool = False, heroes_hof_dir: str = None, single_agent_path: str = None,
                  buffer_storage_path: str = None, reset_limit: bool = False, original_stdout=None, original_stderr=None,
                  multi_mode: bool = False, multi_roster: dict = None, maverick_mode: bool = False,
-                 local_mode: bool = False):
+                 local_mode: bool = False, force_maverick: bool = False):
         """
         Initialize ERL trainer.
 
@@ -623,6 +623,7 @@ class ERLTrainer:
             multi_roster: Committee roster dict with 9 members (required if multi_mode=True)
             maverick_mode: If True, enable Maverick training mode (aggressive reward functions)
             local_mode: If True, use sequential evaluation/validation and serialize disk writes
+            force_maverick: If True, skip non-maverick phase and start directly in maverick phase (DEBUG)
         """
         self.data_loader = data_loader
         self.resume_run_name = resume_run_name
@@ -635,6 +636,7 @@ class ERLTrainer:
         self.reset_limit = reset_limit  # Reset fallback counter on resume
         self.maverick_mode = maverick_mode  # Maverick training mode (aggressive reward functions)
         self.local_mode = local_mode  # Local mode: sequential execution and serialized disk writes
+        self.force_maverick = force_maverick  # Skip non-maverick phase (DEBUG mode)
 
         # Multi-agent committee mode (sequential training of each member)
         self.multi_mode = multi_mode
@@ -733,7 +735,7 @@ class ERLTrainer:
                     state_path = self.checkpoint_dir / "trainer_state.json"
                     if state_path.exists():
                         try:
-                            import json
+                            # json is already imported at module level
                             with open(state_path, 'r') as f:
                                 trainer_state = json.load(f)
                             wandb_run_id = trainer_state.get('wandb_run_id')
@@ -1103,6 +1105,15 @@ class ERLTrainer:
         else:
             print("Local mode: Skipping shared memory (CPU-optimized evaluation)")
             self._shared_memory_names = {}  # Empty dict for compatibility
+            # #region agent log
+            try:
+                with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
+                    f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"erl_trainer.py:1105","message":"Local mode: _shm_metadata not initialized","data":{"local_mode":self.local_mode,"has_shm_metadata":hasattr(self,'_shm_metadata')},"timestamp":int(time.time()*1000)}) + '\n')
+            except Exception:
+                pass  # Silently fail if logging fails
+            # #endregion
+            # Initialize empty _shm_metadata for local mode compatibility
+            self._shm_metadata = {}
 
         # Initialize LocalEvaluator for CPU-optimized local mode
         # This must be initialized after eval_env but before checkpoint loading
@@ -1269,20 +1280,51 @@ class ERLTrainer:
         Returns:
             Dict with shared memory references and other config
         """
-        return {
-            # Shared memory references (no serialization needed)
-            **self._shm_metadata,
-            # Small data that must be pickled (but fast)
-            'dates': self.data_loader.dates,
-            'normalization_stats': self.normalization_stats,
-            'start_idx': start_idx,
-            'end_idx': end_idx,
-            'trading_end_idx': trading_end_idx,
-            'is_training': is_training,
-            'consistency_mode': self.consistency_mode,
-            'gauntlet_mode': gauntlet_mode,
-            'maverick_mode': self.maverick_mode
-        }
+        # #region agent log
+        try:
+            with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
+                has_shm = hasattr(self, '_shm_metadata')
+                shm_keys = list(getattr(self, '_shm_metadata', {}).keys()) if has_shm else []
+                f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"B","location":"erl_trainer.py:1272","message":"_get_shared_env_config called","data":{"local_mode":self.local_mode,"has_shm_metadata":has_shm,"shm_metadata_keys":shm_keys},"timestamp":int(time.time()*1000)}) + '\n')
+        except Exception:
+            pass  # Silently fail if logging fails
+        # #endregion
+        # Handle local mode where _shm_metadata may not exist or be empty
+        shm_dict = getattr(self, '_shm_metadata', {}) or {}
+        
+        # In local mode, include actual arrays instead of shared memory references
+        # This is needed for worker processes that don't use shared memory
+        if self.local_mode or not shm_dict:
+            return {
+                # Include actual arrays for local mode or when shared memory not available
+                'data_array': self.data_loader.data_array,
+                'data_array_full': self.data_loader.data_array_full,
+                # Small data that must be pickled (but fast)
+                'dates': self.data_loader.dates,
+                'normalization_stats': self.normalization_stats,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'trading_end_idx': trading_end_idx,
+                'is_training': is_training,
+                'consistency_mode': self.consistency_mode,
+                'gauntlet_mode': gauntlet_mode,
+                'maverick_mode': self.maverick_mode
+            }
+        else:
+            return {
+                # Shared memory references (no serialization needed)
+                **shm_dict,
+                # Small data that must be pickled (but fast)
+                'dates': self.data_loader.dates,
+                'normalization_stats': self.normalization_stats,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'trading_end_idx': trading_end_idx,
+                'is_training': is_training,
+                'consistency_mode': self.consistency_mode,
+                'gauntlet_mode': gauntlet_mode,
+                'maverick_mode': self.maverick_mode
+            }
 
     def _create_dataloader(self):
         """
@@ -1737,8 +1779,41 @@ class ERLTrainer:
         for member_idx, member in enumerate(members):
             agent_path = get_agent_filepath(member, context_window)
 
+            # Try to download from cloud if file doesn't exist locally
             if not agent_path.exists():
-                raise FileNotFoundError(f"Committee member agent not found: {agent_path}")
+                print(f"  ⚠ Agent file not found locally: {agent_path.name}")
+                print(f"  ⏳ Attempting to download from cloud...")
+                
+                # Construct cloud path: eigen2/global50/cw{N}/agents/{filename}
+                cloud_path = f"eigen2/global50/cw{context_window}/agents/{agent_path.name}"
+                
+                # Ensure parent directory exists
+                agent_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Try to download from cloud
+                try:
+                    if self.cloud_sync.provider != "local":
+                        success = self.cloud_sync.download_file(cloud_path, str(agent_path))
+                        if success and agent_path.exists():
+                            print(f"  ✓ Downloaded: {agent_path.name}")
+                        else:
+                            raise FileNotFoundError(
+                                f"Committee member agent not found locally and download failed: {agent_path}\n"
+                                f"  Cloud path: {cloud_path}\n"
+                                f"  Run 'python committee.py --mirror' to sync all committee agent files."
+                            )
+                    else:
+                        raise FileNotFoundError(
+                            f"Committee member agent not found: {agent_path}\n"
+                            f"  Cloud sync is disabled (local mode).\n"
+                            f"  Run 'python committee.py --mirror' to sync all committee agent files."
+                        )
+                except Exception as e:
+                    raise FileNotFoundError(
+                        f"Committee member agent not found and download failed: {agent_path}\n"
+                        f"  Error: {e}\n"
+                        f"  Run 'python committee.py --mirror' to sync all committee agent files."
+                    )
 
             # Load member agent
             agent = DDPGAgent(agent_id=member_idx)
@@ -1837,8 +1912,23 @@ class ERLTrainer:
                 "At least one maverick agent is required in the committee."
             )
         
+        # Check for force_maverick flag (DEBUG mode - skip non-maverick phase)
+        if self.force_maverick:
+            print(f"\n⚠ FORCE-MAVERICK MODE: Skipping non-maverick phase (DEBUG)")
+            print(f"  Non-maverick members: {len(self.non_maverick_members)} (skipped)")
+            print(f"  Maverick members: {len(self.maverick_members)}")
+            print(f"  Training sequence: 3 turnovers per maverick agent, sequentially")
+            # Initialize maverick turnovers tracking (before _reset_for_maverick_phase which also sets it)
+            self.maverick_turnovers_per_agent = [0] * len(self.maverick_members)
+            # Perform maverick phase initialization (clear buffer, reset population, etc.)
+            # This sets multi_phase='maverick' and maverick_mode=True
+            self._reset_for_maverick_phase()
+            # Load first maverick member
+            first_member_idx = self.maverick_members[0]
+            self.current_maverick_idx = 0
+            self._load_multi_member(first_member_idx)
         # If all members are mavericks, skip non-maverick phase
-        if len(self.non_maverick_members) == 0:
+        elif len(self.non_maverick_members) == 0:
             print(f"\n⚠ All {len(members)} members are mavericks - skipping non-maverick phase")
             self.multi_phase = 'maverick'
             self.maverick_mode = True
@@ -1846,6 +1936,9 @@ class ERLTrainer:
             self.maverick_turnovers_per_agent = [0] * len(self.maverick_members)
             self.current_maverick_idx = 0
             print(f"  Training sequence: 3 turnovers per maverick agent, sequentially")
+            # Load first maverick member
+            first_member_idx = self.maverick_members[0]
+            self._load_multi_member(first_member_idx)
         else:
             # Start with non-maverick phase
             self.multi_phase = 'non_maverick'
@@ -1857,13 +1950,9 @@ class ERLTrainer:
             print(f"  Maverick members: {len(self.maverick_members)}")
             print(f"  Training sequence: 3 turnovers per non-maverick agent, sequentially")
             print(f"  Then: Clear buffer/population and train maverick agents")
-        
-        # Now load the first member for training
-        if self.multi_phase == 'maverick':
-            first_member_idx = self.maverick_members[0]
-        else:
+            # Load first non-maverick member
             first_member_idx = self.non_maverick_members[0]
-        self._load_multi_member(first_member_idx)
+            self._load_multi_member(first_member_idx)
 
     def _load_multi_member(self, member_idx: int):
         """
@@ -1929,6 +2018,36 @@ class ERLTrainer:
                 print(f"  Turnovers for this agent: {self.maverick_turnovers_per_agent[list_idx]}/{Config.MULTI_TARGET_TURNOVERS}")
 
         agent_path = get_agent_filepath(member, context_window)
+        
+        # Try to download from cloud if file doesn't exist locally
+        if not agent_path.exists():
+            print(f"  ⚠ Agent file not found locally: {agent_path.name}")
+            print(f"  ⏳ Attempting to download from cloud...")
+            
+            # Construct cloud path: eigen2/global50/cw{N}/agents/{filename}
+            cloud_path = f"eigen2/global50/cw{context_window}/agents/{agent_path.name}"
+            
+            # Ensure parent directory exists
+            agent_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Try to download from cloud
+            if self.cloud_sync.provider != "local":
+                success = self.cloud_sync.download_file(cloud_path, str(agent_path))
+                if success and agent_path.exists():
+                    print(f"  ✓ Downloaded: {agent_path.name}")
+                else:
+                    raise FileNotFoundError(
+                        f"Committee member agent not found locally and download failed: {agent_path}\n"
+                        f"  Cloud path: {cloud_path}\n"
+                        f"  Run 'python committee.py --mirror' to sync all committee agent files."
+                    )
+            else:
+                raise FileNotFoundError(
+                    f"Committee member agent not found: {agent_path}\n"
+                    f"  Cloud sync is disabled (local mode).\n"
+                    f"  Run 'python committee.py --mirror' to sync all committee agent files."
+                )
+        
         source_agent = DDPGAgent(agent_id=0)
         source_agent.load(str(agent_path))
 
@@ -2125,6 +2244,13 @@ class ERLTrainer:
         Reset buffer, population, and environment for maverick phase.
         Called when transitioning from non-maverick to maverick phase.
         """
+        # #region agent log
+        try:
+            with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"C","location":"erl_trainer.py:2128","message":"_reset_for_maverick_phase called","data":{"local_mode":self.local_mode,"has_shm_metadata":hasattr(self,'_shm_metadata')},"timestamp":int(time.time()*1000)}) + '\n')
+        except Exception:
+            pass  # Silently fail if logging fails
+        # #endregion
         print(f"\n  Clearing replay buffer and resetting population...")
         
         # Clear replay buffer
@@ -2212,6 +2338,17 @@ class ERLTrainer:
             # Reinitialize shared memory with updated maverick_mode
             self._init_shared_memory()
             print(f"  ✓ Shared memory recreated - workers will use maverick_mode=True on next ProcessPoolExecutor")
+        else:
+            # #region agent log
+            try:
+                with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
+                    f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"D","location":"erl_trainer.py:2215","message":"Local mode: ensuring _shm_metadata exists","data":{"local_mode":self.local_mode,"has_shm_metadata":hasattr(self,'_shm_metadata')},"timestamp":int(time.time()*1000)}) + '\n')
+            except Exception:
+                pass  # Silently fail if logging fails
+            # #endregion
+            # Ensure _shm_metadata exists for local mode compatibility
+            if not hasattr(self, '_shm_metadata'):
+                self._shm_metadata = {}
         
         print(f"  ✓ Reset complete - ready for maverick phase")
 
@@ -2230,6 +2367,13 @@ class ERLTrainer:
 
         num_episodes = 5
 
+        # #region agent log
+        try:
+            with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"E","location":"erl_trainer.py:2234","message":"_evaluate_single_agent_for_baseline calling _get_shared_env_config","data":{"local_mode":self.local_mode,"has_shm_metadata":hasattr(self,'_shm_metadata')},"timestamp":int(time.time()*1000)}) + '\n')
+        except Exception:
+            pass  # Silently fail if logging fails
+        # #endregion
         # Prepare environment config using shared memory
         env_config = self._get_shared_env_config(
             start_idx=self.train_start_idx,
@@ -2244,49 +2388,99 @@ class ERLTrainer:
             'critic': {k: v.cpu() for k, v in agent.critic.state_dict().items()}
         }
 
-        # Prepare tasks for parallel evaluation
-        tasks = []
-        for slice_idx in range(num_episodes):
-            # Calculate episode indices
-            total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-            max_start = self.train_end_idx - total_days_needed
-            start_idx = np.random.randint(self.train_start_idx, max_start)
-            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-
-            # Create unique seed for this task
-            task_seed = self.seed + slice_idx * 1000
-
-            tasks.append((
-                agent_state,
-                start_idx,
-                end_idx,
-                False,  # training=False, don't add to buffer
-                task_seed,
-                None,  # No buffer storage
-                0  # file_id_start (unused)
-            ))
-
-        # Execute in parallel
-        num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
-
         slice_fitness_scores = []
 
-        with ProcessPoolExecutor(
-            max_workers=num_workers,
-            mp_context=mp.get_context('spawn'),
-            initializer=_init_worker,
-            initargs=(env_config,)
-        ) as executor:
-            futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
+        # In local mode, use sequential evaluation with eval_env directly
+        if self.local_mode:
+            # Use the existing eval_env for sequential evaluation
+            for slice_idx in tqdm(range(num_episodes), desc="Evaluating baseline"):
+                # Calculate episode indices
+                total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                max_start = self.train_end_idx - total_days_needed
+                start_idx = np.random.randint(self.train_start_idx, max_start)
+                end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
 
-            for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating baseline"):
+                # Set seed for reproducibility
+                task_seed = self.seed + slice_idx * 1000
+                np.random.seed(task_seed)
+                torch.manual_seed(task_seed)
+
                 try:
-                    raw_fitness, episode_info, _ = future.result()
+                    # Reset environment for this episode
+                    self.eval_env.set_training_mode(False)
+                    state, info = self.eval_env.reset(start_idx=start_idx, end_idx=end_idx, trading_end_idx=trading_end_idx)
+
+                    # Run episode
+                    cumulative_reward = 0.0
+                    steps = 0
+
+                    while True:
+                        action = agent.select_action(state, add_noise=False)
+                        next_state, reward, terminated, truncated, info = self.eval_env.step(action)
+                        cumulative_reward += reward
+                        steps += 1
+                        state = next_state
+
+                        if terminated or truncated:
+                            break
+
+                    # Get episode summary
+                    episode_info = self.eval_env.get_episode_summary()
+                    episode_info['steps'] = steps
+
+                    # Calculate fitness
+                    raw_fitness = float(cumulative_reward)
+                    if episode_info['num_trades'] == 0:
+                        raw_fitness -= episode_info['zero_trades_penalty']
+
                     triad_fitness = self.calculate_triad_fitness(episode_info)
                     slice_fitness_scores.append(triad_fitness)
                 except Exception as e:
-                    print(f"\n  ! Worker failed: {e}")
+                    print(f"\n  ! Episode {slice_idx} failed: {e}")
                     slice_fitness_scores.append(-10000.0)
+        else:
+            # Parallel evaluation with ProcessPoolExecutor
+            tasks = []
+            for slice_idx in range(num_episodes):
+                # Calculate episode indices
+                total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+                max_start = self.train_end_idx - total_days_needed
+                start_idx = np.random.randint(self.train_start_idx, max_start)
+                end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+
+                # Create unique seed for this task
+                task_seed = self.seed + slice_idx * 1000
+
+                tasks.append((
+                    agent_state,
+                    start_idx,
+                    end_idx,
+                    False,  # training=False, don't add to buffer
+                    task_seed,
+                    None,  # No buffer storage
+                    0  # file_id_start (unused)
+                ))
+
+            # Execute in parallel
+            num_workers = min(mp.cpu_count() - 1, Config.EVAL_NUM_WORKERS)
+
+            with ProcessPoolExecutor(
+                max_workers=num_workers,
+                mp_context=mp.get_context('spawn'),
+                initializer=_init_worker,
+                initargs=(env_config,)
+            ) as executor:
+                futures = {executor.submit(_run_episode_worker, task): idx for idx, task in enumerate(tasks)}
+
+                for future in tqdm(as_completed(futures), total=len(tasks), desc="Evaluating baseline"):
+                    try:
+                        raw_fitness, episode_info, _ = future.result()
+                        triad_fitness = self.calculate_triad_fitness(episode_info)
+                        slice_fitness_scores.append(triad_fitness)
+                    except Exception as e:
+                        print(f"\n  ! Worker failed: {e}")
+                        slice_fitness_scores.append(-10000.0)
 
         # Calculate fitness using appropriate aggregator
         if self.multi_mode:
@@ -3805,8 +3999,8 @@ class ERLTrainer:
         improved_agent.save(str(new_path))
         print(f"  Saved improved agent: {new_filename}")
 
-        # Update Global50 ledger
-        self._update_global50_for_multi_improvement(member_idx, new_filename, score, improved_agent, val_result)
+        # Update Global50 ledger (returns gauntlet results for roster update)
+        gauntlet_results = self._update_global50_for_multi_improvement(member_idx, new_filename, score, improved_agent, val_result)
 
         # CRITICAL: Update roster in memory so future loads use the improved agent
         # Must include ALL fields required by committee.py for consensus logic:
@@ -3816,17 +4010,22 @@ class ERLTrainer:
         old_run_name = member['run_name']
         old_agent_id = member['agent_id']
 
-        # Extract metrics from validation result
-        roi = val_result.get('roi', 0.0)
-        expectancy = val_result.get('expectancy', 0.0)
-        total_trades = val_result.get('total_trades', 0)
-        quality_count = val_result.get('quality_count', 0)
+        # Use metrics from gauntlet validation (more rigorous than regular validation)
+        gauntlet_score = gauntlet_results.get('gauntlet_score', score)  # Fallback to validation score if missing
+        roi = gauntlet_results.get('roi', val_result.get('roi', 0.0))
+        expectancy = gauntlet_results.get('expectancy', val_result.get('expectancy', 0.0))
+        total_trades = gauntlet_results.get('total_trades', val_result.get('total_trades', 0))
+        quality_count = gauntlet_results.get('quality_count', val_result.get('quality_count', 0))
         quality_ratio = (quality_count / total_trades) if total_trades > 0 else 0.0
-
-        num_wins = val_result.get('num_wins', 0)
-        num_losses = val_result.get('num_losses', 0)
-        total_decisions = num_wins + num_losses
-        win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
+        
+        # Calculate win_ratio from gauntlet results, fallback to validation result calculation
+        win_ratio = gauntlet_results.get('win_rate', 0.0)
+        if win_ratio == 0.0 and 'win_rate' not in gauntlet_results:
+            # Fallback: calculate from validation result
+            num_wins = val_result.get('num_wins', 0)
+            num_losses = val_result.get('num_losses', 0)
+            total_decisions = num_wins + num_losses
+            win_ratio = (num_wins / total_decisions) if total_decisions > 0 else 0.0
 
         # Skip conviction threshold calculation during training - it's only needed for committee inference
         # The thresholds will be recalculated when the committee is loaded for production use
@@ -3837,7 +4036,7 @@ class ERLTrainer:
             'filename': new_filename,
             'run_name': self.run_name,
             'agent_id': improved_agent.agent_id,
-            'gauntlet_score': score,
+            'gauntlet_score': gauntlet_score,  # Use actual gauntlet score, not validation score
             'roi': roi,
             'expectancy': expectancy,
             'quality_ratio': quality_ratio,
@@ -3860,7 +4059,8 @@ class ERLTrainer:
         self.member_baselines[member_idx] = score
 
         # Update member's starting ROI (self-referential hurdle)
-        new_roi = val_result.get('roi', self.member_starting_rois[member_idx])
+        # Use ROI from gauntlet validation (more accurate)
+        new_roi = gauntlet_results.get('roi', val_result.get('roi', self.member_starting_rois[member_idx]))
         self.member_starting_rois[member_idx] = new_roi
         self.roi_hurdle_ema = new_roi
         print(f"  Updated ROI hurdle: {self.member_starting_rois[member_idx]:.2f}%")
@@ -3986,6 +4186,20 @@ class ERLTrainer:
         self.global_hof.roi_p25 = float('-inf')
         self.global_hof.expectancy_p25 = float('-inf')
 
+        # Run gauntlet validation to get certified gauntlet score and display output
+        # This ensures multi-mode uses the same rigorous validation as normal gauntlet mode
+        gauntlet_results = self.run_gauntlet_validation(agent)
+        gauntlet_score = gauntlet_results['gauntlet_score']
+        
+        # Use metrics from gauntlet validation (more rigorous than regular validation)
+        roi = gauntlet_results.get('roi', roi)  # Fallback to val_result if missing
+        expectancy = gauntlet_results.get('expectancy', expectancy)
+        cv = gauntlet_results.get('cv', cv)
+        total_trades = gauntlet_results.get('total_trades', total_trades)
+        quality_count = gauntlet_results.get('quality_count', quality_count)
+        quality_ratio = (quality_count / total_trades) if total_trades > 0 else 0.0
+        win_ratio = gauntlet_results.get('win_rate', win_ratio)
+
         # Upload to Global50 on every improvement
         # Pass the parent entry to be replaced so check_and_promote can:
         # 1. Remove it from the candidate pool before merging
@@ -3995,7 +4209,7 @@ class ERLTrainer:
         parent_entry = (member['run_name'], member['agent_id'])
         promoted, rank = self.global_hof.check_and_promote(
             agent=agent,
-            gauntlet_score=score,
+            gauntlet_score=gauntlet_score,
             generation=self.generation,
             roi=roi,
             expectancy=expectancy,
@@ -4020,7 +4234,10 @@ class ERLTrainer:
                 self._maverick_goal_achieved = True
                 self._maverick_final_rank = rank
         else:
-            print(f"  ℹ Not promoted to Global50 (score={score:.2f}, threshold={original_thresholds['entry_threshold']:.2f})")
+            print(f"  ℹ Not promoted to Global50 (score={gauntlet_score:.2f}, threshold={original_thresholds['entry_threshold']:.2f})")
+        
+        # Return gauntlet results for use in roster update
+        return gauntlet_results
 
     def _process_multi_turnover(self):
         """
@@ -4044,7 +4261,7 @@ class ERLTrainer:
 
         # Save milestone roster and persist updated roster
         from committee import CommitteeManager, convert_numpy_types
-        import json
+        # json is already imported at module level
         context_window = self.multi_roster['context_window_days']
         manager = CommitteeManager(context_window)
 
@@ -5562,7 +5779,10 @@ class ERLTrainer:
                                 self._maverick_goal_achieved = True
                                 self._maverick_final_rank = rank
                                 print(f"\n  ✅ MAVERICK GOAL ACHIEVED!")
-                                print(f"  Training will stop at end of this generation")
+                                if self.multi_mode:
+                                    print(f"  Training continues in multi-mode to reach target turnovers...")
+                                else:
+                                    print(f"  Training will stop at end of this generation")
                             elif self.maverick_mode:
                                 print(f"\n  ⏳ Maverick goal not yet achieved (rank #{rank} > #{Config.MAVERICK_TARGET_RANK})")
                                 print(f"  Training continues...")
@@ -6860,7 +7080,8 @@ class ERLTrainer:
             # (fallback timeout disabled for --multi mode)
 
             # Maverick mode success: Target rank achieved in Global 50
-            if self.maverick_mode and self._maverick_goal_achieved:
+            # BUT: In multi_mode, we continue training for target turnovers regardless of rank achievement
+            if self.maverick_mode and self._maverick_goal_achieved and not self.multi_mode:
                 print(f"\n{'='*60}")
                 print(f"🎯 MAVERICK GOAL ACHIEVED!")
                 print(f"{'='*60}")
@@ -6871,6 +7092,19 @@ class ERLTrainer:
                 print(f"  Generation: {gen + 1}")
                 print(f"{'='*60}")
                 break
+            elif self.maverick_mode and self._maverick_goal_achieved and self.multi_mode:
+                # In multi_mode, celebrate the achievement but continue training for target turnovers
+                print(f"\n{'='*60}")
+                print(f"🎯 MAVERICK GOAL ACHIEVED! (Continuing for target turnovers in multi-mode)")
+                print(f"{'='*60}")
+                print(f"  Maverick Agent promoted to Rank #{self._maverick_final_rank} (Target: <= #{Config.MAVERICK_TARGET_RANK})")
+                print(f"  Agent type: Maverick (aggressive reward functions)")
+                print(f"  Confirmed baseline: {self.confirmed_baseline:.2f}")
+                print(f"  Breakthroughs: {self.confirmed_breakthroughs}")
+                print(f"  Current turnovers: {self.member_breakthroughs[self.current_member_idx]}/{Config.MULTI_TARGET_TURNOVERS}")
+                print(f"  Generation: {gen + 1}")
+                print(f"  Training continues to reach {Config.MULTI_TARGET_TURNOVERS} turnovers per agent...")
+                print(f"{'='*60}")
 
             if self.consistency_mode and self.hof_turnover_count >= self.target_hof_turnovers:
                 print(f"\n{'='*60}")
