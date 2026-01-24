@@ -2950,35 +2950,40 @@ class ERLTrainer:
             # Calculate ROI based on peak capital
             roi_pct = (raw_pnl / peak_capital * 100) if peak_capital > 0 else 0.0
 
-            # A. ROI Score (Power Law)
+            # A. ROI Score (Power Law) - REDUCED from 1.5 to 1.1 for consistency
             if roi_pct >= 0:
-                roi_score = (roi_pct ** 1.5)
+                roi_score = (roi_pct ** 1.1)
             else:
-                roi_score = -(abs(roi_pct) ** 1.5)
+                roi_score = -(abs(roi_pct) ** 1.1)
 
             # B. CLAMPED Volume Scalar (20k Limit)
             # log10(20k) approx 4.3. Clamp to stop "lucky whales"
             raw_vol_scalar = math.log10(peak_capital + 10)
             volume_scalar = min(raw_vol_scalar, 4.3)
 
-            # C. Expectancy^2 (Precision Reward)
+            # C. Expectancy (Precision Reward) - REDUCED from ^2 to ^1.1
             # Expectancy is a unitless metric between 0-10 (NOT a percentage).
             # Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
             # 1.0 expectancy -> 1.0 score -> 1.1x boost
-            # 5.0 expectancy -> 25.0 score -> 3.5x boost
+            # 5.0 expectancy -> 5.8 score -> 1.58x boost (was 3.5x with ^2)
             # Anything below 1.0 expectancy should be penalized (squared amplifies negative)
             if expectancy >= 0:
-                exp_score = (expectancy ** 2)
+                exp_score = (expectancy ** 1.1)
             else:
-                exp_score = -(abs(expectancy) ** 2)
+                exp_score = -(abs(expectancy) ** 1.1)
 
             # D. Base Fitness
             if roi_score > 0:
                 # Win Scenario: Boost by Expectancy
                 # Multiplier (1 + 0.1 * exp_score) implies:
                 # exp=1% (score 1) -> 1.1x boost
-                # exp=5% (score 25) -> 3.5x boost
+                # exp=5% (score 5.8) -> 1.58x boost
                 fitness = roi_score * volume_scalar * (1.0 + (exp_score * 0.1))
+                
+                # CONSISTENCY BONUS: Multiply by (1 + WinRate)
+                # WR 20% -> 1.2x multiplier
+                # WR 60% -> 1.6x multiplier (33% boost over low WR)
+                fitness *= (1.0 + win_rate)
             else:
                 # Loss Scenario: Expectancy failure amplifies pain
                 fitness = roi_score * volume_scalar + (exp_score * volume_scalar)
@@ -3117,22 +3122,22 @@ class ERLTrainer:
         
         # 5. Maverick Scoring (Triad 3.0)
         if self.maverick_mode:
-            # A. ROI Score
+            # A. ROI Score - REDUCED from 1.5 to 1.1 for consistency
             if holographic_roi >= 0:
-                roi_score = (holographic_roi ** 1.5)
+                roi_score = (holographic_roi ** 1.1)
             else:
-                roi_score = -(abs(holographic_roi) ** 1.5)
+                roi_score = -(abs(holographic_roi) ** 1.1)
             
-            # B. Expectancy^2 Reward (The Sniper Fix)
+            # B. Expectancy Reward (The Sniper Fix) - REDUCED from ^2 to ^1.1
             # Expectancy is a unitless metric between 0-10 (NOT a percentage).
             # Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
             # 1.0 expectancy -> 1.0 score -> 1.1x boost
-            # 5.0 expectancy -> 25.0 score -> 3.5x boost
+            # 5.0 expectancy -> 5.8 score -> 1.58x boost
             # Anything below 1.0 expectancy should be penalized (squared amplifies negative)
             if expectancy >= 0:
-                exp_score = (expectancy ** 2)
+                exp_score = (expectancy ** 1.1)
             else:
-                exp_score = -(abs(expectancy) ** 2)
+                exp_score = -(abs(expectancy) ** 1.1)
 
             # C. Volume Scalar (Implied)
             # In holographic mode, volume is implied by the equity curve length.
@@ -3146,13 +3151,16 @@ class ERLTrainer:
             # Combine ROI, Volume, and Expectancy
             if roi_score > 0:
                 fitness = roi_score * volume_scalar * (1.0 + (exp_score * 0.1))
+                # Add consistency bonus (same as Triad)
+                fitness *= (1.0 + win_rate)
             else:
                 fitness = roi_score * volume_scalar + (exp_score * volume_scalar)
             
             # E. Drawdown Penalty (Specific to Holographic)
             # Acts as the "Gauntlet Proxy"
-            if max_drawdown > 0.10:
-                penalty_factor = max(0.1, 1.0 - (max_drawdown - 0.10) * 5.0) # steeper penalty
+            # TIGHTENED: Threshold reduced from 10% to 5% to force sniper-like precision
+            if max_drawdown > 0.05:
+                penalty_factor = max(0.1, 1.0 - (max_drawdown - 0.05) * 10.0) # steeper penalty
                 fitness *= penalty_factor
 
             # F. Global 50 Proximity Gradient

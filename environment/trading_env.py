@@ -532,8 +532,8 @@ class TradingEnvironment(gym.Env):
                 # 3. SNIPER LOGIC: Apply Hurdle FIRST
                 # A trade making 0.5% when hurdle is 0.6% is a LOSS of -0.1%
                 # Convert HURDLE_RATE from decimal (0.006) to percentage (0.6%)
-                # MAVERICK MODE: Lower hurdle (50% of normal) to encourage more trading
-                hurdle_rate = Config.HURDLE_RATE * 0.5 if self.maverick_mode else Config.HURDLE_RATE
+                # MAVERICK MODE: Higher hurdle (1.2x of normal) to encourage precision
+                hurdle_rate = Config.HURDLE_RATE * Config.MAVERICK_HURDLE_MULTIPLIER if self.maverick_mode else Config.HURDLE_RATE
                 hurdle_pct = hurdle_rate * 100.0
                 net_gain_pct = gain_pct - hurdle_pct
 
