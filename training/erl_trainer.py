@@ -3769,9 +3769,9 @@ class ERLTrainer:
             local_accumulation_steps = Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
             print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {gradient_steps} steps/agent (batch_size={Config.LOCAL_BATCH_SIZE}, accum={local_accumulation_steps})")
 
-                # Train agents in this batch by PRE-FETCHING data once for all agents
-                # This cuts disk I/O by a factor of 8x (or whatever batch size is)
-                for batch_idx in tqdm(range(num_batches), desc="Training batches"):
+            # Train agents in this batch by PRE-FETCHING data once for all agents
+            # This cuts disk I/O by a factor of 8x (or whatever batch size is)
+            for batch_idx in tqdm(range(num_batches), desc="Training batches"):
                     batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
                     batch_end = min(batch_start + LOCAL_TRAINING_BATCH_SIZE, len(self.population))
                     batch_agents = self.population[batch_start:batch_end]

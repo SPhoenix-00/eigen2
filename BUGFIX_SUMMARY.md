@@ -200,6 +200,28 @@ When stuck detection triggers, mark the member as "completed" by:
 
 ---
 
+### 10. IndentationError in Local Mode Training Loop (training/erl_trainer.py:3772-3774)
+**Problem**: `IndentationError: unexpected indent` at line 3774 when running `python main.py --maverick --local`. The for loop and preceding comments had incorrect indentation.
+
+**Root Cause**: 
+- Lines 3772-3774 had extra indentation (one level too deep)
+- The for loop should be at the same indentation level as the print statement on line 3770
+- Both should be inside the `if self.local_mode and torch.cuda.is_available():` block
+
+**Solution**: 
+Removed the extra indentation from lines 3772-3774 so they align with line 3770:
+- Comment lines dedented by 4 spaces
+- For loop dedented by 4 spaces to match the correct block level
+
+**Impact**: 
+- Local mode training now starts without syntax errors
+- The batched GPU training loop executes correctly
+
+**Files Modified**:
+- `training/erl_trainer.py` - Lines 3772-3774: Fixed indentation of training batch loop
+
+---
+
 ## Testing Recommendations
 
 1. **Parallel Validation**: Run training with 48+ workers to ensure no CUDA errors
