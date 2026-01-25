@@ -315,6 +315,28 @@ class Config:
             print("\n".join(errors))
             return False
         return True
+    
+    @classmethod
+    def get_min_buffer_size(cls, local_mode: bool = False, is_sweep: bool = False) -> int:
+        """
+        Get the minimum buffer size threshold based on training mode.
+        
+        Args:
+            local_mode: Whether running in local mode (reduced resources)
+            is_sweep: Whether running in wandb sweep mode (faster DDPG)
+        
+        Returns:
+            Minimum buffer size threshold:
+            - MIN_BUFFER_SIZE_SWEEP if is_sweep is True
+            - LOCAL_MIN_BUFFER_SIZE if local_mode is True
+            - MIN_BUFFER_SIZE otherwise
+        """
+        if is_sweep:
+            return cls.MIN_BUFFER_SIZE_SWEEP
+        elif local_mode:
+            return cls.LOCAL_MIN_BUFFER_SIZE
+        else:
+            return cls.MIN_BUFFER_SIZE
 
 
 if __name__ == "__main__":
