@@ -3771,7 +3771,8 @@ class ERLTrainer:
 
             # Train agents in this batch by PRE-FETCHING data once for all agents
             # This cuts disk I/O by a factor of 8x (or whatever batch size is)
-            for batch_idx in tqdm(range(num_batches), desc="Training batches"):
+            with tqdm(total=len(self.population), desc="Training agents", unit="agent") as pbar:
+                for batch_idx in range(num_batches):
                     batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
                     batch_end = min(batch_start + LOCAL_TRAINING_BATCH_SIZE, len(self.population))
                     batch_agents = self.population[batch_start:batch_end]
@@ -3824,6 +3825,9 @@ class ERLTrainer:
                         agent.move_to_device(cpu_device, recreate_optimizers=True)
 
                     torch.cuda.empty_cache()
+                    
+                    # Update progress bar by number of agents processed
+                    pbar.update(len(batch_agents))
 
         else:
             # Original code path for distributed mode or CPU-only
@@ -6426,9 +6430,72 @@ class ERLTrainer:
                 buffer_loaded = True
         else:
             print("! No replay buffer checkpoint found.")
-            print(f"  Buffer will be in: {buffer_storage_path}")
-            # Buffer was already created in __init__ with correct path
-            # No action needed
+            
+            # Try to discover existing transition files and reconstruct buffer
+            storage_path_obj = Path(buffer_storage_path)
+            if storage_path_obj.exists():
+                # Look for both individual transition files and chunk files
+                transition_files = sorted(storage_path_obj.glob("transition_*.pkl.gz"), 
+                                        key=lambda p: int(p.stem.split('_')[1]) if p.stem.split('_')[1].isdigit() else 0)
+                chunk_files = sorted(storage_path_obj.glob("chunk_*.pkl.gz"),
+                                   key=lambda p: int(p.stem.split('_')[1]) if p.stem.split('_')[1].isdigit() else 0)
+                
+                all_files = list(transition_files) + list(chunk_files)
+                
+                if all_files:
+                    print(f"  Found {len(all_files)} existing transition files on disk.")
+                    print(f"  Reconstructing buffer metadata from discovered files...")
+                    
+                    try:
+                        # Reconstruct buffer from discovered files
+                        target_capacity = Config.LOCAL_BUFFER_SIZE if self.local_mode else Config.BUFFER_SIZE
+                        
+                        # Create new buffer with discovered files
+                        self.replay_buffer = OnDiskReplayBuffer(
+                            capacity=target_capacity,
+                            storage_path=buffer_storage_path
+                        )
+                        
+                        # Add discovered files to buffer (most recent files first, up to capacity)
+                        # Files are already sorted by ID, so we take the most recent ones
+                        files_to_add = all_files[-target_capacity:] if len(all_files) > target_capacity else all_files
+                        
+                        from collections import deque
+                        file_paths = [str(f) for f in files_to_add]
+                        self.replay_buffer.buffer = deque(file_paths, maxlen=target_capacity)
+                        
+                        # Estimate total_transitions: chunks contain ~64 transitions, individual files contain 1
+                        total_transitions = 0
+                        for file_path in file_paths:
+                            if 'chunk_' in file_path:
+                                # Try to load chunk to count transitions, or estimate 64
+                                try:
+                                    import gzip, pickle
+                                    with gzip.open(file_path, 'rb') as f:
+                                        chunk_data = pickle.load(f)
+                                        if isinstance(chunk_data, list):
+                                            total_transitions += len(chunk_data)
+                                        else:
+                                            total_transitions += 64  # Default estimate
+                                except:
+                                    total_transitions += 64  # Default estimate
+                            else:
+                                total_transitions += 1
+                        
+                        self.replay_buffer.total_transitions = total_transitions
+                        self.replay_buffer.total_added = len(all_files)  # Best guess
+                        
+                        print(f"  ✓ Reconstructed buffer: {len(self.replay_buffer.buffer)} files, ~{total_transitions} transitions")
+                        buffer_loaded = True
+                    except Exception as e:
+                        print(f"  ⚠️ Error reconstructing buffer: {e}")
+                        print(f"  Continuing with empty buffer...")
+                else:
+                    print(f"  No existing transition files found in: {buffer_storage_path}")
+                    print(f"  Buffer will be empty until transitions are added.")
+            else:
+                print(f"  Buffer storage directory doesn't exist yet: {buffer_storage_path}")
+                print(f"  It will be created when first transitions are added.")
 
         # CRITICAL: Recreate DataLoader after loading buffer
         # The DataLoader created in __init__ points to the old empty buffer
