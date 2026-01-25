@@ -1867,14 +1867,18 @@ class ERLTrainer:
 
             # 3. Calculate ROI adjustment using the SAME formula as training
             # This ensures baseline and training scores are comparable
-            # Formula: |base_fitness| * multiplier * (agent_roi - hurdle_roi) / 100
+            # Formula: multiplier * (agent_roi - hurdle_roi) / 100
             # For baseline, hurdle_roi = agent's own ROI, so adjustment = 0
             # But we compute it explicitly to match the training path
-            hurdle_roi = agent_roi  # Self-referential: competing against own starting ROI
-            min_trades_threshold = Config.ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY
-            confidence_factor = min(1.0, quality_count / min_trades_threshold) if min_trades_threshold > 0 else 1.0
-            roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - hurdle_roi) / 100.0
-            roi_adjustment = roi_adjustment * confidence_factor  # = 0 since agent_roi == hurdle_roi
+            # NOTE: Maverick mode skips ROI adjustment (ROI already emphasized in Triad 3.0 fitness)
+            if self.maverick_mode:
+                roi_adjustment = 0.0
+            else:
+                hurdle_roi = agent_roi  # Self-referential: competing against own starting ROI
+                min_trades_threshold = Config.ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY
+                confidence_factor = min(1.0, quality_count / min_trades_threshold) if min_trades_threshold > 0 else 1.0
+                roi_adjustment = Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - hurdle_roi) / 100.0
+                roi_adjustment = roi_adjustment * confidence_factor  # = 0 since agent_roi == hurdle_roi
 
             # 4. Set the baseline
             combined_fitness = base_combined_fitness + roi_adjustment
@@ -7402,6 +7406,13 @@ class ERLTrainer:
                     # Store for logging (no ROI adjustment in consistency mode)
                     base_combined_fitness = combined_fitness
                     roi_adjustment = 0.0
+                elif self.maverick_mode:
+                    # Maverick mode: Skip ROI adjustment - ROI is already heavily emphasized
+                    # in the Triad 3.0 fitness function (ROI^1.1, volume scalar, expectancy boost)
+                    # Adding ROI adjustment on top causes disproportionate scaling issues
+                    base_combined_fitness = val_fitness + min(0.0, train_fitness)
+                    roi_adjustment = 0.0
+                    combined_fitness = base_combined_fitness
                 else:
                     # Standard mode OR Multi-mode: ROI Expansion with HoF median benchmark
                     # Combined score: penalize agents with negative training fitness
@@ -7410,7 +7421,7 @@ class ERLTrainer:
                     base_combined_fitness = val_fitness + min(0.0, train_fitness)
 
                     # ROI-based scoring adjustment using Hall of Fame median as benchmark
-                    # Formula: Score = Fitness + (|Fitness| × multiplier × (AgentROI − MedianROI) / 100)
+                    # Formula: Score = Fitness + (multiplier × (AgentROI − MedianROI) / 100)
                     # This rewards agents that outperform the HoF median ROI and penalizes those below
                     # MULTI-MODE: In multi-mode, median_hof_roi = member's starting ROI (self-referential baseline)
                     #             Each member competes against their own starting performance, not the global median
@@ -7421,7 +7432,7 @@ class ERLTrainer:
                     min_trades_threshold = Config.ROI_CONFIDENCE_MIN_TRADES_CONSISTENCY if self.consistency_mode else Config.ROI_CONFIDENCE_MIN_TRADES
                     confidence_factor = min(1.0, quality_count / min_trades_threshold)
 
-                    roi_adjustment = abs(base_combined_fitness) * Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
+                    roi_adjustment = Config.ROI_ADJUSTMENT_MULTIPLIER * (agent_roi - median_hof_roi) / 100.0
                     roi_adjustment = roi_adjustment * confidence_factor  # Dampen based on quality trade count
                     combined_fitness = base_combined_fitness + roi_adjustment
 
@@ -7691,7 +7702,8 @@ class ERLTrainer:
                         roi_adjustment_multiplier=Config.ROI_ADJUSTMENT_MULTIPLIER,
                         min_trades_threshold=Config.ROI_CONFIDENCE_MIN_TRADES,
                         erosion_alpha=erosion_alpha,
-                        consistency_mode=self.consistency_mode
+                        consistency_mode=self.consistency_mode,
+                        maverick_mode=self.maverick_mode
                     )
                     if updated_count > 0:
                         print(f"\n🔄 Re-evaluated {updated_count}/{len(self.hall_of_fame.entries)} HoF agents with current median ({median_hof_roi:.2f}%) [EMA α={erosion_alpha:.2f}]")

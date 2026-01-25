@@ -439,7 +439,7 @@ class HallOfFame:
 
     def recompute_all_scores(self, current_median_roi: float, roi_adjustment_multiplier: float,
                             min_trades_threshold: int, erosion_alpha: float = 0.33,
-                            consistency_mode: bool = False) -> int:
+                            consistency_mode: bool = False, maverick_mode: bool = False) -> int:
         """
         Re-evaluate HoF entries' combined fitness using the current median ROI with gradual erosion.
 
@@ -461,6 +461,7 @@ class HallOfFame:
             min_trades_threshold: Minimum quality trades for full confidence (Config.ROI_CONFIDENCE_MIN_TRADES)
             erosion_alpha: EMA smoothing factor (0-1). Higher = faster erosion. Default 0.33 ≈ 3 generations
             consistency_mode: If True, skip ROI adjustment (consistency mode)
+            maverick_mode: If True, skip ROI adjustment (maverick mode - ROI already emphasized in Triad 3.0 fitness)
 
         Returns:
             Number of entries that had their scores updated
@@ -478,6 +479,11 @@ class HallOfFame:
             if consistency_mode:
                 # Consistency mode: validation fitness only (no ROI adjustment)
                 target_combined_fitness = entry.val_fitness
+            elif maverick_mode:
+                # Maverick mode: Skip ROI adjustment - ROI is already heavily emphasized
+                # in the Triad 3.0 fitness function
+                base_combined = entry.val_fitness + min(0.0, entry.train_fitness)
+                target_combined_fitness = base_combined
             else:
                 # Normal mode: recalculate with current median
                 # Base combined: val_fitness + min(0, train_fitness)
@@ -486,8 +492,8 @@ class HallOfFame:
                 # Confidence factor based on quality trades
                 confidence_factor = min(1.0, entry.quality_count / min_trades_threshold) if min_trades_threshold > 0 else 0.0
 
-                # ROI adjustment: (|base| × multiplier × (agent_roi - current_median) / 100) × confidence
-                roi_adjustment = abs(base_combined) * roi_adjustment_multiplier * (entry.roi - current_median_roi) / 100.0
+                # ROI adjustment: (multiplier × (agent_roi - current_median) / 100) × confidence
+                roi_adjustment = roi_adjustment_multiplier * (entry.roi - current_median_roi) / 100.0
                 roi_adjustment = roi_adjustment * confidence_factor
 
                 target_combined_fitness = base_combined + roi_adjustment
