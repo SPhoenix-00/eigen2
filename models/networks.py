@@ -68,7 +68,10 @@ class FeatureExtractor(nn.Module):
         self.lstm_output_size = Config.LSTM_HIDDEN * (2 if Config.LSTM_BIDIRECTIONAL else 1)
 
         # Enable gradient checkpointing
-        self.use_gradient_checkpointing = True
+        # DISABLED for performance on local 4090:
+        # 1. Memory saving not needed (batch 64 fits easily)
+        # 2. Re-computing LSTM forward pass kills performance (17s -> 3s -> ???)
+        self.use_gradient_checkpointing = False
 
     def _cnn_block(self, x: torch.Tensor) -> torch.Tensor:
         """CNN processing block for gradient checkpointing."""

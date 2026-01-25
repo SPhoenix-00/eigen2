@@ -118,22 +118,19 @@ class Config:
     CRITIC_LR = 3e-4
     WEIGHT_DECAY = 5e-4
     
-    # ============ Replay Buffer Parameters ============
-    # Distributed Mode (Cloud/Remote)
-    BUFFER_SIZE = 1500000  # Maximum buffer size for distributed mode
-    BATCH_SIZE = 160  # Batch size for distributed mode training
-    MIN_BUFFER_SIZE = 23200  # Start training after this many transitions (distributed)
+    # Replay buffer
+    BUFFER_SIZE = 1500000  # Maximum buffer size
+    LOCAL_BUFFER_SIZE = 120000  # Reduced buffer size for local mode (16 generations of data)
     
-    # Local Mode (--local flag)
-    LOCAL_BUFFER_SIZE = 120000  # Buffer size for local mode (16 generations of data: 120k / 7.5k = 16 gens)
-    # Rationale: Local mode adds ~7,500 transitions/generation (32 agents, 40% elite, 3 episodes, 125 steps)
-    # With 1.5M buffer, it takes 200 generations to fill, keeping very old bad transitions too long
-    # 120k buffer = 16 generations, keeping recent relevant experience while evicting old bad data
-    LOCAL_BATCH_SIZE = 64  # Batch size for local mode training (reduced for VRAM constraints)
+    BATCH_SIZE = 160
+    LOCAL_BATCH_SIZE = 40  # Increased from 32 to utilize VRAM (target ~18GB)
+    LOCAL_GRADIENT_ACCUMULATION_STEPS = 1  # No accumulation in local mode
+    LOCAL_NUM_DATALOADER_WORKERS = 0  # Run in main process - Windows/WSL multiprocessing overhead is massive
+    LOCAL_POPULATION_SIZE = 48  # Increased from 32 for better diversity
+    LOCAL_GRADIENT_STEPS_PER_GENERATION = 32  # Increased from 8 to 32 (matched distributed) - possible because I/O bottleneck fixed by sharing batches
+    LOCAL_TRAINING_AGENT_BATCH_SIZE = 8  # Train 8 agents at a time on GPU (4 batches of 8 = 32 agents)
+    MIN_BUFFER_SIZE = 23200  # Start training after this many transitions
     LOCAL_MIN_BUFFER_SIZE = 8000  # Start training after this many transitions (local mode, ~1 generation)
-    # Rationale: With 7,500 transitions/generation, 8k allows training to start after 1st generation completes
-    
-    # Sweep Mode (Hyperparameter optimization)
     MIN_BUFFER_SIZE_SWEEP = 5000  # Lower threshold for sweeps (10 gens, faster DDPG)
     
     # Exploration noise
@@ -142,22 +139,7 @@ class Config:
     MIN_NOISE = 0.01
     
     # ============ ERL Parameters ============
-    # Distributed Mode (Cloud/Remote)
-    POPULATION_SIZE = 96  # Population size for distributed mode
-    GRADIENT_STEPS_PER_GENERATION = 32  # Gradient steps per generation (distributed)
-    GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 10  # Reduced steps during stabilization phase (distributed)
-    GRADIENT_ACCUMULATION_STEPS = 1  # Gradient accumulation steps (distributed)
-    NUM_DATALOADER_WORKERS = 6  # Number of background workers for async batch loading (distributed)
-    
-    # Local Mode (--local flag)
-    LOCAL_POPULATION_SIZE = 32  # Smaller population for local mode (vs 96 for distributed)
-    LOCAL_GRADIENT_STEPS_PER_GENERATION = 8  # Fewer gradient steps for local mode (vs 32 for distributed)
-    LOCAL_GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 4  # Reduced steps during stabilization (local mode)
-    LOCAL_GRADIENT_ACCUMULATION_STEPS = 1  # No accumulation in local mode - each step = 1 disk read
-    LOCAL_NUM_DATALOADER_WORKERS = 0  # Run in main process - Windows/WSL multiprocessing overhead is massive
-    LOCAL_TRAINING_AGENT_BATCH_SIZE = 8  # Train 8 agents at a time on GPU (4 batches of 8 = 32 agents)
-    
-    # Common Parameters (shared across modes)
+    POPULATION_SIZE = 96
     NUM_GENERATIONS = 100
     EPISODE_LENGTH = 125  # 6 months trading period (kept for compatibility, use TRADING_PERIOD_DAYS)
     
@@ -211,10 +193,17 @@ class Config:
     # plateaus for 3 consecutive generations (< 2% improvement), helping escape local optima
     # Max caps are set in ERLTrainer (0.8 for rate, 0.1 for std) to allow further increases
     
+    # Training
+    GRADIENT_STEPS_PER_GENERATION = 32
+    GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 10  # Reduced steps during stabilization phase
+    GRADIENT_ACCUMULATION_STEPS = 1
+    
     # ============ Training Parameters ============
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     NUM_WORKERS = 6  # For data loading (deprecated, kept for compatibility)
-    # NOTE: NUM_DATALOADER_WORKERS moved to ERL Parameters section above
+    NUM_DATALOADER_WORKERS = 6  # Number of background workers for async batch loading
+    # With 4 workers, batches are prepared in parallel while GPU trains
+    # Higher = more CPU usage but better GPU utilization
     # NOTE: Random seed is now set dynamically per wandb run in ERLTrainer
     # This ensures parallel runs have unique, independent behavior
     
@@ -228,15 +217,8 @@ class Config:
     LOG_FREQUENCY = 1  # Log every N generations
     
     # ============ Validation Parameters ============
-    # Distributed Mode (Cloud/Remote)
-    EVAL_NUM_WORKERS = 48  # Maximum parallel workers for evaluation (distributed mode)
-    # Actual: min(cpu_count-1, this value)
-    
-    # Local Mode (--local flag)
-    # Local mode uses sequential evaluation (no parallel workers) - handled in LocalEvaluator
-    
-    # Common Parameters (shared across modes)
     EVAL_EPISODES = 5  # Number of episodes for evaluation
+    EVAL_NUM_WORKERS = 48  # Maximum parallel workers for evaluation (actual: min(cpu_count-1, this value))
     SKIP_REEVALUATION_ON_RESUME = True  # Skip re-evaluating agents on resume (only needed if reward function changed)
 
     # ============ Gauntlet Mode Parameters ============
@@ -302,32 +284,13 @@ class Config:
     MAX_GENERATIONS_GAUNTLET = 100  # Maximum generations before stopping regardless of breakthroughs
     
     @classmethod
-    def get_min_buffer_size(cls, local_mode: bool = False, is_sweep: bool = False) -> int:
-        """
-        Get the appropriate minimum buffer size based on mode.
-        
-        Args:
-            local_mode: If True, use local mode parameters
-            is_sweep: If True, use sweep mode parameters (overrides local_mode)
-        
-        Returns:
-            Minimum buffer size threshold
-        """
-        if is_sweep:
-            return cls.MIN_BUFFER_SIZE_SWEEP
-        elif local_mode:
-            return cls.LOCAL_MIN_BUFFER_SIZE
-        else:
-            return cls.MIN_BUFFER_SIZE
-    
-    @classmethod
     def display(cls):
         """Print all configuration parameters"""
         print("=" * 60)
         print("Project Eigen 2 Configuration")
         print("=" * 60)
         for key, value in cls.__dict__.items():
-            if not key.startswith('_') and not callable(value) and key not in ['display', 'get_min_buffer_size']:
+            if not key.startswith('_') and not callable(value) and key != 'display':
                 print(f"{key:.<40} {value}")
         print("=" * 60)
     

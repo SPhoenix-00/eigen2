@@ -52,6 +52,8 @@ from torch.utils.data import DataLoader
 from training.local_evaluator import LocalEvaluator
 
 
+
+
 class NumpyEncoder(json.JSONEncoder):
     """Custom encoder for NumPy data types."""
     def default(self, obj):
@@ -935,6 +937,8 @@ class ERLTrainer:
             # No external buffer - create new buffer in checkpoint directory
             buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
             print(f"Buffer storage: {buffer_storage_path}")
+            
+            buffer_capacity = Config.LOCAL_BUFFER_SIZE if self.local_mode else Config.BUFFER_SIZE
             self.replay_buffer = OnDiskReplayBuffer(
                 capacity=buffer_capacity,
                 storage_path=buffer_storage_path
@@ -3765,20 +3769,22 @@ class ERLTrainer:
             local_accumulation_steps = Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
             print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {gradient_steps} steps/agent (batch_size={Config.LOCAL_BATCH_SIZE}, accum={local_accumulation_steps})")
 
-            for batch_idx in range(num_batches):
-                batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
-                batch_end = min(batch_start + LOCAL_TRAINING_BATCH_SIZE, len(self.population))
-                batch_agents = self.population[batch_start:batch_end]
+                # Train agents in this batch by PRE-FETCHING data once for all agents
+                # This cuts disk I/O by a factor of 8x (or whatever batch size is)
+                for batch_idx in tqdm(range(num_batches), desc="Training batches"):
+                    batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
+                    batch_end = min(batch_start + LOCAL_TRAINING_BATCH_SIZE, len(self.population))
+                    batch_agents = self.population[batch_start:batch_end]
 
-                # Move batch of agents to GPU (with optimizer recreation)
-                for agent in batch_agents:
-                    agent.move_to_device(Config.DEVICE, recreate_optimizers=True)
+                    # Move batch of agents to GPU (with optimizer recreation)
+                    for agent in batch_agents:
+                        agent.move_to_device(Config.DEVICE, recreate_optimizers=True)
 
-                # Train agents in this batch using DataLoader iterator
-                for agent in tqdm(batch_agents, desc=f"Training batch {batch_idx + 1}/{num_batches}"):
-                    actor_losses = []
-                    critic_losses = []
+                    actor_losses_batch = []
+                    critic_losses_batch = []
 
+                    # INVERTED LOOP: Step -> Data -> Agents
+                    # Fetch data ONCE per step, feed to ALL agents
                     for step in range(gradient_steps):
                         for accum_step in range(local_accumulation_steps):
                             # Use DataLoader iterator (has async prefetching)
@@ -3786,33 +3792,38 @@ class ERLTrainer:
                             batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
 
                             is_last_accum = (accum_step == local_accumulation_steps - 1)
-                            critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+                            
+                            # Train all agents on this shared batch
+                            for agent in batch_agents:
+                                critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
 
-                            if agent.agent_id == 0:
-                                attention_weights = agent.actor.get_attention_weights()
-                                if attention_weights is not None:
-                                    self.update_feature_importance(attention_weights)
+                                if agent.agent_id == 0:
+                                    attention_weights = agent.actor.get_attention_weights()
+                                    if attention_weights is not None:
+                                        self.update_feature_importance(attention_weights)
 
-                            actor_losses.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
-                            critic_losses.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+                                actor_losses_batch.append(actor_loss.detach().cpu().item() if isinstance(actor_loss, torch.Tensor) else actor_loss)
+                                critic_losses_batch.append(critic_loss.detach().cpu().item() if isinstance(critic_loss, torch.Tensor) else critic_loss)
+                            
                             del batch
-
-                    if agent.agent_id == 0:
-                        self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
-                        self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
+                    
+                    # Log representative stats (from first agent in batch)
+                    if len(batch_agents) > 0 and batch_agents[0].agent_id == 0:
+                        self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses_batch), self.generation)
+                        self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses_batch), self.generation)
                         wandb.log({
-                            "train/actor_loss": np.mean(actor_losses),
-                            "train/critic_loss": np.mean(critic_losses),
+                            "train/actor_loss": np.mean(actor_losses_batch),
+                            "train/critic_loss": np.mean(critic_losses_batch),
                         }, step=self.generation)
 
-                    del actor_losses
-                    del critic_losses
+                    del actor_losses_batch
+                    del critic_losses_batch
+                
+                    # Move batch of agents back to CPU (with optimizer recreation to free GPU memory)
+                    for agent in batch_agents:
+                        agent.move_to_device(cpu_device, recreate_optimizers=True)
 
-                # Move batch of agents back to CPU (with optimizer recreation to free GPU memory)
-                for agent in batch_agents:
-                    agent.move_to_device(cpu_device, recreate_optimizers=True)
-
-                torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()
 
         else:
             # Original code path for distributed mode or CPU-only
