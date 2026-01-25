@@ -105,9 +105,10 @@ class ReplayBuffer:
     
     def is_ready(self) -> bool:
         """Check if buffer has enough samples for training."""
-        # Use lower threshold for W&B sweeps to enable DDPG with fewer generations
+        # Determine mode: check if capacity matches local buffer size (heuristic for local mode)
         is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
-        min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
+        is_local = (self.capacity == Config.LOCAL_BUFFER_SIZE)
+        min_size = Config.get_min_buffer_size(local_mode=is_local, is_sweep=is_sweep)
         return len(self.buffer) >= min_size
     
     def clear(self):
@@ -859,8 +860,10 @@ class OnDiskReplayBuffer(IterableDataset):
 
     def is_ready(self) -> bool:
         """Check if buffer has enough transitions for training."""
+        # Determine mode: check if capacity matches local buffer size (heuristic for local mode)
         is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
-        min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
+        is_local = (self.capacity == Config.LOCAL_BUFFER_SIZE)
+        min_size = Config.get_min_buffer_size(local_mode=is_local, is_sweep=is_sweep)
         return self.total_transitions >= min_size
     
     def clear(self):

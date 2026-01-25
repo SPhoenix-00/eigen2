@@ -808,8 +808,8 @@ class ERLTrainer:
                         config={
                             "population_size": Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE,
                             "num_generations": Config.NUM_GENERATIONS,
-                            "buffer_size": Config.BUFFER_SIZE,
-                            "batch_size": Config.BATCH_SIZE,
+                            "buffer_size": Config.LOCAL_BUFFER_SIZE if self.local_mode else Config.BUFFER_SIZE,
+                            "batch_size": Config.LOCAL_BATCH_SIZE if self.local_mode else Config.BATCH_SIZE,
                             "actor_lr": Config.ACTOR_LR,
                             "critic_lr": Config.CRITIC_LR,
                             "trading_period_days": Config.TRADING_PERIOD_DAYS,
@@ -861,6 +861,10 @@ class ERLTrainer:
 
         # Create replay buffer with storage INSIDE checkpoint directory
         # This ensures buffer files are synced to cloud along with checkpoints
+        # Use appropriate buffer size based on mode (local vs distributed)
+        buffer_capacity = Config.LOCAL_BUFFER_SIZE if self.local_mode else Config.BUFFER_SIZE
+        print(f"Buffer capacity: {buffer_capacity:,} transitions ({'local' if self.local_mode else 'distributed'} mode)")
+        
         # If external buffer path provided (via --buffer), use it to copy/load existing buffer
         if self.external_buffer_storage_path:
             # User provided an external buffer path - use it to initialize buffer
@@ -899,7 +903,7 @@ class ERLTrainer:
                         print(f"  ⚠ Error loading buffer metadata: {e}")
                         print(f"  Creating new buffer with storage in: {new_buffer_storage_path}")
                         self.replay_buffer = OnDiskReplayBuffer(
-                            capacity=Config.BUFFER_SIZE,
+                            capacity=buffer_capacity,
                             storage_path=new_buffer_storage_path
                         )
                 else:
@@ -908,7 +912,7 @@ class ERLTrainer:
                     # Create buffer pointing to external storage
                     # This allows reusing the files even without metadata
                     self.replay_buffer = OnDiskReplayBuffer(
-                        capacity=Config.BUFFER_SIZE,
+                        capacity=buffer_capacity,
                         storage_path=str(external_path)
                     )
                     # Update to new path for future writes
@@ -924,7 +928,7 @@ class ERLTrainer:
                 print(f"  Creating new buffer instead")
                 buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
                 self.replay_buffer = OnDiskReplayBuffer(
-                    capacity=Config.BUFFER_SIZE,
+                    capacity=buffer_capacity,
                     storage_path=buffer_storage_path
                 )
         else:
@@ -932,7 +936,7 @@ class ERLTrainer:
             buffer_storage_path = str(self.checkpoint_dir / "buffer_storage")
             print(f"Buffer storage: {buffer_storage_path}")
             self.replay_buffer = OnDiskReplayBuffer(
-                capacity=Config.BUFFER_SIZE,
+                capacity=buffer_capacity,
                 storage_path=buffer_storage_path
             )
 
@@ -3678,9 +3682,9 @@ class ERLTrainer:
         - GPU never waits for I/O - significant speedup
         """
         if not self.replay_buffer.is_ready():
-            # Show correct threshold based on sweep vs regular training
+            # Show correct threshold based on mode
             is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
-            min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
+            min_size = Config.get_min_buffer_size(local_mode=self.local_mode, is_sweep=is_sweep)
             print(f"Buffer not ready: {len(self.replay_buffer)} / {min_size}")
             return
 
@@ -3722,9 +3726,15 @@ class ERLTrainer:
         # Normal: 32 steps × 192 batch = 6,144 samples (full exploration)
         # Stabilization/Multi: 10 steps × 192 batch = 1,920 samples (maintenance training)
         # Local: 8 steps for faster iteration on single GPU
+        # Local Stabilization: 4 steps for even faster iteration
         if self.local_mode:
-            gradient_steps = Config.LOCAL_GRADIENT_STEPS_PER_GENERATION
-            print(f"  [Local Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} distributed)]")
+            if self.breakthrough_state == BreakthroughState.STABILIZATION or self.multi_mode:
+                gradient_steps = Config.LOCAL_GRADIENT_STEPS_PER_GENERATION_STABILIZATION
+                mode_name = "Multi-Agent" if self.multi_mode else "Stabilization"
+                print(f"  [Local {mode_name} Mode: {gradient_steps} gradient steps (vs {Config.LOCAL_GRADIENT_STEPS_PER_GENERATION} normal local)]")
+            else:
+                gradient_steps = Config.LOCAL_GRADIENT_STEPS_PER_GENERATION
+                print(f"  [Local Mode: {gradient_steps} gradient steps (vs {Config.GRADIENT_STEPS_PER_GENERATION} distributed)]")
         elif self.breakthrough_state == BreakthroughState.STABILIZATION or self.multi_mode:
             gradient_steps = Config.GRADIENT_STEPS_PER_GENERATION_STABILIZATION
             mode_name = "Multi-Agent" if self.multi_mode else "Stabilization"
@@ -6380,24 +6390,26 @@ class ERLTrainer:
                 # Resize buffer if config has changed since checkpoint was saved
                 # The deque's maxlen is baked into the saved object, so we need to
                 # explicitly create a new deque with the updated capacity
-                if self.replay_buffer.capacity != Config.BUFFER_SIZE:
-                    print(f"⚠️ Resizing buffer: {self.replay_buffer.capacity:,} -> {Config.BUFFER_SIZE:,}")
+                target_capacity = Config.LOCAL_BUFFER_SIZE if self.local_mode else Config.BUFFER_SIZE
+                if self.replay_buffer.capacity != target_capacity:
+                    print(f"⚠️ Resizing buffer: {self.replay_buffer.capacity:,} -> {target_capacity:,}")
                     from collections import deque
 
                     # Create new deque with NEW capacity and copy old data
-                    new_deque = deque(self.replay_buffer.buffer, maxlen=Config.BUFFER_SIZE)
+                    new_deque = deque(self.replay_buffer.buffer, maxlen=target_capacity)
 
                     # Update buffer object
                     self.replay_buffer.buffer = new_deque
-                    self.replay_buffer.capacity = Config.BUFFER_SIZE
+                    self.replay_buffer.capacity = target_capacity
                     print(f"✓ Buffer resized successfully ({len(self.replay_buffer):,} transitions preserved)")
 
                 buffer_loaded = True
             except Exception as e:
                 print(f"❌ Error loading buffer: {e}")
                 print("  Creating new empty buffer...")
+                target_capacity = Config.LOCAL_BUFFER_SIZE if self.local_mode else Config.BUFFER_SIZE
                 self.replay_buffer = OnDiskReplayBuffer(
-                    capacity=Config.BUFFER_SIZE,
+                    capacity=target_capacity,
                     storage_path=buffer_storage_path
                 )
                 buffer_loaded = True
@@ -7874,7 +7886,8 @@ class ERLTrainer:
                 gen_time=gen_time,
                 avg_gen_time=np.mean(self.generation_times) if self.generation_times else 0,
                 resource_stats=resource_stats,
-                gauntlet_info=gauntlet_info
+                gauntlet_info=gauntlet_info,
+                local_mode=self.local_mode
             )
 
             # Show progress plot every 5 generations

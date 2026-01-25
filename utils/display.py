@@ -219,7 +219,8 @@ def print_generation_summary(gen: int, total_gens: int,
                              gen_time: float,
                              avg_gen_time: float,
                              resource_stats: Optional[dict] = None,
-                             gauntlet_info: Optional[dict] = None):
+                             gauntlet_info: Optional[dict] = None,
+                             local_mode: bool = False):
     """
     Print a comprehensive summary of the generation.
 
@@ -365,10 +366,12 @@ def print_generation_summary(gen: int, total_gens: int,
     # System section
     print("\n⚙️  SYSTEM STATUS")
     print("-" * 70)
-    print(f"  Replay Buffer:     {buffer_size:>12,} / {Config.BUFFER_SIZE:,}")
-    # Show correct minimum based on sweep vs regular training
+    # Show correct buffer capacity based on mode
+    buffer_capacity = Config.LOCAL_BUFFER_SIZE if local_mode else Config.BUFFER_SIZE
+    print(f"  Replay Buffer:     {buffer_size:>12,} / {buffer_capacity:,}")
+    # Show correct minimum based on mode
     is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
-    min_size = Config.MIN_BUFFER_SIZE_SWEEP if is_sweep else Config.MIN_BUFFER_SIZE
+    min_size = Config.get_min_buffer_size(local_mode=local_mode, is_sweep=is_sweep)
     print(f"  Buffer Ready:      {' '*10}{'✓ Yes' if buffer_size >= min_size else '✗ No (needs ' + str(min_size-buffer_size) + ' more)'}")
     print(f"  Generation Time:   {gen_time:>11.1f}s")
     print(f"  Avg Gen Time:      {avg_gen_time:>11.1f}s")
