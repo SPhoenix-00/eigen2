@@ -2980,10 +2980,18 @@ class ERLTrainer:
                 # exp=5% (score 5.8) -> 1.58x boost
                 fitness = roi_score * volume_scalar * (1.0 + (exp_score * 0.1))
                 
-                # CONSISTENCY BONUS: Multiply by (1 + WinRate)
-                # WR 20% -> 1.2x multiplier
-                # WR 60% -> 1.6x multiplier (33% boost over low WR)
-                fitness *= (1.0 + win_rate)
+                # CONSISTENCY SCALING: WR^2
+                # This naturally suppresses low win rates and super-linearizes high ones
+                fitness *= (win_rate ** 2)
+                
+                # WIN RATE HINGE PENALTY
+                # Creates a steep gradient ramp up to 60% WR
+                # Below 60%: Massive penalty (e.g., 40% WR -> -200 pts)
+                # Above 60%: No penalty, pure performance
+                if win_rate < 0.60:
+                    wr_deficit = win_rate - 0.60  # Negative value
+                    penalty = wr_deficit * 1000.0
+                    fitness += penalty  # Adds negative value
             else:
                 # Loss Scenario: Expectancy failure amplifies pain
                 fitness = roi_score * volume_scalar + (exp_score * volume_scalar)
@@ -3151,8 +3159,14 @@ class ERLTrainer:
             # Combine ROI, Volume, and Expectancy
             if roi_score > 0:
                 fitness = roi_score * volume_scalar * (1.0 + (exp_score * 0.1))
-                # Add consistency bonus (same as Triad)
-                fitness *= (1.0 + win_rate)
+                # Add consistency scaling (WR^2)
+                fitness *= (win_rate ** 2)
+                
+                # Add Win Rate Hinge Penalty (< 60%)
+                if win_rate < 0.60:
+                    wr_deficit = win_rate - 0.60
+                    penalty = wr_deficit * 1000.0
+                    fitness += penalty
             else:
                 fitness = roi_score * volume_scalar + (exp_score * volume_scalar)
             
