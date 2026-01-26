@@ -250,34 +250,15 @@ def print_generation_summary(gen: int, total_gens: int,
             - stabilization_progress: tuple (current, total) or None
             - breakthrough_history: list of breakthrough events
     """
-    mean_fitness = np.mean(fitness_scores)
-    max_fitness = np.max(fitness_scores)
-    min_fitness = np.min(fitness_scores)
+    # Calculated metrics removed as they are no longer displayed
+
     
     print("\n" + "="*70)
     print(f"{'GENERATION ' + str(gen+1) + ' / ' + str(total_gens):^70}")
     print("="*70)
     
-    # Fitness section
-    print("\n📊 FITNESS METRICS")
-    print("-" * 70)
-    print(f"  Mean:              {mean_fitness:>12.2f}")
-    print(f"  Maximum:           {max_fitness:>12.2f}  {'🌟 NEW BEST!' if max_fitness > best_fitness else ''}")
-    print(f"  Minimum:           {min_fitness:>12.2f}")
-    print(f"  Std Dev:           {np.std(fitness_scores):>12.2f}")
-    print(f"  Positive Agents:   {pop_stats['agents_with_positive_fitness']:>12} / {len(fitness_scores)}")
+    # Fitness section removed as per user request for streamlining
     
-    # Fitness distribution
-    print(f"\n  Distribution: ", end="")
-    for f in sorted(fitness_scores, reverse=True):
-        if f > 0:
-            print("█", end="")
-        elif f > -100:
-            print("▓", end="")
-        else:
-            print("░", end="")
-    print()
-
     # Gauntlet State Machine section (if in gauntlet mode)
     if gauntlet_info and gauntlet_info.get('gauntlet_enabled'):
         print("\n🎮 GAUNTLET STATE")
@@ -354,15 +335,8 @@ def print_generation_summary(gen: int, total_gens: int,
             else:
                 print(f"  Entry Threshold:   {'None (Open)':>12}")
 
-    # Trading section
-    print("\n📈 TRADING ACTIVITY")
-    print("-" * 70)
-    print(f"  Total Trades:      {pop_stats['total_trades']:>12}")
-    print(f"  Avg per Agent:     {pop_stats['avg_trades_per_agent']:>12.1f}")
-    print(f"  Wins:              {pop_stats['total_wins']:>12}  ({pop_stats['total_wins']/max(pop_stats['total_trades'],1)*100:.1f}%)")
-    print(f"  Losses:            {pop_stats['total_losses']:>12}  ({pop_stats['total_losses']/max(pop_stats['total_trades'],1)*100:.1f}%)")
-    print(f"  Avg Win Rate:      {pop_stats['avg_win_rate']:>11.1%}")
-    
+    # Trading section removed as per user request for streamlining
+
     # System section
     print("\n⚙️  SYSTEM STATUS")
     print("-" * 70)
@@ -378,15 +352,6 @@ def print_generation_summary(gen: int, total_gens: int,
 
     # Progress and ETA - context-aware based on training mode
     _print_progress_and_eta(gen, total_gens, avg_gen_time, gauntlet_info)
-
-    # Add one-line resource summary if provided
-    if resource_stats:
-        print("\n💻 RESOURCE USAGE")
-        print("-" * 70)
-        print(f"  Peak VRAM: {resource_stats['peak_vram_gb']:.1f}GB  |  "
-              f"Peak RAM: {resource_stats['peak_ram_gb']:.1f}GB  |  "
-              f"Peak Disk: {resource_stats['peak_disk_gb']:.1f}GB  |  "
-              f"Avg Gen Time: {avg_gen_time:.1f}s")
 
     print("\n" + "="*70)
 

@@ -29,8 +29,8 @@ All training parameters have been split into **Local Mode** (`--local` flag) and
 ### 5. Gradient Steps Per Generation
 - **Distributed Normal:** `GRADIENT_STEPS_PER_GENERATION = 32`
 - **Distributed Stabilization:** `GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 10`
-- **Local Normal:** `LOCAL_GRADIENT_STEPS_PER_GENERATION = 8`
-- **Local Stabilization:** `LOCAL_GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 4`
+- **Local Normal:** `LOCAL_GRADIENT_STEPS_PER_GENERATION = 32`
+- **Local Stabilization:** `LOCAL_GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 16`
 
 ### 6. DataLoader Workers
 - **Distributed:** `NUM_DATALOADER_WORKERS = 6` (parallel batch loading)

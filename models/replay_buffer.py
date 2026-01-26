@@ -399,13 +399,6 @@ class OnDiskReplayBuffer(IterableDataset):
             storage_path: Directory to store transition files.
         """
         super().__init__()
-        # #region agent log
-        import json
-        try:
-            with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a', encoding='utf-8') as f:
-                f.write(json.dumps({"sessionId":"debug-session","runId":"buffer-init","hypothesisId":"E","location":"replay_buffer.py:401","message":"OnDiskReplayBuffer.__init__","data":{"capacity_param":capacity,"Config_BUFFER_SIZE":Config.BUFFER_SIZE,"final_capacity":capacity or Config.BUFFER_SIZE},"timestamp":int(__import__('time').time()*1000)}) + '\n')
-        except: pass
-        # #endregion
         self.capacity = capacity or Config.BUFFER_SIZE
         self.storage_path = Path(storage_path)
 

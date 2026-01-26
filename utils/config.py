@@ -128,7 +128,7 @@ class Config:
     LOCAL_NUM_DATALOADER_WORKERS = 0  # Run in main process - Windows/WSL multiprocessing overhead is massive
     LOCAL_POPULATION_SIZE = 48  # Increased from 32 for better diversity
     LOCAL_GRADIENT_STEPS_PER_GENERATION = 32  # Increased from 8 to 32 (matched distributed) - possible because I/O bottleneck fixed by sharing batches
-    LOCAL_GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 4  # Reduced steps during stabilization phase in local mode
+    LOCAL_GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 16  # Increased from 4 to 16 (user request) - 4 was too low vs 32 normal
     LOCAL_TRAINING_AGENT_BATCH_SIZE = 8  # Train 8 agents at a time on GPU (4 batches of 8 = 32 agents)
     MIN_BUFFER_SIZE = 23200  # Start training after this many transitions
     LOCAL_MIN_BUFFER_SIZE = 8000  # Start training after this many transitions (local mode, ~1 generation)
