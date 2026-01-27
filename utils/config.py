@@ -120,7 +120,7 @@ class Config:
     
     # Replay buffer
     BUFFER_SIZE = 1500000  # Maximum buffer size
-    LOCAL_BUFFER_SIZE = 120000  # Reduced buffer size for local mode (16 generations of data)
+    LOCAL_BUFFER_SIZE = 180_000         # Reduced buffer size for local mode (16 generations of data)
     
     BATCH_SIZE = 160
     LOCAL_BATCH_SIZE = 40  # Increased from 32 to utilize VRAM (target ~18GB)
@@ -177,7 +177,7 @@ class Config:
     MAVERICK_CAP = 5       # Maximum Mavericks allowed in Global 50 (The "Highlander" Rule)
     MAVERICK_TARGET_RANK = 20  # Training stops when Maverick reaches this rank or higher
     MAVERICK_MARKET_BENCHMARK_COL = 44  # Column for market benchmark (S&P 500 proxy) for FOMO calculation
-    MAVERICK_LOSS_MULTIPLIER = 1.5  # Magnify losses by 1.5x in maverick mode (strict loss aversion)
+    MAVERICK_LOSS_MULTIPLIER = 1.2  # Magnify losses by 1.2x in maverick mode (moderate loss aversion)
     MAVERICK_HURDLE_MULTIPLIER = 1.2  # Multiplier for hurdle rate in maverick mode (1.2x higher hurdle)
 
     # Consistency mode - loss magnification for training on consistency

@@ -529,35 +529,60 @@ class TradingEnvironment(gym.Env):
                 cost = position.entry_price * shares
                 self.current_capital_employed -= cost
 
-                # 3. SNIPER LOGIC: Apply Hurdle FIRST
-                # A trade making 0.5% when hurdle is 0.6% is a LOSS of -0.1%
-                # Convert HURDLE_RATE from decimal (0.006) to percentage (0.6%)
-                # MAVERICK MODE: Higher hurdle (1.2x of normal) to encourage precision
-                hurdle_rate = Config.HURDLE_RATE * Config.MAVERICK_HURDLE_MULTIPLIER if self.maverick_mode else Config.HURDLE_RATE
-                hurdle_pct = hurdle_rate * 100.0
-                net_gain_pct = gain_pct - hurdle_pct
-
+                # 3. SNIPER LOGIC: Apply Hurdle
                 # 4. Conviction Scaling (Keep convex surface)
                 scaled_coefficient = position.coefficient ** Config.CONVICTION_SCALING_POWER
 
-                # 5. Calculate Reward with Asymmetric Penalty
-                if net_gain_pct >= 0:
-                    # WIN: Linear reward
-                    base_reward = scaled_coefficient * net_gain_pct
-                    self.num_wins += 1
-                else:
-                    # LOSS: Apply magnification based on mode
-                    # Consistency mode: 1.5x magnification (focus on reducing drawdowns)
-                    # Maverick mode: 1.2x magnification (moderate loss sensitivity)
-                    # Normal mode: 1.0x (treat losses equally to gains)
-                    if self.consistency_mode:
-                        loss_multiplier = Config.CONSISTENCY_LOSS_MULTIPLIER
-                    elif self.maverick_mode:
-                        loss_multiplier = Config.MAVERICK_LOSS_MULTIPLIER
+                if self.maverick_mode:
+                    # --- MAVERICK MODE: BONUS/PENALTY MODEL ---
+                    # Dead Zone: -1.0% to +1.0% (Linear Reward, no scaling)
+                    # Upside: > 1.0% (0.5x Bonus)
+                    # Downside: < -1.0% (0.5x Penalty scaling)
+                    
+                    threshold = 1.0  # 1.0% boundary
+                    
+                    if gain_pct >= 0:
+                        # WIN
+                        base_reward = scaled_coefficient * gain_pct
+                        self.num_wins += 1
+                        
+                        # BONUS: If gain > 1.0%, add 0.5x excess
+                        if gain_pct > threshold:
+                            excess_gain = gain_pct - threshold
+                            base_reward += scaled_coefficient * excess_gain * 0.5
                     else:
-                        loss_multiplier = 1.0
-                    base_reward = scaled_coefficient * net_gain_pct * loss_multiplier
-                    self.num_losses += 1
+                        # LOSS
+                        base_reward = scaled_coefficient * gain_pct
+                        self.num_losses += 1
+                        
+                        # PENALTY: If loss < -1.0% (e.g. -2.0%), amplify the excess
+                        # gain_pct is negative, so we check if it's LESS than -threshold
+                        if gain_pct < -threshold:
+                            excess_loss = abs(gain_pct) - threshold
+                            # Subtract penalty (making the negative score more negative)
+                            # Effectively: Reward = gain - (0.5 * excess)
+                            base_reward -= scaled_coefficient * excess_loss * 0.5
+                
+                else:
+                    # --- NORMAL / CONSISTENCY MODE: PUNISHMENT MODEL ---
+                    # A trade making 0.5% when hurdle is 0.6% is a LOSS of -0.1%
+                    hurdle_rate = Config.HURDLE_RATE
+                    hurdle_pct = hurdle_rate * 100.0
+                    net_gain_pct = gain_pct - hurdle_pct
+
+                    # 5. Calculate Reward with Asymmetric Penalty
+                    if net_gain_pct >= 0:
+                        # WIN: Linear reward
+                        base_reward = scaled_coefficient * net_gain_pct
+                        self.num_wins += 1
+                    else:
+                        # LOSS: Apply magnification based on mode
+                        if self.consistency_mode:
+                            loss_multiplier = Config.CONSISTENCY_LOSS_MULTIPLIER
+                        else:
+                            loss_multiplier = 1.0
+                        base_reward = scaled_coefficient * net_gain_pct * loss_multiplier
+                        self.num_losses += 1
 
                 # 6. Forced Exit Penalty (Lack of decisiveness)
                 # MAVERICK MODE: No forced exit penalty (encourages holding for bigger gains)
