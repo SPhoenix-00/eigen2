@@ -1,0 +1,320 @@
+"""
+Diagnostic script to debug GCS download issues.
+Lists bucket contents and tests multiple file paths.
+"""
+
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Determine log path - works on both Windows and Linux
+if sys.platform == 'win32':
+    log_path = r"d:\GitHub\eigen2\.cursor\debug.log"
+else:
+    # For Linux/remote systems, use workspace root
+    workspace_root = os.environ.get('WORKSPACE', '/workspace')
+    if os.path.exists('/workspace'):
+        log_path = '/workspace/.cursor/debug.log'
+    else:
+        log_path = os.path.join(os.getcwd(), '.cursor', 'debug.log')
+    
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+# #region agent log
+with open(log_path, "a") as f:
+    f.write(json.dumps({
+        "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+        "timestamp": int(datetime.now().timestamp() * 1000),
+        "location": "debug_gcs_download.py:12",
+        "message": "Script started",
+        "data": {"hypothesisId": "A"},
+        "sessionId": "debug-session",
+        "runId": "run1"
+    }) + "\n")
+# #endregion
+
+try:
+    from google.cloud import storage
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:25",
+            "message": "GCS library imported successfully",
+            "data": {"hypothesisId": "A"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    # Initialize client
+    bucket_name = 'eigen2-checkpoints-ase0'
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:40",
+            "message": "Initializing GCS client",
+            "data": {"bucket_name": bucket_name, "hypothesisId": "A"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:50",
+            "message": "GCS client initialized",
+            "data": {"hypothesisId": "A"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    print(f"\n{'='*70}")
+    print("GCS Download Diagnostic")
+    print(f"{'='*70}\n")
+    print(f"Bucket: {bucket_name}\n")
+    
+    # Hypothesis A: File path is wrong (missing eigen2/ prefix)
+    # Hypothesis B: File doesn't exist at all
+    # Hypothesis C: File exists with different name/date
+    # Hypothesis D: Wrong bucket name
+    # Hypothesis E: Credentials issue
+    
+    # Test 1: List all files with Eigen2_Master in name
+    print("Searching for files matching 'Eigen2_Master'...")
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:70",
+            "message": "Starting file search",
+            "data": {"search_pattern": "Eigen2_Master", "hypothesisId": "B"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    matching_files = []
+    all_files = []
+    
+    try:
+        blobs = bucket.list_blobs()
+        for blob in blobs:
+            all_files.append(blob.name)
+            if 'Eigen2_Master' in blob.name:
+                matching_files.append(blob.name)
+    except Exception as e:
+        # #region agent log
+        with open(log_path, "a") as f:
+            f.write(json.dumps({
+                "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "location": "debug_gcs_download.py:90",
+                "message": "Error listing blobs",
+                "data": {"error": str(e), "hypothesisId": "E"},
+                "sessionId": "debug-session",
+                "runId": "run1"
+            }) + "\n")
+        # #endregion
+        print(f"✗ Error listing bucket contents: {e}")
+        matching_files = []
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:100",
+            "message": "File search completed",
+            "data": {
+                "total_files": len(all_files),
+                "matching_files": matching_files,
+                "matching_count": len(matching_files),
+                "hypothesisId": "B"
+            },
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    if matching_files:
+        print(f"✓ Found {len(matching_files)} matching file(s):")
+        for fname in matching_files:
+            print(f"  - {fname}")
+    else:
+        print("✗ No files matching 'Eigen2_Master' found")
+    
+    print(f"\nTotal files in bucket: {len(all_files)}")
+    if len(all_files) > 0 and len(all_files) <= 20:
+        print("\nAll files in bucket:")
+        for fname in sorted(all_files):
+            print(f"  - {fname}")
+    elif len(all_files) > 20:
+        print(f"\nFirst 20 files in bucket:")
+        for fname in sorted(all_files)[:20]:
+            print(f"  - {fname}")
+    
+    # Test 2: Try multiple possible paths
+    print(f"\n{'='*70}")
+    print("Testing possible file paths...")
+    print(f"{'='*70}\n")
+    
+    test_paths = [
+        'Eigen2_Master_PY_OUTPUT_311225.pkl',  # Original (wrong)
+        'eigen2/Eigen2_Master_PY_OUTPUT_311225.pkl',  # With eigen2/ prefix
+        'Eigen2_Master_PY_OUTPUT.pkl',  # Without date suffix
+        'eigen2/Eigen2_Master_PY_OUTPUT.pkl',  # Without date, with prefix
+    ]
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:145",
+            "message": "Starting path tests",
+            "data": {"test_paths": test_paths, "hypothesisId": "A"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    for test_path in test_paths:
+        # #region agent log
+        with open(log_path, "a") as f:
+            f.write(json.dumps({
+                "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "location": "debug_gcs_download.py:155",
+                "message": "Testing path",
+                "data": {"test_path": test_path, "hypothesisId": "A"},
+                "sessionId": "debug-session",
+                "runId": "run1"
+            }) + "\n")
+        # #endregion
+        
+        blob = bucket.blob(test_path)
+        exists = blob.exists()
+        
+        # #region agent log
+        with open(log_path, "a") as f:
+            f.write(json.dumps({
+                "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "location": "debug_gcs_download.py:170",
+                "message": "Path test result",
+                "data": {
+                    "test_path": test_path,
+                    "exists": exists,
+                    "hypothesisId": "A"
+                },
+                "sessionId": "debug-session",
+                "runId": "run1"
+            }) + "\n")
+        # #endregion
+        
+        status = "✓ EXISTS" if exists else "✗ NOT FOUND"
+        print(f"{status}: {test_path}")
+    
+    # Test 3: Check if bucket is accessible
+    print(f"\n{'='*70}")
+    print("Bucket Access Test")
+    print(f"{'='*70}\n")
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:195",
+            "message": "Testing bucket access",
+            "data": {"bucket_name": bucket_name, "hypothesisId": "D"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    try:
+        bucket.reload()
+        # #region agent log
+        with open(log_path, "a") as f:
+            f.write(json.dumps({
+                "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "location": "debug_gcs_download.py:205",
+                "message": "Bucket access successful",
+                "data": {"hypothesisId": "D"},
+                "sessionId": "debug-session",
+                "runId": "run1"
+            }) + "\n")
+        # #endregion
+        print(f"✓ Bucket '{bucket_name}' is accessible")
+    except Exception as e:
+        # #region agent log
+        with open(log_path, "a") as f:
+            f.write(json.dumps({
+                "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+                "timestamp": int(datetime.now().timestamp() * 1000),
+                "location": "debug_gcs_download.py:215",
+                "message": "Bucket access failed",
+                "data": {"error": str(e), "hypothesisId": "D"},
+                "sessionId": "debug-session",
+                "runId": "run1"
+            }) + "\n")
+        # #endregion
+        print(f"✗ Cannot access bucket: {e}")
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:225",
+            "message": "Script completed",
+            "data": {"hypothesisId": "A"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    print(f"\n{'='*70}")
+    print("Diagnostic complete!")
+    print(f"{'='*70}\n")
+
+except ImportError:
+    print("✗ google-cloud-storage not installed")
+    print("Install with: pip install google-cloud-storage")
+except Exception as e:
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:245",
+            "message": "Script error",
+            "data": {"error": str(e), "error_type": type(e).__name__, "hypothesisId": "E"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    print(f"✗ Error: {e}")
+    import traceback
+    traceback.print_exc()
+
