@@ -295,7 +295,69 @@ try:
         if download_error and not download_success:
             print(f"    Error: {download_error[:100]}")
     
-    # Test 3: Check if bucket is accessible
+    # Test 3: Detailed test of the 311225 file specifically
+    print(f"\n{'='*70}")
+    print("Detailed Test: eigen2/Eigen2_Master_PY_OUTPUT_311225.pkl")
+    print(f"{'='*70}\n")
+    
+    target_path = 'eigen2/Eigen2_Master_PY_OUTPUT_311225.pkl'
+    blob = bucket.blob(target_path)
+    
+    # #region agent log
+    with open(log_path, "a") as f:
+        f.write(json.dumps({
+            "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "location": "debug_gcs_download.py:240",
+            "message": "Testing target file specifically",
+            "data": {"target_path": target_path, "hypothesisId": "E"},
+            "sessionId": "debug-session",
+            "runId": "run1"
+        }) + "\n")
+    # #endregion
+    
+    print(f"Target file: {target_path}")
+    print(f"Full GCS path: gs://{bucket_name}/{target_path}\n")
+    
+    # Try exists check
+    try:
+        exists = blob.exists()
+        print(f"blob.exists(): {exists}")
+    except Exception as e:
+        print(f"blob.exists() error: {e}")
+        exists = None
+    
+    # Try to get metadata
+    try:
+        blob.reload()
+        print(f"✓ File metadata accessible")
+        print(f"  Size: {blob.size} bytes")
+        print(f"  Created: {blob.time_created}")
+        print(f"  Content-Type: {blob.content_type}")
+    except Exception as e:
+        print(f"✗ Cannot access file metadata: {e}")
+        print(f"  This suggests a permissions issue.")
+        print(f"  The file may exist but the service account lacks 'storage.objects.get' permission.")
+    
+    # Try actual download
+    print(f"\nAttempting download test...")
+    test_file = "/tmp/test_311225_download.pkl"
+    try:
+        blob.download_to_filename(test_file, timeout=30)
+        file_size = os.path.getsize(test_file)
+        print(f"✓ Download successful! ({file_size} bytes)")
+        os.remove(test_file)
+    except Exception as e:
+        print(f"✗ Download failed: {e}")
+        if "404" in str(e) or "NotFound" in str(e):
+            print(f"\n  Possible causes:")
+            print(f"  1. File doesn't exist at this exact path")
+            print(f"  2. File exists but service account lacks 'storage.objects.get' permission")
+            print(f"  3. File path in console might be slightly different")
+            print(f"\n  Action: Verify the exact path in Google Cloud Console")
+            print(f"  Expected: gs://{bucket_name}/{target_path}")
+    
+    # Test 4: Check if bucket is accessible
     print(f"\n{'='*70}")
     print("Bucket Access Test")
     print(f"{'='*70}\n")
@@ -305,7 +367,7 @@ try:
         f.write(json.dumps({
             "id": f"log_{int(datetime.now().timestamp() * 1000)}",
             "timestamp": int(datetime.now().timestamp() * 1000),
-            "location": "debug_gcs_download.py:195",
+            "location": "debug_gcs_download.py:295",
             "message": "Testing bucket access",
             "data": {"bucket_name": bucket_name, "hypothesisId": "D"},
             "sessionId": "debug-session",
@@ -320,7 +382,7 @@ try:
             f.write(json.dumps({
                 "id": f"log_{int(datetime.now().timestamp() * 1000)}",
                 "timestamp": int(datetime.now().timestamp() * 1000),
-                "location": "debug_gcs_download.py:205",
+                "location": "debug_gcs_download.py:305",
                 "message": "Bucket access successful",
                 "data": {"hypothesisId": "D"},
                 "sessionId": "debug-session",
@@ -334,14 +396,15 @@ try:
             f.write(json.dumps({
                 "id": f"log_{int(datetime.now().timestamp() * 1000)}",
                 "timestamp": int(datetime.now().timestamp() * 1000),
-                "location": "debug_gcs_download.py:215",
+                "location": "debug_gcs_download.py:315",
                 "message": "Bucket access failed",
                 "data": {"error": str(e), "hypothesisId": "D"},
                 "sessionId": "debug-session",
                 "runId": "run1"
             }) + "\n")
         # #endregion
-        print(f"✗ Cannot access bucket: {e}")
+        print(f"✗ Cannot access bucket metadata: {e}")
+        print(f"  Note: This doesn't prevent file downloads if you have 'storage.objects.get' permission")
     
     # #region agent log
     with open(log_path, "a") as f:
