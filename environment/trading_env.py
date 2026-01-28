@@ -535,32 +535,37 @@ class TradingEnvironment(gym.Env):
 
                 if self.maverick_mode:
                     # --- MAVERICK MODE: BONUS/PENALTY MODEL ---
-                    # Dead Zone: -1.0% to +1.0% (Linear Reward, no scaling)
+                    # Apply hurdle rate to filter out low-quality trades
+                    hurdle_rate = Config.HURDLE_RATE * Config.MAVERICK_HURDLE_MULTIPLIER
+                    hurdle_pct = hurdle_rate * 100.0
+                    
+                    # Calculate net gain relative to hurdle
+                    net_gain_pct = gain_pct - hurdle_pct
+                    
+                    # Dead Zone: -1.0% to +1.0% (Linear Reward based on net_gain)
                     # Upside: > 1.0% (0.5x Bonus)
                     # Downside: < -1.0% (0.5x Penalty scaling)
                     
                     threshold = 1.0  # 1.0% boundary
                     
-                    if gain_pct >= 0:
-                        # WIN
-                        base_reward = scaled_coefficient * gain_pct
+                    if net_gain_pct >= 0:
+                        # WIN (Post-hurdle)
+                        base_reward = scaled_coefficient * net_gain_pct
                         self.num_wins += 1
                         
-                        # BONUS: If gain > 1.0%, add 0.5x excess
+                        # BONUS: If raw gain > 1.0%, add 0.5x excess
                         if gain_pct > threshold:
                             excess_gain = gain_pct - threshold
                             base_reward += scaled_coefficient * excess_gain * 0.5
                     else:
-                        # LOSS
-                        base_reward = scaled_coefficient * gain_pct
+                        # LOSS (Post-hurdle)
+                        base_reward = scaled_coefficient * net_gain_pct
                         self.num_losses += 1
                         
-                        # PENALTY: If loss < -1.0% (e.g. -2.0%), amplify the excess
-                        # gain_pct is negative, so we check if it's LESS than -threshold
+                        # PENALTY: If loss < -1.0%, amplify the excess
                         if gain_pct < -threshold:
                             excess_loss = abs(gain_pct) - threshold
                             # Subtract penalty (making the negative score more negative)
-                            # Effectively: Reward = gain - (0.5 * excess)
                             base_reward -= scaled_coefficient * excess_loss * 0.5
                 
                 else:

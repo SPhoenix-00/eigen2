@@ -406,6 +406,8 @@ class OnDiskReplayBuffer(IterableDataset):
         self.storage_path.mkdir(parents=True, exist_ok=True)
 
         # Deque now stores file paths (strings)
+        # NOTE: We set maxlen to capacity, but since we store chunks, we must manage eviction manually
+        # in add_batch/add_batch_columnar to avoid storing (capacity * chunk_size) transitions.
         self.buffer = deque(maxlen=self.capacity)
 
         # Statistics
@@ -561,10 +563,15 @@ class OnDiskReplayBuffer(IterableDataset):
                 total_saved += count
 
         # Add to buffer deque
-        num_to_remove = max(0, len(self.buffer) + len(successful_paths) - self.capacity)
+        # CRITICAL FIX: Capacity is in transitions, but buffer stores chunks.
+        # We must limit the number of chunks to capacity // chunk_size.
+        chunk_capacity = max(1, self.capacity // chunk_size)
+        num_to_remove = max(0, len(self.buffer) + len(successful_paths) - chunk_capacity)
+        
         old_paths_to_remove = []
         if num_to_remove > 0:
-            old_paths_to_remove = [self.buffer[i] for i in range(num_to_remove)]
+            # Get paths to remove and physically remove them from the deque
+            old_paths_to_remove = [self.buffer.popleft() for _ in range(num_to_remove)]
 
         # Add new paths
         for path in successful_paths:
@@ -572,6 +579,14 @@ class OnDiskReplayBuffer(IterableDataset):
 
         # Update statistics
         self.total_transitions += total_saved
+        
+        # Decrement statistics for removed chunks
+        if num_to_remove > 0:
+            # We assume old chunks have roughly chunk_size transitions
+            # This keeps total_transitions accurate to the rolling window size
+            estimated_removed = num_to_remove * chunk_size
+            self.total_transitions -= estimated_removed
+            self.total_transitions = max(0, self.total_transitions)
 
         # Delete old files from disk in parallel
         if old_paths_to_remove:
@@ -669,6 +684,17 @@ class OnDiskReplayBuffer(IterableDataset):
 
         # Add chunk paths to buffer (each entry is a chunk file, not individual transition)
         # Note: capacity is in "entries" - with chunks, each entry holds chunk_size transitions
+        
+        # CRITICAL FIX: Capacity is in transitions, but buffer stores chunks.
+        # We must limit the number of chunks to capacity // chunk_size.
+        chunk_capacity = max(1, self.capacity // chunk_size)
+        num_to_remove = max(0, len(self.buffer) + len(successful_paths) - chunk_capacity)
+        
+        old_paths_to_remove = []
+        if num_to_remove > 0:
+            # Get paths to remove and physically remove them from the deque
+            old_paths_to_remove = [self.buffer.popleft() for _ in range(num_to_remove)]
+
         for path in successful_paths:
             self.buffer.append(path)
 
@@ -676,8 +702,23 @@ class OnDiskReplayBuffer(IterableDataset):
         self.total_transitions += total_saved
         self._chunk_size = chunk_size  # Remember chunk size for reference
 
-        # Handle capacity eviction (simplified - just let deque handle it)
-        # Old files will be cleaned up when they're popped from deque
+        # Decrement statistics for removed chunks
+        if num_to_remove > 0:
+            estimated_removed = num_to_remove * chunk_size
+            self.total_transitions -= estimated_removed
+            self.total_transitions = max(0, self.total_transitions)
+
+        # Handle capacity eviction - delete old files from disk!
+        if old_paths_to_remove:
+            def delete_file(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            
+            # Simple parallel deletion
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                executor.map(delete_file, old_paths_to_remove)
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """

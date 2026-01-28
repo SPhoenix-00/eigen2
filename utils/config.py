@@ -178,7 +178,7 @@ class Config:
     MAVERICK_TARGET_RANK = 20  # Training stops when Maverick reaches this rank or higher
     MAVERICK_MARKET_BENCHMARK_COL = 44  # Column for market benchmark (S&P 500 proxy) for FOMO calculation
     MAVERICK_LOSS_MULTIPLIER = 1.2  # Magnify losses by 1.2x in maverick mode (moderate loss aversion)
-    MAVERICK_HURDLE_MULTIPLIER = 1.2  # Multiplier for hurdle rate in maverick mode (1.2x higher hurdle)
+    MAVERICK_HURDLE_MULTIPLIER = 0.75  # Multiplier for hurdle rate in maverick mode (0.75x = lower hurdle)
 
     # Consistency mode - loss magnification for training on consistency
     # Applied ONLY when --consistency flag is used. Normal mode uses 1.0 (no magnification)

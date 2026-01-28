@@ -1723,7 +1723,8 @@ class AgentEvaluator:
                     cv=metrics['cv'],
                     quality_ratio=metrics['quality_ratio'],
                     win_ratio=metrics['win_ratio'],
-                    total_trades=metrics['total_trades']
+                    total_trades=metrics['total_trades'],
+                    is_maverick=entry.is_maverick
                 )
 
                 # Show results - simple old vs new comparison

@@ -38,6 +38,7 @@ class TeeLogger:
         """Write message to both terminal and file."""
         self.terminal.write(message)
         self.log_file.write(message)
+        self.log_file.flush()  # Ensure immediate write to disk
 
     def flush(self):
         """Flush both outputs."""

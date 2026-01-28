@@ -3162,9 +3162,14 @@ class ERLTrainer:
             # C. Volume Scalar (Implied)
             # In holographic mode, volume is implied by the equity curve length.
             # We add a small bonus for sustaining the curve, but capped.
-            # We map trade count to a scalar similar to log volume.
-            # log10(100 trades) = 2.0. We clamp at 4.3 to match Triad.
-            volume_proxy = math.log10(total_trades + 10)
+            
+            # REINVITED RAW PNL: Use Raw PnL magnitude instead of trade count
+            # This incentivizes accumulation of actual dollars, not just "activity"
+            total_raw_pnl = sum((t.get('exit_price', 0) - t.get('entry_price', 0)) * int(t.get('coefficient', 0)) for t in all_slices_trades)
+            
+            # log10 of PnL magnitude (e.g. $10k -> 4.0)
+            # Adding 10 ensures log is always > 1
+            volume_proxy = math.log10(abs(total_raw_pnl) + 10)
             volume_scalar = min(volume_proxy, 4.3)
             
             # D. Base Fitness
