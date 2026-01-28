@@ -195,7 +195,7 @@ class Config:
     # Max caps are set in ERLTrainer (0.8 for rate, 0.1 for std) to allow further increases
     
     # Training
-    GRADIENT_STEPS_PER_GENERATION = 32
+    GRADIENT_STEPS_PER_GENERATION = 16  # Reduced from 32 for speed optimization
     GRADIENT_STEPS_PER_GENERATION_STABILIZATION = 10  # Reduced steps during stabilization phase
     GRADIENT_ACCUMULATION_STEPS = 1
     
