@@ -211,18 +211,70 @@ try:
         # #endregion
         
         blob = bucket.blob(test_path)
-        exists = blob.exists()
+        
+        # Test 1: Check if exists() works
+        try:
+            exists = blob.exists()
+        except Exception as e:
+            exists = None
+            # #region agent log
+            with open(log_path, "a") as f:
+                f.write(json.dumps({
+                    "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+                    "timestamp": int(datetime.now().timestamp() * 1000),
+                    "location": "debug_gcs_download.py:170",
+                    "message": "exists() check failed",
+                    "data": {
+                        "test_path": test_path,
+                        "error": str(e),
+                        "hypothesisId": "E"
+                    },
+                    "sessionId": "debug-session",
+                    "runId": "run1"
+                }) + "\n")
+            # #endregion
+        
+        # Test 2: Try actual download (even if exists() fails)
+        download_success = False
+        download_error = None
+        test_file = f"/tmp/test_download_{test_path.replace('/', '_')}"
+        
+        try:
+            # #region agent log
+            with open(log_path, "a") as f:
+                f.write(json.dumps({
+                    "id": f"log_{int(datetime.now().timestamp() * 1000)}",
+                    "timestamp": int(datetime.now().timestamp() * 1000),
+                    "location": "debug_gcs_download.py:200",
+                    "message": "Attempting download test",
+                    "data": {"test_path": test_path, "hypothesisId": "A"},
+                    "sessionId": "debug-session",
+                    "runId": "run1"
+                }) + "\n")
+            # #endregion
+            
+            blob.download_to_filename(test_file, timeout=10)
+            download_success = True
+            # Clean up test file
+            if os.path.exists(test_file):
+                os.remove(test_file)
+        except Exception as e:
+            download_error = str(e)
+            if os.path.exists(test_file):
+                os.remove(test_file)
         
         # #region agent log
         with open(log_path, "a") as f:
             f.write(json.dumps({
                 "id": f"log_{int(datetime.now().timestamp() * 1000)}",
                 "timestamp": int(datetime.now().timestamp() * 1000),
-                "location": "debug_gcs_download.py:170",
+                "location": "debug_gcs_download.py:225",
                 "message": "Path test result",
                 "data": {
                     "test_path": test_path,
-                    "exists": exists,
+                    "exists_check": exists,
+                    "download_success": download_success,
+                    "download_error": download_error,
                     "hypothesisId": "A"
                 },
                 "sessionId": "debug-session",
@@ -230,8 +282,18 @@ try:
             }) + "\n")
         # #endregion
         
-        status = "✓ EXISTS" if exists else "✗ NOT FOUND"
+        if download_success:
+            status = "✓ DOWNLOADABLE"
+        elif exists is True:
+            status = "✓ EXISTS (download not tested)"
+        elif exists is False:
+            status = "✗ NOT FOUND"
+        else:
+            status = "? EXISTS CHECK FAILED"
+        
         print(f"{status}: {test_path}")
+        if download_error and not download_success:
+            print(f"    Error: {download_error[:100]}")
     
     # Test 3: Check if bucket is accessible
     print(f"\n{'='*70}")
