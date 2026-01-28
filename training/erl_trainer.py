@@ -3840,6 +3840,12 @@ class ERLTrainer:
 
         else:
             # Original code path for distributed mode or CPU-only
+            # Instrumentation for identifying bottlenecks
+            t_data_load = 0.0
+            t_data_transfer = 0.0
+            t_compute = 0.0
+            total_updates = 0
+
             for agent in tqdm(self.population, desc="Training agents"):
                 actor_losses = []
                 critic_losses = []
@@ -3850,14 +3856,24 @@ class ERLTrainer:
                     for accum_step in range(Config.GRADIENT_ACCUMULATION_STEPS):
                         # Get next batch from DataLoader (already prefetched by workers)
                         # This is FAST - batch is already in RAM, loaded asynchronously
+                        t0 = time.time()
                         batch_cpu = next(self.batch_iterator)
+                        t1 = time.time()
 
                         # Move batch to GPU (fast transfer thanks to pin_memory)
                         batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+                        t2 = time.time()
 
                         # Update with gradient accumulation
                         is_last_accum = (accum_step == Config.GRADIENT_ACCUMULATION_STEPS - 1)
                         critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+                        t3 = time.time()
+
+                        # Accumulate timing stats
+                        t_data_load += (t1 - t0)
+                        t_data_transfer += (t2 - t1)
+                        t_compute += (t3 - t2)
+                        total_updates += 1
 
                         # Capture attention weights from actor (after forward pass in update)
                         # Only capture from first agent to avoid redundant logging
@@ -3887,6 +3903,15 @@ class ERLTrainer:
                 # Explicitly clear loss lists to free memory
                 del actor_losses
                 del critic_losses
+
+            # Print instrumentation results
+            print(f"\n--- Training Bottleneck Analysis ---")
+            print(f"  Total updates: {total_updates}")
+            print(f"  Data Loading:  {t_data_load:.2f}s ({t_data_load/total_updates*1000:.1f} ms/step) - {(t_data_load/(t_data_load+t_data_transfer+t_compute))*100:.1f}%")
+            print(f"  GPU Transfer:  {t_data_transfer:.2f}s ({t_data_transfer/total_updates*1000:.1f} ms/step) - {(t_data_transfer/(t_data_load+t_data_transfer+t_compute))*100:.1f}%")
+            print(f"  Computation:   {t_compute:.2f}s ({t_compute/total_updates*1000:.1f} ms/step) - {(t_compute/(t_data_load+t_data_transfer+t_compute))*100:.1f}%")
+            print(f"  Total Active:  {t_data_load+t_data_transfer+t_compute:.2f}s")
+            print(f"------------------------------------")
 
         # Clear GPU cache once after training all agents
         # Note: With expandable_segments=True, CUDA handles fragmentation efficiently
@@ -7289,10 +7314,12 @@ class ERLTrainer:
 
             # 1. Evaluate population (collect experiences)
             # Use LocalEvaluator in local mode for CPU-optimized execution with in-memory transitions
+            t_eval_start = time.time()
             if self.local_mode:
                 fitness_scores, pop_stats = self.local_evaluator.evaluate_population()
             else:
                 fitness_scores, pop_stats = self.evaluate_population_parallel()
+            t_eval_end = time.time()
 
             # CRITICAL FIX: Clear GPU cache after evaluation to free memory before validation
             # Parallel evaluation workers may leave GPU memory allocated
@@ -7380,10 +7407,12 @@ class ERLTrainer:
 
             # Validate entire population
             # Use LocalEvaluator in local mode for CPU-optimized validation
+            t_val_start = time.time()
             if self.local_mode:
                 all_val_results = self.local_evaluator.validate_population(quality_threshold=quality_threshold)
             else:
                 all_val_results = self.validate_population_parallel(quality_threshold=quality_threshold)
+            t_val_end = time.time()
 
             # Process validation results and calculate combined fitness
             for idx, val_results in enumerate(all_val_results):
@@ -7814,12 +7843,14 @@ class ERLTrainer:
 
             # 2. Train agents using replay buffer
             # First, wait for background transfer to complete (if running in local mode)
+            t_train_start = time.time()
             if self.local_mode:
                 self.local_evaluator.wait_for_transfer()
                 # Move agents to CPU before training (frees GPU memory)
                 # Training will move agents to GPU in batches of 16
                 self.local_evaluator.restore_agents_to_cpu()
             self.train_population()
+            t_train_end = time.time()
 
             # Update resource tracker after training
             self.resource_tracker.update()
@@ -7878,6 +7909,7 @@ class ERLTrainer:
             # - If we run it AFTER evolve_population, the indices are scrambled (crossover/mutation)
             # - Running it before ensures we replace the actual worst agent from THIS generation
             # Pass validation_scores to enable Global 50 injection (replaces worst agent)
+            t_evolve_start = time.time()
             self.check_and_adjust_mutation(self.best_validation_fitness, fitness_scores=validation_scores)
 
             # 4. Evolve population using validation fitness for elite selection
@@ -7885,6 +7917,7 @@ class ERLTrainer:
             # - training fitness: used for tournament selection and DDPG gradient updates
             # - validation scores: used for elite selection (ensures robust generalization)
             self.evolve_population(fitness_scores, validation_scores)
+            t_evolve_end = time.time()
 
             # Update resource tracker after evolution
             self.resource_tracker.update()
@@ -7928,6 +7961,15 @@ class ERLTrainer:
             # Generation time
             gen_time = time.time() - gen_start_time
             self.generation_times.append(gen_time)
+            
+            # Print timing breakdown
+            print(f"\n--- Generation Timing Breakdown ---")
+            print(f"  Evaluation: {t_eval_end - t_eval_start:.2f}s ({((t_eval_end - t_eval_start)/gen_time)*100:.1f}%)")
+            print(f"  Validation: {t_val_end - t_val_start:.2f}s ({((t_val_end - t_val_start)/gen_time)*100:.1f}%)")
+            print(f"  Training:   {t_train_end - t_train_start:.2f}s ({((t_train_end - t_train_start)/gen_time)*100:.1f}%)")
+            print(f"  Evolution:  {t_evolve_end - t_evolve_start:.2f}s ({((t_evolve_end - t_evolve_start)/gen_time)*100:.1f}%)")
+            print(f"  Total:      {gen_time:.2f}s")
+            print(f"-----------------------------------\n")
 
             # Get final resource stats for this generation
             self.resource_tracker.update()
