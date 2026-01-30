@@ -42,6 +42,7 @@ Usage:
     python global50.py --archive-fill                      # Fill Global 50 from archive
     python global50.py --cleanup                           # Archive orphan agents
     python global50.py --cleanup-dry-run                   # Report orphans (no changes)
+    python global50.py --stats                             # Display comprehensive statistics
     python global50.py --agent-dir <path> [--run-name <name>] [--maverick]
 
 Options:
@@ -52,6 +53,7 @@ Options:
     --archive-fill      Fill Global 50 from archive. Evaluates archived agents and promotes qualifying ones.
     --cleanup           Find and archive orphan agents (files in agents/ not in global50.json).
     --cleanup-dry-run   Like --cleanup but only reports orphans without archiving them.
+    --stats             Display comprehensive statistics about the current Global 50 agents.
     --cw DAYS           Context window size in days (e.g., --cw 504 for cw504).
     --agent-dir PATH    Directory containing agent .pth files to evaluate.
     --run-name NAME     Run name for evaluation batch (default: batch-evaluation).
@@ -62,6 +64,8 @@ Examples:
     python global50.py --trim                              # Interactive trim
     python global50.py --cleanup-dry-run                   # Preview orphan cleanup
     python global50.py --cleanup                           # Archive orphan agents
+    python global50.py --stats                             # Display statistics
+    python global50.py --stats --cw 504                     # Display statistics for cw504
     python global50.py --agent-dir checkpoints/run-123/hall_of_fame
     python global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
     python global50.py --agent-dir checkpoints/maverick-run-456/hall_of_fame --maverick
@@ -2953,6 +2957,213 @@ class AgentEvaluator:
         print("\n" + "="*70)
 
 
+def print_global50_stats(context_window_days: int = None):
+    """
+    Load global50.json and display comprehensive statistics.
+    
+    Args:
+        context_window_days: Context window size in days. If None, uses Config.CONTEXT_WINDOW_DAYS.
+    """
+    from utils.config import Config
+    
+    if context_window_days is None:
+        context_window_days = Config.CONTEXT_WINDOW_DAYS
+    
+    context_window_id = f"cw{context_window_days}"
+    json_path = Path("global50") / context_window_id / "global50.json"
+    
+    print("\n" + "="*70)
+    print("GLOBAL 50 STATISTICS")
+    print("="*70)
+    print(f"Context Window: {context_window_days} days ({context_window_id})")
+    
+    if not json_path.exists():
+        print(f"\n❌ Global50 ledger not found: {json_path}")
+        print("   Run with --init to initialize, or --mirror to download from cloud.")
+        print("="*70)
+        return
+    
+    # Load JSON
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"\n❌ Error loading global50.json: {e}")
+        print("="*70)
+        return
+    
+    entries = data.get('entries', [])
+    league_rules = data.get('league_rules', {})
+    capacity = data.get('capacity', 50)
+    
+    if not entries:
+        print(f"\n⚠ No agents in Global 50 (empty ledger)")
+        print("="*70)
+        return
+    
+    # Extract numeric fields
+    gauntlet_scores = [e.get('gauntlet_score', 0) for e in entries]
+    rois = [e.get('roi', 0) for e in entries]
+    expectancies = [e.get('expectancy', 0) for e in entries]
+    cvs = [e.get('cv', 100.0) for e in entries]
+    quality_ratios = [e.get('quality_ratio', 0) for e in entries]
+    win_ratios = [e.get('win_ratio', 0) for e in entries]
+    total_trades = [e.get('total_trades', 0) for e in entries]
+    generations = [e.get('generation', 0) for e in entries]
+    
+    # Count mavericks
+    mavericks = [e for e in entries if e.get('is_maverick', False)]
+    num_mavericks = len(mavericks)
+    
+    # Helper function to calculate stats
+    def calc_stats(values):
+        if not values:
+            return {
+                'min': 0, 'max': 0, 'mean': 0, 'median': 0,
+                'p25': 0, 'p75': 0, 'std': 0
+            }
+        sorted_vals = sorted(values)
+        n = len(sorted_vals)
+        return {
+            'min': min(values),
+            'max': max(values),
+            'mean': np.mean(values),
+            'median': np.median(values),
+            'p25': sorted_vals[n // 4] if n > 0 else 0,
+            'p75': sorted_vals[3 * n // 4] if n > 0 else 0,
+            'std': np.std(values) if n > 1 else 0
+        }
+    
+    # Calculate statistics for each metric
+    gauntlet_stats = calc_stats(gauntlet_scores)
+    roi_stats = calc_stats(rois)
+    expectancy_stats = calc_stats(expectancies)
+    cv_stats = calc_stats(cvs)
+    quality_stats = calc_stats(quality_ratios)
+    win_stats = calc_stats(win_ratios)
+    trades_stats = calc_stats(total_trades)
+    gen_stats = calc_stats(generations)
+    
+    # Print overview
+    print(f"\n📊 OVERVIEW")
+    print("-" * 70)
+    print(f"  Total Agents:     {len(entries):>4} / {capacity}")
+    print(f"  Mavericks [M]:     {num_mavericks:>4} ({100*num_mavericks/len(entries):.1f}%)")
+    print(f"  Regular Agents:    {len(entries) - num_mavericks:>4} ({100*(len(entries)-num_mavericks)/len(entries):.1f}%)")
+    
+    # Print gauntlet score statistics
+    print(f"\n🎯 GAUNTLET SCORE (Efficiency-Adjusted)")
+    print("-" * 70)
+    print(f"  Min:               {gauntlet_stats['min']:>10.2f}")
+    print(f"  25th Percentile:   {gauntlet_stats['p25']:>10.2f}")
+    print(f"  Median:            {gauntlet_stats['median']:>10.2f}")
+    print(f"  75th Percentile:   {gauntlet_stats['p75']:>10.2f}")
+    print(f"  Max:               {gauntlet_stats['max']:>10.2f}")
+    print(f"  Mean:              {gauntlet_stats['mean']:>10.2f}")
+    print(f"  Std Dev:           {gauntlet_stats['std']:>10.2f}")
+    
+    # Print ROI statistics
+    print(f"\n💰 ROI (%)")
+    print("-" * 70)
+    print(f"  Min:               {roi_stats['min']:>10.2f}")
+    print(f"  25th Percentile:   {roi_stats['p25']:>10.2f}")
+    print(f"  Median:            {roi_stats['median']:>10.2f}")
+    print(f"  75th Percentile:   {roi_stats['p75']:>10.2f}")
+    print(f"  Max:               {roi_stats['max']:>10.2f}")
+    print(f"  Mean:              {roi_stats['mean']:>10.2f}")
+    print(f"  Std Dev:           {roi_stats['std']:>10.2f}")
+    
+    # Print expectancy statistics
+    print(f"\n📈 EXPECTANCY")
+    print("-" * 70)
+    print(f"  Min:               {expectancy_stats['min']:>10.2f}")
+    print(f"  25th Percentile:   {expectancy_stats['p25']:>10.2f}")
+    print(f"  Median:            {expectancy_stats['median']:>10.2f}")
+    print(f"  75th Percentile:   {expectancy_stats['p75']:>10.2f}")
+    print(f"  Max:               {expectancy_stats['max']:>10.2f}")
+    print(f"  Mean:              {expectancy_stats['mean']:>10.2f}")
+    print(f"  Std Dev:           {expectancy_stats['std']:>10.2f}")
+    
+    # Print CV (Coefficient of Variation) statistics
+    print(f"\n📉 COEFFICIENT OF VARIATION (CV) - Lower is Better")
+    print("-" * 70)
+    print(f"  Min:               {cv_stats['min']:>10.2f}")
+    print(f"  25th Percentile:   {cv_stats['p25']:>10.2f}")
+    print(f"  Median:            {cv_stats['median']:>10.2f}")
+    print(f"  75th Percentile:   {cv_stats['p75']:>10.2f}")
+    print(f"  Max:               {cv_stats['max']:>10.2f}")
+    print(f"  Mean:              {cv_stats['mean']:>10.2f}")
+    print(f"  Std Dev:           {cv_stats['std']:>10.2f}")
+    
+    # Print quality ratio statistics
+    print(f"\n⭐ QUALITY RATIO")
+    print("-" * 70)
+    print(f"  Min:               {quality_stats['min']:>10.3f}")
+    print(f"  25th Percentile:   {quality_stats['p25']:>10.3f}")
+    print(f"  Median:            {quality_stats['median']:>10.3f}")
+    print(f"  75th Percentile:   {quality_stats['p75']:>10.3f}")
+    print(f"  Max:               {quality_stats['max']:>10.3f}")
+    print(f"  Mean:              {quality_stats['mean']:>10.3f}")
+    print(f"  Std Dev:           {quality_stats['std']:>10.3f}")
+    
+    # Print win ratio statistics
+    print(f"\n🏆 WIN RATIO")
+    print("-" * 70)
+    print(f"  Min:               {win_stats['min']:>10.3f}")
+    print(f"  25th Percentile:   {win_stats['p25']:>10.3f}")
+    print(f"  Median:            {win_stats['median']:>10.3f}")
+    print(f"  75th Percentile:   {win_stats['p75']:>10.3f}")
+    print(f"  Max:               {win_stats['max']:>10.3f}")
+    print(f"  Mean:              {win_stats['mean']:>10.3f}")
+    print(f"  Std Dev:           {win_stats['std']:>10.3f}")
+    
+    # Print total trades statistics
+    print(f"\n📊 TOTAL TRADES")
+    print("-" * 70)
+    print(f"  Min:               {trades_stats['min']:>10.0f}")
+    print(f"  25th Percentile:   {trades_stats['p25']:>10.0f}")
+    print(f"  Median:            {trades_stats['median']:>10.0f}")
+    print(f"  75th Percentile:   {trades_stats['p75']:>10.0f}")
+    print(f"  Max:               {trades_stats['max']:>10.0f}")
+    print(f"  Mean:              {trades_stats['mean']:>10.1f}")
+    print(f"  Std Dev:           {trades_stats['std']:>10.1f}")
+    
+    # Print generation statistics
+    print(f"\n🧬 GENERATION")
+    print("-" * 70)
+    print(f"  Min:               {gen_stats['min']:>10.0f}")
+    print(f"  25th Percentile:   {gen_stats['p25']:>10.0f}")
+    print(f"  Median:            {gen_stats['median']:>10.0f}")
+    print(f"  75th Percentile:   {gen_stats['p75']:>10.0f}")
+    print(f"  Max:               {gen_stats['max']:>10.0f}")
+    print(f"  Mean:              {gen_stats['mean']:>10.1f}")
+    print(f"  Std Dev:           {gen_stats['std']:>10.1f}")
+    
+    # Print top agents
+    print(f"\n🏅 TOP 5 AGENTS (by Gauntlet Score)")
+    print("-" * 70)
+    sorted_entries = sorted(entries, key=lambda e: e.get('gauntlet_score', 0), reverse=True)
+    for i, entry in enumerate(sorted_entries[:5], 1):
+        maverick_marker = "[M]" if entry.get('is_maverick', False) else "   "
+        print(f"  {i}. {maverick_marker} {entry.get('run_name', 'unknown')}_{entry.get('agent_id', 0)}")
+        print(f"     Score: {entry.get('gauntlet_score', 0):>8.2f} | "
+              f"ROI: {entry.get('roi', 0):>6.2f}% | "
+              f"Exp: {entry.get('expectancy', 0):>5.2f} | "
+              f"Trades: {entry.get('total_trades', 0):>4}")
+    
+    # Print league rules info if available
+    if league_rules:
+        print(f"\n⚙️  LEAGUE RULES")
+        print("-" * 70)
+        cw_days = league_rules.get('context_window_days', context_window_days)
+        print(f"  Context Window:    {cw_days} days")
+        entry_threshold = data.get('entry_threshold', 'N/A')
+        if entry_threshold != 'N/A':
+            print(f"  Entry Threshold:   {entry_threshold:.2f}")
+    
+    print("\n" + "="*70)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate agents for Global 50 promotion",
@@ -3073,13 +3284,26 @@ Examples:
         help='Fill Global 50 from archive. Downloads archived agents, evaluates them, and promotes qualifying ones to fill empty slots.'
     )
 
+    parser.add_argument(
+        '--stats',
+        action='store_true',
+        help='Display comprehensive statistics about the current Global 50 agents.'
+    )
+
     args = parser.parse_args()
 
     # Override context window if specified
+    context_window_days = None
     if args.cw:
         from utils.config import Config
+        context_window_days = args.cw
         Config.CONTEXT_WINDOW_DAYS = args.cw
         print(f"Using context window: cw{args.cw}")
+
+    # Handle --stats mode (doesn't need full evaluator setup)
+    if args.stats:
+        print_global50_stats(context_window_days=context_window_days)
+        return
 
     # Initialize evaluator
     evaluator = AgentEvaluator(run_name=args.run_name)
