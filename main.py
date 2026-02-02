@@ -175,8 +175,8 @@ def main():
         parser.add_argument(
             '--maverick',
             action='store_true',
-            help='Enable Maverick mode: aggressive training with Triad 2.0-inspired fitness and 1.2x loss multiplier. '
-                 'Uses 0.3% hurdle rate (50% of normal), no forced exit penalty, and FOMO penalty in fitness. '
+            help='Enable Maverick mode: aggressive training with Triad 2.0-inspired fitness. '
+                 'Uses standard hurdle rate, no forced exit penalty, and FOMO penalty in fitness. '
                  'Produces aggressive signal generators designed to break committee inaction. '
                  'Limited to 5 mavericks in Global 50 (Highlander Rule). Training stops when '
                  'maverick reaches rank 20 or higher.'
