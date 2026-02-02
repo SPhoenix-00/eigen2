@@ -2842,6 +2842,7 @@ class AgentEvaluator:
                             print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f}")
                             
                             # Promote seed maverick (bypass thresholds by setting them to -inf)
+                            # Set standard thresholds to -inf
                             self.global_hof.entry_threshold = float('-inf')
                             self.global_hof.roi_threshold = float('-inf')
                             self.global_hof.expectancy_threshold = float('-inf')
@@ -2852,6 +2853,19 @@ class AgentEvaluator:
                             self.global_hof.gauntlet_p25 = float('-inf')
                             self.global_hof.roi_p25 = float('-inf')
                             self.global_hof.expectancy_p25 = float('-inf')
+                            
+                            # Also set maverick thresholds to -inf (even though maverick_count is 0)
+                            # This ensures analyze_promotion uses the right thresholds when checking
+                            self.global_hof.maverick_entry_threshold = float('-inf')
+                            self.global_hof.maverick_roi_threshold = float('-inf')
+                            self.global_hof.maverick_expectancy_threshold = float('-inf')
+                            self.global_hof.maverick_cv_threshold = float('inf')
+                            self.global_hof.maverick_gauntlet_median = float('-inf')
+                            self.global_hof.maverick_roi_median = float('-inf')
+                            self.global_hof.maverick_expectancy_median = float('-inf')
+                            self.global_hof.maverick_gauntlet_p25 = float('-inf')
+                            self.global_hof.maverick_roi_p25 = float('-inf')
+                            self.global_hof.maverick_expectancy_p25 = float('-inf')
                             
                             promoted, rank = self.global_hof.check_and_promote(
                                 agent=agent,

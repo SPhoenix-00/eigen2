@@ -904,6 +904,7 @@ class GlobalHallOfFame:
             # agents only if maverick_count < MAVERICK_CAP
             final_list = []
             maverick_count = 0
+            non_maverick_count = 0  # Track non-maverick count to enforce 45 limit
             dropouts = []
             new_entry_maverick_rank = None  # Rank among Mavericks (1-based)
 
@@ -933,8 +934,14 @@ class GlobalHallOfFame:
                         # (Don't print here - we'll check at the end if new_entry made it)
                         dropouts.append(entry)
                 else:
-                    # Normal agents are always accepted (subject to capacity)
-                    final_list.append(entry)
+                    # Normal agents: Check non-maverick capacity (CAPACITY - MAVERICK_CAP = 45)
+                    non_maverick_capacity = self.CAPACITY - self.MAVERICK_CAP  # 50 - 5 = 45
+                    if non_maverick_count < non_maverick_capacity:
+                        final_list.append(entry)
+                        non_maverick_count += 1
+                    else:
+                        # Non-maverick cap hit: This non-maverick is rejected
+                        dropouts.append(entry)
 
             # Check if our new entry survived the cut
             if new_entry not in final_list:
