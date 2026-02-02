@@ -44,6 +44,8 @@ Usage:
     python global50.py --cleanup-dry-run                   # Report orphans (no changes)
     python global50.py --reactivate                        # Reactivate agents between archive and long-term-archive
     python global50.py --stats                             # Display comprehensive statistics
+    python global50.py --mark-maverick <run_name>          # Mark all agents with run_name as Mavericks
+    python global50.py --unmark-maverick <run_name>        # Unmark all agents with run_name as Mavericks
     python global50.py --agent-dir <path> [--run-name <name>] [--maverick]
 
 Options:
@@ -57,6 +59,8 @@ Options:
     --reactivate        Reactivate agents: move qualifying agents from long-term-archive to archive,
                         and move non-qualifying agents from archive to long-term-archive.
     --stats             Display comprehensive statistics about the current Global 50 agents.
+    --mark-maverick     Mark all agents with the given run_name as Mavericks in global50, archive, and long-term-archive.
+    --unmark-maverick   Unmark all agents with the given run_name as Mavericks in global50, archive, and long-term-archive.
     --cw DAYS           Context window size in days (e.g., --cw 504 for cw504).
     --agent-dir PATH    Directory containing agent .pth files to evaluate.
     --run-name NAME     Run name for evaluation batch (default: batch-evaluation).
@@ -69,6 +73,8 @@ Examples:
     python global50.py --cleanup                           # Archive orphan agents
     python global50.py --stats                             # Display statistics
     python global50.py --stats --cw 504                     # Display statistics for cw504
+    python global50.py --mark-maverick twilight-haze-313    # Mark all agents with run_name as Mavericks
+    python global50.py --unmark-maverick twilight-haze-313  # Unmark all agents with run_name as Mavericks
     python global50.py --agent-dir checkpoints/run-123/hall_of_fame
     python global50.py --agent-dir workspace/elite_agents --run-name batch-eval-001
     python global50.py --agent-dir checkpoints/maverick-run-456/hall_of_fame --maverick
@@ -3643,6 +3649,360 @@ class AgentEvaluator:
 
         return archive_agents
 
+    def mark_maverick_by_run_name(self, run_name: str, is_maverick: bool = True):
+        """
+        Mark all agents with a given run_name as Mavericks (or unmark them).
+        
+        Updates:
+        - global50.json entries
+        - archive/ JSON files (local and cloud)
+        - long-term-archive/ JSON files (local and cloud)
+        
+        Args:
+            run_name: Run name to match (e.g., 'twilight-haze-313')
+            is_maverick: True to mark as Maverick, False to unmark
+        """
+        print(f"\n{'='*70}")
+        print(f"{'Marking' if is_maverick else 'Unmarking'} Maverick Status by Run Name")
+        print(f"{'='*70}")
+        print(f"Run Name: {run_name}")
+        print(f"Context Window: {self.global_hof.context_window_id}")
+        
+        if not self.global_hof.enabled:
+            print("⚠ Global 50 not enabled (local mode or disabled)")
+            print("Cannot mark Mavericks in cloud storage.")
+            return
+        
+        # Load current Global 50 state
+        print("\n1. Loading Global 50 state...")
+        self.global_hof._download_global_ledger()
+        self.global_hof._load_local_ledger()
+        
+        # Count current mavericks in Global 50
+        current_maverick_count = sum(1 for e in self.global_hof.entries if e.is_maverick)
+        print(f"   Current Maverick count in Global 50: {current_maverick_count}/{self.global_hof.MAVERICK_CAP}")
+        
+        # Find matching entries in Global 50
+        matched_g50 = [e for e in self.global_hof.entries if e.run_name == run_name]
+        
+        # Check maverick cap if setting flag
+        if is_maverick:
+            new_mavericks = sum(1 for e in matched_g50 if not e.is_maverick)
+            if current_maverick_count + new_mavericks > self.global_hof.MAVERICK_CAP:
+                print(f"\n   ⚠ WARNING: Would exceed Maverick cap of {self.global_hof.MAVERICK_CAP}")
+                print(f"      Current: {current_maverick_count}, Adding: {new_mavericks}, Cap: {self.global_hof.MAVERICK_CAP}")
+                print(f"      Note: This only checks Global 50. Archive entries will still be updated.")
+                response = input(f"      Continue updating archive/long-term-archive anyway? (yes/no): ").strip().lower()
+                if response not in ['yes', 'y']:
+                    return
+        
+        # Update Global 50 entries
+        g50_changes = 0
+        if matched_g50:
+            print(f"\n2. Updating Global 50 entries ({len(matched_g50)} found)...")
+            for entry in matched_g50:
+                if entry.is_maverick != is_maverick:
+                    entry.is_maverick = is_maverick
+                    g50_changes += 1
+                    action = "SET" if is_maverick else "UNSET"
+                    print(f"   {action}: {entry.run_name}_{entry.agent_id}")
+            
+            if g50_changes > 0:
+                # Save Global 50
+                self.global_hof._save_local_ledger()
+                self.global_hof._upload_global_ledger()
+                print(f"   ✓ Updated {g50_changes} Global 50 entry/entries")
+            else:
+                print(f"   No changes needed in Global 50")
+        else:
+            print(f"\n2. No matching entries in Global 50")
+        
+        # Update archive JSON files
+        print(f"\n3. Updating archive JSON files...")
+        archive_changes = 0
+        if self.global_hof.local_archive_dir.exists():
+            for json_file in self.global_hof.local_archive_dir.glob("*.json"):
+                try:
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                    
+                    if data.get('run_name') == run_name:
+                        if data.get('is_maverick', False) != is_maverick:
+                            data['is_maverick'] = is_maverick
+                            with open(json_file, 'w') as f:
+                                json.dump(data, f, indent=2)
+                            
+                            # Upload to cloud
+                            filename = json_file.name
+                            cloud_path = f"{self.global_hof.cloud_base}/archive/{filename}"
+                            if self.cloud_sync.upload_file_verified(str(json_file), cloud_path):
+                                archive_changes += 1
+                                action = "SET" if is_maverick else "UNSET"
+                                print(f"   {action}: {filename}")
+                except Exception as e:
+                    print(f"   ⚠ Error updating {json_file.name}: {e}")
+        
+        # Also check cloud archive for files not in local cache
+        cloud_archive_changes = 0
+        cloud_archive_prefix = f"{self.global_hof.cloud_base}/archive/"
+        try:
+            if self.cloud_sync.provider == "gcs":
+                blobs = list(self.cloud_sync.bucket.list_blobs(prefix=cloud_archive_prefix))
+                for blob in blobs:
+                    if blob.name.endswith('.json'):
+                        filename = blob.name.split('/')[-1]
+                        # Check if this file matches the run_name pattern
+                        if run_name in filename:
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                temp_path = tmp.name
+                            try:
+                                blob.download_to_filename(temp_path)
+                                with open(temp_path, 'r') as f:
+                                    data = json.load(f)
+                                
+                                if data.get('run_name') == run_name and data.get('is_maverick', False) != is_maverick:
+                                    data['is_maverick'] = is_maverick
+                                    with open(temp_path, 'w') as f:
+                                        json.dump(data, f, indent=2)
+                                    
+                                    if self.cloud_sync.upload_file_verified(temp_path, blob.name):
+                                        cloud_archive_changes += 1
+                                        action = "SET" if is_maverick else "UNSET"
+                                        print(f"   {action} (cloud): {filename}")
+                            except Exception as e:
+                                print(f"   ⚠ Error updating {blob.name}: {e}")
+                            finally:
+                                import os
+                                if os.path.exists(temp_path):
+                                    os.unlink(temp_path)
+            elif self.cloud_sync.provider == "s3":
+                paginator = self.cloud_sync.client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=self.cloud_sync.bucket_name, Prefix=cloud_archive_prefix)
+                for page in pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            if obj['Key'].endswith('.json'):
+                                filename = obj['Key'].split('/')[-1]
+                                if run_name in filename:
+                                    import tempfile
+                                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                        temp_path = tmp.name
+                                    try:
+                                        self.cloud_sync.client.download_file(
+                                            self.cloud_sync.bucket_name, obj['Key'], temp_path
+                                        )
+                                        with open(temp_path, 'r') as f:
+                                            data = json.load(f)
+                                        
+                                        if data.get('run_name') == run_name and data.get('is_maverick', False) != is_maverick:
+                                            data['is_maverick'] = is_maverick
+                                            with open(temp_path, 'w') as f:
+                                                json.dump(data, f, indent=2)
+                                            
+                                            self.cloud_sync.client.upload_file(
+                                                temp_path, self.cloud_sync.bucket_name, obj['Key']
+                                            )
+                                            cloud_archive_changes += 1
+                                            action = "SET" if is_maverick else "UNSET"
+                                            print(f"   {action} (cloud): {filename}")
+                                    except Exception as e:
+                                        print(f"   ⚠ Error updating {obj['Key']}: {e}")
+                                    finally:
+                                        import os
+                                        if os.path.exists(temp_path):
+                                            os.unlink(temp_path)
+            elif self.cloud_sync.provider == "azure":
+                blob_list = self.cloud_sync.container_client.list_blobs(name_starts_with=cloud_archive_prefix)
+                for blob in blob_list:
+                    if blob.name.endswith('.json'):
+                        filename = blob.name.split('/')[-1]
+                        if run_name in filename:
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                temp_path = tmp.name
+                            try:
+                                blob_client = self.cloud_sync.container_client.get_blob_client(blob.name)
+                                with open(temp_path, 'wb') as f:
+                                    f.write(blob_client.download_blob().readall())
+                                with open(temp_path, 'r') as f:
+                                    data = json.load(f)
+                                
+                                if data.get('run_name') == run_name and data.get('is_maverick', False) != is_maverick:
+                                    data['is_maverick'] = is_maverick
+                                    with open(temp_path, 'w') as f:
+                                        json.dump(data, f, indent=2)
+                                    
+                                    with open(temp_path, 'rb') as f:
+                                        blob_client.upload_blob(f, overwrite=True)
+                                    cloud_archive_changes += 1
+                                    action = "SET" if is_maverick else "UNSET"
+                                    print(f"   {action} (cloud): {filename}")
+                            except Exception as e:
+                                print(f"   ⚠ Error updating {blob.name}: {e}")
+                            finally:
+                                import os
+                                if os.path.exists(temp_path):
+                                    os.unlink(temp_path)
+        except Exception as e:
+            print(f"   ⚠ Error checking cloud archive: {e}")
+        
+        total_archive_changes = archive_changes + cloud_archive_changes
+        if total_archive_changes > 0:
+            print(f"   ✓ Updated {total_archive_changes} archive file(s)")
+        else:
+            print(f"   No matching archive files found")
+        
+        # Update long-term-archive JSON files
+        print(f"\n4. Updating long-term-archive JSON files...")
+        long_term_changes = 0
+        local_long_term_dir = self.global_hof.local_dir / "long-term-archive"
+        
+        if local_long_term_dir.exists():
+            for json_file in local_long_term_dir.glob("*.json"):
+                try:
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                    
+                    if data.get('run_name') == run_name:
+                        if data.get('is_maverick', False) != is_maverick:
+                            data['is_maverick'] = is_maverick
+                            with open(json_file, 'w') as f:
+                                json.dump(data, f, indent=2)
+                            
+                            # Upload to cloud
+                            filename = json_file.name
+                            cloud_path = f"{self.global_hof.cloud_base}/long-term-archive/{filename}"
+                            if self.cloud_sync.upload_file_verified(str(json_file), cloud_path):
+                                long_term_changes += 1
+                                action = "SET" if is_maverick else "UNSET"
+                                print(f"   {action}: {filename}")
+                except Exception as e:
+                    print(f"   ⚠ Error updating {json_file.name}: {e}")
+        
+        # Check cloud long-term-archive
+        cloud_long_term_changes = 0
+        cloud_long_term_prefix = f"{self.global_hof.cloud_base}/long-term-archive/"
+        try:
+            if self.cloud_sync.provider == "gcs":
+                blobs = list(self.cloud_sync.bucket.list_blobs(prefix=cloud_long_term_prefix))
+                for blob in blobs:
+                    if blob.name.endswith('.json'):
+                        filename = blob.name.split('/')[-1]
+                        if run_name in filename:
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                temp_path = tmp.name
+                            try:
+                                blob.download_to_filename(temp_path)
+                                with open(temp_path, 'r') as f:
+                                    data = json.load(f)
+                                
+                                if data.get('run_name') == run_name and data.get('is_maverick', False) != is_maverick:
+                                    data['is_maverick'] = is_maverick
+                                    with open(temp_path, 'w') as f:
+                                        json.dump(data, f, indent=2)
+                                    
+                                    if self.cloud_sync.upload_file_verified(temp_path, blob.name):
+                                        cloud_long_term_changes += 1
+                                        action = "SET" if is_maverick else "UNSET"
+                                        print(f"   {action} (cloud): {filename}")
+                            except Exception as e:
+                                print(f"   ⚠ Error updating {blob.name}: {e}")
+                            finally:
+                                import os
+                                if os.path.exists(temp_path):
+                                    os.unlink(temp_path)
+            elif self.cloud_sync.provider == "s3":
+                paginator = self.cloud_sync.client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=self.cloud_sync.bucket_name, Prefix=cloud_long_term_prefix)
+                for page in pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            if obj['Key'].endswith('.json'):
+                                filename = obj['Key'].split('/')[-1]
+                                if run_name in filename:
+                                    import tempfile
+                                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                        temp_path = tmp.name
+                                    try:
+                                        self.cloud_sync.client.download_file(
+                                            self.cloud_sync.bucket_name, obj['Key'], temp_path
+                                        )
+                                        with open(temp_path, 'r') as f:
+                                            data = json.load(f)
+                                        
+                                        if data.get('run_name') == run_name and data.get('is_maverick', False) != is_maverick:
+                                            data['is_maverick'] = is_maverick
+                                            with open(temp_path, 'w') as f:
+                                                json.dump(data, f, indent=2)
+                                            
+                                            self.cloud_sync.client.upload_file(
+                                                temp_path, self.cloud_sync.bucket_name, obj['Key']
+                                            )
+                                            cloud_long_term_changes += 1
+                                            action = "SET" if is_maverick else "UNSET"
+                                            print(f"   {action} (cloud): {filename}")
+                                    except Exception as e:
+                                        print(f"   ⚠ Error updating {obj['Key']}: {e}")
+                                    finally:
+                                        import os
+                                        if os.path.exists(temp_path):
+                                            os.unlink(temp_path)
+            elif self.cloud_sync.provider == "azure":
+                blob_list = self.cloud_sync.container_client.list_blobs(name_starts_with=cloud_long_term_prefix)
+                for blob in blob_list:
+                    if blob.name.endswith('.json'):
+                        filename = blob.name.split('/')[-1]
+                        if run_name in filename:
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                temp_path = tmp.name
+                            try:
+                                blob_client = self.cloud_sync.container_client.get_blob_client(blob.name)
+                                with open(temp_path, 'wb') as f:
+                                    f.write(blob_client.download_blob().readall())
+                                with open(temp_path, 'r') as f:
+                                    data = json.load(f)
+                                
+                                if data.get('run_name') == run_name and data.get('is_maverick', False) != is_maverick:
+                                    data['is_maverick'] = is_maverick
+                                    with open(temp_path, 'w') as f:
+                                        json.dump(data, f, indent=2)
+                                    
+                                    with open(temp_path, 'rb') as f:
+                                        blob_client.upload_blob(f, overwrite=True)
+                                    cloud_long_term_changes += 1
+                                    action = "SET" if is_maverick else "UNSET"
+                                    print(f"   {action} (cloud): {filename}")
+                            except Exception as e:
+                                print(f"   ⚠ Error updating {blob.name}: {e}")
+                            finally:
+                                import os
+                                if os.path.exists(temp_path):
+                                    os.unlink(temp_path)
+        except Exception as e:
+            print(f"   ⚠ Error checking cloud long-term-archive: {e}")
+        
+        total_long_term_changes = long_term_changes + cloud_long_term_changes
+        if total_long_term_changes > 0:
+            print(f"   ✓ Updated {total_long_term_changes} long-term-archive file(s)")
+        else:
+            print(f"   No matching long-term-archive files found")
+        
+        # Summary
+        total_changes = g50_changes + total_archive_changes + total_long_term_changes
+        print(f"\n{'='*70}")
+        print(f"✓ Complete")
+        print(f"  Global 50: {g50_changes} change(s)")
+        print(f"  Archive: {total_archive_changes} change(s) ({archive_changes} local, {cloud_archive_changes} cloud)")
+        print(f"  Long-term-archive: {total_long_term_changes} change(s) ({long_term_changes} local, {cloud_long_term_changes} cloud)")
+        print(f"  Total: {total_changes} change(s)")
+        
+        if total_changes > 0:
+            print(f"\n  Note: Run --mirror to verify all files are synced")
+        print(f"{'='*70}")
+
     def print_summary(self, results: List[dict]):
         """
         Print summary of evaluation results.
@@ -4029,6 +4389,20 @@ Examples:
         help='Display comprehensive statistics about the current Global 50 agents.'
     )
 
+    parser.add_argument(
+        '--mark-maverick',
+        type=str,
+        metavar='RUN_NAME',
+        help='Mark all agents with the given run_name as Mavericks in global50, archive, and long-term-archive. Propagates through mirroring.'
+    )
+
+    parser.add_argument(
+        '--unmark-maverick',
+        type=str,
+        metavar='RUN_NAME',
+        help='Unmark all agents with the given run_name as Mavericks in global50, archive, and long-term-archive.'
+    )
+
     args = parser.parse_args()
 
     # Setup logging when using --agent-dir --maverick
@@ -4172,6 +4546,16 @@ Examples:
             evaluator.reactivate_agents()
 
             print("\n" + "="*70)
+            return
+
+        # Handle --mark-maverick mode
+        if args.mark_maverick:
+            evaluator.mark_maverick_by_run_name(args.mark_maverick, is_maverick=True)
+            return
+
+        # Handle --unmark-maverick mode
+        if args.unmark_maverick:
+            evaluator.mark_maverick_by_run_name(args.unmark_maverick, is_maverick=False)
             return
 
         # Require agent_dir for evaluation mode
