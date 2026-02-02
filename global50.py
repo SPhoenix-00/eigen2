@@ -2699,6 +2699,147 @@ class AgentEvaluator:
             recompute_thresholds_from_population()
             print(f"\n  ⚠ Global 50 not full - applying normal promotion thresholds from existing {current_size} agents")
 
+        # FIRST PASS: Maverick seeding (if no mavericks exist)
+        # This must happen before candidate discovery to establish maverick thresholds
+        current_mavericks = [e for e in self.global_hof.entries if e.is_maverick]
+        if len(current_mavericks) == 0:
+            print(f"\n{'='*70}")
+            print("FIRST PASS: SEEDING FIRST MAVERICK")
+            print(f"{'='*70}")
+            print("  No mavericks in Global 50. Seeding with best maverick from archive")
+            print("  to establish maverick thresholds before continuing with archive fill...")
+            
+            # Discover archive agents to find maverick candidates
+            archive_agents = self._discover_archive_agents()
+            if archive_agents:
+                # Filter out agents already in Global 50
+                existing_keys = {(e.run_name, e.agent_id) for e in self.global_hof.entries}
+                candidates = [a for a in archive_agents if (a['run_name'], a['agent_id']) not in existing_keys]
+                
+                # Find all maverick candidates
+                maverick_candidates = [c for c in candidates if c.get('is_maverick', False)]
+                
+                if maverick_candidates:
+                    # Sort by ROI * Expectancy (highest first)
+                    maverick_candidates.sort(
+                        key=lambda a: a.get('roi', 0) * a.get('expectancy', 0), 
+                        reverse=True
+                    )
+                    
+                    seed_candidate = maverick_candidates[0]
+                    roi_expectancy_score = seed_candidate.get('roi', 0) * seed_candidate.get('expectancy', 0)
+                    
+                    print(f"\n  Selected seed maverick:")
+                    print(f"    {seed_candidate['run_name']} (Agent {seed_candidate['agent_id']})")
+                    print(f"    ROI: {seed_candidate.get('roi', 0):.2f}%")
+                    print(f"    Expectancy: {seed_candidate.get('expectancy', 0):.4f}")
+                    print(f"    ROI × Expectancy: {roi_expectancy_score:.4f}")
+                    
+                    try:
+                        # Download and load the seed maverick
+                        filename = f"{seed_candidate['run_name']}_{seed_candidate['agent_id']}.pth"
+                        local_agent_path = self.global_hof.local_archive_dir / filename
+                        cloud_archive_path = f"{self.global_hof.cloud_base}/archive/{filename}"
+                        
+                        if not local_agent_path.exists():
+                            print(f"  Downloading from archive...")
+                            success = self.cloud_sync.download_file(cloud_archive_path, str(local_agent_path))
+                            if not success:
+                                print(f"  ✗ Failed to download seed maverick. Continuing with normal archive fill.")
+                            else:
+                                # Load and evaluate
+                                print(f"  Loading agent...")
+                                agent = DDPGAgent(agent_id=seed_candidate['agent_id'])
+                                agent.load(str(local_agent_path))
+                                
+                                print(f"  Running gauntlet...")
+                                new_score, metrics = self.run_gauntlet(
+                                    agent, 
+                                    f"{seed_candidate['run_name']}_{seed_candidate['agent_id']}", 
+                                    is_maverick=True
+                                )
+                                
+                                print(f"  New Score: {new_score:.2f}")
+                                print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f}")
+                                
+                                # Promote seed maverick (bypass thresholds by setting them to -inf)
+                                # Set standard thresholds to -inf
+                                self.global_hof.entry_threshold = float('-inf')
+                                self.global_hof.roi_threshold = float('-inf')
+                                self.global_hof.expectancy_threshold = float('-inf')
+                                self.global_hof.cv_threshold = float('inf')
+                                self.global_hof.gauntlet_median = float('-inf')
+                                self.global_hof.roi_median = float('-inf')
+                                self.global_hof.expectancy_median = float('-inf')
+                                self.global_hof.gauntlet_p25 = float('-inf')
+                                self.global_hof.roi_p25 = float('-inf')
+                                self.global_hof.expectancy_p25 = float('-inf')
+                                
+                                # Also set maverick thresholds to -inf (even though maverick_count is 0)
+                                # This ensures analyze_promotion uses the right thresholds when checking
+                                self.global_hof.maverick_entry_threshold = float('-inf')
+                                self.global_hof.maverick_roi_threshold = float('-inf')
+                                self.global_hof.maverick_expectancy_threshold = float('-inf')
+                                self.global_hof.maverick_cv_threshold = float('inf')
+                                self.global_hof.maverick_gauntlet_median = float('-inf')
+                                self.global_hof.maverick_roi_median = float('-inf')
+                                self.global_hof.maverick_expectancy_median = float('-inf')
+                                self.global_hof.maverick_gauntlet_p25 = float('-inf')
+                                self.global_hof.maverick_roi_p25 = float('-inf')
+                                self.global_hof.maverick_expectancy_p25 = float('-inf')
+                                
+                                promoted, rank = self.global_hof.check_and_promote(
+                                    agent=agent,
+                                    gauntlet_score=new_score,
+                                    generation=seed_candidate.get('generation', 0),
+                                    roi=metrics['roi'],
+                                    expectancy=metrics['expectancy'],
+                                    cv=metrics['cv'],
+                                    quality_ratio=metrics['quality_ratio'],
+                                    win_ratio=metrics['win_ratio'],
+                                    total_trades=metrics['total_trades'],
+                                    run_name=seed_candidate['run_name'],
+                                    suppress_threshold_output=True,
+                                    is_maverick=True
+                                )
+                                
+                                if promoted:
+                                    print(f"  ✓ Seed maverick promoted to Global 50 (rank #{rank})")
+                                    
+                                    # Remove from archive
+                                    if local_agent_path.exists():
+                                        local_agent_path.unlink()
+                                    scoresheet_path = self.global_hof.local_archive_dir / filename.replace('.pth', '.json')
+                                    if scoresheet_path.exists():
+                                        scoresheet_path.unlink()
+                                    self.cloud_sync.delete_file(cloud_archive_path)
+                                    cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{filename.replace('.pth', '.json')}"
+                                    self.cloud_sync.delete_file(cloud_scoresheet_path)
+                                    
+                                    print(f"  ✓ Maverick thresholds established.")
+                                    print(f"\n{'='*70}")
+                                    print("RESTARTING ARCHIVE FILL")
+                                    print(f"{'='*70}")
+                                    print("  Maverick seeded successfully. Restarting archive fill process")
+                                    print("  with updated thresholds and state...")
+                                    
+                                    # Restart archive fill process recursively
+                                    # This will reload state, re-discover candidates, and continue normally
+                                    return self.archive_fill()
+                                else:
+                                    print(f"  ⚠ Failed to promote seed maverick (concurrent update?)")
+                                    print(f"  Continuing with normal archive fill...")
+                                    
+                    except Exception as e:
+                        print(f"  ✗ Error seeding maverick: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        print(f"  Continuing with normal archive fill...")
+                else:
+                    print(f"  ⚠ No maverick candidates found in archive. Continuing with normal archive fill...")
+            else:
+                print(f"  ⚠ No archived agents found. Cannot seed maverick.")
+        
         # Thresholds are managed by GlobalHoF - already updated above
         print(f"\n  Current Thresholds:")
         print(f"    Minimums:  Gauntlet={self.global_hof.entry_threshold:.2f}, ROI={self.global_hof.roi_threshold:.2f}%, Expectancy={self.global_hof.expectancy_threshold:.4f}, CV={self.global_hof.cv_threshold:.3f}")
@@ -2785,133 +2926,6 @@ class AgentEvaluator:
                 return
             else:
                 print("Please enter 'yes' or 'no'.")
-
-        # Special handling: If no mavericks exist in Global 50, seed with best maverick from archive
-        current_mavericks = [e for e in self.global_hof.entries if e.is_maverick]
-        if len(current_mavericks) == 0:
-            print(f"\n{'='*70}")
-            print("SEEDING FIRST MAVERICK")
-            print(f"{'='*70}")
-            print("  No mavericks in Global 50. Selecting best maverick from archive")
-            print("  based on ROI * Expectancy to establish maverick thresholds...")
-            
-            # Find all maverick candidates
-            maverick_candidates = [c for c in candidates if c.get('is_maverick', False)]
-            
-            if maverick_candidates:
-                # Sort by ROI * Expectancy (highest first)
-                maverick_candidates.sort(
-                    key=lambda a: a.get('roi', 0) * a.get('expectancy', 0), 
-                    reverse=True
-                )
-                
-                seed_candidate = maverick_candidates[0]
-                roi_expectancy_score = seed_candidate.get('roi', 0) * seed_candidate.get('expectancy', 0)
-                
-                print(f"\n  Selected seed maverick:")
-                print(f"    {seed_candidate['run_name']} (Agent {seed_candidate['agent_id']})")
-                print(f"    ROI: {seed_candidate.get('roi', 0):.2f}%")
-                print(f"    Expectancy: {seed_candidate.get('expectancy', 0):.4f}")
-                print(f"    ROI × Expectancy: {roi_expectancy_score:.4f}")
-                
-                try:
-                    # Download and load the seed maverick
-                    filename = f"{seed_candidate['run_name']}_{seed_candidate['agent_id']}.pth"
-                    local_agent_path = self.global_hof.local_archive_dir / filename
-                    cloud_archive_path = f"{self.global_hof.cloud_base}/archive/{filename}"
-                    
-                    if not local_agent_path.exists():
-                        print(f"  Downloading from archive...")
-                        success = self.cloud_sync.download_file(cloud_archive_path, str(local_agent_path))
-                        if not success:
-                            print(f"  ✗ Failed to download seed maverick. Continuing with normal evaluation.")
-                        else:
-                            # Load and evaluate
-                            print(f"  Loading agent...")
-                            agent = DDPGAgent(agent_id=seed_candidate['agent_id'])
-                            agent.load(str(local_agent_path))
-                            
-                            print(f"  Running gauntlet...")
-                            new_score, metrics = self.run_gauntlet(
-                                agent, 
-                                f"{seed_candidate['run_name']}_{seed_candidate['agent_id']}", 
-                                is_maverick=True
-                            )
-                            
-                            print(f"  New Score: {new_score:.2f}")
-                            print(f"  ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f}")
-                            
-                            # Promote seed maverick (bypass thresholds by setting them to -inf)
-                            # Set standard thresholds to -inf
-                            self.global_hof.entry_threshold = float('-inf')
-                            self.global_hof.roi_threshold = float('-inf')
-                            self.global_hof.expectancy_threshold = float('-inf')
-                            self.global_hof.cv_threshold = float('inf')
-                            self.global_hof.gauntlet_median = float('-inf')
-                            self.global_hof.roi_median = float('-inf')
-                            self.global_hof.expectancy_median = float('-inf')
-                            self.global_hof.gauntlet_p25 = float('-inf')
-                            self.global_hof.roi_p25 = float('-inf')
-                            self.global_hof.expectancy_p25 = float('-inf')
-                            
-                            # Also set maverick thresholds to -inf (even though maverick_count is 0)
-                            # This ensures analyze_promotion uses the right thresholds when checking
-                            self.global_hof.maverick_entry_threshold = float('-inf')
-                            self.global_hof.maverick_roi_threshold = float('-inf')
-                            self.global_hof.maverick_expectancy_threshold = float('-inf')
-                            self.global_hof.maverick_cv_threshold = float('inf')
-                            self.global_hof.maverick_gauntlet_median = float('-inf')
-                            self.global_hof.maverick_roi_median = float('-inf')
-                            self.global_hof.maverick_expectancy_median = float('-inf')
-                            self.global_hof.maverick_gauntlet_p25 = float('-inf')
-                            self.global_hof.maverick_roi_p25 = float('-inf')
-                            self.global_hof.maverick_expectancy_p25 = float('-inf')
-                            
-                            promoted, rank = self.global_hof.check_and_promote(
-                                agent=agent,
-                                gauntlet_score=new_score,
-                                generation=seed_candidate.get('generation', 0),
-                                roi=metrics['roi'],
-                                expectancy=metrics['expectancy'],
-                                cv=metrics['cv'],
-                                quality_ratio=metrics['quality_ratio'],
-                                win_ratio=metrics['win_ratio'],
-                                total_trades=metrics['total_trades'],
-                                run_name=seed_candidate['run_name'],
-                                suppress_threshold_output=True,
-                                is_maverick=True
-                            )
-                            
-                            if promoted:
-                                print(f"  ✓ Seed maverick promoted to Global 50 (rank #{rank})")
-                                
-                                # Remove from archive
-                                if local_agent_path.exists():
-                                    local_agent_path.unlink()
-                                scoresheet_path = self.global_hof.local_archive_dir / filename.replace('.pth', '.json')
-                                if scoresheet_path.exists():
-                                    scoresheet_path.unlink()
-                                self.cloud_sync.delete_file(cloud_archive_path)
-                                cloud_scoresheet_path = f"{self.global_hof.cloud_base}/archive/{filename.replace('.pth', '.json')}"
-                                self.cloud_sync.delete_file(cloud_scoresheet_path)
-                                
-                                # Remove from candidates list so it doesn't get evaluated again
-                                candidates = [c for c in candidates if (c['run_name'], c['agent_id']) != (seed_candidate['run_name'], seed_candidate['agent_id'])]
-                                
-                                # Recompute thresholds now that we have a maverick
-                                recompute_thresholds_from_population()
-                                
-                                print(f"  ✓ Maverick thresholds established. Continuing with normal evaluation...")
-                            else:
-                                print(f"  ⚠ Failed to promote seed maverick (concurrent update?)")
-                                
-                except Exception as e:
-                    print(f"  ✗ Error seeding maverick: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    print(f"  Continuing with normal evaluation...")
-            else:
-                print(f"  ⚠ No maverick candidates found in archive. Continuing with normal evaluation...")
 
         # Tiered promotion criteria (progressively relaxed):
         # Tier 0: Full criteria - minimums (4/4) + 2/3 P25 + 1/3 median
