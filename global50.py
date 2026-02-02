@@ -100,7 +100,7 @@ from models.ddpg_agent import DDPGAgent
 from erl.global_hof import GlobalHallOfFame, LeagueRules, GlobalHoFEntry
 from utils.config import Config
 from utils.cloud_sync import get_cloud_sync_from_env
-from training.erl_trainer import ERLTrainer
+from training.erl_trainer import ERLTrainer, BreakthroughState
 
 
 class TeeLogger:
@@ -256,6 +256,14 @@ class AgentEvaluator:
             self.normalization_stats
         )
 
+        # Set up attributes needed for calculate_triad_fitness
+        # These are required to match training evaluation scoring
+        self.gauntlet_helper.maverick_mode = False  # Will be set per-evaluation based on is_maverick
+        self.gauntlet_helper.consistency_mode = False  # Will be set per-evaluation based on is_maverick
+        self.gauntlet_helper.breakthrough_state = BreakthroughState.NORMAL  # Default state for global50 evaluation
+        self.gauntlet_helper.quality_threshold = Config.ROI_QUALITY_THRESHOLD  # Default: 7.5%
+        self.gauntlet_helper.global_hof = self.global_hof  # Reference to global_hof for proximity gradient
+
         # Bind ERLTrainer methods to our helper object
         self.gauntlet_helper.generate_gauntlet_slices = ERLTrainer.generate_gauntlet_slices.__get__(
             self.gauntlet_helper, GauntletHelper
@@ -264,6 +272,9 @@ class AgentEvaluator:
             self.gauntlet_helper, GauntletHelper
         )
         self.gauntlet_helper.calculate_expectancy = ERLTrainer.calculate_expectancy.__get__(
+            self.gauntlet_helper, GauntletHelper
+        )
+        self.gauntlet_helper.calculate_triad_fitness = ERLTrainer.calculate_triad_fitness.__get__(
             self.gauntlet_helper, GauntletHelper
         )
 
@@ -343,11 +354,16 @@ class AgentEvaluator:
         # Enable gauntlet mode for soft zero-trades penalty (tactical no-trade is acceptable)
         self.gauntlet_helper.eval_env.set_gauntlet_mode(True)
 
+        # Set mode flags for calculate_triad_fitness (must match training evaluation)
+        # Maverick agents are incompatible with consistency mode
+        self.gauntlet_helper.maverick_mode = is_maverick
+        self.gauntlet_helper.consistency_mode = not is_maverick
+
         # Evaluate each slice using ERLTrainer's run_episode_batched
         for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
             # Use ERLTrainer's optimized batched inference
             # Note: training=False so replay_buffer is not used
-            fitness, episode_info = self.gauntlet_helper.run_episode_batched(
+            raw_fitness, episode_info = self.gauntlet_helper.run_episode_batched(
                 agent=agent,
                 env=self.gauntlet_helper.eval_env,
                 start_idx=start_idx,
@@ -356,13 +372,14 @@ class AgentEvaluator:
                 batch_size=16
             )
 
-            # Apply zero-trades gradient (matches ERLTrainer logic)
-            if episode_info['num_trades'] == 0:
-                max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
-                fitness = fitness + max_coeff
+            # CRITICAL: Use calculate_triad_fitness to match training evaluation scoring
+            # This ensures global50.py --eval scores agents the same way as main.py training
+            # The raw_fitness from run_episode_batched is cumulative_reward, but training
+            # uses calculate_triad_fitness(episode_info) which applies Triad 3.0 formula
+            triad_fitness = self.gauntlet_helper.calculate_triad_fitness(episode_info)
 
             slice_results.append({
-                'fitness': fitness,
+                'fitness': triad_fitness,  # Use triad_fitness instead of raw_fitness
                 'win_rate': episode_info['win_rate'],
                 'num_trades': episode_info['num_trades'],
                 'num_wins': episode_info['num_wins'],
