@@ -167,6 +167,20 @@ class GlobalHallOfFame:
         self.gauntlet_p25: float = float('-inf')
         self.roi_p25: float = float('-inf')
         self.expectancy_p25: float = float('-inf')
+
+        # Maverick thresholds (Highlander Rule: compare Mavericks only against Mavericks)
+        self.maverick_entry_threshold: float = float('-inf')
+        self.maverick_roi_threshold: float = float('-inf')
+        self.maverick_expectancy_threshold: float = float('-inf')
+        self.maverick_cv_threshold: float = float('inf')
+        self.maverick_gauntlet_median: float = float('-inf')
+        self.maverick_roi_median: float = float('-inf')
+        self.maverick_expectancy_median: float = float('-inf')
+        self.maverick_gauntlet_p25: float = float('-inf')
+        self.maverick_roi_p25: float = float('-inf')
+        self.maverick_expectancy_p25: float = float('-inf')
+        self.maverick_count: int = 0
+
         self.league_compatible: bool = False
 
         # Thread safety for atomic updates
@@ -431,21 +445,67 @@ class GlobalHallOfFame:
             self.gauntlet_p25 = float('-inf')
             self.roi_p25 = float('-inf')
             self.expectancy_p25 = float('-inf')
+
+        # Always calculate Maverick thresholds based on existing Mavericks (Highlander logic)
+        # This applies even if the Global 50 is not full.
+        mavericks = [e for e in self.entries if e.is_maverick]
+        self.maverick_count = len(mavericks)
+
+        if self.maverick_count > 0:
+            m_gauntlet_scores = [e.gauntlet_score for e in mavericks]
+            m_roi_values = [e.roi for e in mavericks]
+            m_expectancy_values = [e.expectancy for e in mavericks]
+            m_cv_values = [e.cv for e in mavericks]
+
+            self.maverick_entry_threshold = min(m_gauntlet_scores)
+            self.maverick_roi_threshold = min(m_roi_values)
+            self.maverick_expectancy_threshold = min(m_expectancy_values)
+            self.maverick_cv_threshold = max(m_cv_values)
+
+            self.maverick_gauntlet_median = float(np.percentile(m_gauntlet_scores, 50))
+            self.maverick_roi_median = float(np.percentile(m_roi_values, 50))
+            self.maverick_expectancy_median = float(np.percentile(m_expectancy_values, 50))
+
+            self.maverick_gauntlet_p25 = float(np.percentile(m_gauntlet_scores, 25))
+            self.maverick_roi_p25 = float(np.percentile(m_roi_values, 25))
+            self.maverick_expectancy_p25 = float(np.percentile(m_expectancy_values, 25))
         else:
-            # Get the 50th ranked agent's score (worst in top 50)
-            sorted_entries = sorted(self.entries, key=lambda e: e.gauntlet_score, reverse=True)
-            self.entry_threshold = sorted_entries[self.CAPACITY - 1].gauntlet_score
-            # ROI and expectancy thresholds = minimum in the population
-            self.roi_threshold = min(e.roi for e in self.entries)
-            self.expectancy_threshold = min(e.expectancy for e in self.entries)
-            # CV threshold = maximum in the population (worst allowed volatility)
+            # No Mavericks? Open entry for the first ones.
+            self.maverick_entry_threshold = float('-inf')
+            self.maverick_roi_threshold = float('-inf')
+            self.maverick_expectancy_threshold = float('-inf')
+            self.maverick_cv_threshold = float('inf')
+            self.maverick_gauntlet_median = float('-inf')
+            self.maverick_roi_median = float('-inf')
+            self.maverick_expectancy_median = float('-inf')
+            self.maverick_gauntlet_p25 = float('-inf')
+            self.maverick_roi_p25 = float('-inf')
+            self.maverick_expectancy_p25 = float('-inf')
+
+        else:
+            # Filter for non-maverick agents to ensure clean separation of pools
+            non_mavericks = [e for e in self.entries if not e.is_maverick]
+            
+            if not non_mavericks:
+                # Fallback if no non-mavericks exist (should prevent crash if logic violated)
+                non_mavericks = self.entries
+
+            # Get the worst non-maverick agent's score
+            sorted_entries = sorted(non_mavericks, key=lambda e: e.gauntlet_score, reverse=True)
+            self.entry_threshold = sorted_entries[-1].gauntlet_score
+            
+            # ROI and expectancy thresholds = minimum in the non-maverick population
+            self.roi_threshold = min(e.roi for e in non_mavericks)
+            self.expectancy_threshold = min(e.expectancy for e in non_mavericks)
+            # CV threshold = maximum in the non-maverick population (worst allowed volatility)
             # Lower CV is better, so new agents must have CV below the worst current CV
-            self.cv_threshold = max(e.cv for e in self.entries)
+            self.cv_threshold = max(e.cv for e in non_mavericks)
 
             # Calculate median (50th percentile) and 25th percentile for all 3 metrics
-            gauntlet_scores = [e.gauntlet_score for e in self.entries]
-            roi_values = [e.roi for e in self.entries]
-            expectancy_values = [e.expectancy for e in self.entries]
+            # strictly on non-maverick agents
+            gauntlet_scores = [e.gauntlet_score for e in non_mavericks]
+            roi_values = [e.roi for e in non_mavericks]
+            expectancy_values = [e.expectancy for e in non_mavericks]
 
             self.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
             self.roi_median = float(np.percentile(roi_values, 50))
@@ -588,63 +648,97 @@ class GlobalHallOfFame:
         if not self.league_compatible:
             return False, ["League configuration incompatible"]
 
+        # Select thresholds based on agent type (Maverick vs Standard)
+        # Maverick Highlander Rule: Mavericks compete ONLY against other Mavericks
+        if is_maverick and self.maverick_count > 0:
+            threshold_gauntlet = self.maverick_entry_threshold
+            threshold_roi = self.maverick_roi_threshold
+            threshold_expectancy = self.maverick_expectancy_threshold
+            threshold_cv = self.maverick_cv_threshold
+            
+            p25_gauntlet = self.maverick_gauntlet_p25
+            p25_roi = self.maverick_roi_p25
+            p25_expectancy = self.maverick_expectancy_p25
+            
+            median_gauntlet = self.maverick_gauntlet_median
+            median_roi = self.maverick_roi_median
+            median_expectancy = self.maverick_expectancy_median
+            
+            mode_label = f"Maverick (vs {self.maverick_count} Mavericks)"
+        else:
+            # Standard agents (or Mavericks if none exist yet) compete against global thresholds
+            threshold_gauntlet = self.entry_threshold
+            threshold_roi = self.roi_threshold
+            threshold_expectancy = self.expectancy_threshold
+            threshold_cv = self.cv_threshold
+            
+            p25_gauntlet = self.gauntlet_p25
+            p25_roi = self.roi_p25
+            p25_expectancy = self.expectancy_p25
+            
+            median_gauntlet = self.gauntlet_median
+            median_roi = self.roi_median
+            median_expectancy = self.expectancy_median
+            
+            mode_label = "Standard"
+
         # Criterion 1: Must beat ALL 4 minimum thresholds
         failures = []
-        passes_gauntlet_threshold = gauntlet_score > self.entry_threshold
-        passes_roi_threshold = roi > self.roi_threshold
-        passes_expectancy_threshold = expectancy > self.expectancy_threshold
-        passes_cv_threshold = cv < self.cv_threshold  # CV: lower is better
+        passes_gauntlet_threshold = gauntlet_score > threshold_gauntlet
+        passes_roi_threshold = roi > threshold_roi
+        passes_expectancy_threshold = expectancy > threshold_expectancy
+        passes_cv_threshold = cv < threshold_cv  # CV: lower is better
         
         if not passes_gauntlet_threshold:
-            failures.append(f"Gauntlet Score {gauntlet_score:.2f} <= Threshold {self.entry_threshold:.2f}")
+            failures.append(f"Gauntlet Score {gauntlet_score:.2f} <= Threshold {threshold_gauntlet:.2f}")
         if not passes_roi_threshold:
-            failures.append(f"ROI {roi:.2f}% <= Threshold {self.roi_threshold:.2f}%")
+            failures.append(f"ROI {roi:.2f}% <= Threshold {threshold_roi:.2f}%")
         if not passes_expectancy_threshold:
-            failures.append(f"Expectancy {expectancy:.4f} <= Threshold {self.expectancy_threshold:.4f}")
+            failures.append(f"Expectancy {expectancy:.4f} <= Threshold {threshold_expectancy:.4f}")
         if not passes_cv_threshold:
-            failures.append(f"CV {cv:.2f} >= Threshold {self.cv_threshold:.2f} (Lower is better)")
+            failures.append(f"CV {cv:.2f} >= Threshold {threshold_cv:.2f} (Lower is better)")
         
         # Always show threshold results for verbose output
-        reasons.append("Gate 1: Minimum Thresholds (All must pass):")
-        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > {self.entry_threshold:.2f} {'✅' if passes_gauntlet_threshold else '❌'}")
-        reasons.append(f"  - ROI: {roi:.2f}% > {self.roi_threshold:.2f}% {'✅' if passes_roi_threshold else '❌'}")
-        reasons.append(f"  - Expectancy: {expectancy:.4f} > {self.expectancy_threshold:.4f} {'✅' if passes_expectancy_threshold else '❌'}")
-        reasons.append(f"  - CV: {cv:.2f} < {self.cv_threshold:.2f} {'✅' if passes_cv_threshold else '❌'} (lower is better)")
+        reasons.append(f"Gate 1: Minimum Thresholds ({mode_label} - All must pass):")
+        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > {threshold_gauntlet:.2f} {'✅' if passes_gauntlet_threshold else '❌'}")
+        reasons.append(f"  - ROI: {roi:.2f}% > {threshold_roi:.2f}% {'✅' if passes_roi_threshold else '❌'}")
+        reasons.append(f"  - Expectancy: {expectancy:.4f} > {threshold_expectancy:.4f} {'✅' if passes_expectancy_threshold else '❌'}")
+        reasons.append(f"  - CV: {cv:.2f} < {threshold_cv:.2f} {'✅' if passes_cv_threshold else '❌'} (lower is better)")
         
         if failures:
             return False, reasons
 
         # Criterion 2: At least 2 of 3 metrics must beat 25th percentile
-        beats_gauntlet_p25 = gauntlet_score > self.gauntlet_p25
-        beats_roi_p25 = roi > self.roi_p25
-        beats_expectancy_p25 = expectancy > self.expectancy_p25
+        beats_gauntlet_p25 = gauntlet_score > p25_gauntlet
+        beats_roi_p25 = roi > p25_roi
+        beats_expectancy_p25 = expectancy > p25_expectancy
         # Count all 3 metrics
         metrics_to_check = [beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25]
         count_above_p25 = sum(metrics_to_check)
         required_p25 = 2  # Need 2 of 3
         
-        reasons.append(f"\nGate 2: p25 Criterion (Need 2/3 to pass):")
-        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > p25 ({self.gauntlet_p25:.2f}) {'✅' if beats_gauntlet_p25 else '❌'}")
-        reasons.append(f"  - ROI: {roi:.2f}% > p25 ({self.roi_p25:.2f}%) {'✅' if beats_roi_p25 else '❌'}")
-        reasons.append(f"  - Expectancy: {expectancy:.4f} > p25 ({self.expectancy_p25:.4f}) {'✅' if beats_expectancy_p25 else '❌'}")
+        reasons.append(f"\nGate 2: p25 Criterion ({mode_label} - Need 2/3 to pass):")
+        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > p25 ({p25_gauntlet:.2f}) {'✅' if beats_gauntlet_p25 else '❌'}")
+        reasons.append(f"  - ROI: {roi:.2f}% > p25 ({p25_roi:.2f}%) {'✅' if beats_roi_p25 else '❌'}")
+        reasons.append(f"  - Expectancy: {expectancy:.4f} > p25 ({p25_expectancy:.4f}) {'✅' if beats_expectancy_p25 else '❌'}")
         reasons.append(f"  Result: {count_above_p25}/{required_p25} passed {'✅' if count_above_p25 >= required_p25 else '❌'}")
         
         if count_above_p25 < required_p25:
             return False, reasons
 
         # Criterion 3: At least 1 metric must beat median (50th percentile)
-        beats_gauntlet_median = gauntlet_score > self.gauntlet_median
-        beats_roi_median = roi > self.roi_median
-        beats_expectancy_median = expectancy > self.expectancy_median
+        beats_gauntlet_median = gauntlet_score > median_gauntlet
+        beats_roi_median = roi > median_roi
+        beats_expectancy_median = expectancy > median_expectancy
         # Count all 3 metrics
         metrics_to_check_median = [beats_gauntlet_median, beats_roi_median, beats_expectancy_median]
         count_above_median = sum(metrics_to_check_median)
         required_median = 1  # Always need at least 1
         
-        reasons.append(f"\nGate 3: Median Criterion (Need 1/3 to pass):")
-        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > Median ({self.gauntlet_median:.2f}) {'✅' if beats_gauntlet_median else '❌'}")
-        reasons.append(f"  - ROI: {roi:.2f}% > Median ({self.roi_median:.2f}%) {'✅' if beats_roi_median else '❌'}")
-        reasons.append(f"  - Expectancy: {expectancy:.4f} > Median ({self.expectancy_median:.4f}) {'✅' if beats_expectancy_median else '❌'}")
+        reasons.append(f"\nGate 3: Median Criterion ({mode_label} - Need 1/3 to pass):")
+        reasons.append(f"  - Gauntlet: {gauntlet_score:.2f} > Median ({median_gauntlet:.2f}) {'✅' if beats_gauntlet_median else '❌'}")
+        reasons.append(f"  - ROI: {roi:.2f}% > Median ({median_roi:.2f}%) {'✅' if beats_roi_median else '❌'}")
+        reasons.append(f"  - Expectancy: {expectancy:.4f} > Median ({median_expectancy:.4f}) {'✅' if beats_expectancy_median else '❌'}")
         reasons.append(f"  Result: {count_above_median}/{required_median} passed {'✅' if count_above_median >= required_median else '❌'}")
         
         if count_above_median < required_median:

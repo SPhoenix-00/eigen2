@@ -641,10 +641,36 @@ class AgentEvaluator:
             if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
                 return  # Full, normal thresholds apply
 
-            gauntlet_scores = [e.gauntlet_score for e in self.global_hof.entries]
-            roi_values = [e.roi for e in self.global_hof.entries]
-            expectancy_values = [e.expectancy for e in self.global_hof.entries]
-            cv_values = [e.cv for e in self.global_hof.entries]
+            # Define the comparison pool
+            pool = self.global_hof.entries
+            
+            # MAVERICK FIX: Compare Mavericks only against Mavericks (Highlander within Mavericks)
+            if is_maverick:
+                maverick_pool = [e for e in pool if e.is_maverick]
+                if len(maverick_pool) > 0:
+                    pool = maverick_pool
+                    print(f"   [Maverick Mode] Setting thresholds based on {len(pool)} existing Maverick(s)")
+                else:
+                    # If no Mavericks exist, we cannot enforce "Better than existing Mavericks".
+                    # We skip recomputing thresholds (leaving them at -inf) to allow the first Mavericks to enter.
+                    print(f"   [Maverick Mode] No existing Mavericks to set thresholds - Entry Open")
+                    return
+            else:
+                # STANDARD AGENTS: Compare only against other standard agents
+                non_maverick_pool = [e for e in pool if not e.is_maverick]
+                if len(non_maverick_pool) > 0:
+                    pool = non_maverick_pool
+                    print(f"   [Standard Mode] Setting thresholds based on {len(pool)} existing Standard Agent(s)")
+                else:
+                    # Fallback if no standard agents exist (e.g. only mavericks in list)
+                    # We accept all standard agents in this case
+                    print(f"   [Standard Mode] No existing Standard Agents to set thresholds - Entry Open")
+                    return
+
+            gauntlet_scores = [e.gauntlet_score for e in pool]
+            roi_values = [e.roi for e in pool]
+            expectancy_values = [e.expectancy for e in pool]
+            cv_values = [e.cv for e in pool]
 
             # Override the -inf/+inf thresholds with actual population statistics
             self.global_hof.entry_threshold = min(gauntlet_scores)
@@ -660,6 +686,28 @@ class AgentEvaluator:
             self.global_hof.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
             self.global_hof.roi_p25 = float(np.percentile(roi_values, 25))
             self.global_hof.expectancy_p25 = float(np.percentile(expectancy_values, 25))
+            
+            # If we are in Maverick mode with existing Mavericks, we must also update the 
+            # Maverick-specific thresholds in global_hof because the logic we just added to global_hof 
+            # relies on them. However, since we are overriding the "standard" thresholds here 
+            # to simulate a full population, we should ensure the Maverick thresholds align with this manual override
+            # if we want analyze_promotion to work correctly for the manual check.
+            
+            # Actually, since we modified analyze_promotion to use Maverick thresholds when is_maverick=True,
+            # we need to make sure those Maverick thresholds are set correctly here too.
+            if is_maverick:
+                self.global_hof.maverick_entry_threshold = self.global_hof.entry_threshold
+                self.global_hof.maverick_roi_threshold = self.global_hof.roi_threshold
+                self.global_hof.maverick_expectancy_threshold = self.global_hof.expectancy_threshold
+                self.global_hof.maverick_cv_threshold = self.global_hof.cv_threshold
+                
+                self.global_hof.maverick_gauntlet_median = self.global_hof.gauntlet_median
+                self.global_hof.maverick_roi_median = self.global_hof.roi_median
+                self.global_hof.maverick_expectancy_median = self.global_hof.expectancy_median
+                
+                self.global_hof.maverick_gauntlet_p25 = self.global_hof.gauntlet_p25
+                self.global_hof.maverick_roi_p25 = self.global_hof.roi_p25
+                self.global_hof.maverick_expectancy_p25 = self.global_hof.expectancy_p25
 
         # Apply threshold recomputation if Global 50 is not full
         if self.global_hof.enabled:

@@ -5747,25 +5747,42 @@ class ERLTrainer:
                     # Recompute thresholds from population if Global 50 is not full
                     # (When not full, _update_entry_threshold sets them to -inf, but we want actual values)
                     if self.global_hof.enabled and len(self.global_hof.entries) > 0 and len(self.global_hof.entries) < self.global_hof.CAPACITY:
-                        gauntlet_scores = [e.gauntlet_score for e in self.global_hof.entries]
-                        roi_values = [e.roi for e in self.global_hof.entries]
-                        expectancy_values = [e.expectancy for e in self.global_hof.entries]
-                        cv_values = [e.cv for e in self.global_hof.entries]
+                        # Define the pool of agents to compare against
+                        pool = self.global_hof.entries
                         
-                        # Override the -inf/+inf thresholds with actual population statistics
-                        self.global_hof.entry_threshold = min(gauntlet_scores)
-                        self.global_hof.roi_threshold = min(roi_values)
-                        self.global_hof.expectancy_threshold = min(expectancy_values)
-                        # CV threshold = max CV in population (worst allowed volatility, lower is better)
-                        self.global_hof.cv_threshold = max(cv_values)
+                        if self.maverick_mode:
+                            # In Maverick mode, compare against existing Mavericks if any
+                            maverick_pool = [e for e in pool if e.is_maverick]
+                            if maverick_pool:
+                                pool = maverick_pool
+                        else:
+                            # In Standard mode, compare ONLY against existing Standard agents
+                            non_maverick_pool = [e for e in pool if not e.is_maverick]
+                            if non_maverick_pool:
+                                pool = non_maverick_pool
                         
-                        self.global_hof.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
-                        self.global_hof.roi_median = float(np.percentile(roi_values, 50))
-                        self.global_hof.expectancy_median = float(np.percentile(expectancy_values, 50))
-                        
-                        self.global_hof.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
-                        self.global_hof.roi_p25 = float(np.percentile(roi_values, 25))
-                        self.global_hof.expectancy_p25 = float(np.percentile(expectancy_values, 25))
+                        # Only update thresholds if we have a valid pool to compare against
+                        # If pool is empty (e.g. first Maverick), thresholds remain at -inf (open entry)
+                        if pool:
+                            gauntlet_scores = [e.gauntlet_score for e in pool]
+                            roi_values = [e.roi for e in pool]
+                            expectancy_values = [e.expectancy for e in pool]
+                            cv_values = [e.cv for e in pool]
+                            
+                            # Override the -inf/+inf thresholds with actual population statistics
+                            self.global_hof.entry_threshold = min(gauntlet_scores)
+                            self.global_hof.roi_threshold = min(roi_values)
+                            self.global_hof.expectancy_threshold = min(expectancy_values)
+                            # CV threshold = max CV in population (worst allowed volatility, lower is better)
+                            self.global_hof.cv_threshold = max(cv_values)
+                            
+                            self.global_hof.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
+                            self.global_hof.roi_median = float(np.percentile(roi_values, 50))
+                            self.global_hof.expectancy_median = float(np.percentile(expectancy_values, 50))
+                            
+                            self.global_hof.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
+                            self.global_hof.roi_p25 = float(np.percentile(roi_values, 25))
+                            self.global_hof.expectancy_p25 = float(np.percentile(expectancy_values, 25))
 
                     # Check if agent qualifies for promotion
                     should_promote_result = False
