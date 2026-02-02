@@ -848,6 +848,21 @@ class GlobalHallOfFame:
                     self.entries = [e for e in self.entries if e != replaced_entry]
                     print(f"  Replacing parent: {parent_run_name}_{parent_agent_id}")
 
+            # Anti-sniper check for Mavericks: Prevent mavericks with fewer trades than
+            # the highest-trade non-maverick agent from being promoted
+            # This check happens after replacement logic so we compare against the final state
+            if is_maverick:
+                non_mavericks = [e for e in self.entries if not e.is_maverick]
+                if non_mavericks:
+                    max_non_maverick_trades = max(e.total_trades for e in non_mavericks)
+                    if total_trades < max_non_maverick_trades:
+                        print(f"\n  ❌ REJECTED: Maverick has too few trades (Anti-Sniper Rule)")
+                        print(f"  Maverick trades: {total_trades}")
+                        print(f"  Highest non-maverick trades: {max_non_maverick_trades}")
+                        print(f"  Mavericks must have at least as many trades as the highest-trade non-maverick agent")
+                        print(f"{'='*60}\n")
+                        return False, -1
+
             # Create new entry
             # Use provided run_name if given (e.g., for archive fill), otherwise use self.run_name
             entry_run_name = run_name if run_name is not None else self.run_name

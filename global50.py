@@ -3141,6 +3141,7 @@ class AgentEvaluator:
         # Check which long-term-archive agents qualify
         print("\nChecking long-term-archive agents against current minimums...")
         qualifying_from_long_term = []
+        sniper_mavericks_skipped = 0
         for agent_data in long_term_agents:
             # Skip agents missing required fields
             if 'gauntlet_score' not in agent_data or 'roi' not in agent_data:
@@ -3148,6 +3149,17 @@ class AgentEvaluator:
                 continue
             
             is_maverick = agent_data.get('is_maverick', False)
+            total_trades = agent_data.get('total_trades', 0)
+            
+            # Check anti-sniper rule for mavericks
+            if is_maverick and not self._passes_anti_sniper_check(total_trades, is_maverick):
+                sniper_mavericks_skipped += 1
+                non_mavericks = [e for e in self.global_hof.entries if not e.is_maverick]
+                max_non_maverick_trades = max(e.total_trades for e in non_mavericks) if non_mavericks else 0
+                print(f"  ⚠ Skipping maverick {agent_data.get('run_name', 'unknown')}_{agent_data.get('agent_id', 'unknown')}: "
+                      f"too few trades ({total_trades} < {max_non_maverick_trades}, Anti-Sniper Rule)")
+                continue
+            
             if self._meets_all_minimums(
                 agent_data.get('gauntlet_score', 0.0),
                 agent_data.get('roi', 0.0),
@@ -3158,10 +3170,13 @@ class AgentEvaluator:
                 qualifying_from_long_term.append(agent_data)
 
         print(f"  {len(qualifying_from_long_term)} agents qualify for reactivation")
+        if sniper_mavericks_skipped > 0:
+            print(f"  {sniper_mavericks_skipped} maverick(s) skipped due to Anti-Sniper Rule")
 
         # Check which archive agents don't qualify
         print("\nChecking archive agents against current minimums...")
         non_qualifying_from_archive = []
+        sniper_mavericks_moved = 0
         for agent_data in archive_agents:
             # Skip agents missing required fields
             if 'gauntlet_score' not in agent_data or 'roi' not in agent_data:
@@ -3169,6 +3184,18 @@ class AgentEvaluator:
                 continue
             
             is_maverick = agent_data.get('is_maverick', False)
+            total_trades = agent_data.get('total_trades', 0)
+            
+            # Check if maverick fails anti-sniper rule (should be moved to long-term-archive)
+            if is_maverick and not self._passes_anti_sniper_check(total_trades, is_maverick):
+                non_qualifying_from_archive.append(agent_data)
+                sniper_mavericks_moved += 1
+                non_mavericks = [e for e in self.global_hof.entries if not e.is_maverick]
+                max_non_maverick_trades = max(e.total_trades for e in non_mavericks) if non_mavericks else 0
+                print(f"  ⚠ Maverick {agent_data.get('run_name', 'unknown')}_{agent_data.get('agent_id', 'unknown')} "
+                      f"fails Anti-Sniper Rule ({total_trades} < {max_non_maverick_trades} trades) - will move to long-term-archive")
+                continue
+            
             if not self._meets_all_minimums(
                 agent_data.get('gauntlet_score', 0.0),
                 agent_data.get('roi', 0.0),
@@ -3179,6 +3206,8 @@ class AgentEvaluator:
                 non_qualifying_from_archive.append(agent_data)
 
         print(f"  {len(non_qualifying_from_archive)} agents should be moved to long-term-archive")
+        if sniper_mavericks_moved > 0:
+            print(f"  {sniper_mavericks_moved} maverick(s) moved due to Anti-Sniper Rule")
 
         # Move qualifying agents from long-term-archive to archive
         if qualifying_from_long_term:
@@ -3205,6 +3234,31 @@ class AgentEvaluator:
         print(f"{'='*70}")
         print(f"  Reactivated:      {len(qualifying_from_long_term)} agents (long-term-archive → archive)")
         print(f"  Moved to long-term: {len(non_qualifying_from_archive)} agents (archive → long-term-archive)")
+
+    def _passes_anti_sniper_check(self, total_trades: int, is_maverick: bool) -> bool:
+        """
+        Anti-sniper check for Mavericks: Prevent mavericks with fewer trades than
+        the highest-trade non-maverick agent from being considered qualified.
+        
+        Args:
+            total_trades: Agent's total number of trades
+            is_maverick: Whether this is a maverick agent
+            
+        Returns:
+            True if agent passes the anti-sniper check (or is not a maverick), False otherwise
+        """
+        # Only applies to mavericks
+        if not is_maverick:
+            return True
+        
+        # If no non-mavericks exist, allow the maverick (edge case)
+        non_mavericks = [e for e in self.global_hof.entries if not e.is_maverick]
+        if not non_mavericks:
+            return True
+        
+        # Maverick must have at least as many trades as the highest-trade non-maverick
+        max_non_maverick_trades = max(e.total_trades for e in non_mavericks)
+        return total_trades >= max_non_maverick_trades
 
     def _meets_all_minimums(self, gauntlet_score: float, roi: float, expectancy: float, cv: float, is_maverick: bool) -> bool:
         """
