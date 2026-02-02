@@ -44,6 +44,7 @@ Usage:
     python global50.py --cleanup-dry-run                   # Report orphans (no changes)
     python global50.py --reactivate                        # Reactivate agents between archive and long-term-archive
     python global50.py --stats                             # Display comprehensive statistics
+    python global50.py --stats-all                         # Display all agents in global50, archive, and long-term-archive
     python global50.py --mark-maverick <run_name>          # Mark all agents with run_name as Mavericks
     python global50.py --unmark-maverick <run_name>        # Unmark all agents with run_name as Mavericks
     python global50.py --agent-dir <path> [--run-name <name>] [--maverick]
@@ -59,6 +60,7 @@ Options:
     --reactivate        Reactivate agents: move qualifying agents from long-term-archive to archive,
                         and move non-qualifying agents from archive to long-term-archive.
     --stats             Display comprehensive statistics about the current Global 50 agents.
+    --stats-all         Display detailed agent lists for all agents in global50, archive, and long-term-archive.
     --mark-maverick     Mark all agents with the given run_name as Mavericks in global50, archive, and long-term-archive.
     --unmark-maverick   Unmark all agents with the given run_name as Mavericks in global50, archive, and long-term-archive.
     --cw DAYS           Context window size in days (e.g., --cw 504 for cw504).
@@ -73,6 +75,8 @@ Examples:
     python global50.py --cleanup                           # Archive orphan agents
     python global50.py --stats                             # Display statistics
     python global50.py --stats --cw 504                     # Display statistics for cw504
+    python global50.py --stats-all                         # Display all agents in all locations
+    python global50.py --stats-all --cw 504                 # Display all agents for cw504
     python global50.py --mark-maverick twilight-haze-313    # Mark all agents with run_name as Mavericks
     python global50.py --unmark-maverick twilight-haze-313  # Unmark all agents with run_name as Mavericks
     python global50.py --agent-dir checkpoints/run-123/hall_of_fame
@@ -4238,6 +4242,24 @@ def print_global50_stats(context_window_days: int = None):
               f"Exp: {entry.get('expectancy', 0):>5.2f} | "
               f"Trades: {entry.get('total_trades', 0):>4}")
     
+    # Print detailed agent list
+    print(f"\n{'='*70}")
+    print("All Agents in Global 50")
+    print(f"{'='*70}")
+    print(f"{'#':<4} {'Score':<12} {'ROI %':<10} {'Expectancy':<12} {'CV':<8} {'Trades':<8} {'Run Name':<30} {'Agent ID':<10} {'M'}")
+    print(f"{'-'*110}")
+    
+    sorted_entries = sorted(entries, key=lambda e: e.get('gauntlet_score', 0), reverse=True)
+    for i, entry in enumerate(sorted_entries, 1):
+        maverick_tag = " [M]" if entry.get('is_maverick', False) else ""
+        print(f"{i:<4} {entry.get('gauntlet_score', 0):<12.2f} "
+              f"{entry.get('roi', 0):<10.2f} "
+              f"{entry.get('expectancy', 0):<12.4f} "
+              f"{entry.get('cv', 100.0):<8.3f} "
+              f"{entry.get('total_trades', 0):<8} "
+              f"{entry.get('run_name', 'unknown'):<30} "
+              f"{entry.get('agent_id', 0):<10}{maverick_tag}")
+    
     # Print league rules info if available
     if league_rules:
         print(f"\n⚙️  LEAGUE RULES")
@@ -4249,6 +4271,262 @@ def print_global50_stats(context_window_days: int = None):
             print(f"  Entry Threshold:   {entry_threshold:.2f}")
     
     print("\n" + "="*70)
+
+
+def print_all_stats(context_window_days: int = None):
+    """
+    Display detailed statistics for all agents in global50, archive, and long-term-archive.
+    
+    Args:
+        context_window_days: Context window size in days. If None, uses Config.CONTEXT_WINDOW_DAYS.
+    """
+    from utils.config import Config
+    from utils.cloud_sync import get_cloud_sync_from_env
+    
+    if context_window_days is None:
+        context_window_days = Config.CONTEXT_WINDOW_DAYS
+    
+    context_window_id = f"cw{context_window_days}"
+    json_path = Path("global50") / context_window_id / "global50.json"
+    
+    print("\n" + "="*70)
+    print("COMPREHENSIVE STATISTICS (All Locations)")
+    print("="*70)
+    print(f"Context Window: {context_window_days} days ({context_window_id})")
+    
+    # Initialize cloud sync for discovering archive agents
+    cloud_sync = get_cloud_sync_from_env()
+    cloud_base = f"{cloud_sync.project_name}/global50/{context_window_id}"
+    
+    # Helper function to print agent table
+    def print_agent_table(title: str, agents: list, source: str = ""):
+        if not agents:
+            print(f"\n{title}")
+            print(f"{'='*70}")
+            print(f"  No agents found in {source}")
+            return
+        
+        print(f"\n{'='*70}")
+        print(f"{title} ({len(agents)} agent(s))")
+        print(f"{'='*70}")
+        print(f"{'#':<4} {'Score':<12} {'ROI %':<10} {'Expectancy':<12} {'CV':<8} {'Trades':<8} {'Run Name':<30} {'Agent ID':<10} {'M'}")
+        print(f"{'-'*110}")
+        
+        # Sort by score (descending)
+        sorted_agents = sorted(agents, key=lambda a: a.get('gauntlet_score', 0), reverse=True)
+        for i, agent in enumerate(sorted_agents, 1):
+            maverick_tag = " [M]" if agent.get('is_maverick', False) else ""
+            print(f"{i:<4} {agent.get('gauntlet_score', 0):<12.2f} "
+                  f"{agent.get('roi', 0):<10.2f} "
+                  f"{agent.get('expectancy', 0):<12.4f} "
+                  f"{agent.get('cv', 100.0):<8.3f} "
+                  f"{agent.get('total_trades', 0):<8} "
+                  f"{agent.get('run_name', 'unknown'):<30} "
+                  f"{agent.get('agent_id', 0):<10}{maverick_tag}")
+    
+    # Load Global 50 agents
+    global50_agents = []
+    if json_path.exists():
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            global50_agents = data.get('entries', [])
+        except Exception as e:
+            print(f"\n⚠ Error loading global50.json: {e}")
+    else:
+        print(f"\n⚠ Global50 ledger not found: {json_path}")
+    
+    print_agent_table("Global 50 Agents", global50_agents, "Global 50")
+    
+    # Load archive agents
+    archive_agents = []
+    local_archive_dir = Path("global50") / context_window_id / "archive"
+    cloud_archive_prefix = f"{cloud_base}/archive/"
+    
+    # Check local archive
+    if local_archive_dir.exists():
+        for json_file in local_archive_dir.glob("*.json"):
+            try:
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                archive_agents.append(data)
+            except Exception as e:
+                pass  # Skip invalid files
+    
+    # Check cloud archive
+    try:
+        if cloud_sync.provider == "gcs":
+            blobs = list(cloud_sync.bucket.list_blobs(prefix=cloud_archive_prefix))
+            for blob in blobs:
+                if blob.name.endswith('.json'):
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                        temp_path = tmp.name
+                    try:
+                        blob.download_to_filename(temp_path)
+                        with open(temp_path, 'r') as f:
+                            data = json.load(f)
+                        # Check if not already in list (avoid duplicates)
+                        key = (data.get('run_name'), data.get('agent_id'))
+                        if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in archive_agents):
+                            archive_agents.append(data)
+                    except Exception:
+                        pass
+                    finally:
+                        import os
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+        elif cloud_sync.provider == "s3":
+            paginator = cloud_sync.client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=cloud_sync.bucket_name, Prefix=cloud_archive_prefix)
+            for page in pages:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        if obj['Key'].endswith('.json'):
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                temp_path = tmp.name
+                            try:
+                                cloud_sync.client.download_file(
+                                    cloud_sync.bucket_name, obj['Key'], temp_path
+                                )
+                                with open(temp_path, 'r') as f:
+                                    data = json.load(f)
+                                key = (data.get('run_name'), data.get('agent_id'))
+                                if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in archive_agents):
+                                    archive_agents.append(data)
+                            except Exception:
+                                pass
+                            finally:
+                                import os
+                                if os.path.exists(temp_path):
+                                    os.unlink(temp_path)
+        elif cloud_sync.provider == "azure":
+            blob_list = cloud_sync.container_client.list_blobs(name_starts_with=cloud_archive_prefix)
+            for blob in blob_list:
+                if blob.name.endswith('.json'):
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                        temp_path = tmp.name
+                    try:
+                        blob_client = cloud_sync.container_client.get_blob_client(blob.name)
+                        with open(temp_path, 'wb') as f:
+                            f.write(blob_client.download_blob().readall())
+                        with open(temp_path, 'r') as f:
+                            data = json.load(f)
+                        key = (data.get('run_name'), data.get('agent_id'))
+                        if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in archive_agents):
+                            archive_agents.append(data)
+                    except Exception:
+                        pass
+                    finally:
+                        import os
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+    except Exception as e:
+        print(f"\n⚠ Error checking cloud archive: {e}")
+    
+    print_agent_table("Archive Agents", archive_agents, "Archive")
+    
+    # Load long-term-archive agents
+    long_term_agents = []
+    local_long_term_dir = Path("global50") / context_window_id / "long-term-archive"
+    cloud_long_term_prefix = f"{cloud_base}/long-term-archive/"
+    
+    # Check local long-term-archive
+    if local_long_term_dir.exists():
+        for json_file in local_long_term_dir.glob("*.json"):
+            try:
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                long_term_agents.append(data)
+            except Exception:
+                pass
+    
+    # Check cloud long-term-archive
+    try:
+        if cloud_sync.provider == "gcs":
+            blobs = list(cloud_sync.bucket.list_blobs(prefix=cloud_long_term_prefix))
+            for blob in blobs:
+                if blob.name.endswith('.json'):
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                        temp_path = tmp.name
+                    try:
+                        blob.download_to_filename(temp_path)
+                        with open(temp_path, 'r') as f:
+                            data = json.load(f)
+                        key = (data.get('run_name'), data.get('agent_id'))
+                        if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in long_term_agents):
+                            long_term_agents.append(data)
+                    except Exception:
+                        pass
+                    finally:
+                        import os
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+        elif cloud_sync.provider == "s3":
+            paginator = cloud_sync.client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=cloud_sync.bucket_name, Prefix=cloud_long_term_prefix)
+            for page in pages:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        if obj['Key'].endswith('.json'):
+                            import tempfile
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                temp_path = tmp.name
+                            try:
+                                cloud_sync.client.download_file(
+                                    cloud_sync.bucket_name, obj['Key'], temp_path
+                                )
+                                with open(temp_path, 'r') as f:
+                                    data = json.load(f)
+                                key = (data.get('run_name'), data.get('agent_id'))
+                                if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in long_term_agents):
+                                    long_term_agents.append(data)
+                            except Exception:
+                                pass
+                            finally:
+                                import os
+                                if os.path.exists(temp_path):
+                                    os.unlink(temp_path)
+        elif cloud_sync.provider == "azure":
+            blob_list = cloud_sync.container_client.list_blobs(name_starts_with=cloud_long_term_prefix)
+            for blob in blob_list:
+                if blob.name.endswith('.json'):
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                        temp_path = tmp.name
+                    try:
+                        blob_client = cloud_sync.container_client.get_blob_client(blob.name)
+                        with open(temp_path, 'wb') as f:
+                            f.write(blob_client.download_blob().readall())
+                        with open(temp_path, 'r') as f:
+                            data = json.load(f)
+                        key = (data.get('run_name'), data.get('agent_id'))
+                        if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in long_term_agents):
+                            long_term_agents.append(data)
+                    except Exception:
+                        pass
+                    finally:
+                        import os
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+    except Exception as e:
+        print(f"\n⚠ Error checking cloud long-term-archive: {e}")
+    
+    print_agent_table("Long-Term Archive Agents", long_term_agents, "Long-Term Archive")
+    
+    # Summary
+    total_agents = len(global50_agents) + len(archive_agents) + len(long_term_agents)
+    print(f"\n{'='*70}")
+    print("Summary")
+    print(f"{'='*70}")
+    print(f"  Global 50:          {len(global50_agents):>4} agent(s)")
+    print(f"  Archive:            {len(archive_agents):>4} agent(s)")
+    print(f"  Long-Term Archive:  {len(long_term_agents):>4} agent(s)")
+    print(f"  Total:              {total_agents:>4} agent(s)")
+    print(f"{'='*70}")
 
 
 def main():
@@ -4390,6 +4668,12 @@ Examples:
     )
 
     parser.add_argument(
+        '--stats-all',
+        action='store_true',
+        help='Display detailed agent lists for all agents in global50, archive, and long-term-archive.'
+    )
+
+    parser.add_argument(
         '--mark-maverick',
         type=str,
         metavar='RUN_NAME',
@@ -4437,6 +4721,11 @@ Examples:
         # Handle --stats mode (doesn't need full evaluator setup)
         if args.stats:
             print_global50_stats(context_window_days=context_window_days)
+            return
+
+        # Handle --stats-all mode (doesn't need full evaluator setup)
+        if args.stats_all:
+            print_all_stats(context_window_days=context_window_days)
             return
 
         # Initialize evaluator
