@@ -2741,14 +2741,15 @@ class AgentEvaluator:
         print(f"\n{'='*70}")
         print("Candidates for Evaluation")
         print(f"{'='*70}")
-        print(f"{'#':<4} {'Archived Score':<15} {'ROI %':<10} {'Expectancy':<12} {'Run Name':<30} {'M'}")
-        print(f"{'-'*80}")
+        print(f"{'#':<4} {'Archived Score':<15} {'ROI %':<10} {'Expectancy':<12} {'Trades':<8} {'Run Name':<30} {'M'}")
+        print(f"{'-'*88}")
 
         for i, candidate in enumerate(candidates, 1):
             maverick_tag = " [M]" if candidate.get('is_maverick', False) else ""
             print(f"{i:<4} {candidate.get('gauntlet_score', 0):<15.2f} "
                   f"{candidate.get('roi', 0):<10.2f} "
                   f"{candidate.get('expectancy', 0):<12.4f} "
+                  f"{candidate.get('total_trades', 0):<8} "
                   f"{candidate['run_name']:<30}{maverick_tag}")
 
         # Ask for confirmation
@@ -2984,7 +2985,7 @@ class AgentEvaluator:
                 maverick_tag = " [M]" if is_maverick else ""
                 
                 print(f"\n  → {candidate['run_name']} (Agent {candidate['agent_id']}){maverick_tag}")
-                print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f}")
+                print(f"    Score: {new_score:.2f} | ROI: {metrics['roi']:.2f}% | Expectancy: {metrics['expectancy']:.4f} | CV: {metrics['cv']:.3f} | Trades: {metrics['total_trades']}")
 
                 # Attempt promotion - we bypass should_promote check since we did our own tiered check
                 # Temporarily set all thresholds (minimums, medians, P25) to -inf/+inf to allow promotion
@@ -3074,12 +3075,14 @@ class AgentEvaluator:
             all_rois = [e.roi for e in self.global_hof.entries]
             all_expectancies = [e.expectancy for e in self.global_hof.entries]
             all_cvs = [e.cv for e in self.global_hof.entries]
+            all_trades = [e.total_trades for e in self.global_hof.entries]
 
             print(f"\n  Current Global 50 Metrics:")
             print(f"    Gauntlet:    min={min(all_scores):.2f}  mean={sum(all_scores)/len(all_scores):.2f}  max={max(all_scores):.2f}")
             print(f"    ROI:         min={min(all_rois):.2f}%  mean={sum(all_rois)/len(all_rois):.2f}%  max={max(all_rois):.2f}%")
             print(f"    Expectancy:  min={min(all_expectancies):.4f}  mean={sum(all_expectancies)/len(all_expectancies):.4f}  max={max(all_expectancies):.4f}")
             print(f"    CV:          min={min(all_cvs):.3f}  mean={sum(all_cvs)/len(all_cvs):.3f}  max={max(all_cvs):.3f}")
+            print(f"    Total Trades: min={min(all_trades)}  mean={sum(all_trades)/len(all_trades):.1f}  max={max(all_trades)}")
 
             # Show updated thresholds
             print(f"\n  Updated Thresholds:")
@@ -3667,7 +3670,8 @@ class AgentEvaluator:
             for r in results:
                 if r['promoted']:
                     maverick_tag = " [M]" if r.get('is_maverick', False) else ""
-                    print(f"  {r['agent_name']:.<50} {r['gauntlet_score']:>10.2f}{maverick_tag}")
+                    trades = r.get('total_trades', r.get('metrics', {}).get('total_trades', 0))
+                    print(f"  {r['agent_name']:.<50} {r['gauntlet_score']:>10.2f}  Trades: {trades:>6}{maverick_tag}")
 
         if self.global_hof.enabled:
             stats = self.global_hof.get_stats()
