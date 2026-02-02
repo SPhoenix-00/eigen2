@@ -42,6 +42,7 @@ Usage:
     python global50.py --archive-fill                      # Fill Global 50 from archive
     python global50.py --cleanup                           # Archive orphan agents
     python global50.py --cleanup-dry-run                   # Report orphans (no changes)
+    python global50.py --reactivate                        # Reactivate agents between archive and long-term-archive
     python global50.py --stats                             # Display comprehensive statistics
     python global50.py --agent-dir <path> [--run-name <name>] [--maverick]
 
@@ -53,6 +54,8 @@ Options:
     --archive-fill      Fill Global 50 from archive. Evaluates archived agents and promotes qualifying ones.
     --cleanup           Find and archive orphan agents (files in agents/ not in global50.json).
     --cleanup-dry-run   Like --cleanup but only reports orphans without archiving them.
+    --reactivate        Reactivate agents: move qualifying agents from long-term-archive to archive,
+                        and move non-qualifying agents from archive to long-term-archive.
     --stats             Display comprehensive statistics about the current Global 50 agents.
     --cw DAYS           Context window size in days (e.g., --cw 504 for cw504).
     --agent-dir PATH    Directory containing agent .pth files to evaluate.
@@ -79,6 +82,7 @@ import torch
 import numpy as np
 from datetime import datetime
 import json
+import shutil
 
 from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
@@ -2875,6 +2879,425 @@ class AgentEvaluator:
 
         print(f"\n{'='*70}")
 
+    def reactivate_agents(self):
+        """
+        Reactivate agents between archive and long-term-archive.
+        
+        - Moves qualifying agents from long-term-archive to archive (they can then be promoted)
+        - Moves non-qualifying agents from archive to long-term-archive
+        - All moves are verified before deletion from source location
+        """
+        print(f"\n{'='*70}")
+        print("REACTIVATE MODE")
+        print(f"{'='*70}")
+
+        if not self.global_hof.enabled:
+            print("⚠ Global 50 not enabled (local mode or disabled)")
+            print("Cannot reactivate agents.")
+            return
+
+        # Load current Global 50 state
+        print("\nLoading current Global 50 state...")
+        self.global_hof._download_global_ledger()
+        self.global_hof._load_local_ledger()
+        self.global_hof._update_entry_threshold()
+
+        print(f"\n  Current Global 50 size: {len(self.global_hof.entries)}/{self.global_hof.CAPACITY}")
+        print(f"  Mavericks: {sum(1 for e in self.global_hof.entries if e.is_maverick)}/{self.global_hof.MAVERICK_CAP}")
+
+        # Discover agents in long-term-archive
+        print("\nDiscovering agents in long-term-archive...")
+        long_term_agents = self._discover_long_term_archive_agents()
+        print(f"  Found {len(long_term_agents)} agents in long-term-archive")
+
+        # Discover agents in archive
+        print("\nDiscovering agents in archive...")
+        archive_agents = self._discover_archive_agents()
+        print(f"  Found {len(archive_agents)} agents in archive")
+
+        # Check which long-term-archive agents qualify
+        print("\nChecking long-term-archive agents against current minimums...")
+        qualifying_from_long_term = []
+        for agent_data in long_term_agents:
+            # Skip agents missing required fields
+            if 'gauntlet_score' not in agent_data or 'roi' not in agent_data:
+                print(f"  ⚠ Skipping {agent_data.get('run_name', 'unknown')}_{agent_data.get('agent_id', 'unknown')}: missing required fields")
+                continue
+            
+            is_maverick = agent_data.get('is_maverick', False)
+            if self._meets_all_minimums(
+                agent_data.get('gauntlet_score', 0.0),
+                agent_data.get('roi', 0.0),
+                agent_data.get('expectancy', 0.0),
+                agent_data.get('cv', 100.0),
+                is_maverick
+            ):
+                qualifying_from_long_term.append(agent_data)
+
+        print(f"  {len(qualifying_from_long_term)} agents qualify for reactivation")
+
+        # Check which archive agents don't qualify
+        print("\nChecking archive agents against current minimums...")
+        non_qualifying_from_archive = []
+        for agent_data in archive_agents:
+            # Skip agents missing required fields
+            if 'gauntlet_score' not in agent_data or 'roi' not in agent_data:
+                print(f"  ⚠ Skipping {agent_data.get('run_name', 'unknown')}_{agent_data.get('agent_id', 'unknown')}: missing required fields")
+                continue
+            
+            is_maverick = agent_data.get('is_maverick', False)
+            if not self._meets_all_minimums(
+                agent_data.get('gauntlet_score', 0.0),
+                agent_data.get('roi', 0.0),
+                agent_data.get('expectancy', 0.0),
+                agent_data.get('cv', 100.0),
+                is_maverick
+            ):
+                non_qualifying_from_archive.append(agent_data)
+
+        print(f"  {len(non_qualifying_from_archive)} agents should be moved to long-term-archive")
+
+        # Move qualifying agents from long-term-archive to archive
+        if qualifying_from_long_term:
+            print(f"\n{'='*70}")
+            print(f"Moving {len(qualifying_from_long_term)} qualifying agents from long-term-archive to archive...")
+            print(f"{'='*70}")
+            for agent_data in qualifying_from_long_term:
+                self._move_agent_long_term_to_archive(agent_data)
+        else:
+            print("\nNo agents to move from long-term-archive to archive.")
+
+        # Move non-qualifying agents from archive to long-term-archive
+        if non_qualifying_from_archive:
+            print(f"\n{'='*70}")
+            print(f"Moving {len(non_qualifying_from_archive)} non-qualifying agents from archive to long-term-archive...")
+            print(f"{'='*70}")
+            for agent_data in non_qualifying_from_archive:
+                self._move_agent_archive_to_long_term(agent_data)
+        else:
+            print("\nNo agents to move from archive to long-term-archive.")
+
+        print(f"\n{'='*70}")
+        print("✓ Reactivation Complete!")
+        print(f"{'='*70}")
+        print(f"  Reactivated:      {len(qualifying_from_long_term)} agents (long-term-archive → archive)")
+        print(f"  Moved to long-term: {len(non_qualifying_from_archive)} agents (archive → long-term-archive)")
+
+    def _meets_all_minimums(self, gauntlet_score: float, roi: float, expectancy: float, cv: float, is_maverick: bool) -> bool:
+        """
+        Check if an agent meets all 4 minimum thresholds (gauntlet, ROI, expectancy, CV).
+        Uses segregated thresholds for mavericks vs non-mavericks.
+        
+        Args:
+            gauntlet_score: Agent's gauntlet score
+            roi: Agent's ROI percentage
+            expectancy: Agent's expectancy metric
+            cv: Agent's coefficient of variation (lower is better)
+            is_maverick: Whether this is a maverick agent
+            
+        Returns:
+            True if agent meets all 4 minimums, False otherwise
+        """
+        # Handle edge case: if Global 50 is empty, no agent can meet minimums
+        if len(self.global_hof.entries) == 0:
+            return False
+
+        # Select thresholds based on agent type (Maverick vs Standard)
+        # If maverick_count > 0, use maverick thresholds; otherwise use standard thresholds
+        # (This matches the logic in analyze_promotion)
+        if is_maverick and self.global_hof.maverick_count > 0:
+            threshold_gauntlet = self.global_hof.maverick_entry_threshold
+            threshold_roi = self.global_hof.maverick_roi_threshold
+            threshold_expectancy = self.global_hof.maverick_expectancy_threshold
+            threshold_cv = self.global_hof.maverick_cv_threshold
+        else:
+            threshold_gauntlet = self.global_hof.entry_threshold
+            threshold_roi = self.global_hof.roi_threshold
+            threshold_expectancy = self.global_hof.expectancy_threshold
+            threshold_cv = self.global_hof.cv_threshold
+
+        # Check all 4 minimums
+        passes_gauntlet = gauntlet_score > threshold_gauntlet
+        passes_roi = roi > threshold_roi
+        passes_expectancy = expectancy > threshold_expectancy
+        passes_cv = cv < threshold_cv  # CV: lower is better
+
+        return passes_gauntlet and passes_roi and passes_expectancy and passes_cv
+
+    def _discover_long_term_archive_agents(self) -> List[dict]:
+        """
+        Discover all agents in long-term-archive (both local and cloud).
+        
+        Returns:
+            List of dicts with agent metadata (run_name, agent_id, gauntlet_score, etc.)
+        """
+        long_term_agents = []
+        local_long_term_dir = self.global_hof.local_dir / "long-term-archive"
+        cloud_long_term_prefix = f"{self.global_hof.cloud_base}/long-term-archive/"
+
+        # Check local long-term-archive
+        if local_long_term_dir.exists():
+            print(f"  Checking local: {local_long_term_dir}")
+            for json_file in local_long_term_dir.glob("*.json"):
+                try:
+                    with open(json_file, 'r') as f:
+                        data = json.load(f)
+                    long_term_agents.append(data)
+                except Exception as e:
+                    print(f"  ⚠ Could not parse {json_file}: {e}")
+
+        # Check cloud long-term-archive
+        try:
+            if self.cloud_sync.provider == "gcs":
+                blobs = self.cloud_sync.bucket.list_blobs(prefix=cloud_long_term_prefix)
+                for blob in blobs:
+                    if blob.name.endswith('.json'):
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                            temp_path = tmp.name
+                        try:
+                            blob.download_to_filename(temp_path)
+                            with open(temp_path, 'r') as f:
+                                data = json.load(f)
+                            # Only add if not already in list (avoid duplicates)
+                            key = (data.get('run_name'), data.get('agent_id'))
+                            if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in long_term_agents):
+                                long_term_agents.append(data)
+                        except Exception as e:
+                            print(f"  ⚠ Could not parse {blob.name}: {e}")
+                        finally:
+                            import os
+                            if os.path.exists(temp_path):
+                                os.unlink(temp_path)
+
+            elif self.cloud_sync.provider == "s3":
+                paginator = self.cloud_sync.client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=self.cloud_sync.bucket_name, Prefix=cloud_long_term_prefix)
+                for page in pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            if obj['Key'].endswith('.json'):
+                                import tempfile
+                                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                    temp_path = tmp.name
+                                try:
+                                    self.cloud_sync.client.download_file(
+                                        self.cloud_sync.bucket_name, obj['Key'], temp_path
+                                    )
+                                    with open(temp_path, 'r') as f:
+                                        data = json.load(f)
+                                    key = (data.get('run_name'), data.get('agent_id'))
+                                    if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in long_term_agents):
+                                        long_term_agents.append(data)
+                                except Exception as e:
+                                    print(f"  ⚠ Could not parse {obj['Key']}: {e}")
+                                finally:
+                                    import os
+                                    if os.path.exists(temp_path):
+                                        os.unlink(temp_path)
+
+            elif self.cloud_sync.provider == "azure":
+                blob_list = self.cloud_sync.container_client.list_blobs(name_starts_with=cloud_long_term_prefix)
+                for blob in blob_list:
+                    if blob.name.endswith('.json'):
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                            temp_path = tmp.name
+                        try:
+                            blob_client = self.cloud_sync.container_client.get_blob_client(blob.name)
+                            with open(temp_path, 'wb') as f:
+                                f.write(blob_client.download_blob().readall())
+                            with open(temp_path, 'r') as f:
+                                data = json.load(f)
+                            key = (data.get('run_name'), data.get('agent_id'))
+                            if not any(a.get('run_name') == key[0] and a.get('agent_id') == key[1] for a in long_term_agents):
+                                long_term_agents.append(data)
+                        except Exception as e:
+                            print(f"  ⚠ Could not parse {blob.name}: {e}")
+                        finally:
+                            import os
+                            if os.path.exists(temp_path):
+                                os.unlink(temp_path)
+        except Exception as e:
+            print(f"  ⚠ Error listing cloud long-term-archive: {e}")
+
+        return long_term_agents
+
+    def _move_agent_long_term_to_archive(self, agent_data: dict):
+        """
+        Move an agent from long-term-archive to archive (both local and cloud).
+        Verifies the move before deleting from source.
+        
+        Args:
+            agent_data: Agent metadata dict
+        """
+        filename = f"{agent_data['run_name']}_{agent_data['agent_id']}.pth"
+        scoresheet_filename = filename.replace('.pth', '.json')
+        
+        local_long_term_dir = self.global_hof.local_dir / "long-term-archive"
+        local_archive_dir = self.global_hof.local_archive_dir
+        
+        # Ensure directories exist
+        local_long_term_dir.mkdir(parents=True, exist_ok=True)
+        local_archive_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Local: Move from long-term-archive to archive
+        local_src_pth = local_long_term_dir / filename
+        local_dst_pth = local_archive_dir / filename
+        local_src_json = local_long_term_dir / scoresheet_filename
+        local_dst_json = local_archive_dir / scoresheet_filename
+
+        # Download from cloud if not in local cache
+        if not local_src_pth.exists():
+            cloud_long_term_pth = f"{self.global_hof.cloud_base}/long-term-archive/{filename}"
+            if self.cloud_sync.file_exists(cloud_long_term_pth):
+                self.cloud_sync.download_file(cloud_long_term_pth, str(local_src_pth))
+                print(f"   ✓ Downloaded {filename} from cloud long-term-archive")
+
+        if not local_src_json.exists():
+            cloud_long_term_json = f"{self.global_hof.cloud_base}/long-term-archive/{scoresheet_filename}"
+            if self.cloud_sync.file_exists(cloud_long_term_json):
+                self.cloud_sync.download_file(cloud_long_term_json, str(local_src_json))
+                print(f"   ✓ Downloaded {scoresheet_filename} from cloud long-term-archive")
+
+        # Move locally
+        if local_src_pth.exists():
+            shutil.move(str(local_src_pth), str(local_dst_pth))
+            print(f"   ✓ Moved locally: {filename} (long-term-archive → archive)")
+        else:
+            print(f"   ⚠ {filename} not found locally, will download to archive")
+
+        if local_src_json.exists():
+            shutil.move(str(local_src_json), str(local_dst_json))
+        else:
+            # Create JSON from agent_data if missing
+            with open(local_dst_json, 'w') as f:
+                json.dump(agent_data, f, indent=2)
+
+        # Cloud: Upload to archive/ with verification
+        cloud_archive_pth = f"{self.global_hof.cloud_base}/archive/{filename}"
+        cloud_archive_json = f"{self.global_hof.cloud_base}/archive/{scoresheet_filename}"
+        cloud_long_term_pth = f"{self.global_hof.cloud_base}/long-term-archive/{filename}"
+        cloud_long_term_json = f"{self.global_hof.cloud_base}/long-term-archive/{scoresheet_filename}"
+
+        if local_dst_pth.exists():
+            if self.global_hof.enabled:
+                self.cloud_sync.upload_file_verified(str(local_dst_pth), cloud_archive_pth)
+            else:
+                self.cloud_sync.upload_file(str(local_dst_pth), cloud_archive_pth, background=False)
+        
+        if local_dst_json.exists():
+            if self.global_hof.enabled:
+                self.cloud_sync.upload_file_verified(str(local_dst_json), cloud_archive_json)
+            else:
+                self.cloud_sync.upload_file(str(local_dst_json), cloud_archive_json, background=False)
+
+        # Delete from cloud long-term-archive ONLY after confirming archive exists
+        if self.cloud_sync.file_exists(cloud_archive_pth):
+            if self.cloud_sync.delete_file(cloud_long_term_pth):
+                print(f"   ✓ Deleted from cloud long-term-archive: {filename}")
+            else:
+                print(f"   ⚠ Failed to delete from cloud long-term-archive: {filename}")
+            
+            if self.cloud_sync.file_exists(cloud_archive_json):
+                if self.cloud_sync.delete_file(cloud_long_term_json):
+                    print(f"   ✓ Deleted from cloud long-term-archive: {scoresheet_filename}")
+        else:
+            print(f"   ⚠ Archive upload failed, keeping in long-term-archive: {filename}")
+
+        # Delete from local long-term-archive if still exists
+        if local_src_pth.exists():
+            local_src_pth.unlink()
+        if local_src_json.exists():
+            local_src_json.unlink()
+
+    def _move_agent_archive_to_long_term(self, agent_data: dict):
+        """
+        Move an agent from archive to long-term-archive (both local and cloud).
+        Verifies the move before deleting from source.
+        
+        Args:
+            agent_data: Agent metadata dict
+        """
+        filename = f"{agent_data['run_name']}_{agent_data['agent_id']}.pth"
+        scoresheet_filename = filename.replace('.pth', '.json')
+        
+        local_archive_dir = self.global_hof.local_archive_dir
+        local_long_term_dir = self.global_hof.local_dir / "long-term-archive"
+        
+        # Ensure directories exist
+        local_long_term_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Local: Move from archive to long-term-archive
+        local_src_pth = local_archive_dir / filename
+        local_dst_pth = local_long_term_dir / filename
+        local_src_json = local_archive_dir / scoresheet_filename
+        local_dst_json = local_long_term_dir / scoresheet_filename
+
+        # Download from cloud if not in local cache
+        if not local_src_pth.exists():
+            cloud_archive_pth = f"{self.global_hof.cloud_base}/archive/{filename}"
+            if self.cloud_sync.file_exists(cloud_archive_pth):
+                self.cloud_sync.download_file(cloud_archive_pth, str(local_src_pth))
+                print(f"   ✓ Downloaded {filename} from cloud archive")
+
+        if not local_src_json.exists():
+            cloud_archive_json = f"{self.global_hof.cloud_base}/archive/{scoresheet_filename}"
+            if self.cloud_sync.file_exists(cloud_archive_json):
+                self.cloud_sync.download_file(cloud_archive_json, str(local_src_json))
+                print(f"   ✓ Downloaded {scoresheet_filename} from cloud archive")
+
+        # Move locally
+        if local_src_pth.exists():
+            shutil.move(str(local_src_pth), str(local_dst_pth))
+            print(f"   ✓ Moved locally: {filename} (archive → long-term-archive)")
+        else:
+            print(f"   ⚠ {filename} not found locally, will download to long-term-archive")
+
+        if local_src_json.exists():
+            shutil.move(str(local_src_json), str(local_dst_json))
+        else:
+            # Create JSON from agent_data if missing
+            with open(local_dst_json, 'w') as f:
+                json.dump(agent_data, f, indent=2)
+
+        # Cloud: Upload to long-term-archive/ with verification
+        cloud_long_term_pth = f"{self.global_hof.cloud_base}/long-term-archive/{filename}"
+        cloud_long_term_json = f"{self.global_hof.cloud_base}/long-term-archive/{scoresheet_filename}"
+        cloud_archive_pth = f"{self.global_hof.cloud_base}/archive/{filename}"
+        cloud_archive_json = f"{self.global_hof.cloud_base}/archive/{scoresheet_filename}"
+
+        if local_dst_pth.exists():
+            if self.global_hof.enabled:
+                self.cloud_sync.upload_file_verified(str(local_dst_pth), cloud_long_term_pth)
+            else:
+                self.cloud_sync.upload_file(str(local_dst_pth), cloud_long_term_pth, background=False)
+        
+        if local_dst_json.exists():
+            if self.global_hof.enabled:
+                self.cloud_sync.upload_file_verified(str(local_dst_json), cloud_long_term_json)
+            else:
+                self.cloud_sync.upload_file(str(local_dst_json), cloud_long_term_json, background=False)
+
+        # Delete from cloud archive ONLY after confirming long-term-archive exists
+        if self.cloud_sync.file_exists(cloud_long_term_pth):
+            if self.cloud_sync.delete_file(cloud_archive_pth):
+                print(f"   ✓ Deleted from cloud archive: {filename}")
+            else:
+                print(f"   ⚠ Failed to delete from cloud archive: {filename}")
+            
+            if self.cloud_sync.file_exists(cloud_long_term_json):
+                if self.cloud_sync.delete_file(cloud_archive_json):
+                    print(f"   ✓ Deleted from cloud archive: {scoresheet_filename}")
+        else:
+            print(f"   ⚠ Long-term-archive upload failed, keeping in archive: {filename}")
+
+        # Delete from local archive if still exists
+        if local_src_pth.exists():
+            local_src_pth.unlink()
+        if local_src_json.exists():
+            local_src_json.unlink()
+
     def _discover_archive_agents(self) -> List[dict]:
         """
         Discover all archived agents in cloud storage.
@@ -3302,6 +3725,12 @@ Examples:
 
   # Fill Global 50 from archive for a specific context window
   python global50.py --archive-fill --cw 504
+
+  # Reactivate agents between archive and long-term-archive
+  python global50.py --reactivate
+
+  # Reactivate agents for a specific context window
+  python global50.py --reactivate --cw 504
         """
     )
 
@@ -3372,6 +3801,12 @@ Examples:
         '--archive-fill',
         action='store_true',
         help='Fill Global 50 from archive. Downloads archived agents, evaluates them, and promotes qualifying ones to fill empty slots.'
+    )
+
+    parser.add_argument(
+        '--reactivate',
+        action='store_true',
+        help='Reactivate agents: move qualifying agents from long-term-archive to archive, and move non-qualifying agents from archive to long-term-archive.'
     )
 
     parser.add_argument(
@@ -3510,6 +3945,17 @@ Examples:
             print("="*70)
 
             evaluator.archive_fill()
+
+            print("\n" + "="*70)
+            return
+
+        # Handle --reactivate mode (reactivate agents between archive and long-term-archive)
+        if args.reactivate:
+            print("\n" + "="*70)
+            print("REACTIVATE MODE")
+            print("="*70)
+
+            evaluator.reactivate_agents()
 
             print("\n" + "="*70)
             return

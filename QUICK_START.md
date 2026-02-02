@@ -48,7 +48,9 @@ python3 -m pip install --no-cache-dir -r requirements.txt google-cloud-storage
 scp -P YOUR_PORT gcs-credentials.json root@YOUR_HOST:/workspace/
 ```
 
-### 4. Download Training Data (on RunPod)
+### 4. Download Training Data
+
+**On RunPod (bash):**
 ```bash
 cd /workspace
 export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
@@ -63,14 +65,26 @@ print("✓ Training data downloaded")
 EOF
 ```
 
+**On Windows (PowerShell):**
+```powershell
+cd D:\GitHub\eigen2
+$env:GOOGLE_APPLICATION_CREDENTIALS="D:\GitHub\eigen2\gcs-credentials.json"
+
+python -c "from google.cloud import storage; client = storage.Client(); bucket = client.bucket('eigen2-checkpoints-ase0'); blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_311225.pkl'); blob.download_to_filename('Eigen2_Master_PY_OUTPUT_311225.pkl'); print('✓ Training data downloaded')"
+```
+
 ### 5. Login to W&B
 ```bash
 wandb login
 # Paste API key from: https://wandb.ai/authorize
 # 7deffe6a4942dc629a3327c7df7be882859d638c
+# $env:WANDB_API_KEY="7deffe6a4942dc629a3327c7df7be882859d638c"
+
 ```
 
-### 6. Start Training in tmux
+### 6. Start Training
+
+**On Linux/RunPod (bash):**
 ```bash
 cd /workspace
 tmux -u new -s training
@@ -81,6 +95,25 @@ export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
 
 python main.py              # New training
 python main.py --resume     # Resume from last run
+```
+
+**On Windows (PowerShell):**
+```powershell
+cd D:\GitHub\eigen2
+
+$env:CLOUD_PROVIDER="gcs"
+$env:CLOUD_BUCKET="eigen2-checkpoints-ase0"
+$env:GOOGLE_APPLICATION_CREDENTIALS="D:\GitHub\eigen2\gcs-credentials.json"
+
+python main.py              # New training
+python main.py --resume     # Resume from last run
+```
+
+**Note:** Environment variables set with `$env:` in PowerShell are only valid for the current session. To make them persistent, use:
+```powershell
+[System.Environment]::SetEnvironmentVariable("CLOUD_PROVIDER", "gcs", "User")
+[System.Environment]::SetEnvironmentVariable("CLOUD_BUCKET", "eigen2-checkpoints-ase0", "User")
+[System.Environment]::SetEnvironmentVariable("GOOGLE_APPLICATION_CREDENTIALS", "D:\GitHub\eigen2\gcs-credentials.json", "User")
 ```
 
 ---
@@ -287,10 +320,19 @@ See [EVALUATION_GUIDE.md](EVALUATION_GUIDE.md) for detailed usage and output for
 ## Troubleshooting
 
 **GCS connection issues:**
+
+**On Linux/RunPod (bash):**
 ```bash
 export CLOUD_PROVIDER=gcs
 export CLOUD_BUCKET=eigen2-checkpoints-ase0
 export GOOGLE_APPLICATION_CREDENTIALS=/workspace/gcs-credentials.json
+```
+
+**On Windows (PowerShell):**
+```powershell
+$env:CLOUD_PROVIDER="gcs"
+$env:CLOUD_BUCKET="eigen2-checkpoints-ase0"
+$env:GOOGLE_APPLICATION_CREDENTIALS="D:\GitHub\eigen2\gcs-credentials.json"
 ```
 
 **wandb login error:**
