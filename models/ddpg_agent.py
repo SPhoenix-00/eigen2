@@ -362,7 +362,7 @@ class DDPGAgent:
             "has_weights_only_param": hasattr(torch.load, '__code__') and 'weights_only' in str(torch.load.__code__.co_varnames)
         }, "A")
         # #endregion
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         # #region agent log
         _debug_log("ddpg_agent.py:336", "load() torch.load succeeded", {
             "checkpoint_keys": list(checkpoint.keys()),
@@ -407,7 +407,7 @@ class DDPGAgent:
         }, "B")
         # #endregion
         try:
-            checkpoint = torch.load(path, map_location=self.device)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
             # #region agent log
             _debug_log("ddpg_agent.py:365", "load_weights_only() torch.load succeeded", {
                 "checkpoint_keys": list(checkpoint.keys()) if isinstance(checkpoint, dict) else "not_dict"
