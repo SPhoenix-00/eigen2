@@ -445,6 +445,38 @@ class GlobalHallOfFame:
             self.gauntlet_p25 = float('-inf')
             self.roi_p25 = float('-inf')
             self.expectancy_p25 = float('-inf')
+        else:
+            # Filter for non-maverick agents to ensure clean separation of pools
+            non_mavericks = [e for e in self.entries if not e.is_maverick]
+            
+            if not non_mavericks:
+                # Fallback if no non-mavericks exist (should prevent crash if logic violated)
+                non_mavericks = self.entries
+
+            # Get the worst non-maverick agent's score
+            sorted_entries = sorted(non_mavericks, key=lambda e: e.gauntlet_score, reverse=True)
+            self.entry_threshold = sorted_entries[-1].gauntlet_score
+            
+            # ROI and expectancy thresholds = minimum in the non-maverick population
+            self.roi_threshold = min(e.roi for e in non_mavericks)
+            self.expectancy_threshold = min(e.expectancy for e in non_mavericks)
+            # CV threshold = maximum in the non-maverick population (worst allowed volatility)
+            # Lower CV is better, so new agents must have CV below the worst current CV
+            self.cv_threshold = max(e.cv for e in non_mavericks)
+
+            # Calculate median (50th percentile) and 25th percentile for all 3 metrics
+            # strictly on non-maverick agents
+            gauntlet_scores = [e.gauntlet_score for e in non_mavericks]
+            roi_values = [e.roi for e in non_mavericks]
+            expectancy_values = [e.expectancy for e in non_mavericks]
+
+            self.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
+            self.roi_median = float(np.percentile(roi_values, 50))
+            self.expectancy_median = float(np.percentile(expectancy_values, 50))
+
+            self.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
+            self.roi_p25 = float(np.percentile(roi_values, 25))
+            self.expectancy_p25 = float(np.percentile(expectancy_values, 25))
 
         # Always calculate Maverick thresholds based on existing Mavericks (Highlander logic)
         # This applies even if the Global 50 is not full.
@@ -481,39 +513,6 @@ class GlobalHallOfFame:
             self.maverick_gauntlet_p25 = float('-inf')
             self.maverick_roi_p25 = float('-inf')
             self.maverick_expectancy_p25 = float('-inf')
-
-        else:
-            # Filter for non-maverick agents to ensure clean separation of pools
-            non_mavericks = [e for e in self.entries if not e.is_maverick]
-            
-            if not non_mavericks:
-                # Fallback if no non-mavericks exist (should prevent crash if logic violated)
-                non_mavericks = self.entries
-
-            # Get the worst non-maverick agent's score
-            sorted_entries = sorted(non_mavericks, key=lambda e: e.gauntlet_score, reverse=True)
-            self.entry_threshold = sorted_entries[-1].gauntlet_score
-            
-            # ROI and expectancy thresholds = minimum in the non-maverick population
-            self.roi_threshold = min(e.roi for e in non_mavericks)
-            self.expectancy_threshold = min(e.expectancy for e in non_mavericks)
-            # CV threshold = maximum in the non-maverick population (worst allowed volatility)
-            # Lower CV is better, so new agents must have CV below the worst current CV
-            self.cv_threshold = max(e.cv for e in non_mavericks)
-
-            # Calculate median (50th percentile) and 25th percentile for all 3 metrics
-            # strictly on non-maverick agents
-            gauntlet_scores = [e.gauntlet_score for e in non_mavericks]
-            roi_values = [e.roi for e in non_mavericks]
-            expectancy_values = [e.expectancy for e in non_mavericks]
-
-            self.gauntlet_median = float(np.percentile(gauntlet_scores, 50))
-            self.roi_median = float(np.percentile(roi_values, 50))
-            self.expectancy_median = float(np.percentile(expectancy_values, 50))
-
-            self.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
-            self.roi_p25 = float(np.percentile(roi_values, 25))
-            self.expectancy_p25 = float(np.percentile(expectancy_values, 25))
 
     def _discover_fallback_leagues(self):
         """
