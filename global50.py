@@ -1095,6 +1095,111 @@ class AgentEvaluator:
 
         return sorted(context_windows)
 
+    def _sync_archive_directory(self, context_window_id: str, local_archive_dir: Path, cloud_archive_prefix: str) -> bool:
+        """
+        Sync archive directory between local and cloud for a context window.
+        
+        Args:
+            context_window_id: Context window ID (e.g., 'cw151')
+            local_archive_dir: Local archive directory path
+            cloud_archive_prefix: Cloud archive prefix (e.g., 'eigen2/global50/cw151/archive/')
+            
+        Returns:
+            True if synced successfully, False if errors occurred.
+        """
+        # Ensure local archive directory exists
+        local_archive_dir.mkdir(parents=True, exist_ok=True)
+        
+        # List local archive files
+        local_files = {}
+        if local_archive_dir.exists():
+            for f in local_archive_dir.glob("*"):
+                if f.is_file():
+                    local_files[f.name] = f
+        
+        # List cloud archive files
+        cloud_files = set()
+        try:
+            if self.cloud_sync.provider == "gcs":
+                blobs = self.cloud_sync.bucket.list_blobs(prefix=cloud_archive_prefix)
+                for blob in blobs:
+                    filename = blob.name.split('/')[-1]
+                    if filename:  # Skip empty names (directory markers)
+                        cloud_files.add(filename)
+            elif self.cloud_sync.provider == "s3":
+                paginator = self.cloud_sync.client.get_paginator('list_objects_v2')
+                pages = paginator.paginate(Bucket=self.cloud_sync.bucket_name, Prefix=cloud_archive_prefix)
+                for page in pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            filename = obj['Key'].split('/')[-1]
+                            if filename:
+                                cloud_files.add(filename)
+            elif self.cloud_sync.provider == "azure":
+                blob_list = self.cloud_sync.container_client.list_blobs(name_starts_with=cloud_archive_prefix)
+                for blob in blob_list:
+                    filename = blob.name.split('/')[-1]
+                    if filename:
+                        cloud_files.add(filename)
+        except Exception as e:
+            print(f"    ⚠ Error listing cloud archive: {e}")
+            return False
+        
+        local_file_names = set(local_files.keys())
+        
+        # Files only in cloud - download them
+        missing_local = cloud_files - local_file_names
+        downloaded = 0
+        failed_downloads = []
+        
+        for filename in missing_local:
+            cloud_path = f"{cloud_archive_prefix}{filename}"
+            local_path = local_archive_dir / filename
+            try:
+                if self.cloud_sync.download_file(cloud_path, str(local_path)):
+                    downloaded += 1
+                else:
+                    failed_downloads.append(filename)
+            except Exception as e:
+                failed_downloads.append(filename)
+        
+        if downloaded > 0:
+            print(f"    ✓ Downloaded {downloaded} archive file(s) from cloud")
+        if failed_downloads:
+            print(f"    ⚠ Failed to download {len(failed_downloads)} archive file(s)")
+            return False
+        
+        # Files only in local - upload them
+        missing_cloud = local_file_names - cloud_files
+        uploaded = 0
+        failed_uploads = []
+        
+        for filename in missing_cloud:
+            local_path = local_files[filename]
+            cloud_path = f"{cloud_archive_prefix}{filename}"
+            try:
+                if self.cloud_sync.upload_file_verified(str(local_path), cloud_path):
+                    uploaded += 1
+                else:
+                    failed_uploads.append(filename)
+            except Exception as e:
+                failed_uploads.append(filename)
+        
+        if uploaded > 0:
+            print(f"    ✓ Uploaded {uploaded} archive file(s) to cloud")
+        if failed_uploads:
+            print(f"    ⚠ Failed to upload {len(failed_uploads)} archive file(s)")
+            return False
+        
+        # Files in both - verify they match (simple size check for now)
+        common_files = local_file_names & cloud_files
+        if common_files:
+            # For now, we assume if files exist in both places they're synced
+            # A more thorough check would compare checksums, but that's expensive
+            pass
+        
+        return True
+
     def check_mirror_status_for_context_window(self, context_window_id: str) -> bool:
         """
         Check synchronization status for a specific context window.
@@ -1112,8 +1217,10 @@ class AgentEvaluator:
         local_dir = Path("global50") / context_window_id
         local_json_path = local_dir / "global50.json"
         local_agents_dir = local_dir / "agents"
+        local_archive_dir = local_dir / "archive"
         cloud_base = f"{self.cloud_sync.project_name}/global50/{context_window_id}"
         cloud_json_path = f"{cloud_base}/global50.json"
+        cloud_archive_prefix = f"{cloud_base}/archive/"
 
         print(f"\n  [{context_window_id}]")
 
@@ -1192,6 +1299,7 @@ class AgentEvaluator:
             # Create local directory structure
             local_dir.mkdir(parents=True, exist_ok=True)
             local_agents_dir.mkdir(parents=True, exist_ok=True)
+            local_archive_dir.mkdir(parents=True, exist_ok=True)
 
             # Move temp file to local json path
             import shutil
@@ -1240,6 +1348,12 @@ class AgentEvaluator:
             except Exception as e:
                 print(f"    ⚠ Error downloading agents: {e}")
                 return False
+
+            # Sync archive directory
+            print(f"    Syncing archive directory...")
+            archive_synced = self._sync_archive_directory(context_window_id, local_archive_dir, cloud_archive_prefix)
+            if not archive_synced:
+                print(f"    ⚠ Archive sync had errors (continuing anyway)")
 
             return True
 
@@ -1297,6 +1411,12 @@ class AgentEvaluator:
                     else:
                         print(f"    ✓ Downloaded {downloaded}/{missing_count} missing agents")
 
+                # Sync archive directory
+                print(f"    Syncing archive directory...")
+                archive_synced = self._sync_archive_directory(context_window_id, local_archive_dir, cloud_archive_prefix)
+                if not archive_synced:
+                    print(f"    ⚠ Archive sync had errors (continuing anyway)")
+
                 if temp_cloud_path and os.path.exists(temp_cloud_path):
                     os.unlink(temp_cloud_path)
                 return True
@@ -1336,6 +1456,11 @@ class AgentEvaluator:
                         print(f"    → Uploading local to cloud...")
                         if self.cloud_sync.upload_file_verified(str(local_json_path), cloud_json_path):
                             print(f"    ✓ Cloud updated to match local")
+                            # Sync archive directory
+                            print(f"    Syncing archive directory...")
+                            archive_synced = self._sync_archive_directory(context_window_id, local_archive_dir, cloud_archive_prefix)
+                            if not archive_synced:
+                                print(f"    ⚠ Archive sync had errors (continuing anyway)")
                             if temp_cloud_path and os.path.exists(temp_cloud_path):
                                 os.unlink(temp_cloud_path)
                             return True
@@ -1350,6 +1475,11 @@ class AgentEvaluator:
                         import shutil
                         shutil.copy(temp_cloud_path, str(local_json_path))
                         print(f"    ✓ Local updated to match cloud")
+                        # Sync archive directory
+                        print(f"    Syncing archive directory...")
+                        archive_synced = self._sync_archive_directory(context_window_id, local_archive_dir, cloud_archive_prefix)
+                        if not archive_synced:
+                            print(f"    ⚠ Archive sync had errors (continuing anyway)")
                         if temp_cloud_path and os.path.exists(temp_cloud_path):
                             os.unlink(temp_cloud_path)
                         return True
@@ -2482,16 +2612,27 @@ class AgentEvaluator:
         # We define a helper function to recompute thresholds after each promotion,
         # since check_and_promote internally calls _update_entry_threshold which resets to -inf.
         def recompute_thresholds_from_population():
-            """Recompute thresholds from existing population (used during archive-fill)."""
+            """Recompute thresholds from existing population (used during archive-fill).
+            
+            Segregates mavericks and non-mavericks to maintain proper gating metrics.
+            """
             if len(self.global_hof.entries) == 0:
                 return  # No entries, can't compute thresholds
             if len(self.global_hof.entries) >= self.global_hof.CAPACITY:
-                return  # Full, normal thresholds apply
+                return  # Full, normal thresholds apply (handled by _update_entry_threshold)
 
-            gauntlet_scores = [e.gauntlet_score for e in self.global_hof.entries]
-            roi_values = [e.roi for e in self.global_hof.entries]
-            expectancy_values = [e.expectancy for e in self.global_hof.entries]
-            cv_values = [e.cv for e in self.global_hof.entries]
+            # Filter for non-maverick agents to ensure clean separation of pools
+            non_mavericks = [e for e in self.global_hof.entries if not e.is_maverick]
+            
+            if not non_mavericks:
+                # Fallback if no non-mavericks exist (should prevent crash if logic violated)
+                non_mavericks = self.global_hof.entries
+
+            # Compute non-maverick thresholds
+            gauntlet_scores = [e.gauntlet_score for e in non_mavericks]
+            roi_values = [e.roi for e in non_mavericks]
+            expectancy_values = [e.expectancy for e in non_mavericks]
+            cv_values = [e.cv for e in non_mavericks]
 
             # Override the -inf/+inf thresholds with actual population statistics
             self.global_hof.entry_threshold = min(gauntlet_scores)
@@ -2507,6 +2648,42 @@ class AgentEvaluator:
             self.global_hof.gauntlet_p25 = float(np.percentile(gauntlet_scores, 25))
             self.global_hof.roi_p25 = float(np.percentile(roi_values, 25))
             self.global_hof.expectancy_p25 = float(np.percentile(expectancy_values, 25))
+
+            # Always calculate Maverick thresholds based on existing Mavericks (Highlander logic)
+            # This applies even if the Global 50 is not full.
+            mavericks = [e for e in self.global_hof.entries if e.is_maverick]
+            self.global_hof.maverick_count = len(mavericks)
+
+            if self.global_hof.maverick_count > 0:
+                m_gauntlet_scores = [e.gauntlet_score for e in mavericks]
+                m_roi_values = [e.roi for e in mavericks]
+                m_expectancy_values = [e.expectancy for e in mavericks]
+                m_cv_values = [e.cv for e in mavericks]
+
+                self.global_hof.maverick_entry_threshold = min(m_gauntlet_scores)
+                self.global_hof.maverick_roi_threshold = min(m_roi_values)
+                self.global_hof.maverick_expectancy_threshold = min(m_expectancy_values)
+                self.global_hof.maverick_cv_threshold = max(m_cv_values)
+
+                self.global_hof.maverick_gauntlet_median = float(np.percentile(m_gauntlet_scores, 50))
+                self.global_hof.maverick_roi_median = float(np.percentile(m_roi_values, 50))
+                self.global_hof.maverick_expectancy_median = float(np.percentile(m_expectancy_values, 50))
+
+                self.global_hof.maverick_gauntlet_p25 = float(np.percentile(m_gauntlet_scores, 25))
+                self.global_hof.maverick_roi_p25 = float(np.percentile(m_roi_values, 25))
+                self.global_hof.maverick_expectancy_p25 = float(np.percentile(m_expectancy_values, 25))
+            else:
+                # No Mavericks? Open entry for the first ones.
+                self.global_hof.maverick_entry_threshold = float('-inf')
+                self.global_hof.maverick_roi_threshold = float('-inf')
+                self.global_hof.maverick_expectancy_threshold = float('-inf')
+                self.global_hof.maverick_cv_threshold = float('inf')
+                self.global_hof.maverick_gauntlet_median = float('-inf')
+                self.global_hof.maverick_roi_median = float('-inf')
+                self.global_hof.maverick_expectancy_median = float('-inf')
+                self.global_hof.maverick_gauntlet_p25 = float('-inf')
+                self.global_hof.maverick_roi_p25 = float('-inf')
+                self.global_hof.maverick_expectancy_p25 = float('-inf')
 
         if current_size > 0 and current_size < self.global_hof.CAPACITY:
             recompute_thresholds_from_population()
@@ -2604,30 +2781,63 @@ class AgentEvaluator:
         # Tier 2: Relax P25 to 1/3 - minimums (4/4) + 1/3 P25
         # Tier 3: Remove P25 requirement - minimums only (4/4)
         def should_promote_with_tier(gauntlet_score: float, roi: float, expectancy: float, cv: float, tier: int, is_maverick: bool = False) -> bool:
-            """Check promotion with tiered criteria relaxation."""
+            """Check promotion with tiered criteria relaxation.
+            
+            Uses segregated thresholds for mavericks vs non-mavericks (Highlander rule).
+            """
+            # Select thresholds based on agent type (Maverick vs Standard)
+            # Maverick Highlander Rule: Mavericks compete ONLY against other Mavericks
+            if is_maverick and self.global_hof.maverick_count > 0:
+                threshold_gauntlet = self.global_hof.maverick_entry_threshold
+                threshold_roi = self.global_hof.maverick_roi_threshold
+                threshold_expectancy = self.global_hof.maverick_expectancy_threshold
+                threshold_cv = self.global_hof.maverick_cv_threshold
+                
+                p25_gauntlet = self.global_hof.maverick_gauntlet_p25
+                p25_roi = self.global_hof.maverick_roi_p25
+                p25_expectancy = self.global_hof.maverick_expectancy_p25
+                
+                median_gauntlet = self.global_hof.maverick_gauntlet_median
+                median_roi = self.global_hof.maverick_roi_median
+                median_expectancy = self.global_hof.maverick_expectancy_median
+            else:
+                # Standard agents (or Mavericks if none exist yet) compete against global thresholds
+                threshold_gauntlet = self.global_hof.entry_threshold
+                threshold_roi = self.global_hof.roi_threshold
+                threshold_expectancy = self.global_hof.expectancy_threshold
+                threshold_cv = self.global_hof.cv_threshold
+                
+                p25_gauntlet = self.global_hof.gauntlet_p25
+                p25_roi = self.global_hof.roi_p25
+                p25_expectancy = self.global_hof.expectancy_p25
+                
+                median_gauntlet = self.global_hof.gauntlet_median
+                median_roi = self.global_hof.roi_median
+                median_expectancy = self.global_hof.expectancy_median
+
             # Criterion 1: Must beat ALL 4 minimum thresholds
-            if gauntlet_score <= self.global_hof.entry_threshold:
+            if gauntlet_score <= threshold_gauntlet:
                 return False
-            if roi <= self.global_hof.roi_threshold:
+            if roi <= threshold_roi:
                 return False
-            if expectancy <= self.global_hof.expectancy_threshold:
+            if expectancy <= threshold_expectancy:
                 return False
             # CV check: lower is better, so agent CV must be < threshold
-            if cv >= self.global_hof.cv_threshold:
+            if cv >= threshold_cv:
                 return False
 
             # Count P25 breaches (need 2 of 3)
-            beats_gauntlet_p25 = gauntlet_score > self.global_hof.gauntlet_p25
-            beats_roi_p25 = roi > self.global_hof.roi_p25
-            beats_expectancy_p25 = expectancy > self.global_hof.expectancy_p25
+            beats_gauntlet_p25 = gauntlet_score > p25_gauntlet
+            beats_roi_p25 = roi > p25_roi
+            beats_expectancy_p25 = expectancy > p25_expectancy
             # Need 2 of 3 (gauntlet, ROI, expectancy)
             metrics_to_check_p25 = [beats_gauntlet_p25, beats_roi_p25, beats_expectancy_p25]
             count_above_p25 = sum(metrics_to_check_p25)
 
             # Count median breaches (need 1 of 3)
-            beats_gauntlet_median = gauntlet_score > self.global_hof.gauntlet_median
-            beats_roi_median = roi > self.global_hof.roi_median
-            beats_expectancy_median = expectancy > self.global_hof.expectancy_median
+            beats_gauntlet_median = gauntlet_score > median_gauntlet
+            beats_roi_median = roi > median_roi
+            beats_expectancy_median = expectancy > median_expectancy
             # Need 1 of 3 (gauntlet, ROI, expectancy)
             metrics_to_check_median = [beats_gauntlet_median, beats_roi_median, beats_expectancy_median]
             count_above_median = sum(metrics_to_check_median)
