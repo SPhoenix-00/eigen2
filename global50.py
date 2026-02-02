@@ -89,6 +89,48 @@ from utils.cloud_sync import get_cloud_sync_from_env
 from training.erl_trainer import ERLTrainer
 
 
+class TeeLogger:
+    """Logger that writes to both file and stdout."""
+
+    def __init__(self, filepath: Path):
+        """
+        Initialize TeeLogger.
+
+        Args:
+            filepath: Path to the log file
+        """
+        self.terminal = sys.stdout
+        self.log_file = open(filepath, 'w', encoding='utf-8', buffering=1)  # Line buffered
+
+    def write(self, message):
+        """Write message to both terminal and file."""
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()  # Ensure immediate write to disk
+
+    def flush(self):
+        """Flush both outputs."""
+        self.terminal.flush()
+        self.log_file.flush()
+
+    def isatty(self):
+        """Check if the terminal is a TTY (needed by wandb and other libraries)."""
+        return self.terminal.isatty()
+
+    def fileno(self):
+        """Return the file descriptor (needed by some libraries)."""
+        return self.terminal.fileno()
+
+    def close(self):
+        """Close the log file."""
+        self.log_file.close()
+
+    def __del__(self):
+        """Ensure file is closed on deletion."""
+        if hasattr(self, 'log_file') and not self.log_file.closed:
+            self.log_file.close()
+
+
 class AgentEvaluator:
     """Evaluates agents and promotes them to Global 50."""
 
@@ -3292,136 +3334,166 @@ Examples:
 
     args = parser.parse_args()
 
-    # Override context window if specified
-    context_window_days = None
-    if args.cw:
-        from utils.config import Config
-        context_window_days = args.cw
-        Config.CONTEXT_WINDOW_DAYS = args.cw
-        print(f"Using context window: cw{args.cw}")
+    # Setup logging when using --agent-dir --maverick
+    tee_logger = None
+    if args.agent_dir and args.maverick:
+        # Create evaluation_results directory
+        log_dir = Path("evaluation_results")
+        log_dir.mkdir(exist_ok=True)
 
-    # Handle --stats mode (doesn't need full evaluator setup)
-    if args.stats:
-        print_global50_stats(context_window_days=context_window_days)
-        return
+        # Create log file
+        log_file = log_dir / "log.txt"
 
-    # Initialize evaluator
-    evaluator = AgentEvaluator(run_name=args.run_name)
+        # Redirect stdout to both terminal and log file
+        tee_logger = TeeLogger(log_file)
+        sys.stdout = tee_logger
+        sys.stderr = tee_logger  # Also capture error messages
 
-    # Handle --init mode (first-time setup)
-    if args.init:
-        print("\n" + "="*70)
-        print("INITIALIZATION MODE - First-Time Setup")
-        print("="*70)
+        print("="*60)
+        print("Global 50 Agent Evaluation (Maverick Mode)")
+        print(f"Logging to: {log_file}")
+        print("="*60)
 
-        if evaluator.global_hof.enabled:
-            print("\n✓ Global 50 initialized successfully!")
-            print(f"  Cloud Provider: {evaluator.cloud_sync.provider}")
-            print(f"  Bucket: {evaluator.cloud_sync.bucket_name}")
-            print(f"  Project: {evaluator.cloud_sync.project_name}")
+    try:
+        # Override context window if specified
+        context_window_days = None
+        if args.cw:
+            from utils.config import Config
+            context_window_days = args.cw
+            Config.CONTEXT_WINDOW_DAYS = args.cw
+            print(f"Using context window: cw{args.cw}")
 
-            stats = evaluator.global_hof.get_stats()
-            print(f"\n  Current Size: {stats['size']}/50")
-            print(f"  Entry Threshold: {stats['entry_threshold']}")
+        # Handle --stats mode (doesn't need full evaluator setup)
+        if args.stats:
+            print_global50_stats(context_window_days=context_window_days)
+            return
 
-            print("\nGlobal 50 structure created and mirrored:")
-            print(f"  Local:  {evaluator.global_hof.local_dir}")
-            print(f"  Cloud:  gs://{evaluator.cloud_sync.bucket_name}/{evaluator.global_hof.cloud_base}/")
-            print(f"  Status: MIRRORED")
+        # Initialize evaluator
+        evaluator = AgentEvaluator(run_name=args.run_name)
 
-            print("\n  Subdirectories:")
-            print(f"    - agents/  (active Global 50 agents)")
-            print(f"    - archive/ (retired agents)")
+        # Handle --init mode (first-time setup)
+        if args.init:
+            print("\n" + "="*70)
+            print("INITIALIZATION MODE - First-Time Setup")
+            print("="*70)
 
-            print("\n✓ Setup complete! You can now run evaluations.")
-            print("\nNext step:")
-            print(f"  python global50.py --agent-dir <path>")
+            if evaluator.global_hof.enabled:
+                print("\n✓ Global 50 initialized successfully!")
+                print(f"  Cloud Provider: {evaluator.cloud_sync.provider}")
+                print(f"  Bucket: {evaluator.cloud_sync.bucket_name}")
+                print(f"  Project: {evaluator.cloud_sync.project_name}")
+
+                stats = evaluator.global_hof.get_stats()
+                print(f"\n  Current Size: {stats['size']}/50")
+                print(f"  Entry Threshold: {stats['entry_threshold']}")
+
+                print("\nGlobal 50 structure created and mirrored:")
+                print(f"  Local:  {evaluator.global_hof.local_dir}")
+                print(f"  Cloud:  gs://{evaluator.cloud_sync.bucket_name}/{evaluator.global_hof.cloud_base}/")
+                print(f"  Status: MIRRORED")
+
+                print("\n  Subdirectories:")
+                print(f"    - agents/  (active Global 50 agents)")
+                print(f"    - archive/ (retired agents)")
+
+                print("\n✓ Setup complete! You can now run evaluations.")
+                print("\nNext step:")
+                print(f"  python global50.py --agent-dir <path>")
+            else:
+                print("\n✗ Initialization FAILED")
+                print(f"  Cloud Provider: {evaluator.cloud_sync.provider}")
+                print("\nPlease check your environment variables:")
+                print("  - CLOUD_PROVIDER=gcs")
+                print("  - CLOUD_BUCKET=<your-bucket>")
+                print("  - GOOGLE_APPLICATION_CREDENTIALS=<path-to-credentials>")
+
+            print("\n" + "="*70)
+            return
+
+        # Handle --mirror mode (check sync status)
+        if args.mirror:
+            print("\n" + "="*70)
+            print("MIRROR CHECK MODE (All Context Windows)")
+            print("="*70)
+
+            in_sync = evaluator.check_mirror_status()
+
+            print("\n" + "="*70)
+            return
+
+        # Handle --trim mode (interactive multi-threshold trim)
+        if args.trim:
+            print("\n" + "="*70)
+            print("TRIM MODE")
+            print("="*70)
+
+            evaluator.trim_agents()
+
+            print("\n" + "="*70)
+            return
+
+        # Handle --eval mode (re-evaluate all agents)
+        if args.eval:
+            print("\n" + "="*70)
+            print("RE-EVALUATION MODE")
+            print("="*70)
+
+            evaluator.reevaluate_global50()
+
+            print("\n" + "="*70)
+            return
+
+        # Handle --cleanup and --cleanup-dry-run modes
+        if args.cleanup or args.cleanup_dry_run:
+            print("\n" + "="*70)
+            print("CLEANUP MODE")
+            print("="*70)
+
+            dry_run = args.cleanup_dry_run  # --cleanup-dry-run = dry run, --cleanup = actually archive
+            evaluator.cleanup_orphan_agents(dry_run=dry_run)
+
+            print("\n" + "="*70)
+            return
+
+        # Handle --archive-fill mode (fill Global 50 from archive)
+        if args.archive_fill:
+            print("\n" + "="*70)
+            print("ARCHIVE FILL MODE")
+            print("="*70)
+
+            evaluator.archive_fill()
+
+            print("\n" + "="*70)
+            return
+
+        # Require agent_dir for evaluation mode
+        if not args.agent_dir:
+            print("Error: --agent-dir is required (or use --init for first-time setup)")
+            parser.print_help()
+            return
+
+        # Convert to Path
+        agent_dir = Path(args.agent_dir)
+
+        # Evaluate agents
+        results = evaluator.evaluate_batch(agent_dir, is_maverick=args.maverick)
+
+        # Print summary
+        if results:
+            evaluator.print_summary(results)
         else:
-            print("\n✗ Initialization FAILED")
-            print(f"  Cloud Provider: {evaluator.cloud_sync.provider}")
-            print("\nPlease check your environment variables:")
-            print("  - CLOUD_PROVIDER=gcs")
-            print("  - CLOUD_BUCKET=<your-bucket>")
-            print("  - GOOGLE_APPLICATION_CREDENTIALS=<path-to-credentials>")
+            print("\nNo agents to evaluate. Exiting.")
 
-        print("\n" + "="*70)
-        return
+        print("\nEvaluation complete!")
 
-    # Handle --mirror mode (check sync status)
-    if args.mirror:
-        print("\n" + "="*70)
-        print("MIRROR CHECK MODE (All Context Windows)")
-        print("="*70)
-
-        in_sync = evaluator.check_mirror_status()
-
-        print("\n" + "="*70)
-        return
-
-    # Handle --trim mode (interactive multi-threshold trim)
-    if args.trim:
-        print("\n" + "="*70)
-        print("TRIM MODE")
-        print("="*70)
-
-        evaluator.trim_agents()
-
-        print("\n" + "="*70)
-        return
-
-    # Handle --eval mode (re-evaluate all agents)
-    if args.eval:
-        print("\n" + "="*70)
-        print("RE-EVALUATION MODE")
-        print("="*70)
-
-        evaluator.reevaluate_global50()
-
-        print("\n" + "="*70)
-        return
-
-    # Handle --cleanup and --cleanup-dry-run modes
-    if args.cleanup or args.cleanup_dry_run:
-        print("\n" + "="*70)
-        print("CLEANUP MODE")
-        print("="*70)
-
-        dry_run = args.cleanup_dry_run  # --cleanup-dry-run = dry run, --cleanup = actually archive
-        evaluator.cleanup_orphan_agents(dry_run=dry_run)
-
-        print("\n" + "="*70)
-        return
-
-    # Handle --archive-fill mode (fill Global 50 from archive)
-    if args.archive_fill:
-        print("\n" + "="*70)
-        print("ARCHIVE FILL MODE")
-        print("="*70)
-
-        evaluator.archive_fill()
-
-        print("\n" + "="*70)
-        return
-
-    # Require agent_dir for evaluation mode
-    if not args.agent_dir:
-        print("Error: --agent-dir is required (or use --init for first-time setup)")
-        parser.print_help()
-        return
-
-    # Convert to Path
-    agent_dir = Path(args.agent_dir)
-
-    # Evaluate agents
-    results = evaluator.evaluate_batch(agent_dir, is_maverick=args.maverick)
-
-    # Print summary
-    if results:
-        evaluator.print_summary(results)
-    else:
-        print("\nNo agents to evaluate. Exiting.")
-
-    print("\nEvaluation complete!")
+    finally:
+        # Restore original stdout/stderr and close log file if logging was enabled
+        if tee_logger:
+            sys.stdout = tee_logger.terminal
+            sys.stderr = tee_logger.terminal
+            log_file = tee_logger.log_file.name
+            tee_logger.close()
+            print(f"\n✓ Complete evaluation log saved to: {log_file}")
 
 
 if __name__ == "__main__":
