@@ -1812,7 +1812,14 @@ def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray,
 
         if len(active_coeffs) >= 20:
             # Sufficient history for this stock
-            threshold_vector[i] = np.percentile(active_coeffs, percentile)
+            # For very high percentiles (>= 99.0), ensure we have enough data points
+            # to avoid edge cases in percentile calculation
+            min_points_for_high_percentile = max(20, int(100 / (100 - percentile)) if percentile >= 99.0 else 20)
+            if len(active_coeffs) >= min_points_for_high_percentile:
+                threshold_vector[i] = np.percentile(active_coeffs, percentile)
+            else:
+                # Not enough points for reliable high percentile, use max value instead
+                threshold_vector[i] = np.max(active_coeffs) if len(active_coeffs) > 0 else global_threshold
         else:
             # Insufficient history, fallback to global threshold
             threshold_vector[i] = global_threshold
@@ -1821,7 +1828,8 @@ def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray,
 
 
 def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info,
-                                       context_window_days: int, percentile: float) -> list:
+                                       context_window_days: int, percentile: float,
+                                       val_tensor_cpu=None) -> list:
     """
     Recalculate conviction thresholds for all committee members at a given percentile.
 
@@ -1835,6 +1843,7 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
         holdout_info: Holdout period info dict
         context_window_days: Context window size
         percentile: Percentile to use for conviction threshold (e.g., 90, 95, 99, 99.9)
+        val_tensor_cpu: Optional pre-loaded validation tensor on CPU (for sweeps to avoid reloading)
 
     Returns:
         New list of member dicts with recalculated conviction thresholds
@@ -1844,57 +1853,84 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
     # Deep copy to avoid modifying original
     new_members = copy.deepcopy(members)
 
-    # Get validation data tensor (same as used during draft)
-    val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+    # Get validation data tensor (reuse if provided, otherwise load fresh)
+    if val_tensor_cpu is None:
+        val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+        # Move to CPU immediately to avoid GPU memory fragmentation
+        val_tensor_cpu = val_tensor.cpu()
+        del val_tensor
+        torch.cuda.empty_cache()
+        # Note: We don't delete val_tensor_cpu here since caller might want to reuse it
+        should_cleanup_tensor = True
+    else:
+        # Reusing provided tensor - don't clean it up
+        should_cleanup_tensor = False
     
-    # Move to CPU immediately to avoid GPU memory fragmentation
-    val_tensor_cpu = val_tensor.cpu()
-    del val_tensor
-    torch.cuda.empty_cache()
-    
-    num_days = len(valid_indices)
+    # num_days and num_stocks are not actually used in this function, but kept for potential future use
     num_stocks = Config.NUM_INVESTABLE_STOCKS
 
-    for member in tqdm(new_members, desc=f"Recalculating P{percentile} thresholds"):
+    for member_idx, member in enumerate(tqdm(new_members, desc=f"Recalculating P{percentile} thresholds")):
         filepath = get_agent_filepath(member, context_window_days)
         agent = load_agent_actor_only(filepath, 0)
 
         if agent is not None:
-            # Generate coefficients using same method as calculate_coefficient_correlations
-            with torch.no_grad():
-                batch_size = 32
-                num_samples = val_tensor_cpu.shape[0]
-                all_coefs = []
+            try:
+                # Generate coefficients using same method as calculate_coefficient_correlations
+                with torch.no_grad():
+                    batch_size = 32
+                    num_samples = val_tensor_cpu.shape[0]
+                    all_coefs = []
 
-                for start_idx in range(0, num_samples, batch_size):
-                    end_idx = min(start_idx + batch_size, num_samples)
-                    # Move batch to GPU only when needed
-                    batch = val_tensor_cpu[start_idx:end_idx].to(Config.DEVICE)
-                    batch_actions = agent.actor(batch).cpu().numpy()
-                    # Extract coefficients (first output dimension)
-                    all_coefs.append(batch_actions[:, :, 0])
-                    # Delete batch (but DON'T call empty_cache here - it's too expensive!)
-                    del batch
+                    for start_idx in range(0, num_samples, batch_size):
+                        end_idx = min(start_idx + batch_size, num_samples)
+                        # Move batch to GPU only when needed
+                        batch = val_tensor_cpu[start_idx:end_idx].to(Config.DEVICE)
+                        batch_actions = agent.actor(batch).cpu().numpy()
+                        # Extract coefficients (first output dimension)
+                        all_coefs.append(batch_actions[:, :, 0])
+                        # Delete batch (but DON'T call empty_cache here - it's too expensive!)
+                        del batch
 
-                # Concatenate to [Days, Stocks]
-                agent_coeffs_2d = np.concatenate(all_coefs, axis=0)
+                    # Concatenate to [Days, Stocks]
+                    agent_coeffs_2d = np.concatenate(all_coefs, axis=0)
 
-            # Recalculate with new percentile
-            conviction_threshold_vector = calculate_agent_stats_vectorized(
-                agent_coeffs_2d, percentile=percentile
-            )
-            member['stats']['conviction_threshold_vector'] = conviction_threshold_vector.tolist()
+                # Recalculate with new percentile
+                conviction_threshold_vector = calculate_agent_stats_vectorized(
+                    agent_coeffs_2d, percentile=percentile
+                )
+                member['stats']['conviction_threshold_vector'] = conviction_threshold_vector.tolist()
 
+            except Exception as e:
+                print(f"  ⚠ Error processing member {member.get('agent_id', member_idx)}: {e}")
+                import traceback
+                traceback.print_exc()
+            
             # Aggressive cleanup - move actor to CPU first to ensure GPU memory is released
-            agent.actor.cpu()
-            del agent
+            try:
+                if agent is not None:
+                    agent.actor.cpu()
+                    del agent
+            except:
+                pass
+            
             # Only call empty_cache once per agent, not per batch!
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            
+            # Additional cleanup every few agents to prevent memory buildup
+            # This helps prevent CUDA allocator fragmentation from many small allocations
+            if (member_idx + 1) % 3 == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # Reset peak stats to help allocator reconsider its caching strategy
+                    torch.cuda.reset_peak_memory_stats()
 
-    # Clean up val_tensor_cpu
-    del val_tensor_cpu
-    torch.cuda.empty_cache()
+    # Clean up val_tensor_cpu only if we created it (not if it was provided)
+    if should_cleanup_tensor:
+        del val_tensor_cpu
+        torch.cuda.empty_cache()
     gc.collect()
 
     return new_members
@@ -2990,6 +3026,14 @@ def run_combined_sweep(manager: CommitteeManager, loader, stats, holdout_info,
     total_combinations = len(quorum_values) * len(percentile_values)
     current_combination = 0
 
+    # Load validation tensor ONCE before the sweep to avoid reloading for each combination
+    print(f"\n  Pre-loading validation tensor for threshold recalculation...")
+    val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+    val_tensor_cpu = val_tensor.cpu()
+    del val_tensor
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
     for quorum in quorum_values:
         print(f"\n{'='*60}")
         print(f"QUORUM = {quorum}")
@@ -3004,11 +3048,11 @@ def run_combined_sweep(manager: CommitteeManager, loader, stats, holdout_info,
             print(f"COMBINATION {current_combination}/{total_combinations}: Quorum={quorum}, Conviction=P{percentile}")
             print(f"{'='*60}")
 
-            # Recalculate conviction thresholds with this percentile
+            # Recalculate conviction thresholds with this percentile (reuse pre-loaded tensor)
             print(f"  Recalculating thresholds for {len(roster['members'])} members at P{percentile}...")
             members_with_new_thresholds = recalculate_conviction_thresholds(
                 roster['members'], loader, stats, holdout_info,
-                context_window_days, percentile
+                context_window_days, percentile, val_tensor_cpu=val_tensor_cpu
             )
 
             # Run lightweight validation for sweep
@@ -3028,8 +3072,19 @@ def run_combined_sweep(manager: CommitteeManager, loader, stats, holdout_info,
             del members_with_new_thresholds
             gc.collect()
             if torch.cuda.is_available():
+                # Force PyTorch's CUDA allocator to release cached blocks
+                # empty_cache() only releases blocks that are truly free, but the allocator
+                # keeps a pool of cached blocks that can fragment over many allocations
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()  # Wait for all CUDA operations to complete
+                torch.cuda.synchronize()
+                # Additional cleanup: reset memory stats to force allocator to reconsider
+                # This doesn't free memory but can help with fragmentation
+                torch.cuda.reset_peak_memory_stats()
+
+    # Clean up pre-loaded validation tensor
+    del val_tensor_cpu
+    torch.cuda.empty_cache()
+    gc.collect()
 
     # Restore original quorum
     Config.COMMITTEE_QUORUM = original_quorum
