@@ -2311,6 +2311,9 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         if closed_trades:
             all_committee_closed_trades.extend(closed_trades)
         
+        # Initialize csv_filename (used in slice_result even when skipping exports)
+        csv_filename = None
+        
         # Skip exports during sweeps to save time
         if closed_trades and not skip_exports:
             # Sanitize dates for filename (replace slashes with dashes)
