@@ -1821,7 +1821,7 @@ def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray,
 
 
 def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info,
-                                       context_window_days: int, percentile: int) -> list:
+                                       context_window_days: int, percentile: float) -> list:
     """
     Recalculate conviction thresholds for all committee members at a given percentile.
 
@@ -1834,7 +1834,7 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
         stats: Normalization stats dict
         holdout_info: Holdout period info dict
         context_window_days: Context window size
-        percentile: Percentile to use for conviction threshold (e.g., 90, 95, 99)
+        percentile: Percentile to use for conviction threshold (e.g., 90, 95, 99, 99.9)
 
     Returns:
         New list of member dicts with recalculated conviction thresholds
@@ -2654,7 +2654,7 @@ def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
         stats: Normalization stats dict
         holdout_info: Holdout period info dict
         context_window_days: Context window size
-        percentile_values: List of percentile values to test (e.g., [90, 95, 99])
+        percentile_values: List of percentile values to test (e.g., [90, 95, 99, 99.9])
 
     Returns:
         Dict mapping percentile value to validation results
@@ -2744,6 +2744,141 @@ def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
     print(f"\n{'='*60}")
     print(f"RECOMMENDATION: P{best_percentile} achieved highest mean fitness ({best_fitness:.2f})")
     print(f"  Conviction trades at P{best_percentile}: {best_conviction_trades}")
+    print(f"{'='*60}")
+
+    return all_results
+
+
+def run_combined_sweep(manager: CommitteeManager, loader, stats, holdout_info,
+                       context_window_days: int, quorum_values: list, percentile_values: list) -> dict:
+    """
+    Run validation with multiple quorum values AND conviction percentiles in a grid search.
+    
+    This performs a nested sweep: for each quorum value, test all conviction percentiles.
+    This allows finding the optimal combination of both parameters.
+
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        quorum_values: List of quorum values to test (e.g., [2, 3, 4, 5])
+        percentile_values: List of percentile values to test (e.g., [90, 95, 99, 99.9])
+
+    Returns:
+        Dict mapping (quorum, percentile) tuple to validation results
+    """
+    print("\n" + "="*60)
+    print("COMBINED SWEEP: Grid Search Over Quorum & Conviction Percentile")
+    print("="*60)
+    print(f"  Quorum values to test: {quorum_values}")
+    print(f"  Percentile values to test: {percentile_values}")
+    print(f"  Total combinations: {len(quorum_values) * len(percentile_values)}")
+    print(f"  Committee size: {Config.COMMITTEE_SIZE}")
+
+    roster = manager.load_roster()
+    if roster is None:
+        print(f"❌ No roster found. Run --draft first.")
+        return None
+
+    original_quorum = Config.COMMITTEE_QUORUM
+    all_results = {}
+    total_combinations = len(quorum_values) * len(percentile_values)
+    current_combination = 0
+
+    for quorum in quorum_values:
+        print(f"\n{'='*60}")
+        print(f"QUORUM = {quorum}")
+        print(f"{'='*60}")
+        
+        # Override quorum
+        Config.COMMITTEE_QUORUM = quorum
+
+        for percentile in percentile_values:
+            current_combination += 1
+            print(f"\n{'='*60}")
+            print(f"COMBINATION {current_combination}/{total_combinations}: Quorum={quorum}, Conviction=P{percentile}")
+            print(f"{'='*60}")
+
+            # Recalculate conviction thresholds with this percentile
+            print(f"  Recalculating thresholds for {len(roster['members'])} members at P{percentile}...")
+            members_with_new_thresholds = recalculate_conviction_thresholds(
+                roster['members'], loader, stats, holdout_info,
+                context_window_days, percentile
+            )
+
+            # Run validation with current quorum and recalculated members
+            results = run_validation(
+                manager, loader, stats, holdout_info, context_window_days,
+                members_override=members_with_new_thresholds
+            )
+
+            if results:
+                all_results[(quorum, percentile)] = {
+                    'aggregate': results['committee_aggregate'],
+                    'consensus': results['consensus_summary'],
+                }
+
+            # Clean up between runs
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # Restore original quorum
+    Config.COMMITTEE_QUORUM = original_quorum
+
+    # Print comprehensive comparison summary
+    print("\n" + "="*60)
+    print("COMBINED SWEEP COMPARISON SUMMARY")
+    print("="*60)
+
+    # Main results table
+    print(f"\n{'Quorum':<8} {'Percentile':<12} {'Fitness':<10} {'Win Rate':<10} {'Quality':<10} {'Expectancy':<12} {'ROI':<10} {'Trades':<8}")
+    print("-" * 90)
+
+    # Sort by quorum first, then percentile
+    sorted_keys = sorted(all_results.keys(), key=lambda x: (x[0], x[1]))
+    
+    for key in sorted_keys:
+        quorum, percentile = key
+        agg = all_results[key]['aggregate']
+        # Handle inf/nan for quality ratio display
+        qr = agg['mean_quality_ratio']
+        qr_str = "inf" if np.isinf(qr) else ("nan" if np.isnan(qr) else f"{qr:.3f}")
+        print(f"{quorum:<8} P{percentile:<11} {agg['mean_fitness']:<10.2f} {agg['mean_win_rate']*100:<10.1f}% "
+              f"{qr_str:<10} {agg['mean_expectancy']:<12.6f} "
+              f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
+
+    # Consensus breakdown table
+    print(f"\n{'Quorum':<8} {'Percentile':<12} {'By Quorum':<12} {'By Conviction':<14} {'Vetoed':<10} {'Unanimity':<12} {'Avg Votes':<10}")
+    print("-" * 90)
+
+    for key in sorted_keys:
+        quorum, percentile = key
+        cs = all_results[key]['consensus']
+        if 'note' not in cs:
+            print(f"{quorum:<8} P{percentile:<11} {cs.get('total_trades_by_quorum', 0):<12} "
+                  f"{cs.get('total_trades_by_conviction', 0):<14} "
+                  f"{cs.get('total_trades_vetoed', 0):<10} "
+                  f"{cs.get('avg_unanimity_pct', 0):<12.1f}% "
+                  f"{cs.get('avg_consensus_votes', 0):<10.2f}")
+        else:
+            print(f"{quorum:<8} P{percentile:<11} {cs['note']}")
+
+    # Find best combination by fitness
+    best_key = max(all_results.keys(), key=lambda k: all_results[k]['aggregate']['mean_fitness'])
+    best_quorum, best_percentile = best_key
+    best_fitness = all_results[best_key]['aggregate']['mean_fitness']
+    best_consensus = all_results[best_key]['consensus']
+
+    print(f"\n{'='*60}")
+    print(f"RECOMMENDATION: Quorum={best_quorum}, Conviction=P{best_percentile}")
+    print(f"  Achieved highest mean fitness: {best_fitness:.2f}")
+    print(f"  Win Rate: {all_results[best_key]['aggregate']['mean_win_rate']*100:.2f}%")
+    print(f"  ROI: {all_results[best_key]['aggregate']['mean_roi']:.2f}%")
+    print(f"  Trades by Quorum: {best_consensus.get('total_trades_by_quorum', 0)}")
+    print(f"  Trades by Conviction: {best_consensus.get('total_trades_by_conviction', 0)}")
     print(f"{'='*60}")
 
     return all_results
@@ -3449,7 +3584,7 @@ def run_simulation(manager: CommitteeManager, loader, stats, context_window_days
 
 
 def update_conviction_percentile(manager: CommitteeManager, loader, stats, holdout_info,
-                                  context_window_days: int, percentile: int) -> bool:
+                                  context_window_days: int, percentile: float) -> bool:
     """
     Update conviction percentile in existing committee roster.
     
@@ -3867,8 +4002,8 @@ if __name__ == "__main__":
                         help='Check cloud sync status, download missing files')
     parser.add_argument('--update-maverick-flags', action='store_true',
                         help='Update is_maverick flags in committee roster from Global50')
-    parser.add_argument('--update-conviction', type=int, default=None,
-                        help='Update conviction percentile in roster (e.g., 90, 95, 99)')
+    parser.add_argument('--update-conviction', type=float, default=None,
+                        help='Update conviction percentile in roster (e.g., 90, 95, 99, 99.9)')
     parser.add_argument('--simulate', action='store_true',
                         help='Simulate committee deployment over a custom date range')
     parser.add_argument('--quorum', type=int, default=None,
@@ -3878,12 +4013,14 @@ if __name__ == "__main__":
     parser.add_argument('--conviction-percentile', type=int, default=None,
                         help='Override conviction percentile threshold (default: 95)')
     parser.add_argument('--sweep-conviction', type=str, default=None,
-                        help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99")')
+                        help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99,99.9")')
+    parser.add_argument('--sweep-both', type=str, default=None,
+                        help='Sweep both quorum and conviction (grid search). Format: "quorums:percentiles" (e.g., "2,3,4:90,95,99,99.9")')
     parser.add_argument('--swap-agent', type=str, default=None,
                         help='Evaluate and swap a specific agent (e.g. "run-name_id")')
     args = parser.parse_args()
 
-    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.update_maverick_flags and not args.update_conviction and not args.simulate and not args.sweep_quorum and not args.sweep_conviction and not args.swap_agent:
+    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.update_maverick_flags and not args.update_conviction and not args.simulate and not args.sweep_quorum and not args.sweep_conviction and not args.sweep_both and not args.swap_agent:
         print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--update-maverick-flags] [--update-conviction] [--simulate] [--swap-agent]")
         print("\nOptions:")
         print("  --draft              Run Phase 1: Draft committee from Global50 (interactive refinement)")
@@ -3893,12 +4030,13 @@ if __name__ == "__main__":
         print("  --verify-only        Verify data split without running")
         print("  --mirror             Check cloud sync status, download missing files")
         print("  --update-maverick-flags  Update is_maverick flags in committee roster from Global50")
-        print("  --update-conviction N    Update conviction percentile in roster (e.g., 90, 95, 99)")
+        print("  --update-conviction N    Update conviction percentile in roster (e.g., 90, 95, 99, 99.9)")
         print("  --simulate           Simulate committee deployment over a custom date range")
         print("  --quorum N       Override quorum threshold for validation (default: 3)")
         print("  --sweep-quorum   Sweep multiple quorum values (e.g., '2,3,4,5')")
         print("  --conviction-percentile N  Override conviction percentile (default: 95)")
-        print("  --sweep-conviction  Sweep multiple conviction percentiles (e.g., '90,95,99')")
+        print("  --sweep-conviction  Sweep multiple conviction percentiles (e.g., '90,95,99,99.9')")
+        print("  --sweep-both     Sweep both quorum and conviction (grid search). Format: 'quorums:percentiles' (e.g., '2,3,4:90,95,99,99.9')")
         exit(0)
 
     print("Initializing Committee Engine...")
@@ -3945,7 +4083,7 @@ if __name__ == "__main__":
 
     # Handle --update-conviction mode
     if args.update_conviction is not None:
-        if not (1 <= args.update_conviction <= 100):
+        if not (1.0 <= args.update_conviction <= 100.0):
             print("❌ Percentile must be between 1 and 100")
             exit(1)
         update_conviction_percentile(manager, loader, stats, holdout_info, context_window_days, args.update_conviction)
@@ -3978,8 +4116,22 @@ if __name__ == "__main__":
 
     # Handle --sweep-conviction (runs validation multiple times with different percentiles)
     if args.sweep_conviction:
-        percentile_values = [int(p.strip()) for p in args.sweep_conviction.split(',')]
+        percentile_values = [float(p.strip()) for p in args.sweep_conviction.split(',')]
         run_conviction_sweep(manager, loader, stats, holdout_info, context_window_days, percentile_values)
+        exit(0)
+
+    # Handle --sweep-both (grid search over quorum and conviction percentile)
+    if args.sweep_both:
+        if ':' not in args.sweep_both:
+            print("❌ --sweep-both format error. Expected format: 'quorums:percentiles' (e.g., '2,3,4:90,95,99')")
+            exit(1)
+        parts = args.sweep_both.split(':', 1)
+        if len(parts) != 2:
+            print("❌ --sweep-both format error. Expected format: 'quorums:percentiles' (e.g., '2,3,4:90,95,99')")
+            exit(1)
+        quorum_values = [int(q.strip()) for q in parts[0].split(',')]
+        percentile_values = [float(p.strip()) for p in parts[1].split(',')]
+        run_combined_sweep(manager, loader, stats, holdout_info, context_window_days, quorum_values, percentile_values)
         exit(0)
 
     # Handle --quorum override
