@@ -1873,9 +1873,8 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
                     batch_actions = agent.actor(batch).cpu().numpy()
                     # Extract coefficients (first output dimension)
                     all_coefs.append(batch_actions[:, :, 0])
-                    # Immediately delete batch from GPU
+                    # Delete batch (but DON'T call empty_cache here - it's too expensive!)
                     del batch
-                    torch.cuda.empty_cache()
 
                 # Concatenate to [Days, Stocks]
                 agent_coeffs_2d = np.concatenate(all_coefs, axis=0)
@@ -1886,8 +1885,10 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
             )
             member['stats']['conviction_threshold_vector'] = conviction_threshold_vector.tolist()
 
-            # Aggressive cleanup
+            # Aggressive cleanup - move actor to CPU first to ensure GPU memory is released
+            agent.actor.cpu()
             del agent
+            # Only call empty_cache once per agent, not per batch!
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
