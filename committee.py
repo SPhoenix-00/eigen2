@@ -1846,6 +1846,12 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
 
     # Get validation data tensor (same as used during draft)
     val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+    
+    # Move to CPU immediately to avoid GPU memory fragmentation
+    val_tensor_cpu = val_tensor.cpu()
+    del val_tensor
+    torch.cuda.empty_cache()
+    
     num_days = len(valid_indices)
     num_stocks = Config.NUM_INVESTABLE_STOCKS
 
@@ -1857,15 +1863,19 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
             # Generate coefficients using same method as calculate_coefficient_correlations
             with torch.no_grad():
                 batch_size = 32
-                num_samples = val_tensor.shape[0]
+                num_samples = val_tensor_cpu.shape[0]
                 all_coefs = []
 
                 for start_idx in range(0, num_samples, batch_size):
                     end_idx = min(start_idx + batch_size, num_samples)
-                    batch = val_tensor[start_idx:end_idx]
+                    # Move batch to GPU only when needed
+                    batch = val_tensor_cpu[start_idx:end_idx].to(Config.DEVICE)
                     batch_actions = agent.actor(batch).cpu().numpy()
                     # Extract coefficients (first output dimension)
                     all_coefs.append(batch_actions[:, :, 0])
+                    # Immediately delete batch from GPU
+                    del batch
+                    torch.cuda.empty_cache()
 
                 # Concatenate to [Days, Stocks]
                 agent_coeffs_2d = np.concatenate(all_coefs, axis=0)
@@ -1876,8 +1886,15 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
             )
             member['stats']['conviction_threshold_vector'] = conviction_threshold_vector.tolist()
 
+            # Aggressive cleanup
             del agent
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+    # Clean up val_tensor_cpu
+    del val_tensor_cpu
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return new_members
 
@@ -2037,10 +2054,12 @@ def evaluate_committee_on_slice(members: list, loader, stats,
         # The 'day' field in the trade is already the exit date (when close action occurred)
         trade['exit_date'] = trade.get('day', '')
 
-    # Clean up
+    # Aggressive cleanup
     committee.cleanup()
+    del committee
     del env
     torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
     # Return metrics in expected format
     return {
@@ -2825,10 +2844,13 @@ def run_combined_sweep(manager: CommitteeManager, loader, stats, holdout_info,
                     'consensus': results['consensus_summary'],
                 }
 
-            # Clean up between runs
+            # Aggressive cleanup - delete everything except stored results
+            del results
+            del members_with_new_thresholds
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Wait for all CUDA operations to complete
 
     # Restore original quorum
     Config.COMMITTEE_QUORUM = original_quorum
