@@ -1949,6 +1949,9 @@ def evaluate_agent_on_slice(agent_path: Path, loader, stats,
         'expectancy': summary['avg_reward_per_trade'],
         'roi': summary['roi'],
         'fitness': summary['total_reward'],  # Total reward is the fitness
+        'raw_pnl': summary.get('raw_pnl', 0.0),
+        'peak_capital_employed': summary.get('peak_capital_employed', 0.0),
+        'closed_trades': summary.get('closed_trades', []),
     }
 
 
@@ -2054,6 +2057,40 @@ def evaluate_committee_on_slice(members: list, loader, stats,
         'raw_pnl': summary.get('raw_pnl', 0.0),
         'peak_capital_employed': summary.get('peak_capital_employed', 0.0),
     }
+
+
+def calculate_expectancy(closed_trades):
+    """
+    Calculate Expectancy metric for trading performance.
+
+    Expectancy = (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
+
+    Args:
+        closed_trades: List of closed trade dictionaries with 'gain_pct' field
+
+    Returns:
+        Expectancy value (float)
+    """
+    if not closed_trades:
+        return 0.0
+
+    # Separate wins and losses
+    wins = [t['gain_pct'] for t in closed_trades if t['gain_pct'] > 0]
+    losses = [abs(t['gain_pct']) for t in closed_trades if t['gain_pct'] <= 0]
+
+    if not wins and not losses:
+        return 0.0
+
+    avg_win = np.mean(wins) if wins else 0.0
+    avg_loss = np.mean(losses) if losses else 0.0
+
+    win_rate = len(wins) / len(closed_trades)
+    loss_rate = 1.0 - win_rate
+
+    # Expectancy = (Probability of Win * Reward) - (Probability of Loss * Risk)
+    expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+
+    return expectancy
 
 
 def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
@@ -2188,6 +2225,8 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             end_date = loader.dates[slice_end - 1]  # -1 because slice_end is exclusive
 
             metrics = evaluate_agent_on_slice(filepath, loader, stats, slice_start, slice_end)
+            # Collect closed trades for aggregate expectancy calculation
+            closed_trades_agent = metrics.get('closed_trades', [])
             agent_results['slice_metrics'].append({
                 'slice': s,
                 'slice_type': slice_type,
@@ -2204,24 +2243,44 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
                 'num_trades': metrics.get('num_trades', 0),
                 'num_wins': metrics.get('num_wins', 0),
                 'num_losses': metrics.get('num_losses', 0),
+                'raw_pnl': metrics.get('raw_pnl', 0.0),
+                'peak_capital_employed': metrics.get('peak_capital_employed', 0.0),
+                'closed_trades': closed_trades_agent,
             })
 
         # Calculate aggregates for this agent
         agent_results['fresh_mean_fitness'] = float(np.mean([m['fitness'] for m in agent_results['slice_metrics']]))
-        agent_results['fresh_mean_win_rate'] = float(np.mean([m['win_rate'] for m in agent_results['slice_metrics']]))
-        # Calculate aggregate quality ratio from total wins/losses across all slices
+        # Calculate aggregate win rate from total wins/trades across all slices
         total_wins_agent = sum([m.get('num_wins', 0) for m in agent_results['slice_metrics']])
         total_losses_agent = sum([m.get('num_losses', 0) for m in agent_results['slice_metrics']])
+        total_trades_agent = total_wins_agent + total_losses_agent
+        agent_results['fresh_mean_win_rate'] = (
+            (total_wins_agent / total_trades_agent) if total_trades_agent > 0 else 0.0
+        )
+        # Calculate aggregate quality ratio from total wins/losses across all slices
         agent_results['fresh_mean_quality_ratio'] = (
             (total_wins_agent / total_losses_agent) if total_losses_agent > 0 else float('inf')
         )
-        agent_results['fresh_mean_expectancy'] = float(np.mean([m['expectancy'] for m in agent_results['slice_metrics']]))
-        agent_results['fresh_mean_roi'] = float(np.mean([m['roi'] for m in agent_results['slice_metrics']]))
+        # Calculate aggregate expectancy from all closed trades across all slices
+        all_agent_closed_trades = []
+        for m in agent_results['slice_metrics']:
+            if m.get('closed_trades'):
+                all_agent_closed_trades.extend(m['closed_trades'])
+        agent_results['fresh_mean_expectancy'] = float(calculate_expectancy(all_agent_closed_trades))
+        # Calculate aggregate ROI from total raw_pnl / total peak_capital_employed across all slices
+        total_raw_pnl_agent = sum([m.get('raw_pnl', 0.0) for m in agent_results['slice_metrics']])
+        total_peak_capital_agent = sum([m.get('peak_capital_employed', 0.0) for m in agent_results['slice_metrics']])
+        agent_results['fresh_mean_roi'] = (
+            (total_raw_pnl_agent / total_peak_capital_agent * 100) if total_peak_capital_agent > 0 else 0.0
+        )
 
         results['individual_agents'].append(agent_results)
 
     # Validate committee consensus on each slice
     print(f"\nValidating committee consensus...")
+
+    # Collect all closed trades across slices for aggregate calculations
+    all_committee_closed_trades = []
 
     for s in range(num_slices):
         # Calculate absolute slice indices (deterministic, evenly spaced)
@@ -2248,6 +2307,9 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
 
         # Save closed trades to CSV and upload to cloud
         closed_trades = metrics.get('closed_trades', [])
+        # Collect closed trades for aggregate calculations
+        if closed_trades:
+            all_committee_closed_trades.extend(closed_trades)
         if closed_trades:
             # Sanitize dates for filename (replace slashes with dashes)
             start_date_safe = sanitize_date_for_filename(start_date)
@@ -2341,20 +2403,26 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     results['committee_aggregate']['mean_fitness'] = float(
         np.mean([s['fitness'] for s in results['committee_slices']])
     )
-    results['committee_aggregate']['mean_win_rate'] = float(
-        np.mean([s['win_rate'] for s in results['committee_slices']])
-    )
-    # Calculate aggregate quality ratio from total wins/losses across all slices
+    # Calculate aggregate win rate from total wins/trades across all slices
     total_wins = sum([s.get('num_wins', 0) for s in results['committee_slices']])
     total_losses = sum([s.get('num_losses', 0) for s in results['committee_slices']])
+    total_trades = total_wins + total_losses
+    results['committee_aggregate']['mean_win_rate'] = (
+        (total_wins / total_trades) if total_trades > 0 else 0.0
+    )
+    # Calculate aggregate quality ratio from total wins/losses across all slices
     results['committee_aggregate']['mean_quality_ratio'] = (
         (total_wins / total_losses) if total_losses > 0 else float('inf')
     )
+    # Calculate aggregate expectancy from all closed trades across all slices
     results['committee_aggregate']['mean_expectancy'] = float(
-        np.mean([s['expectancy'] for s in results['committee_slices']])
+        calculate_expectancy(all_committee_closed_trades)
     )
-    results['committee_aggregate']['mean_roi'] = float(
-        np.mean([s['roi'] for s in results['committee_slices']])
+    # Calculate aggregate ROI from total raw_pnl / total peak_capital_employed across all slices
+    total_raw_pnl = sum([s.get('raw_pnl', 0.0) for s in results['committee_slices']])
+    total_peak_capital = sum([s.get('peak_capital_employed', 0.0) for s in results['committee_slices']])
+    results['committee_aggregate']['mean_roi'] = (
+        (total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0
     )
     results['committee_aggregate']['total_trades'] = int(
         sum([s['num_trades'] for s in results['committee_slices']])
