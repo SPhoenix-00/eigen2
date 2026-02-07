@@ -3348,6 +3348,169 @@ def run_simulation(manager: CommitteeManager, loader, stats, context_window_days
     return metrics
 
 
+def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent_to_swap: str):
+    """
+    Find best replacement candidates for a specific committee member.
+    """
+    print("\n" + "="*60)
+    print(f"COMMITTEE AGENT SWAP EVALUATION")
+    print(f"Target: {agent_to_swap}")
+    print("="*60)
+
+    # 1. Load Roster
+    roster = manager.load_roster()
+    if not roster:
+        print("❌ No committee roster found. Run --draft first.")
+        return
+
+    # 2. Check if agent exists in roster
+    current_ids = [f"{m['run_name']}_{m['agent_id']}" for m in roster['members']]
+    if agent_to_swap not in current_ids:
+        print(f"❌ Agent {agent_to_swap} not found in current committee.")
+        print(f"Current members: {', '.join(current_ids)}")
+        return
+
+    # 3. Load Global50 candidates
+    entries = load_global50_candidates(manager.context_window_days)
+    if not entries:
+        return
+
+    # 4. Map IDs to indices
+    entry_map = {f"{e['run_name']}_{e['agent_id']}": i for i, e in enumerate(entries)}
+    
+    current_indices = []
+    target_idx = -1
+    
+    for mid in current_ids:
+        if mid in entry_map:
+            idx = entry_map[mid]
+            current_indices.append(idx)
+            if mid == agent_to_swap:
+                target_idx = idx
+        else:
+            print(f"⚠ Warning: Member {mid} not found in Global50 (skipping)")
+
+    if target_idx == -1:
+        print(f"❌ Target {agent_to_swap} not found in Global50.")
+        return
+
+    base_indices = [i for i in current_indices if i != target_idx]
+
+    # 5. Calculate Correlations (Validation Data)
+    print("\nCalculating coefficient correlations (this may take a moment)...")
+    val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+    corr_matrix, coefficients, _ = calculate_coefficient_correlations(
+        entries, val_tensor, manager.context_window_days
+    )
+
+    # 6. Evaluate Current Committee
+    curr_obj, curr_score, curr_avg, curr_max = committee_objective(tuple(current_indices), entries, corr_matrix)
+    print(f"\nCurrent Committee Status:")
+    print(f"  Objective: {curr_obj:.2f}")
+    print(f"  Score Sum: {curr_score:.2f}")
+    print(f"  Avg Corr:  {curr_avg:.4f}")
+
+    # 7. Find Candidates
+    candidates = []
+    for i in range(len(entries)):
+        if i in current_indices: continue
+        if corr_matrix[i, i] != 1.0: continue # Invalid data
+
+        # Trial committee
+        trial_indices = tuple(sorted(base_indices + [i]))
+        obj, score, avg, mx = committee_objective(trial_indices, entries, corr_matrix)
+        
+        candidates.append({
+            'index': i,
+            'entry': entries[i],
+            'objective': obj,
+            'score': score,
+            'avg_corr': avg,
+            'max_corr': mx
+        })
+
+    candidates.sort(key=lambda x: x['objective'], reverse=True)
+
+    # 8. Display Top 10
+    print(f"\nTop 10 Swap Candidates for {agent_to_swap}:")
+    print(f"{'#':<3} {'Agent':<25} {'Obj':<10} {'Diff':<8} {'Score':<10} {'AvgCorr':<8} {'ROI':<7} {'M'}")
+    print("-" * 90)
+
+    for rank, c in enumerate(candidates[:10]):
+        e = c['entry']
+        eid = f"{e['run_name']}_{e['agent_id']}"
+        diff = c['objective'] - curr_obj
+        mav = "✓" if e.get('is_maverick') else ""
+        print(f"{rank+1:<3} {eid:<25} {c['objective']:.2f}      {diff:+.2f}    {c['score']:.2f}      {c['avg_corr']:.4f}   {e.get('roi',0):.1f}%   {mav}")
+
+    # 9. Interactive Swap
+    choice = input("\nEnter candidate rank to swap (or Enter to cancel): ")
+    if not choice.isdigit():
+        return
+
+    rank = int(choice)
+    if 1 <= rank <= len(candidates):
+        chosen = candidates[rank-1]
+        print(f"\nSwapping {agent_to_swap} ➔ {chosen['entry']['run_name']}_{chosen['entry']['agent_id']}...")
+        
+        # Calculate stats for new member
+        chosen_coeffs = coefficients[chosen['index']]
+        # Reshape: [Days * Stocks] -> [Days, Stocks]
+        num_days = len(valid_indices)
+        num_stocks = Config.NUM_INVESTABLE_STOCKS
+        chosen_coeffs_2d = chosen_coeffs.reshape(num_days, num_stocks)
+        
+        conviction_vec = calculate_agent_stats_vectorized(chosen_coeffs_2d)
+        
+        # Build new member dict
+        e = chosen['entry']
+        new_member = {
+            'filename': f"{e['run_name']}_{e['agent_id']}.pth",
+            'agent_id': e['agent_id'],
+            'run_name': e['run_name'],
+            'gauntlet_score': e['gauntlet_score'],
+            'roi': e.get('roi', 0.0),
+            'expectancy': e.get('expectancy', 0.0),
+            'quality_ratio': e.get('quality_ratio', 0.0),
+            'win_ratio': e.get('win_ratio', 0.0),
+            'is_maverick': e.get('is_maverick', False),
+            'stats': {
+                'conviction_threshold_vector': conviction_vec.tolist()
+            }
+        }
+        
+        # Update roster members
+        new_roster_members = []
+        for m in roster['members']:
+            mid = f"{m['run_name']}_{m['agent_id']}"
+            if mid == agent_to_swap:
+                new_roster_members.append(new_member)
+            else:
+                new_roster_members.append(m)
+        
+        roster['members'] = new_roster_members
+        
+        # Update roster metadata
+        roster['aggregate_score'] = chosen['score']
+        roster['objective_value'] = chosen['objective']
+        roster['correlation']['average'] = chosen['avg_corr']
+        roster['correlation']['max_pair'] = chosen['max_corr']
+        roster['last_updated'] = str(datetime.now())
+        
+        # Construct new submatrix for visualization
+        new_indices = tuple(sorted(base_indices + [chosen['index']]))
+        n_new = len(new_indices)
+        sub_matrix = np.zeros((n_new, n_new))
+        for r in range(n_new):
+            for c_col in range(n_new):
+                sub_matrix[r, c_col] = corr_matrix[new_indices[r], new_indices[c_col]]
+                
+        roster['correlation']['matrix'] = sub_matrix.tolist()
+        
+        manager.save_roster(roster, sub_matrix)
+        print("✓ Swap complete!")
+
+
 # --- Main ---
 
 if __name__ == "__main__":
@@ -3376,10 +3539,12 @@ if __name__ == "__main__":
                         help='Override conviction percentile threshold (default: 95)')
     parser.add_argument('--sweep-conviction', type=str, default=None,
                         help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99")')
+    parser.add_argument('--swap-agent', type=str, default=None,
+                        help='Evaluate and swap a specific agent (e.g. "run-name_id")')
     args = parser.parse_args()
 
-    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.update_maverick_flags and not args.simulate and not args.sweep_quorum and not args.sweep_conviction:
-        print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--update-maverick-flags] [--simulate]")
+    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.update_maverick_flags and not args.simulate and not args.sweep_quorum and not args.sweep_conviction and not args.swap_agent:
+        print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--update-maverick-flags] [--simulate] [--swap-agent]")
         print("\nOptions:")
         print("  --draft              Run Phase 1: Draft committee from Global50 (interactive refinement)")
         print("  --draft-deep         Run Phase 1 with automatic deep refinement (no manual swaps)")
@@ -3435,6 +3600,11 @@ if __name__ == "__main__":
 
     if args.verify_only:
         print("\n✓ Verification complete.")
+        exit(0)
+
+    # Handle --swap-agent
+    if args.swap_agent:
+        run_swap_agent(manager, loader, stats, holdout_info, args.swap_agent)
         exit(0)
 
     # Validate --maverick is used with draft
