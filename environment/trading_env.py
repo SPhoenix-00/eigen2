@@ -123,8 +123,8 @@ class TradingEnvironment(gym.Env):
         # Define action and observation spaces
         # Action: [108 stocks, 2 values (coefficient, sale_target)]
         self.action_space = spaces.Box(
-            low=np.array([[0.0, Config.MIN_SALE_TARGET]] * Config.NUM_INVESTABLE_STOCKS),
-            high=np.array([[np.inf, Config.MAX_SALE_TARGET]] * Config.NUM_INVESTABLE_STOCKS),
+            low=np.array([[0.0, Config.MIN_SALE_TARGET]] * Config.NUM_INVESTABLE_STOCKS, dtype=np.float32),
+            high=np.array([[np.inf, Config.MAX_SALE_TARGET]] * Config.NUM_INVESTABLE_STOCKS, dtype=np.float32),
             shape=(Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM),
             dtype=np.float32
         )
@@ -135,8 +135,8 @@ class TradingEnvironment(gym.Env):
                     data_array.shape[1],  # num_columns
                     Config.FEATURES_PER_CELL)
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
+            low=np.float32(-np.inf),
+            high=np.float32(np.inf),
             shape=obs_shape,
             dtype=np.float32
         )
