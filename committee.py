@@ -1942,6 +1942,8 @@ def evaluate_agent_on_slice(agent_path: Path, loader, stats,
     # Return metrics in expected format
     return {
         'num_trades': summary['num_trades'],
+        'num_wins': summary['num_wins'],
+        'num_losses': summary['num_losses'],
         'win_rate': summary['win_rate'],
         'quality_ratio': (summary['num_wins'] / summary['num_losses']) if summary['num_losses'] > 0 else float('inf'),
         'expectancy': summary['avg_reward_per_trade'],
@@ -2040,6 +2042,8 @@ def evaluate_committee_on_slice(members: list, loader, stats,
     # Return metrics in expected format
     return {
         'num_trades': summary['num_trades'],
+        'num_wins': summary['num_wins'],
+        'num_losses': summary['num_losses'],
         'win_rate': summary['win_rate'],
         'quality_ratio': (summary['num_wins'] / summary['num_losses']) if summary['num_losses'] > 0 else float('inf'),
         'expectancy': summary['avg_reward_per_trade'],
@@ -2050,22 +2054,6 @@ def evaluate_committee_on_slice(members: list, loader, stats,
         'raw_pnl': summary.get('raw_pnl', 0.0),
         'peak_capital_employed': summary.get('peak_capital_employed', 0.0),
     }
-
-
-def safe_mean_quality_ratio(values):
-    """Calculate mean of quality ratio values, excluding inf and nan.
-    
-    When calculating mean quality ratio, we filter out inf values (which occur
-    when num_losses=0) to get a mathematically correct mean. If all values
-    are inf, we return inf. If all values are nan, we return nan.
-    """
-    finite_values = [v for v in values if np.isfinite(v)]
-    if not finite_values:
-        # If no finite values, check if any are inf
-        if any(np.isinf(v) for v in values):
-            return float('inf')
-        return float('nan')
-    return float(np.mean(finite_values))
 
 
 def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
@@ -2214,12 +2202,19 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
                 'expectancy': metrics.get('expectancy', 0.0),
                 'roi': metrics.get('roi', 0.0),
                 'num_trades': metrics.get('num_trades', 0),
+                'num_wins': metrics.get('num_wins', 0),
+                'num_losses': metrics.get('num_losses', 0),
             })
 
         # Calculate aggregates for this agent
         agent_results['fresh_mean_fitness'] = float(np.mean([m['fitness'] for m in agent_results['slice_metrics']]))
         agent_results['fresh_mean_win_rate'] = float(np.mean([m['win_rate'] for m in agent_results['slice_metrics']]))
-        agent_results['fresh_mean_quality_ratio'] = safe_mean_quality_ratio([m['quality_ratio'] for m in agent_results['slice_metrics']])
+        # Calculate aggregate quality ratio from total wins/losses across all slices
+        total_wins_agent = sum([m.get('num_wins', 0) for m in agent_results['slice_metrics']])
+        total_losses_agent = sum([m.get('num_losses', 0) for m in agent_results['slice_metrics']])
+        agent_results['fresh_mean_quality_ratio'] = (
+            (total_wins_agent / total_losses_agent) if total_losses_agent > 0 else float('inf')
+        )
         agent_results['fresh_mean_expectancy'] = float(np.mean([m['expectancy'] for m in agent_results['slice_metrics']]))
         agent_results['fresh_mean_roi'] = float(np.mean([m['roi'] for m in agent_results['slice_metrics']]))
 
@@ -2332,6 +2327,8 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
             'expectancy': metrics.get('expectancy', 0.0),
             'roi': metrics.get('roi', 0.0),
             'num_trades': metrics.get('num_trades', 0),
+            'num_wins': metrics.get('num_wins', 0),
+            'num_losses': metrics.get('num_losses', 0),
             'consensus_stats': metrics.get('consensus_stats', {'note': 'Consensus applied per-step'}),
             'raw_pnl': metrics.get('raw_pnl', 0.0),
             'peak_capital_employed': metrics.get('peak_capital_employed', 0.0),
@@ -2347,8 +2344,11 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     results['committee_aggregate']['mean_win_rate'] = float(
         np.mean([s['win_rate'] for s in results['committee_slices']])
     )
-    results['committee_aggregate']['mean_quality_ratio'] = safe_mean_quality_ratio(
-        [s['quality_ratio'] for s in results['committee_slices']]
+    # Calculate aggregate quality ratio from total wins/losses across all slices
+    total_wins = sum([s.get('num_wins', 0) for s in results['committee_slices']])
+    total_losses = sum([s.get('num_losses', 0) for s in results['committee_slices']])
+    results['committee_aggregate']['mean_quality_ratio'] = (
+        (total_wins / total_losses) if total_losses > 0 else float('inf')
     )
     results['committee_aggregate']['mean_expectancy'] = float(
         np.mean([s['expectancy'] for s in results['committee_slices']])
@@ -3089,6 +3089,8 @@ def simulate_committee_continuous(members: list, loader, stats,
 
     return {
         'num_trades': summary['num_trades'],
+        'num_wins': summary['num_wins'],
+        'num_losses': summary['num_losses'],
         'win_rate': summary['win_rate'],
         'quality_ratio': (summary['num_wins'] / summary['num_losses']) if summary['num_losses'] > 0 else float('inf'),
         'expectancy': summary['avg_reward_per_trade'],
