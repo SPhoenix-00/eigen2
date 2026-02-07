@@ -2095,7 +2095,7 @@ def calculate_expectancy(closed_trades):
 
 def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
                    context_window_days: int, members_override: list = None,
-                   conviction_percentile: int = None) -> dict:
+                   conviction_percentile: int = None, skip_exports: bool = False) -> dict:
     """
     Run 5-slice validation on the committee: 3 slices on validation data, 2 slices on holdout data.
 
@@ -2310,7 +2310,9 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         # Collect closed trades for aggregate calculations
         if closed_trades:
             all_committee_closed_trades.extend(closed_trades)
-        if closed_trades:
+        
+        # Skip exports during sweeps to save time
+        if closed_trades and not skip_exports:
             # Sanitize dates for filename (replace slashes with dashes)
             start_date_safe = sanitize_date_for_filename(start_date)
             end_date_safe = sanitize_date_for_filename(end_date)
@@ -2582,8 +2584,8 @@ def run_quorum_sweep(manager: CommitteeManager, loader, stats, holdout_info,
         # Override quorum
         Config.COMMITTEE_QUORUM = quorum
 
-        # Run validation
-        results = run_validation(manager, loader, stats, holdout_info, context_window_days)
+        # Run validation (skip exports during sweep to save time)
+        results = run_validation(manager, loader, stats, holdout_info, context_window_days, skip_exports=True)
 
         if results:
             all_results[quorum] = {
@@ -2685,10 +2687,10 @@ def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
             context_window_days, percentile
         )
 
-        # Run validation with recalculated members
+        # Run validation with recalculated members (skip exports during sweep to save time)
         results = run_validation(
             manager, loader, stats, holdout_info, context_window_days,
-            members_override=members_with_new_thresholds
+            members_override=members_with_new_thresholds, skip_exports=True
         )
 
         if results:
@@ -2808,10 +2810,10 @@ def run_combined_sweep(manager: CommitteeManager, loader, stats, holdout_info,
                 context_window_days, percentile
             )
 
-            # Run validation with current quorum and recalculated members
+            # Run validation with current quorum and recalculated members (skip exports during sweep to save time)
             results = run_validation(
                 manager, loader, stats, holdout_info, context_window_days,
-                members_override=members_with_new_thresholds
+                members_override=members_with_new_thresholds, skip_exports=True
             )
 
             if results:
