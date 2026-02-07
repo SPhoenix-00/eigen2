@@ -3646,7 +3646,7 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
     print(f"  Total Trades:    {baseline_agg['total_trades']}")
 
     # 10. Run validation for top candidates
-    top_n = min(5, len(candidates))  # Validate top 5 candidates
+    top_n = min(10, len(candidates))  # Validate top 10 candidates
     print(f"\n{'='*60}")
     print(f"RUNNING VALIDATION FOR TOP {top_n} CANDIDATES")
     print(f"{'='*60}")
@@ -3710,21 +3710,27 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
     print(f"\n{'='*60}")
     print("CANDIDATE IMPACT ANALYSIS")
     print(f"{'='*60}")
-    print(f"\n{'Rank':<5} {'Agent':<25} {'Fitness':<12} {'ΔFitness':<12} {'WinRate':<10} {'ΔWinRate':<10} {'Quality':<10} {'ΔQuality':<10} {'Expectancy':<12} {'ΔExpectancy':<12} {'ROI':<8} {'ΔROI':<8} {'Trades':<8}")
-    print("-" * 150)
+    print(f"\n{'Rank':<5} {'Agent':<25} {'Fitness':<12} {'ΔFitness':<12} {'WinRate':<10} {'ΔWinRate':<10} {'Quality':<10} {'ΔQuality':<10} {'Expectancy':<12} {'ΔExpectancy':<12} {'ROI':<8} {'ΔROI':<8} {'AvgCorr':<10} {'ΔAvgCorr':<12} {'MaxCorr':<10} {'ΔMaxCorr':<12} {'Trades':<8}")
+    print("-" * 200)
     
-    # Baseline row
+    # Baseline row - get current correlation from roster
+    baseline_avg_corr = roster.get('correlation', {}).get('average', 0.0)
+    baseline_max_corr = roster.get('correlation', {}).get('max_pair', 0.0)
+    
     print(f"{'BASE':<5} {'(Current Committee)':<25} "
           f"{baseline_agg['mean_fitness']:<12.2f} {'--':<12} "
           f"{baseline_agg['mean_win_rate']*100:<9.2f}% {'--':<10} "
           f"{baseline_agg['mean_quality_ratio']:<10.2f} {'--':<10} "
           f"{baseline_agg['mean_expectancy']:<12.2f} {'--':<12} "
-          f"{baseline_agg['mean_roi']*100:<7.2f}% {'--':<8} "
+          f"{baseline_agg['mean_roi']:<7.2f}% {'--':<8} "
+          f"{baseline_avg_corr:<10.4f} {'--':<12} "
+          f"{baseline_max_corr:<10.4f} {'--':<12} "
           f"{baseline_agg['total_trades']:<8}")
     
     # Candidate rows
     for cvr in candidate_validation_results:
         agg = cvr['results']
+        c = cvr['candidate']
         e = cvr['entry']
         eid = cvr['agent_id']
         
@@ -3733,13 +3739,17 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
         delta_quality = agg['mean_quality_ratio'] - baseline_agg['mean_quality_ratio']
         delta_expectancy = agg['mean_expectancy'] - baseline_agg['mean_expectancy']
         delta_roi = agg['mean_roi'] - baseline_agg['mean_roi']
+        delta_avg_corr = c['avg_corr'] - baseline_avg_corr
+        delta_max_corr = c['max_corr'] - baseline_max_corr
         
         # Format deltas with +/- signs
         delta_fitness_str = f"{delta_fitness:+.2f}"
         delta_win_rate_str = f"{delta_win_rate*100:+.2f}%"
         delta_quality_str = f"{delta_quality:+.2f}" if not (np.isinf(delta_quality) or np.isnan(delta_quality)) else "N/A"
         delta_expectancy_str = f"{delta_expectancy:+.2f}"
-        delta_roi_str = f"{delta_roi*100:+.2f}%"
+        delta_roi_str = f"{delta_roi:+.2f}%"
+        delta_avg_corr_str = f"{delta_avg_corr:+.4f}"
+        delta_max_corr_str = f"{delta_max_corr:+.4f}"
         
         quality_str = f"{agg['mean_quality_ratio']:.2f}" if not (np.isinf(agg['mean_quality_ratio']) or np.isnan(agg['mean_quality_ratio'])) else "inf"
         
@@ -3748,7 +3758,9 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
               f"{agg['mean_win_rate']*100:<9.2f}% {delta_win_rate_str:<10} "
               f"{quality_str:<10} {delta_quality_str:<10} "
               f"{agg['mean_expectancy']:<12.2f} {delta_expectancy_str:<12} "
-              f"{agg['mean_roi']*100:<7.2f}% {delta_roi_str:<8} "
+              f"{agg['mean_roi']:<7.2f}% {delta_roi_str:<8} "
+              f"{c['avg_corr']:<10.4f} {delta_avg_corr_str:<12} "
+              f"{c['max_corr']:<10.4f} {delta_max_corr_str:<12} "
               f"{agg['total_trades']:<8}")
     
     # 12. Interactive Swap
@@ -3776,9 +3788,6 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
             chosen_entry = chosen['entry']
         
         print(f"\nSwapping {agent_to_swap} ➔ {chosen_entry['run_name']}_{chosen_entry['agent_id']}...")
-    else:
-        print(f"❌ Invalid rank. Please enter a number between 1 and {top_n}.")
-        return
         
         # Calculate stats for new member
         chosen_coeffs = coefficients[chosen['index']]
@@ -3835,6 +3844,9 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
         
         manager.save_roster(roster, sub_matrix)
         print("✓ Swap complete!")
+    else:
+        print(f"❌ Invalid rank. Please enter a number between 1 and {top_n}.")
+        return
 
 
 # --- Main ---
