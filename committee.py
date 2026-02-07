@@ -3642,7 +3642,7 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
     qr_str_baseline = "inf" if np.isinf(qr_baseline) else ("nan" if np.isnan(qr_baseline) else f"{qr_baseline:.2f}")
     print(f"  Mean Quality:    {qr_str_baseline}")
     print(f"  Mean Expectancy: {baseline_agg['mean_expectancy']:.2f}")
-    print(f"  Mean ROI:        {baseline_agg['mean_roi']:.2%}")
+    print(f"  Mean ROI:        {baseline_agg['mean_roi']:.2f}%")
     print(f"  Total Trades:    {baseline_agg['total_trades']}")
 
     # 10. Run validation for top candidates
