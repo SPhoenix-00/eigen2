@@ -3348,6 +3348,67 @@ def run_simulation(manager: CommitteeManager, loader, stats, context_window_days
     return metrics
 
 
+def update_conviction_percentile(manager: CommitteeManager, loader, stats, holdout_info,
+                                  context_window_days: int, percentile: int) -> bool:
+    """
+    Update conviction percentile in existing committee roster.
+    
+    This preserves all committee members and metadata, only updating
+    the conviction threshold vectors to the new percentile.
+    
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        percentile: New conviction percentile (e.g., 90, 95, 99)
+    
+    Returns:
+        True if update succeeded, False otherwise
+    """
+    print("\n" + "="*60)
+    print(f"UPDATING CONVICTION PERCENTILE TO P{percentile}")
+    print("="*60)
+    
+    # Load roster
+    roster = manager.load_roster()
+    if not roster:
+        print("❌ No committee roster found. Run --draft first.")
+        return False
+    
+    print(f"  Current roster: {len(roster['members'])} members")
+    current_percentile = roster.get('conviction_percentile', 95)
+    print(f"  Current percentile: P{current_percentile}")
+    print(f"  Target percentile: P{percentile}")
+    
+    if current_percentile == percentile:
+        print(f"\n✓ Roster already uses P{percentile}. No update needed.")
+        return True
+    
+    # Recalculate thresholds
+    print(f"\nRecalculating conviction thresholds at P{percentile}...")
+    updated_members = recalculate_conviction_thresholds(
+        roster['members'], loader, stats, holdout_info,
+        context_window_days, percentile
+    )
+    
+    # Update roster
+    roster['members'] = updated_members
+    roster['conviction_percentile'] = percentile
+    roster['last_updated'] = datetime.now().isoformat() + 'Z'
+    
+    # Save roster (this will also sync to cloud)
+    print(f"\nSaving updated roster...")
+    if manager.save_roster(roster):
+        print(f"✓ Roster updated with P{percentile} conviction thresholds")
+        print(f"✓ Synced to cloud")
+        return True
+    else:
+        print(f"✗ Failed to save roster")
+        return False
+
+
 def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent_to_swap: str):
     """
     Find best replacement candidates for a specific committee member.
@@ -3529,6 +3590,8 @@ if __name__ == "__main__":
                         help='Check cloud sync status, download missing files')
     parser.add_argument('--update-maverick-flags', action='store_true',
                         help='Update is_maverick flags in committee roster from Global50')
+    parser.add_argument('--update-conviction', type=int, default=None,
+                        help='Update conviction percentile in roster (e.g., 90, 95, 99)')
     parser.add_argument('--simulate', action='store_true',
                         help='Simulate committee deployment over a custom date range')
     parser.add_argument('--quorum', type=int, default=None,
@@ -3543,8 +3606,8 @@ if __name__ == "__main__":
                         help='Evaluate and swap a specific agent (e.g. "run-name_id")')
     args = parser.parse_args()
 
-    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.update_maverick_flags and not args.simulate and not args.sweep_quorum and not args.sweep_conviction and not args.swap_agent:
-        print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--update-maverick-flags] [--simulate] [--swap-agent]")
+    if not args.draft and not args.draft_deep and not args.validate and not args.verify_only and not args.mirror and not args.update_maverick_flags and not args.update_conviction and not args.simulate and not args.sweep_quorum and not args.sweep_conviction and not args.swap_agent:
+        print("Usage: python committee.py [--draft] [--draft-deep] [--validate] [--verify-only] [--mirror] [--update-maverick-flags] [--update-conviction] [--simulate] [--swap-agent]")
         print("\nOptions:")
         print("  --draft              Run Phase 1: Draft committee from Global50 (interactive refinement)")
         print("  --draft-deep         Run Phase 1 with automatic deep refinement (no manual swaps)")
@@ -3553,6 +3616,7 @@ if __name__ == "__main__":
         print("  --verify-only        Verify data split without running")
         print("  --mirror             Check cloud sync status, download missing files")
         print("  --update-maverick-flags  Update is_maverick flags in committee roster from Global50")
+        print("  --update-conviction N    Update conviction percentile in roster (e.g., 90, 95, 99)")
         print("  --simulate           Simulate committee deployment over a custom date range")
         print("  --quorum N       Override quorum threshold for validation (default: 3)")
         print("  --sweep-quorum   Sweep multiple quorum values (e.g., '2,3,4,5')")
@@ -3600,6 +3664,14 @@ if __name__ == "__main__":
 
     if args.verify_only:
         print("\n✓ Verification complete.")
+        exit(0)
+
+    # Handle --update-conviction mode
+    if args.update_conviction is not None:
+        if not (1 <= args.update_conviction <= 100):
+            print("❌ Percentile must be between 1 and 100")
+            exit(1)
+        update_conviction_percentile(manager, loader, stats, holdout_info, context_window_days, args.update_conviction)
         exit(0)
 
     # Handle --swap-agent
