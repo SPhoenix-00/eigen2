@@ -2052,6 +2052,22 @@ def evaluate_committee_on_slice(members: list, loader, stats,
     }
 
 
+def safe_mean_quality_ratio(values):
+    """Calculate mean of quality ratio values, excluding inf and nan.
+    
+    When calculating mean quality ratio, we filter out inf values (which occur
+    when num_losses=0) to get a mathematically correct mean. If all values
+    are inf, we return inf. If all values are nan, we return nan.
+    """
+    finite_values = [v for v in values if np.isfinite(v)]
+    if not finite_values:
+        # If no finite values, check if any are inf
+        if any(np.isinf(v) for v in values):
+            return float('inf')
+        return float('nan')
+    return float(np.mean(finite_values))
+
+
 def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
                    context_window_days: int, members_override: list = None,
                    conviction_percentile: int = None) -> dict:
@@ -2203,7 +2219,7 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
         # Calculate aggregates for this agent
         agent_results['fresh_mean_fitness'] = float(np.mean([m['fitness'] for m in agent_results['slice_metrics']]))
         agent_results['fresh_mean_win_rate'] = float(np.mean([m['win_rate'] for m in agent_results['slice_metrics']]))
-        agent_results['fresh_mean_quality_ratio'] = float(np.mean([m['quality_ratio'] for m in agent_results['slice_metrics']]))
+        agent_results['fresh_mean_quality_ratio'] = safe_mean_quality_ratio([m['quality_ratio'] for m in agent_results['slice_metrics']])
         agent_results['fresh_mean_expectancy'] = float(np.mean([m['expectancy'] for m in agent_results['slice_metrics']]))
         agent_results['fresh_mean_roi'] = float(np.mean([m['roi'] for m in agent_results['slice_metrics']]))
 
@@ -2331,8 +2347,8 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     results['committee_aggregate']['mean_win_rate'] = float(
         np.mean([s['win_rate'] for s in results['committee_slices']])
     )
-    results['committee_aggregate']['mean_quality_ratio'] = float(
-        np.mean([s['quality_ratio'] for s in results['committee_slices']])
+    results['committee_aggregate']['mean_quality_ratio'] = safe_mean_quality_ratio(
+        [s['quality_ratio'] for s in results['committee_slices']]
     )
     results['committee_aggregate']['mean_expectancy'] = float(
         np.mean([s['expectancy'] for s in results['committee_slices']])
@@ -2373,9 +2389,12 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     for agent in results['individual_agents']:
         print(f"\n  {agent['run_name']}_{agent['agent_id']}:")
         print(f"    Stored Gauntlet: {agent['stored_gauntlet']:.2f}")
+        # Handle inf/nan for quality ratio display
+        qr_agent = agent['fresh_mean_quality_ratio']
+        qr_str = "inf" if np.isinf(qr_agent) else ("nan" if np.isnan(qr_agent) else f"{qr_agent:.3f}")
         print(f"    Fresh Averages: fitness={agent['fresh_mean_fitness']:.2f}, "
               f"win_rate={agent['fresh_mean_win_rate']:.2%}, "
-              f"quality_ratio={agent['fresh_mean_quality_ratio']:.3f}, "
+              f"quality_ratio={qr_str}, "
               f"expectancy={agent['fresh_mean_expectancy']:.6f}, "
               f"roi={agent['fresh_mean_roi']:.2f}%")
         for m in agent['slice_metrics']:
@@ -2419,7 +2438,12 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     ca = results['committee_aggregate']
     print(f"  Mean Fitness: {ca['mean_fitness']:.2f}")
     print(f"  Mean Win Rate: {ca['mean_win_rate']:.2%}")
-    print(f"  Mean Quality Ratio: {ca['mean_quality_ratio']:.3f}")
+    # Handle inf/nan for quality ratio display
+    qr = ca['mean_quality_ratio']
+    if np.isinf(qr) or np.isnan(qr):
+        print(f"  Mean Quality Ratio: inf" if np.isinf(qr) else f"  Mean Quality Ratio: nan")
+    else:
+        print(f"  Mean Quality Ratio: {qr:.3f}")
     print(f"  Mean Expectancy: {ca['mean_expectancy']:.6f}")
     print(f"  Mean ROI: {ca['mean_roi']:.2f}%")
     print(f"  Total Trades (All Slices): {ca['total_trades']}")
@@ -2518,8 +2542,11 @@ def run_quorum_sweep(manager: CommitteeManager, loader, stats, holdout_info,
 
     for quorum in sorted(all_results.keys()):
         agg = all_results[quorum]['aggregate']
+        # Handle inf/nan for quality ratio display
+        qr_quorum = agg['mean_quality_ratio']
+        qr_str_quorum = "inf" if np.isinf(qr_quorum) else ("nan" if np.isnan(qr_quorum) else f"{qr_quorum:.3f}")
         print(f"{quorum:<8} {agg['mean_fitness']:<10.2f} {agg['mean_win_rate']*100:<10.1f}% "
-              f"{agg['mean_quality_ratio']:<10.3f} {agg['mean_expectancy']:<12.6f} "
+              f"{qr_str_quorum:<10} {agg['mean_expectancy']:<12.6f} "
               f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
 
     # Consensus breakdown
@@ -2618,8 +2645,11 @@ def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
 
     for percentile in sorted(all_results.keys()):
         agg = all_results[percentile]['aggregate']
+        # Handle inf/nan for quality ratio display
+        qr_percentile = agg['mean_quality_ratio']
+        qr_str_percentile = "inf" if np.isinf(qr_percentile) else ("nan" if np.isnan(qr_percentile) else f"{qr_percentile:.3f}")
         print(f"P{percentile:<11} {agg['mean_fitness']:<10.2f} {agg['mean_win_rate']*100:<10.1f}% "
-              f"{agg['mean_quality_ratio']:<10.3f} {agg['mean_expectancy']:<12.6f} "
+              f"{qr_str_percentile:<10} {agg['mean_expectancy']:<12.6f} "
               f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
 
     # Consensus breakdown (conviction trades are the key metric here)
@@ -3504,8 +3534,10 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
 
     candidates.sort(key=lambda x: x['objective'], reverse=True)
 
-    # 8. Display Top 10
-    print(f"\nTop 10 Swap Candidates for {agent_to_swap}:")
+    # 8. Display Top 10 by Objective (before validation)
+    print(f"\n{'='*60}")
+    print("TOP 10 CANDIDATES BY OBJECTIVE FUNCTION")
+    print(f"{'='*60}")
     print(f"{'#':<3} {'Agent':<25} {'Obj':<10} {'Diff':<8} {'Score':<10} {'AvgCorr':<8} {'ROI':<7} {'M'}")
     print("-" * 90)
 
@@ -3516,15 +3548,167 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
         mav = "✓" if e.get('is_maverick') else ""
         print(f"{rank+1:<3} {eid:<25} {c['objective']:.2f}      {diff:+.2f}    {c['score']:.2f}      {c['avg_corr']:.4f}   {e.get('roi',0):.1f}%   {mav}")
 
-    # 9. Interactive Swap
-    choice = input("\nEnter candidate rank to swap (or Enter to cancel): ")
+    # 9. Get baseline validation metrics for current committee
+    print(f"\n{'='*60}")
+    print("RUNNING BASELINE VALIDATION (Current Committee)")
+    print(f"{'='*60}")
+    baseline_results = run_validation(
+        manager, loader, stats, holdout_info, manager.context_window_days,
+        members_override=None, conviction_percentile=None
+    )
+    
+    if not baseline_results:
+        print("❌ Failed to run baseline validation")
+        return
+    
+    baseline_agg = baseline_results['committee_aggregate']
+    print(f"\n{'='*60}")
+    print("BASELINE COMMITTEE METRICS")
+    print(f"{'='*60}")
+    print(f"  Mean Fitness:    {baseline_agg['mean_fitness']:.2f}")
+    print(f"  Mean Win Rate:   {baseline_agg['mean_win_rate']:.2%}")
+    # Handle inf/nan for quality ratio display
+    qr_baseline = baseline_agg['mean_quality_ratio']
+    qr_str_baseline = "inf" if np.isinf(qr_baseline) else ("nan" if np.isnan(qr_baseline) else f"{qr_baseline:.2f}")
+    print(f"  Mean Quality:    {qr_str_baseline}")
+    print(f"  Mean Expectancy: {baseline_agg['mean_expectancy']:.2f}")
+    print(f"  Mean ROI:        {baseline_agg['mean_roi']:.2%}")
+    print(f"  Total Trades:    {baseline_agg['total_trades']}")
+
+    # 10. Run validation for top candidates
+    top_n = min(5, len(candidates))  # Validate top 5 candidates
+    print(f"\n{'='*60}")
+    print(f"RUNNING VALIDATION FOR TOP {top_n} CANDIDATES")
+    print(f"{'='*60}")
+    print("This will take some time...")
+    
+    candidate_validation_results = []
+    
+    for rank, c in enumerate(candidates[:top_n]):
+        e = c['entry']
+        eid = f"{e['run_name']}_{e['agent_id']}"
+        print(f"\n[{rank+1}/{top_n}] Validating candidate: {eid}")
+        
+        # Build modified members list with this candidate swapped in
+        chosen_coeffs = coefficients[c['index']]
+        num_days = len(valid_indices)
+        num_stocks = Config.NUM_INVESTABLE_STOCKS
+        chosen_coeffs_2d = chosen_coeffs.reshape(num_days, num_stocks)
+        conviction_vec = calculate_agent_stats_vectorized(chosen_coeffs_2d)
+        
+        new_member = {
+            'filename': f"{e['run_name']}_{e['agent_id']}.pth",
+            'agent_id': e['agent_id'],
+            'run_name': e['run_name'],
+            'gauntlet_score': e['gauntlet_score'],
+            'roi': e.get('roi', 0.0),
+            'expectancy': e.get('expectancy', 0.0),
+            'quality_ratio': e.get('quality_ratio', 0.0),
+            'win_ratio': e.get('win_ratio', 0.0),
+            'is_maverick': e.get('is_maverick', False),
+            'stats': {
+                'conviction_threshold_vector': conviction_vec.tolist()
+            }
+        }
+        
+        modified_members = []
+        for m in roster['members']:
+            mid = f"{m['run_name']}_{m['agent_id']}"
+            if mid == agent_to_swap:
+                modified_members.append(new_member)
+            else:
+                modified_members.append(m)
+        
+        # Run validation with modified committee
+        validation_results = run_validation(
+            manager, loader, stats, holdout_info, manager.context_window_days,
+            members_override=modified_members, conviction_percentile=None
+        )
+        
+        if validation_results:
+            candidate_validation_results.append({
+                'rank': rank + 1,
+                'candidate': c,
+                'entry': e,
+                'agent_id': eid,
+                'results': validation_results['committee_aggregate']
+            })
+        else:
+            print(f"  ⚠ Failed to validate candidate {eid}")
+    
+    # 10. Display comprehensive comparison
+    print(f"\n{'='*60}")
+    print("CANDIDATE IMPACT ANALYSIS")
+    print(f"{'='*60}")
+    print(f"\n{'Rank':<5} {'Agent':<25} {'Fitness':<12} {'ΔFitness':<12} {'WinRate':<10} {'ΔWinRate':<10} {'Quality':<10} {'ΔQuality':<10} {'Expectancy':<12} {'ΔExpectancy':<12} {'ROI':<8} {'ΔROI':<8} {'Trades':<8}")
+    print("-" * 150)
+    
+    # Baseline row
+    print(f"{'BASE':<5} {'(Current Committee)':<25} "
+          f"{baseline_agg['mean_fitness']:<12.2f} {'--':<12} "
+          f"{baseline_agg['mean_win_rate']*100:<9.2f}% {'--':<10} "
+          f"{baseline_agg['mean_quality_ratio']:<10.2f} {'--':<10} "
+          f"{baseline_agg['mean_expectancy']:<12.2f} {'--':<12} "
+          f"{baseline_agg['mean_roi']*100:<7.2f}% {'--':<8} "
+          f"{baseline_agg['total_trades']:<8}")
+    
+    # Candidate rows
+    for cvr in candidate_validation_results:
+        agg = cvr['results']
+        e = cvr['entry']
+        eid = cvr['agent_id']
+        
+        delta_fitness = agg['mean_fitness'] - baseline_agg['mean_fitness']
+        delta_win_rate = agg['mean_win_rate'] - baseline_agg['mean_win_rate']
+        delta_quality = agg['mean_quality_ratio'] - baseline_agg['mean_quality_ratio']
+        delta_expectancy = agg['mean_expectancy'] - baseline_agg['mean_expectancy']
+        delta_roi = agg['mean_roi'] - baseline_agg['mean_roi']
+        
+        # Format deltas with +/- signs
+        delta_fitness_str = f"{delta_fitness:+.2f}"
+        delta_win_rate_str = f"{delta_win_rate*100:+.2f}%"
+        delta_quality_str = f"{delta_quality:+.2f}" if not (np.isinf(delta_quality) or np.isnan(delta_quality)) else "N/A"
+        delta_expectancy_str = f"{delta_expectancy:+.2f}"
+        delta_roi_str = f"{delta_roi*100:+.2f}%"
+        
+        quality_str = f"{agg['mean_quality_ratio']:.2f}" if not (np.isinf(agg['mean_quality_ratio']) or np.isnan(agg['mean_quality_ratio'])) else "inf"
+        
+        print(f"{cvr['rank']:<5} {eid:<25} "
+              f"{agg['mean_fitness']:<12.2f} {delta_fitness_str:<12} "
+              f"{agg['mean_win_rate']*100:<9.2f}% {delta_win_rate_str:<10} "
+              f"{quality_str:<10} {delta_quality_str:<10} "
+              f"{agg['mean_expectancy']:<12.2f} {delta_expectancy_str:<12} "
+              f"{agg['mean_roi']*100:<7.2f}% {delta_roi_str:<8} "
+              f"{agg['total_trades']:<8}")
+    
+    # 12. Interactive Swap
+    print(f"\n{'='*60}")
+    print("SWAP SELECTION")
+    print(f"{'='*60}")
+    print("Based on the validation results above, select a candidate to swap in.")
+    print(f"Note: Only candidates that were validated (ranks 1-{top_n}) can be selected.")
+    
+    choice = input(f"\nEnter candidate rank (1-{top_n}) to swap, or Enter to cancel: ")
     if not choice.isdigit():
+        print("Cancelled.")
         return
 
     rank = int(choice)
-    if 1 <= rank <= len(candidates):
-        chosen = candidates[rank-1]
-        print(f"\nSwapping {agent_to_swap} ➔ {chosen['entry']['run_name']}_{chosen['entry']['agent_id']}...")
+    if 1 <= rank <= top_n:
+        # Find the candidate in validation results
+        cvr = next((c for c in candidate_validation_results if c['rank'] == rank), None)
+        if cvr:
+            chosen = cvr['candidate']
+            chosen_entry = cvr['entry']
+        else:
+            # Fallback to original candidates list
+            chosen = candidates[rank-1]
+            chosen_entry = chosen['entry']
+        
+        print(f"\nSwapping {agent_to_swap} ➔ {chosen_entry['run_name']}_{chosen_entry['agent_id']}...")
+    else:
+        print(f"❌ Invalid rank. Please enter a number between 1 and {top_n}.")
+        return
         
         # Calculate stats for new member
         chosen_coeffs = coefficients[chosen['index']]
@@ -3536,17 +3720,16 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
         conviction_vec = calculate_agent_stats_vectorized(chosen_coeffs_2d)
         
         # Build new member dict
-        e = chosen['entry']
         new_member = {
-            'filename': f"{e['run_name']}_{e['agent_id']}.pth",
-            'agent_id': e['agent_id'],
-            'run_name': e['run_name'],
-            'gauntlet_score': e['gauntlet_score'],
-            'roi': e.get('roi', 0.0),
-            'expectancy': e.get('expectancy', 0.0),
-            'quality_ratio': e.get('quality_ratio', 0.0),
-            'win_ratio': e.get('win_ratio', 0.0),
-            'is_maverick': e.get('is_maverick', False),
+            'filename': f"{chosen_entry['run_name']}_{chosen_entry['agent_id']}.pth",
+            'agent_id': chosen_entry['agent_id'],
+            'run_name': chosen_entry['run_name'],
+            'gauntlet_score': chosen_entry['gauntlet_score'],
+            'roi': chosen_entry.get('roi', 0.0),
+            'expectancy': chosen_entry.get('expectancy', 0.0),
+            'quality_ratio': chosen_entry.get('quality_ratio', 0.0),
+            'win_ratio': chosen_entry.get('win_ratio', 0.0),
+            'is_maverick': chosen_entry.get('is_maverick', False),
             'stats': {
                 'conviction_threshold_vector': conviction_vec.tolist()
             }
