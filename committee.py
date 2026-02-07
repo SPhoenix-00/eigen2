@@ -2574,6 +2574,184 @@ def run_validation(manager: CommitteeManager, loader, stats, holdout_info,
     return results
 
 
+def run_validation_sweep(manager: CommitteeManager, loader, stats, holdout_info,
+                          context_window_days: int, members_override: list = None) -> dict:
+    """
+    Lightweight validation wrapper for sweeps - only computes metrics we need.
+    
+    This function skips:
+    - Individual agent validation (not needed for sweeps)
+    - All exports (CSV, XLSX, cloud uploads)
+    - Verbose printing
+    
+    Only computes and returns:
+    - committee_aggregate: mean_fitness, mean_win_rate, mean_quality_ratio, mean_expectancy, mean_roi, total_trades
+    - consensus_summary: avg_unanimity_pct, avg_min_consensus_pct, avg_consensus_votes, etc.
+    
+    Args:
+        manager: CommitteeManager instance
+        loader: StockDataLoader instance
+        stats: Normalization stats dict
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        members_override: Optional pre-computed members list (for A/B testing)
+    
+    Returns:
+        Dict with only committee_aggregate and consensus_summary
+    """
+    roster = manager.load_roster()
+    if roster is None:
+        print(f"❌ No roster found. Run --draft first.")
+        return None
+    
+    # Use override members if provided, otherwise use roster members
+    if members_override is not None:
+        members = members_override
+    else:
+        members = roster['members']
+    
+    num_slices = Config.COMMITTEE_VALIDATION_SLICES
+    episode_length = Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+    
+    # Calculate validation range (absolute day indices)
+    val_start_idx = holdout_info['val_start']
+    val_end_idx = holdout_info['val_end']
+    
+    # Calculate holdout range (absolute day indices)
+    holdout_start_idx = holdout_info['holdout_start']
+    holdout_end_idx = holdout_info['holdout_end']
+    
+    # Total available data
+    val_days = val_end_idx - val_start_idx + 1
+    holdout_days = holdout_end_idx - holdout_start_idx + 1
+    
+    # Generate deterministic slices: 3 from validation, 2 from holdout
+    num_val_slices = 3
+    num_holdout_slices = 2
+    
+    # Calculate deterministic start points (evenly spaced)
+    val_usable_range = val_days - episode_length
+    val_step = val_usable_range // (num_val_slices - 1) if num_val_slices > 1 else 0
+    
+    holdout_usable_range = holdout_days - episode_length
+    holdout_step = holdout_usable_range // (num_holdout_slices - 1) if num_holdout_slices > 1 else 0
+    
+    # Only validate committee consensus on each slice (skip individual agents)
+    committee_slices = []
+    all_committee_closed_trades = []
+    
+    for s in range(num_slices):
+        # Calculate absolute slice indices (deterministic, evenly spaced)
+        if s < num_val_slices:
+            slice_start = val_start_idx + (s * val_step)
+            slice_end = slice_start + episode_length
+            slice_type = 'validation'
+        else:
+            holdout_slice_idx = s - num_val_slices
+            slice_start = holdout_start_idx + (holdout_slice_idx * holdout_step)
+            slice_end = slice_start + episode_length
+            slice_type = 'holdout'
+        
+        # Evaluate committee on this slice
+        metrics = evaluate_committee_on_slice(
+            members, loader, stats, context_window_days, slice_start, slice_end
+        )
+        
+        # Collect closed trades for aggregate calculations (but don't store them)
+        closed_trades = metrics.get('closed_trades', [])
+        if closed_trades:
+            all_committee_closed_trades.extend(closed_trades)
+        
+        # Store only minimal slice data
+        committee_slices.append({
+            'fitness': metrics.get('fitness', 0.0),
+            'win_rate': metrics.get('win_rate', 0.0),
+            'quality_ratio': metrics.get('quality_ratio', 0.0),
+            'expectancy': metrics.get('expectancy', 0.0),
+            'roi': metrics.get('roi', 0.0),
+            'num_trades': metrics.get('num_trades', 0),
+            'num_wins': metrics.get('num_wins', 0),
+            'num_losses': metrics.get('num_losses', 0),
+            'consensus_stats': metrics.get('consensus_stats', {'note': 'Consensus applied per-step'}),
+            'raw_pnl': metrics.get('raw_pnl', 0.0),
+            'peak_capital_employed': metrics.get('peak_capital_employed', 0.0),
+        })
+        
+        # Aggressive cleanup after each slice
+        del closed_trades
+        del metrics
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    # Calculate committee aggregates
+    committee_aggregate = {
+        'mean_fitness': float(np.mean([s['fitness'] for s in committee_slices])),
+        'mean_win_rate': 0.0,
+        'mean_quality_ratio': 0.0,
+        'mean_expectancy': 0.0,
+        'mean_roi': 0.0,
+        'total_trades': 0,
+    }
+    
+    # Calculate aggregate win rate from total wins/trades across all slices
+    total_wins = sum([s.get('num_wins', 0) for s in committee_slices])
+    total_losses = sum([s.get('num_losses', 0) for s in committee_slices])
+    total_trades = total_wins + total_losses
+    committee_aggregate['mean_win_rate'] = (
+        (total_wins / total_trades) if total_trades > 0 else 0.0
+    )
+    
+    # Calculate aggregate quality ratio
+    committee_aggregate['mean_quality_ratio'] = (
+        (total_wins / total_losses) if total_losses > 0 else float('inf')
+    )
+    
+    # Calculate aggregate expectancy from all closed trades
+    committee_aggregate['mean_expectancy'] = float(
+        calculate_expectancy(all_committee_closed_trades)
+    )
+    
+    # Calculate aggregate ROI from total raw_pnl / total peak_capital_employed
+    total_raw_pnl = sum([s.get('raw_pnl', 0.0) for s in committee_slices])
+    total_peak_capital = sum([s.get('peak_capital_employed', 0.0) for s in committee_slices])
+    committee_aggregate['mean_roi'] = (
+        (total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0
+    )
+    committee_aggregate['total_trades'] = int(total_trades)
+    
+    # Aggregate consensus stats across all slices
+    all_consensus_stats = [s['consensus_stats'] for s in committee_slices]
+    
+    if all(isinstance(cs, dict) and 'avg_consensus_votes' in cs for cs in all_consensus_stats):
+        consensus_summary = {
+            'avg_unanimity_pct': float(np.mean([cs['unanimity_pct'] for cs in all_consensus_stats])),
+            'avg_min_consensus_pct': float(np.mean([cs['min_consensus_pct'] for cs in all_consensus_stats])),
+            'avg_consensus_votes': float(np.mean([cs['avg_consensus_votes'] for cs in all_consensus_stats])),
+            'total_trades_by_quorum': int(sum([cs['trades_by_quorum'] for cs in all_consensus_stats])),
+            'total_trades_by_conviction': int(sum([cs['trades_by_conviction'] for cs in all_consensus_stats])),
+            'total_trades_vetoed': int(sum([cs['trades_vetoed'] for cs in all_consensus_stats])),
+        }
+    else:
+        consensus_summary = {
+            'note': 'Consensus tracking was not enabled or no data available'
+        }
+    
+    # Final cleanup
+    del all_committee_closed_trades
+    del committee_slices
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    
+    return {
+        'committee_aggregate': committee_aggregate,
+        'consensus_summary': consensus_summary,
+    }
+
+
 def run_quorum_sweep(manager: CommitteeManager, loader, stats, holdout_info,
                      context_window_days: int, quorum_values: list) -> dict:
     """
@@ -2607,8 +2785,8 @@ def run_quorum_sweep(manager: CommitteeManager, loader, stats, holdout_info,
         # Override quorum
         Config.COMMITTEE_QUORUM = quorum
 
-        # Run validation (skip exports during sweep to save time)
-        results = run_validation(manager, loader, stats, holdout_info, context_window_days, skip_exports=True)
+        # Run lightweight validation for sweep
+        results = run_validation_sweep(manager, loader, stats, holdout_info, context_window_days)
 
         if results:
             all_results[quorum] = {
@@ -2710,10 +2888,10 @@ def run_conviction_sweep(manager: CommitteeManager, loader, stats, holdout_info,
             context_window_days, percentile
         )
 
-        # Run validation with recalculated members (skip exports during sweep to save time)
-        results = run_validation(
+        # Run lightweight validation for sweep
+        results = run_validation_sweep(
             manager, loader, stats, holdout_info, context_window_days,
-            members_override=members_with_new_thresholds, skip_exports=True
+            members_override=members_with_new_thresholds
         )
 
         if results:
@@ -2833,10 +3011,10 @@ def run_combined_sweep(manager: CommitteeManager, loader, stats, holdout_info,
                 context_window_days, percentile
             )
 
-            # Run validation with current quorum and recalculated members (skip exports during sweep to save time)
-            results = run_validation(
+            # Run lightweight validation for sweep
+            results = run_validation_sweep(
                 manager, loader, stats, holdout_info, context_window_days,
-                members_override=members_with_new_thresholds, skip_exports=True
+                members_override=members_with_new_thresholds
             )
 
             if results:
