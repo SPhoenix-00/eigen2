@@ -3441,6 +3441,7 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
     
     current_indices = []
     target_idx = -1
+    target_is_maverick = False
     
     for mid in current_ids:
         if mid in entry_map:
@@ -3448,6 +3449,7 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
             current_indices.append(idx)
             if mid == agent_to_swap:
                 target_idx = idx
+                target_is_maverick = entries[idx].get('is_maverick', False)
         else:
             print(f"⚠ Warning: Member {mid} not found in Global50 (skipping)")
 
@@ -3456,6 +3458,11 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
         return
 
     base_indices = [i for i in current_indices if i != target_idx]
+
+    if target_is_maverick:
+        print(f"  Target {agent_to_swap} is a Maverick [M]. Only Maverick candidates will be considered.")
+    else:
+        print(f"  Target {agent_to_swap} is NOT a Maverick. Only non-Maverick candidates will be considered.")
 
     # 5. Calculate Correlations (Validation Data)
     print("\nCalculating coefficient correlations (this may take a moment)...")
@@ -3476,6 +3483,11 @@ def run_swap_agent(manager: CommitteeManager, loader, stats, holdout_info, agent
     for i in range(len(entries)):
         if i in current_indices: continue
         if corr_matrix[i, i] != 1.0: continue # Invalid data
+        
+        # Maverick Filter
+        candidate_is_maverick = entries[i].get('is_maverick', False)
+        if target_is_maverick != candidate_is_maverick:
+            continue
 
         # Trial committee
         trial_indices = tuple(sorted(base_indices + [i]))
