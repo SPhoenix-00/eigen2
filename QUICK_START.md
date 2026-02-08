@@ -59,8 +59,8 @@ python3 << 'EOF'
 from google.cloud import storage
 client = storage.Client()
 bucket = client.bucket('eigen2-checkpoints-ase0')
-blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_311225.pkl')
-blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT_311225.pkl')
+blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_060226.pkl')
+blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT_060226.pkl')
 print("✓ Training data downloaded")
 EOF
 ```
@@ -70,7 +70,7 @@ EOF
 cd D:\GitHub\eigen2
 $env:GOOGLE_APPLICATION_CREDENTIALS="D:\GitHub\eigen2\gcs-credentials.json"
 
-python -c "from google.cloud import storage; client = storage.Client(); bucket = client.bucket('eigen2-checkpoints-ase0'); blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_311225.pkl'); blob.download_to_filename('Eigen2_Master_PY_OUTPUT_311225.pkl'); print('✓ Training data downloaded')"
+python -c "from google.cloud import storage; client = storage.Client(); bucket = client.bucket('eigen2-checkpoints-ase0'); blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_060226.pkl'); blob.download_to_filename('Eigen2_Master_PY_OUTPUT_060226.pkl'); print('✓ Training data downloaded')"
 ```
 
 ### 5. Login to W&B
@@ -353,8 +353,8 @@ python3 << 'EOF'
 from google.cloud import storage
 client = storage.Client()
 bucket = client.bucket('eigen2-checkpoints-ase0')
-blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_311225.pkl')
-blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT_311225.pkl')
+blob = bucket.blob('eigen2/Eigen2_Master_PY_OUTPUT_060226.pkl')
+blob.download_to_filename('/workspace/Eigen2_Master_PY_OUTPUT_060226.pkl')
 EOF
 ```
 

@@ -9,7 +9,7 @@ import re
 
 # --- Configuration ---
 INPUT_FILE = 'Eigen2_Master(GFIN)_05_skinny - MASTER.csv'
-OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_311225.pkl'
+OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_060226.pkl'
 OUTPUT_FILE_CSV = 'Eigen2_Master_PY_OUTPUT_151025_FOR_COMPARE.csv'
 
 # --- Index Map for Slicing (Step 2: ManipulateArrayString) ---
@@ -691,9 +691,9 @@ def update_config_files(new_filename):
         with open(script_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # Update OUTPUT_FILE_PKL
-        pattern = r"OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_311225.pkl']+'"
-        replacement = f"OUTPUT_FILE_PKL = 'Eigen2_Master_PY_OUTPUT_311225.pkl'"
+        # Update OUTPUT_FILE_PKL - match any current value and replace with new filename
+        pattern = r"OUTPUT_FILE_PKL = '[^']+'"
+        replacement = f"OUTPUT_FILE_PKL = '{new_basename}'"
         new_content = re.sub(pattern, replacement, content)
         
         if new_content != content:
@@ -786,12 +786,12 @@ def generate_output_filename(base_filename, date=None):
 def append_mode(production_file, new_data_file, *, update_config=False, allow_overlap=False):
     """
     Append mode: Process new raw data and append to existing production dataset.
-    Uses last 150 rows from production as history for proper indicator calculation.
+    Uses last 300 rows from production as history for proper indicator calculation.
     History provides warm-up for EMAs (need 34 minimum) plus extra rows for full convergence.
     Since history is converted to raw OHLC, all indicators must recalculate from scratch.
     EMAs need additional rows beyond the minimum to fully converge to stable values.
     """
-    HISTORY_ROWS = 150  # History rows: 34 minimum + 116 extra for full EMA convergence
+    HISTORY_ROWS = 300  # History rows: 34 minimum + 266 extra for full EMA convergence
     VBA_CALC_RAMP_UP_ROWS = 34  # Ramp-up rows to skip (minimum required)
     
     print("="*60)
