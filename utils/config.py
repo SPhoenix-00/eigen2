@@ -157,9 +157,10 @@ class Config:
 
     # Single-agent mode - focused refinement of one Global50 agent
     # Population is initialized from clones of the single agent with varying mutation levels
-    SINGLE_CLONE_FRAC = 0.50            # 50% pure clones (no mutation)
-    SINGLE_NORMAL_MUTATION_FRAC = 0.25  # 25% with normal mutation rate
-    SINGLE_PLATEAU_MUTATION_FRAC = 0.25 # 25% with plateau (1.5x) mutation rate
+    # Only 2 pure clones kept as safety anchors; the rest explore via mutation
+    SINGLE_CLONE_FRAC = 0.04            # ~2 pure clones (anchor/safety net)
+    SINGLE_NORMAL_MUTATION_FRAC = 0.48  # 48% with normal mutation rate
+    SINGLE_PLATEAU_MUTATION_FRAC = 0.48 # 48% with plateau (1.5x) mutation rate
     # Note: These must sum to 1.0
 
     SINGLE_STABILIZATION_GENERATIONS = 5  # Generations before breakthrough detection starts

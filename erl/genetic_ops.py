@@ -226,6 +226,23 @@ def create_next_generation(population: List[DDPGAgent],
             num_offspring -= 1
 
     # -----------------------------------------------------------------
+    # CROSSOVER COLLAPSE DETECTION
+    # When all elites have identical fitness (e.g., from single-agent initialization
+    # or homogeneous population), crossover produces clones because:
+    #   alpha * W + (1 - alpha) * W = W
+    # This wastes ~40% of population slots on identical agents.
+    # Fix: detect homogeneity and redirect crossover slots to mutation.
+    # -----------------------------------------------------------------
+    if num_elites > 1 and num_offspring > 0:
+        top_scores = sorted(scores_for_elites, reverse=True)[:num_elites]
+        score_range = top_scores[0] - top_scores[-1]
+        scale = max(abs(top_scores[0]), abs(top_scores[-1]), 1.0)
+        if score_range / scale < 0.001:  # Less than 0.1% relative difference
+            redirected = num_offspring
+            num_mutants += num_offspring
+            num_offspring = 0
+            print(f"  ⚠ Crossover collapse detected: top {num_elites} agents have near-identical scores")
+            print(f"    Redirecting {redirected} crossover slots → mutation ({num_mutants} total mutants)")
 
     next_gen = []
 
