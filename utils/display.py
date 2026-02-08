@@ -329,7 +329,7 @@ def print_generation_dashboard(gen: int, total_gens: int,
         print(f"  ROI:              {roi:>9.2f}%{_delta('best_roi', pct=True)}")
         print(f"  Win Rate:         {wr:>9.1f}%   ({wins}W / {losses}L){_delta('best_win_rate', '.1f', '%')}")
         print(f"  Quality Ratio:    {qr:>9.1f}%   ({qc}/{tt} trades){_delta('best_quality_ratio', '.1f', '%')}")
-        print(f"  Expectancy:       {exp:>10.2f}   per trade{_delta('best_expectancy')}")
+        print(f"  Expectancy:       {exp:>10.2f}{_delta('best_expectancy')}")
         print(f"  PnL:              ${pnl:>9.2f}{_delta('best_pnl', '.2f', '')}")
 
     # ---- Population Health ----
