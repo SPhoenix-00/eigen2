@@ -131,34 +131,40 @@ def mutate(agent: DDPGAgent, mutation_rate: float = None,
     if mutation_std is None:
         mutation_std = Config.MUTATION_STD
     
-    # Clone agent
+    # Clone agent (independent tensors so mutation only affects the copy)
     mutated = agent.clone()
-    
-    # Mutate actor
+
+    # Mutate actor: in-place so we definitely modify mutated's parameters
     for param in mutated.actor.parameters():
         if len(param.shape) == 0:  # Skip scalar parameters
             continue
-        
-        # Create mask for which weights to mutate
-        mask = torch.rand_like(param) < mutation_rate
-        
-        # Add Gaussian noise to selected weights
-        noise = torch.randn_like(param) * mutation_std
-        param.data += mask.float() * noise
-    
+        mask = (torch.rand_like(param, device=param.device, dtype=param.dtype) < mutation_rate)
+        noise = torch.randn_like(param, device=param.device, dtype=param.dtype) * mutation_std
+        param.data.add_(mask.float() * noise)
+
     # Mutate critic
     for param in mutated.critic.parameters():
         if len(param.shape) == 0:
             continue
-        
-        mask = torch.rand_like(param) < mutation_rate
-        noise = torch.randn_like(param) * mutation_std
-        param.data += mask.float() * noise
-    
-    # Update target networks
+        mask = (torch.rand_like(param, device=param.device, dtype=param.dtype) < mutation_rate)
+        noise = torch.randn_like(param, device=param.device, dtype=param.dtype) * mutation_std
+        param.data.add_(mask.float() * noise)
+
+    # Update target networks from mutated main networks
     mutated.actor_target.load_state_dict(mutated.actor.state_dict())
     mutated.critic_target.load_state_dict(mutated.critic.state_dict())
-    
+
+    # Verify mutation actually changed weights (actor is what drives behavior)
+    with torch.no_grad():
+        orig_first = next(agent.actor.parameters())
+        mut_first = next(mutated.actor.parameters())
+        if orig_first.shape == mut_first.shape:
+            # Compare on same device
+            mut_on_orig_device = mut_first.to(orig_first.device)
+            if torch.allclose(orig_first, mut_on_orig_device):
+                raise RuntimeError(
+                    "mutate(): weights unchanged after mutation. Check clone() independence and device."
+                )
     return mutated
 
 def create_next_generation(population: List[DDPGAgent],

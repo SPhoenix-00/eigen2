@@ -360,6 +360,12 @@ See [EVALUATION_GUIDE.md](EVALUATION_GUIDE.md) for detailed usage and output for
 
 ---
 
+## Recent Fixes
+
+**Population diversity (clone/mutate, 2026-02):** Fixed agents being identical (no variability) when initializing from a single seed. Cause: `DDPGAgent.clone()` could leave parameter tensors sharing storage with the source, so genetic mutation was not applied to independent copies. Fixes: (1) `clone()` now loads from an explicitly cloned state dict (`detach().clone().to(device)` per tensor) so the new agent's parameters never share storage. (2) `mutate()` in `erl/genetic_ops.py` uses in-place `param.data.add_(...)`, explicit device/dtype for RNG, and a runtime check that actor weights actually change; if not, it raises. Files: `models/ddpg_agent.py`, `erl/genetic_ops.py`.
+
+---
+
 ## Troubleshooting
 
 **GCS connection issues:**

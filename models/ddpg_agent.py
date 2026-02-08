@@ -380,23 +380,24 @@ class DDPGAgent:
         self.critic_target = self.critic_target.to(self.device)
     
     def clone(self) -> 'DDPGAgent':
-        """Create a deep copy of this agent."""
+        """Create a deep copy of this agent with independent parameter tensors."""
         new_agent = DDPGAgent(agent_id=self.agent_id)
+        target_device = new_agent.device
 
-        # CRITICAL FIX: Use state_dict() directly without deepcopy
-        # PyTorch's load_state_dict already creates new tensor copies
-        # Using deepcopy creates temporary duplicates that linger in memory (~3-5GB per gen)
-        new_agent.actor.load_state_dict(self.actor.state_dict())
-        new_agent.actor_target.load_state_dict(self.actor_target.state_dict())
-        new_agent.critic.load_state_dict(self.critic.state_dict())
-        new_agent.critic_target.load_state_dict(self.critic_target.state_dict())
+        # Load from explicitly cloned state dict so parameters never share storage with source.
+        # This guarantees mutation in genetic_ops.mutate() modifies only the copy.
+        def _load_cloned_state(module, source_module):
+            sd = {k: v.detach().clone().to(target_device) for k, v in source_module.state_dict().items()}
+            module.load_state_dict(sd, strict=True)
+
+        _load_cloned_state(new_agent.actor, self.actor)
+        _load_cloned_state(new_agent.actor_target, self.actor_target)
+        _load_cloned_state(new_agent.critic, self.critic)
+        _load_cloned_state(new_agent.critic_target, self.critic_target)
         new_agent.noise_scale = self.noise_scale
         new_agent.is_elite = self.is_elite  # Preserve elite status
 
-        # CRITICAL: Ensure networks are on the correct device after loading state_dict
-        # load_state_dict doesn't move tensors - it keeps them on the source device
-        # If source agent was on CPU, we need to move to target device (GPU if available)
-        target_device = new_agent.device
+        # Networks are already on target_device from _load_cloned_state
         new_agent.actor = new_agent.actor.to(target_device)
         new_agent.actor_target = new_agent.actor_target.to(target_device)
         new_agent.critic = new_agent.critic.to(target_device)
