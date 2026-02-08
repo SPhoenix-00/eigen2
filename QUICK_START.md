@@ -4,6 +4,7 @@
 - GCS Bucket: `eigen2-checkpoints-ase0`
 - Credentials: `gcs-credentials.json`
 - RunPod account with RTX 4090 instance
+- **PyTorch:** Code uses current CUDA APIs (`total_memory`, `PYTORCH_ALLOC_CONF`); compatible with PyTorch 2.x.
 
 ---
 
