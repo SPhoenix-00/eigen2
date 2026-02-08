@@ -22,8 +22,6 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 if sys.platform != 'win32':
     from multiprocessing import resource_tracker
-from enum import Enum
-from dataclasses import dataclass
 from collections import OrderedDict
 
 # Maximum number of agents to cache per worker to prevent memory leaks
@@ -51,19 +49,31 @@ from torch.utils.data import DataLoader
 # Local mode evaluator (CPU-optimized, no I/O during evaluation)
 from training.local_evaluator import LocalEvaluator
 
+# Phase 1 extractions - import from focused modules
+from training.fitness import (
+    NumpyEncoder,
+    calculate_triad_fitness as _calculate_triad_fitness,
+    calculate_holographic_fitness as _calculate_holographic_fitness,
+    calculate_pessimistic_fitness,
+    calculate_penalized_median_fitness,
+    aggregate_agent_stats,
+    aggregate_population_stats,
+    calculate_expectancy as _calculate_expectancy,
+    hash_agent,
+    hash_validation_slices,
+)
+from training.breakthrough import BreakthroughState, BreakthroughCandidate
+from training.episode import (
+    run_episode as _run_episode,
+    run_episode_batched as _run_episode_batched,
+)
+from training.validation_slices import (
+    generate_validation_slices as _generate_validation_slices,
+    generate_gauntlet_slices as _generate_gauntlet_slices,
+)
 
 
-
-class NumpyEncoder(json.JSONEncoder):
-    """Custom encoder for NumPy data types."""
-    def default(self, obj):
-        if isinstance(obj, (np.integer, np.int64, np.int32)):
-            return int(obj)
-        elif isinstance(obj, (np.floating, np.float64, np.float32)):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super(NumpyEncoder, self).default(obj)
+# NumpyEncoder moved to training.fitness (re-exported above)
 
 
 # Global variables for worker processes
@@ -550,50 +560,7 @@ def _run_validation_worker(args):
     }
 
 
-class BreakthroughState(Enum):
-    """
-    State machine for Gauntlet Mode breakthrough validation.
-
-    Transitions:
-        NORMAL → DETECTION (spike detected)
-        DETECTION → STABILIZATION (candidate locked in)
-        STABILIZATION → GAUNTLET (stabilization complete)
-        GAUNTLET → CONFIRMED (passed stress test) → NORMAL (ratchet applied, search for next)
-        GAUNTLET → REJECTED (failed stress test) → NORMAL (continue searching)
-    """
-    NORMAL = "normal"  # Normal training, monitoring for spikes
-    DETECTION = "detection"  # Potential breakthrough detected
-    STABILIZATION = "stabilization"  # Locked on candidate, allowing convergence
-    GAUNTLET = "gauntlet"  # Running rigorous stress test
-    CONFIRMED = "confirmed"  # Breakthrough confirmed, apply ratchet
-    REJECTED = "rejected"  # Candidate failed Gauntlet, back to normal
-
-
-@dataclass
-class BreakthroughCandidate:
-    """
-    Represents a candidate agent (or agents) for breakthrough validation.
-
-    Attributes:
-        agent: The best candidate DDPGAgent (for single-agent compatibility)
-        agents: List of all agents that breached the threshold (quorum)
-        agent_idx: Index of best agent
-        agent_indices: Indices of all agents that breached
-        spike_score: Best validation score that triggered detection
-        spike_scores: Scores of all agents that breached
-        detection_generation: Generation when spike was detected
-        stabilization_start_gen: Generation when stabilization started
-        gauntlet_score: Score achieved in Gauntlet (None until tested)
-    """
-    agent: 'DDPGAgent'
-    agents: list['DDPGAgent']
-    agent_idx: int
-    agent_indices: list[int]
-    spike_score: float
-    spike_scores: list[float]
-    detection_generation: int
-    stabilization_start_gen: Optional[int] = None
-    gauntlet_score: Optional[float] = None
+# BreakthroughState and BreakthroughCandidate moved to training.breakthrough (re-exported above)
 
 
 class ERLTrainer:
@@ -2476,795 +2443,79 @@ class ERLTrainer:
                    start_idx: int, end_idx: int,
                    training: bool = True,
                    transition_collector: list = None) -> Tuple[float, Dict]:
-        """
-        Run one episode with an agent using a persistent environment.
-
-        Args:
-            agent: Agent to run
-            env: Persistent TradingEnvironment to reuse (critical for memory efficiency)
-            start_idx: Starting day index (first day of trading period)
-            end_idx: Ending day index (includes settlement period)
-            training: Whether this is training (adds to replay buffer)
-            transition_collector: Optional list to collect transitions instead of writing to disk.
-                                  When provided, transitions are appended here for batch writing later.
-                                  Used in local mode to serialize disk I/O.
-
-        Returns:
-            Tuple of (cumulative_reward, episode_info)
-        """
-        # Calculate trading end (when model stops opening new positions)
-        trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-        # Set environment training mode (affects observation noise for regularization)
-        env.set_training_mode(training)
-
-        # CRITICAL FIX: Reset persistent environment with new indices
-        # DO NOT create new TradingEnvironment here - reuse the passed env
-        state, info = env.reset(
-            start_idx=start_idx,
-            end_idx=end_idx,
-            trading_end_idx=trading_end_idx
+        """Run one episode with an agent. Delegates to training.episode."""
+        return _run_episode(
+            agent, env, start_idx, end_idx,
+            training=training,
+            replay_buffer=self.replay_buffer,
+            transition_collector=transition_collector,
         )
-        cumulative_reward = 0.0
-        steps = 0
-
-        # Run episode
-        while True:
-            # Select action
-            action = agent.select_action(state, add_noise=training)
-
-            # Take step
-            next_state, reward, terminated, truncated, info = env.step(action)
-
-            # Store transition - either in collector for batch writing or directly to buffer
-            transition = {
-                'state': state.astype(np.float32),
-                'action': action.astype(np.float32),
-                'reward': reward,
-                'next_state': next_state.astype(np.float32),
-                'done': float(terminated or truncated)
-            }
-
-            if transition_collector is not None:
-                # Collect for batch writing (local mode)
-                transition_collector.append(transition)
-            else:
-                # Write directly to buffer (parallel mode writes in workers)
-                self.replay_buffer.add(**transition)
-            
-            cumulative_reward += reward
-            steps += 1
-            
-            # Move to next state
-            state = next_state
-            
-            if terminated or truncated:
-                break
-        
-        # Get episode summary
-        episode_summary = env.get_episode_summary()
-        episode_summary['steps'] = steps
-
-        # CRITICAL: Use cumulative_reward from environment
-        # This includes ALL penalties (inaction, losses, etc.)
-        final_fitness = float(cumulative_reward)
-
-        # Apply zero-trades penalty if no trades were made (mode-specific penalty from env)
-        if episode_summary['num_trades'] == 0:
-            final_fitness -= episode_summary['zero_trades_penalty']
-
-        # Apply win rate bonus if enough trades and win rate above threshold
-        if episode_summary['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:
-            win_rate_pct = episode_summary['win_rate'] * 100.0  # Convert to percentage
-            if win_rate_pct > Config.WIN_RATE_BONUS_THRESHOLD:
-                bonus = (win_rate_pct - Config.WIN_RATE_BONUS_THRESHOLD) ** 2
-                final_fitness += bonus
-                episode_summary['win_rate_bonus'] = bonus
-            else:
-                episode_summary['win_rate_bonus'] = 0.0
-        else:
-            episode_summary['win_rate_bonus'] = 0.0
-
-        # NOTE: No need to delete env - we're reusing persistent environments now
-        return final_fitness, episode_summary
 
     def run_episode_batched(self, agent: DDPGAgent, env: TradingEnvironment,
                            start_idx: int, end_idx: int,
                            training: bool = True, batch_size: int = 16) -> Tuple[float, Dict]:
-        """
-        Run one episode with batched inference for faster evaluation.
-
-        Collects multiple states and processes them in a single forward pass through
-        the actor network, providing 10-15% speedup for GPU inference.
-
-        Args:
-            agent: Agent to run
-            env: Persistent TradingEnvironment to reuse
-            start_idx: Starting day index
-            end_idx: Ending day index
-            training: Whether this is training (adds to replay buffer)
-            batch_size: Number of states to batch together (default: 16)
-
-        Returns:
-            Tuple of (cumulative_reward, episode_info)
-        """
-        # Calculate trading end
-        trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-        # Set environment training mode
-        env.set_training_mode(training)
-
-        # Reset environment
-        state, info = env.reset(
-            start_idx=start_idx,
-            end_idx=end_idx,
-            trading_end_idx=trading_end_idx
+        """Run one episode with batched inference. Delegates to training.episode."""
+        return _run_episode_batched(
+            agent, env, start_idx, end_idx,
+            training=training,
+            batch_size=batch_size,
+            replay_buffer=self.replay_buffer,
         )
-        cumulative_reward = 0.0
-        steps = 0
-
-        # State buffer for batching
-        state_buffer = []
-        replay_buffer_data = []  # Store transitions for later addition to replay buffer
-
-        while True:
-            # Collect states for batching
-            state_buffer.append(state.copy())
-
-            # When buffer is full (or episode ending), process batch
-            if len(state_buffer) >= batch_size:
-                # ONE forward pass for entire batch (much faster on GPU)
-                states_array = np.stack(state_buffer)  # [batch_size, context_days, num_cols, features]
-                actions_batch = agent.select_actions_batch(states_array, add_noise=training)
-
-                # Apply actions sequentially (environment is stateful)
-                for i, action in enumerate(actions_batch):
-                    next_state, reward, terminated, truncated, info = env.step(action)
-
-                    # Store transition for replay buffer (if training)
-                    if training:
-                        replay_buffer_data.append({
-                            'state': state_buffer[i].astype(np.float32),
-                            'action': action.astype(np.float32),
-                            'reward': reward,
-                            'next_state': next_state.astype(np.float32),
-                            'done': float(terminated or truncated)
-                        })
-
-                    cumulative_reward += reward
-                    steps += 1
-                    state = next_state
-
-                    if terminated or truncated:
-                        break
-
-                # Clear buffer
-                state_buffer = []
-
-                if terminated or truncated:
-                    break
-
-        # Process any remaining states in buffer
-        if len(state_buffer) > 0:
-            states_array = np.stack(state_buffer)
-            actions_batch = agent.select_actions_batch(states_array, add_noise=training)
-
-            for i, action in enumerate(actions_batch):
-                next_state, reward, terminated, truncated, info = env.step(action)
-
-                if training:
-                    replay_buffer_data.append({
-                        'state': state_buffer[i].astype(np.float32),
-                        'action': action.astype(np.float32),
-                        'reward': reward,
-                        'next_state': next_state.astype(np.float32),
-                        'done': float(terminated or truncated)
-                    })
-
-                cumulative_reward += reward
-                steps += 1
-                state = next_state
-
-                if terminated or truncated:
-                    break
-
-        # Add all transitions to replay buffer at once (if training)
-        if training:
-            for transition in replay_buffer_data:
-                self.replay_buffer.add(
-                    state=transition['state'],
-                    action=transition['action'],
-                    reward=transition['reward'],
-                    next_state=transition['next_state'],
-                    done=transition['done']
-                )
-
-        # Get episode summary
-        episode_summary = env.get_episode_summary()
-        episode_summary['steps'] = steps
-
-        # Calculate final fitness
-        final_fitness = float(cumulative_reward)
-
-        # Apply zero-trades penalty if no trades were made (mode-specific penalty from env)
-        if episode_summary['num_trades'] == 0:
-            final_fitness -= episode_summary['zero_trades_penalty']
-
-        return final_fitness, episode_summary
 
     def generate_validation_slices(self) -> List[Tuple[int, int, int]]:
-        """
-        Generate 10 validation slices from validation set.
-
-        Divides validation period into 4 equal quarters, then samples:
-        - 4 slices from within each quarter
-        - 3 straddling slices between quarters (Q1-Q2, Q2-Q3, Q3-Q4)
-        - 3 random slices from anywhere in the validation period
-
-        This ensures comprehensive coverage with overlapping windows across different market conditions.
-
-        Each slice consists of:
-        - CONTEXT_WINDOW_DAYS (151) of prior data (may come from training data for context)
-        - TRADING_PERIOD_DAYS (125) where agent can trade (from validation set)
-        - SETTLEMENT_PERIOD_DAYS (30) to close positions (from validation set)
-
-        Returns:
-            List of 10 tuples: (start_idx, end_idx, trading_end_idx)
-        """
-        # NOTE: start_idx is the first day of TRADING (not context)
-        # The environment automatically looks back CONTEXT_WINDOW_DAYS from start_idx for context
-        # So we just need to ensure trading + settlement fit within validation set
-
-        # Trading must start at or after val_start_idx
-        min_start = self.val_start_idx
-
-        # Trading + settlement must end before val_end_idx
-        max_start = self.val_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
-
-        if max_start < min_start:
-            raise ValueError(f"Not enough validation data: need {Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS} days")
-
-        # Divide the validation range into 4 equal segments
-        total_range = max_start - min_start + 1
-        segment_size = total_range // 4
-
-        slices = []
-
-        # 1. Sample one slice from each quarter (4 slices)
-        for segment_idx in range(4):
-            # Calculate segment boundaries
-            segment_start = min_start + (segment_idx * segment_size)
-            # For the last segment, extend to max_start to avoid rounding issues
-            segment_end = max_start + 1 if segment_idx == 3 else min_start + ((segment_idx + 1) * segment_size)
-
-            # Sample one random start index from this segment
-            start_idx = np.random.randint(segment_start, segment_end)
-            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-            trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-            slices.append((start_idx, end_idx, trading_end_idx))
-
-        # 2. Sample straddling slices between quarters (3 slices)
-        for straddle_idx in range(3):
-            # Define straddling region: from halfway through quarter N to halfway through quarter N+1
-            straddle_start = min_start + (segment_size // 2) + (straddle_idx * segment_size)
-            straddle_end = min_start + (segment_size // 2) + ((straddle_idx + 1) * segment_size)
-
-            # Ensure we don't exceed max_start
-            straddle_end = min(straddle_end, max_start + 1)
-
-            # Sample one random start index from this straddling region
-            if straddle_end > straddle_start:
-                start_idx = np.random.randint(straddle_start, straddle_end)
-                end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-                trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-                slices.append((start_idx, end_idx, trading_end_idx))
-
-        # 3. Sample 3 completely random slices from entire validation range (3 slices)
-        for _ in range(3):
-            start_idx = np.random.randint(min_start, max_start + 1)
-            end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-            trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-            slices.append((start_idx, end_idx, trading_end_idx))
-
-        return slices
+        """Generate 10 validation slices from validation set. Delegates to training.validation_slices."""
+        return _generate_validation_slices(self.val_start_idx, self.val_end_idx)
 
     def generate_gauntlet_slices(self) -> List[Tuple[int, int, int]]:
-        """
-        Generate 20+ rigorous validation slices for Gauntlet stress test.
-
-        Samples slices from BOTH training and validation data to ensure the agent
-        performs robustly across all market regimes, not just validation period.
-
-        Strategy:
-        - 10 slices from training data (different market conditions)
-        - 10 slices from validation data (out-of-sample)
-
-        This prevents agents from gaming the validation set and ensures genuine
-        robustness across all available market data.
-
-        Returns:
-            List of 20 tuples: (start_idx, end_idx, trading_end_idx)
-        """
-        slices = []
-
-        # 1. Sample 10 slices from training data
-        min_start_train = self.train_start_idx
-        max_start_train = self.train_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
-
-        if max_start_train >= min_start_train:
-            # Divide training range into 10 segments
-            train_range = max_start_train - min_start_train + 1
-            train_segment_size = max(1, train_range // 10)
-
-            for i in range(10):
-                segment_start = min_start_train + (i * train_segment_size)
-                segment_end = min(max_start_train + 1, segment_start + train_segment_size)
-
-                if segment_end > segment_start:
-                    start_idx = np.random.randint(segment_start, segment_end)
-                    end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-                    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-                    slices.append((start_idx, end_idx, trading_end_idx))
-
-        # 2. Sample 10 slices from validation data
-        min_start_val = self.val_start_idx
-        max_start_val = self.val_end_idx - (Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS)
-
-        if max_start_val >= min_start_val:
-            # Divide validation range into 10 segments
-            val_range = max_start_val - min_start_val + 1
-            val_segment_size = max(1, val_range // 10)
-
-            for i in range(10):
-                segment_start = min_start_val + (i * val_segment_size)
-                segment_end = min(max_start_val + 1, segment_start + val_segment_size)
-
-                if segment_end > segment_start:
-                    start_idx = np.random.randint(segment_start, segment_end)
-                    end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
-                    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-
-                    slices.append((start_idx, end_idx, trading_end_idx))
-
-        return slices
-
-    def _hash_agent(self, agent: DDPGAgent) -> str:
-        """
-        Create hash of agent's weights for caching.
-        Uses first layer weights for efficiency while maintaining uniqueness.
-
-        Args:
-            agent: Agent to hash
-
-        Returns:
-            MD5 hash string
-        """
-        import hashlib
-        actor_weights = agent.actor.state_dict()
-        # Hash first layer weights only (sufficient for uniqueness)
-        first_layer = list(actor_weights.values())[0].cpu().numpy()
-        return hashlib.md5(first_layer.tobytes()).hexdigest()
-
-    def _hash_validation_slices(self, slices: List[Tuple[int, int, int]]) -> str:
-        """
-        Hash validation slices configuration.
-
-        Args:
-            slices: List of (start_idx, end_idx, trading_end_idx) tuples
-
-        Returns:
-            MD5 hash string
-        """
-        import hashlib
-        return hashlib.md5(str(slices).encode()).hexdigest()
-
-    def calculate_triad_fitness(self, stats: Dict) -> float:
-        """
-        Triad 3.0: Maverick Selectivity & Gradient Update
-        """
-        total_trades = stats.get('num_trades', 0)
-        
-        # 1. Handle Inactivity
-        if total_trades == 0:
-            if self.maverick_mode:
-                return -50.0 + stats.get('max_coefficient_during_episode', 0)
-            
-            # In consistency mode during stabilization/gauntlet, use soft penalty
-            if self.consistency_mode and self.breakthrough_state in (BreakthroughState.STABILIZATION, BreakthroughState.GAUNTLET):
-                penalty = Config.ZERO_TRADES_PENALTY_GAUNTLET
-            elif self.consistency_mode:
-                penalty = Config.ZERO_TRADES_PENALTY_CONSISTENCY
-            else:
-                penalty = Config.ZERO_TRADES_PENALTY_NORMAL
-            return -penalty + stats.get('max_coefficient_during_episode', 0)
-
-        # 2. Calculate Core Metrics
-        win_rate = stats.get('win_rate', 0.0) # 0.0 to 1.0
-        
-        # Calculate Quality Ratio (QR)
-        closed_trades = stats.get('closed_trades', [])
-        if closed_trades:
-            # Safely handle quality_threshold if not strictly defined
-            q_thresh = getattr(self, 'quality_threshold', 1.0) 
-            quality_count = sum(1 for t in closed_trades if t.get('gain_pct', 0) >= q_thresh)
-            qr = quality_count / total_trades
-        else:
-            qr = 0.0
-
-        raw_pnl = stats.get('raw_pnl', 0.0)
-        total_inv = stats.get('total_investment', 0.0)
-        
-        # Calculate Expectancy (The "Precision" Metric) for gradient use
-        # Expectancy = (Win% * AvgWin%) - (Loss% * AvgLoss%)
-        # Expectancy is a unitless metric between 0-10 (NOT a percentage).
-        # Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
-        if closed_trades:
-            wins = [t['gain_pct'] for t in closed_trades if t['gain_pct'] > 0]
-            losses = [abs(t['gain_pct']) for t in closed_trades if t['gain_pct'] <= 0]
-            
-            avg_win = np.mean(wins) if wins else 0.0
-            avg_loss = np.mean(losses) if losses else 0.0
-            
-            wr_calc = len(wins) / len(closed_trades)
-            lr_calc = 1.0 - wr_calc
-            expectancy = (wr_calc * avg_win) - (lr_calc * avg_loss)
-        else:
-            expectancy = 0.0
-
-        # --- MAVERICK MODE: Triad 3.0 scoring with Gradient ---
-        if self.maverick_mode:
-            # Get peak capital employed
-            peak_capital = stats.get('peak_capital_employed', total_inv)
-            if peak_capital <= 0:
-                peak_capital = total_inv if total_inv > 0 else 1.0
-
-            # Calculate ROI based on peak capital
-            roi_pct = (raw_pnl / peak_capital * 100) if peak_capital > 0 else 0.0
-
-            # A. ROI Score (Power Law) - REDUCED from 1.5 to 1.1 for consistency
-            if roi_pct >= 0:
-                roi_score = (roi_pct ** 1.1)
-            else:
-                roi_score = -(abs(roi_pct) ** 1.1)
-
-            # B. CLAMPED Volume Scalar (20k Limit)
-            # log10(20k) approx 4.3. Clamp to stop "lucky whales"
-            raw_vol_scalar = math.log10(peak_capital + 10)
-            volume_scalar = min(raw_vol_scalar, 4.3)
-
-            # C. Expectancy (Precision Reward) - REDUCED from ^2 to ^1.1
-            # Expectancy is a unitless metric between 0-10 (NOT a percentage).
-            # Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
-            # 1.0 expectancy -> 1.0 score -> 1.1x boost
-            # 5.0 expectancy -> 5.8 score -> 1.58x boost (was 3.5x with ^2)
-            # Anything below 1.0 expectancy should be penalized (squared amplifies negative)
-            if expectancy >= 0:
-                exp_score = (expectancy ** 1.1)
-            else:
-                exp_score = -(abs(expectancy) ** 1.1)
-
-            # D. Base Fitness
-            if roi_score > 0:
-                # Win Scenario: Boost by Expectancy
-                # Multiplier (1 + 0.1 * exp_score) implies:
-                # exp=1% (score 1) -> 1.1x boost
-                # exp=5% (score 5.8) -> 1.58x boost
-                fitness = roi_score * volume_scalar * (1.0 + (exp_score * 0.1))
-                
-                # CONSISTENCY SCALING: WR^2
-                # This naturally suppresses low win rates and super-linearizes high ones
-                fitness *= (win_rate ** 2)
-                
-                # WIN RATE HINGE PENALTY
-                # Creates a steep gradient ramp up to 60% WR
-                # Below 60%: Massive penalty (e.g., 40% WR -> -200 pts)
-                # Above 60%: No penalty, pure performance
-                if win_rate < 0.60:
-                    wr_deficit = win_rate - 0.60  # Negative value
-                    penalty = wr_deficit * 1000.0
-                    fitness += penalty  # Adds negative value
-            else:
-                # Loss Scenario: Expectancy failure amplifies pain
-                fitness = roi_score * volume_scalar + (exp_score * volume_scalar)
-
-            # E. FOMO Penalty (Dampened)
-            market_return = stats.get('market_return_pct', 0.0)
-            alpha_gap = market_return - roi_pct
-            fomo_penalty = max(0.0, alpha_gap) * 5.0
-            fitness -= fomo_penalty
-
-            # F. Global 50 Proximity Gradient
-            # Pull agent towards admissibility thresholds
-            if hasattr(self, 'global_hof') and self.global_hof.enabled and self.global_hof.entry_threshold > -999:
-                t_score = [self.global_hof.entry_threshold, self.global_hof.gauntlet_p25, self.global_hof.gauntlet_median]
-                t_roi   = [self.global_hof.roi_threshold,   self.global_hof.roi_p25,      self.global_hof.roi_median]
-                t_exp   = [self.global_hof.expectancy_threshold, self.global_hof.expectancy_p25, self.global_hof.expectancy_median]
-
-                curr_score = fitness 
-                curr_roi = roi_pct
-                curr_exp = expectancy
-
-                def calc_gap(target, current):
-                    return max(0.0, target - current)
-
-                # Weights: Entry=3.0, p25=1.5, Median=1.0
-                gap_score = (calc_gap(t_score[0], curr_score)*3.0 + calc_gap(t_score[1], curr_score)*1.5 + calc_gap(t_score[2], curr_score))
-                gap_roi   = (calc_gap(t_roi[0], curr_roi)*3.0     + calc_gap(t_roi[1], curr_roi)*1.5     + calc_gap(t_roi[2], curr_roi))
-                
-                # Expectancy is 0-10 metric (similar scale to ROI which is 0-50%), use same weights as ROI
-                gap_exp   = (calc_gap(t_exp[0], curr_exp)*3.0     + calc_gap(t_exp[1], curr_exp)*1.5     + calc_gap(t_exp[2], curr_exp))
-
-                proximity_penalty = (gap_score * 0.5) + (gap_roi * 1.0) + (gap_exp * 1.0)
-                fitness -= proximity_penalty
-
-            return float(fitness)
-
-        # --- NORMAL/CONSISTENCY MODE: Standard Triad scoring ---
-        # Calculate ROI for normal/consistency mode
-        roi_pct = (raw_pnl / total_inv * 100) if total_inv > 0 else 0.0
-        
-        # ROI Expansion Mode: Uncap ROI and apply super-linear scaling
-        if roi_pct >= 0:
-            roi_score = (roi_pct ** 1.1)
-        else:
-            roi_score = -(abs(roi_pct) ** 1.1)
-
-        # 3. Volume Scalar (Log Magnitude)
-        # Adding 10 ensures log is always > 1, providing a baseline score
-        volume_scalar = math.log10(abs(raw_pnl) + 10)
-
-        # 4. Calculate Fitness
-        if roi_score > 0:
-            # Win Scenario
-            base_score = roi_score * volume_scalar
-            consistency_bonus = (1.0 + (win_rate ** 2))
-            conviction_bonus = (1.0 + qr)
-            fitness = base_score * consistency_bonus * conviction_bonus * 10.0
-        else:
-            # Loss Scenario
-            fitness = roi_score * volume_scalar * 10.0
-
-        return float(fitness)
-
-    def calculate_holographic_fitness(self, all_slices_trades: List[Dict]) -> float:
-        """
-        HOLOGRAPHIC SCORING:
-        Stitches trades from all slices into a single 'Virtual Equity Curve'.
-        Updated to include Triad 3.0 Logic: Expectancy^2, Volume Clamp, and G50 Gradient.
-        """
-        # 1. Safety Checks
-        if not all_slices_trades:
-            # Maverick penalty for inaction (forces them to trade)
-            return -5000.0 if self.maverick_mode else -10.0
-            
-        total_trades = len(all_slices_trades)
-        
-        # 2. Sort trades chronologically
-        from datetime import datetime
-        try:
-            def get_sort_key(t):
-                d_str = t.get('entry_date') or t.get('day') or t.get('exit_date')
-                if isinstance(d_str, str) and d_str:
-                    try:
-                        return datetime.strptime(d_str, '%Y-%m-%d')
-                    except ValueError:
-                        pass
-                return datetime.min
-            all_slices_trades.sort(key=get_sort_key)
-        except Exception:
-            pass 
-            
-        # 3. Calculate Virtual Equity Curve & Stats
-        virtual_equity = 1.0
-        peak_equity = 1.0
-        max_drawdown = 0.0
-        
-        wins = 0
-        winning_pnl = []
-        losing_pnl = []
-        
-        for trade in all_slices_trades:
-            shares = int(trade.get('coefficient', 0))
-            if shares == 0:
-                continue
-
-            entry_price = trade.get('entry_price', 0.0)
-            exit_price = trade.get('exit_price', 0.0)
-            
-            if entry_price > 0:
-                raw_roi = (exit_price - entry_price) / entry_price
-                
-                # Update Virtual Equity (assumes fixed fractional betting)
-                virtual_equity *= (1.0 + (raw_roi * 0.1))
-                
-                if virtual_equity > peak_equity:
-                    peak_equity = virtual_equity
-                
-                current_dd = (peak_equity - virtual_equity) / peak_equity
-                if current_dd > max_drawdown:
-                    max_drawdown = current_dd
-                    
-                if raw_roi > 0:
-                    wins += 1
-                    winning_pnl.append(raw_roi)
-                else:
-                    losing_pnl.append(abs(raw_roi))
-
-        # 4. Calculate Final Metrics
-        holographic_roi = (virtual_equity - 1.0) * 100.0
-        win_rate = wins / total_trades if total_trades > 0 else 0.0
-        
-        # Calculate Expectancy (Triad 3.0 Requirement)
-        avg_win = np.mean(winning_pnl) * 100.0 if winning_pnl else 0.0
-        avg_loss = np.mean(losing_pnl) * 100.0 if losing_pnl else 0.0
-        expectancy = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
-        
-        # 5. Maverick Scoring (Triad 3.0)
-        if self.maverick_mode:
-            # A. ROI Score - REDUCED from 1.5 to 1.1 for consistency
-            if holographic_roi >= 0:
-                roi_score = (holographic_roi ** 1.1)
-            else:
-                roi_score = -(abs(holographic_roi) ** 1.1)
-            
-            # B. Expectancy Reward (The Sniper Fix) - REDUCED from ^2 to ^1.1
-            # Expectancy is a unitless metric between 0-10 (NOT a percentage).
-            # Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
-            # 1.0 expectancy -> 1.0 score -> 1.1x boost
-            # 5.0 expectancy -> 5.8 score -> 1.58x boost
-            # Anything below 1.0 expectancy should be penalized (squared amplifies negative)
-            if expectancy >= 0:
-                exp_score = (expectancy ** 1.1)
-            else:
-                exp_score = -(abs(expectancy) ** 1.1)
-
-            # C. Volume Scalar (Implied)
-            # In holographic mode, volume is implied by the equity curve length.
-            # We add a small bonus for sustaining the curve, but capped.
-            
-            # REINVITED RAW PNL: Use Raw PnL magnitude instead of trade count
-            # This incentivizes accumulation of actual dollars, not just "activity"
-            total_raw_pnl = sum((t.get('exit_price', 0) - t.get('entry_price', 0)) * int(t.get('coefficient', 0)) for t in all_slices_trades)
-            
-            # log10 of PnL magnitude (e.g. $10k -> 4.0)
-            # Adding 10 ensures log is always > 1
-            volume_proxy = math.log10(abs(total_raw_pnl) + 10)
-            volume_scalar = min(volume_proxy, 4.3)
-            
-            # D. Base Fitness
-            # Combine ROI, Volume, and Expectancy
-            if roi_score > 0:
-                fitness = roi_score * volume_scalar * (1.0 + (exp_score * 0.1))
-                # Add consistency scaling (WR^2)
-                fitness *= (win_rate ** 2)
-                
-                # Add Win Rate Hinge Penalty (< 60%)
-                if win_rate < 0.60:
-                    wr_deficit = win_rate - 0.60
-                    penalty = wr_deficit * 1000.0
-                    fitness += penalty
-            else:
-                fitness = roi_score * volume_scalar + (exp_score * volume_scalar)
-            
-            # E. Drawdown Penalty (Specific to Holographic)
-            # Acts as the "Gauntlet Proxy"
-            # TIGHTENED: Threshold reduced from 10% to 5% to force sniper-like precision
-            if max_drawdown > 0.05:
-                penalty_factor = max(0.1, 1.0 - (max_drawdown - 0.05) * 10.0) # steeper penalty
-                fitness *= penalty_factor
-
-            # F. Global 50 Proximity Gradient
-            # Pull agent towards admissibility thresholds
-            if hasattr(self, 'global_hof') and self.global_hof.enabled and self.global_hof.entry_threshold > -999:
-                t_score = [self.global_hof.entry_threshold, self.global_hof.gauntlet_p25, self.global_hof.gauntlet_median]
-                
-                curr_score = fitness 
-                
-                # Calculate Weighted Gap for Score Only
-                # (ROI/Expectancy gaps are harder to map 1:1 in holographic mode, so we focus on Score)
-                def calc_gap(target, current):
-                    return max(0.0, target - current)
-
-                # Weights: Entry=3.0, p25=1.5, Median=1.0
-                gap_score = (calc_gap(t_score[0], curr_score)*3.0 + calc_gap(t_score[1], curr_score)*1.5 + calc_gap(t_score[2], curr_score))
-                
-                # Apply penalty
-                fitness -= gap_score * 0.5
-
-            return float(fitness)
-            
-        return float(holographic_roi)
-
-    def _calculate_pessimistic_fitness(self, slice_fitness_scores: List[float]) -> float:
-        """
-        Calculate fitness using pessimistic aggregator (0.4*mean + 0.6*min).
-
-        This aligns training incentives with validation requirements by giving
-        60% weight to worst slice performance and 40% to average performance.
-
-        Args:
-            slice_fitness_scores: List of fitness scores from multiple evaluation slices
-
-        Returns:
-            Pessimistically aggregated fitness score
-        """
-        mean_score = np.mean(slice_fitness_scores)
-        min_score = np.min(slice_fitness_scores)
-        return (0.4 * mean_score) + (0.6 * min_score)
-
-    def _calculate_penalized_median_fitness(self, slice_fitness_scores: List[float]) -> float:
-        """
-        Calculate fitness using Penalized Median scoring: Median - (0.5 * StdDev).
-
-        This rewards agents that reliably perform well while penalizing volatility.
-        Used by Gauntlet validation and --multi mode to ensure consistent performance
-        across diverse market conditions.
-
-        Args:
-            slice_fitness_scores: List of fitness scores from multiple evaluation slices
-
-        Returns:
-            Penalized median fitness score
-        """
-        scores_np = np.array(slice_fitness_scores)
-        median_score = float(np.median(scores_np))
-        std_score = float(np.std(scores_np))
-        return median_score - (0.5 * std_score)
-
-    def _aggregate_agent_stats(self, slice_episode_stats: List[Dict]) -> Dict:
-        """
-        Aggregate episode statistics across all training slices for a single agent.
-
-        Calculates global win rate (total wins / total trades) rather than
-        averaging per-slice win rates for more accurate representation.
-
-        Args:
-            slice_episode_stats: List of episode info dicts from multiple slices
-
-        Returns:
-            Aggregated stats dict with num_trades, num_wins, num_losses, win_rate
-        """
-        agent_total_wins = sum(s['num_wins'] for s in slice_episode_stats)
-        agent_total_losses = sum(s['num_losses'] for s in slice_episode_stats)
-        agent_total_trades = agent_total_wins + agent_total_losses
-        agent_win_rate = agent_total_wins / agent_total_trades if agent_total_trades > 0 else 0.0
-
-        return {
-            'num_trades': int(np.mean([s['num_trades'] for s in slice_episode_stats])),
-            'num_wins': int(np.mean([s['num_wins'] for s in slice_episode_stats])),
-            'num_losses': int(np.mean([s['num_losses'] for s in slice_episode_stats])),
-            'win_rate': agent_win_rate,
-        }
-
-    def _aggregate_population_stats(self, all_episode_stats: List[Dict], fitness_scores: List[float]) -> Dict:
-        """
-        Aggregate statistics across all agents in the population.
-
-        Args:
-            all_episode_stats: List of per-agent aggregated stats dicts
-            fitness_scores: List of fitness scores for all agents
-
-        Returns:
-            Population-level aggregate stats dict
-        """
-        agents_with_trades = [s for s in all_episode_stats if s['num_trades'] > 0]
-        avg_win_rate = (
-            float(sum(s['win_rate'] for s in agents_with_trades) / len(agents_with_trades))
-            if agents_with_trades else 0.0
+        """Generate 20 gauntlet stress-test slices. Delegates to training.validation_slices."""
+        return _generate_gauntlet_slices(
+            self.train_start_idx, self.train_end_idx,
+            self.val_start_idx, self.val_end_idx,
         )
 
-        return {
-            'total_trades': int(sum(s['num_trades'] for s in all_episode_stats)),
-            'avg_trades_per_agent': float(sum(s['num_trades'] for s in all_episode_stats) / len(all_episode_stats)),
-            'total_wins': int(sum(s['num_wins'] for s in all_episode_stats)),
-            'total_losses': int(sum(s['num_losses'] for s in all_episode_stats)),
-            'avg_win_rate': avg_win_rate,
-            'agents_with_positive_fitness': int(sum(1 for f in fitness_scores if f > 0)),
-        }
+    def _hash_agent(self, agent: DDPGAgent) -> str:
+        """Create hash of agent's weights for caching."""
+        return hash_agent(agent)
+
+    def _hash_validation_slices(self, slices: List[Tuple[int, int, int]]) -> str:
+        """Hash validation slices configuration."""
+        return hash_validation_slices(slices)
+
+    def calculate_triad_fitness(self, stats: Dict) -> float:
+        """Triad 3.0: Maverick Selectivity & Gradient Update. Delegates to training.fitness."""
+        return _calculate_triad_fitness(
+            stats,
+            maverick_mode=self.maverick_mode,
+            consistency_mode=self.consistency_mode,
+            quality_threshold=getattr(self, 'quality_threshold', 1.0),
+            roi_hurdle_pct=getattr(self, 'roi_hurdle_ema', 0.0),
+            breakthrough_state=self.breakthrough_state,
+            global_hof=getattr(self, 'global_hof', None),
+        )
+
+    def calculate_holographic_fitness(self, all_slices_trades: List[Dict]) -> float:
+        """Holographic scoring. Delegates to training.fitness."""
+        return _calculate_holographic_fitness(
+            all_slices_trades,
+            maverick_mode=self.maverick_mode,
+            global_hof=getattr(self, 'global_hof', None),
+        )
+
+    def _calculate_pessimistic_fitness(self, slice_fitness_scores: List[float]) -> float:
+        """Calculate fitness using pessimistic aggregator (0.4*mean + 0.6*min)."""
+        return calculate_pessimistic_fitness(slice_fitness_scores)
+
+    def _calculate_penalized_median_fitness(self, slice_fitness_scores: List[float]) -> float:
+        """Calculate fitness using Penalized Median scoring: Median - (0.5 * StdDev)."""
+        return calculate_penalized_median_fitness(slice_fitness_scores)
+
+    def _aggregate_agent_stats(self, slice_episode_stats: List[Dict]) -> Dict:
+        """Aggregate episode statistics across all training slices for a single agent."""
+        return aggregate_agent_stats(slice_episode_stats)
+
+    def _aggregate_population_stats(self, all_episode_stats: List[Dict], fitness_scores: List[float]) -> Dict:
+        """Aggregate statistics across all agents in the population."""
+        return aggregate_population_stats(all_episode_stats, fitness_scores)
 
     def evaluate_population(self) -> Tuple[List[float], Dict]:
         """
@@ -4332,44 +3583,8 @@ class ERLTrainer:
             print(f"\n✓ MULTI-MODE TRAINING COMPLETE!")
 
     def calculate_expectancy(self, closed_trades):
-        """
-        Calculate Expectancy metric for trading performance.
-
-        Expectancy = (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
-
-        Note: Expectancy is a unitless metric between 0-10 (NOT a percentage).
-        Expectancy of 1.0 is roughly equivalent to 50% WR (minimum viable).
-
-        - If Expectancy > 0: The agent has a mathematical edge
-        - If Expectancy trends up: The agent is becoming a sharper trader
-        - If Expectancy is flat but PnL is up: The agent is just trading more (scaling), not getting smarter
-
-        Args:
-            closed_trades: List of closed trade dictionaries with 'gain_pct' field
-
-        Returns:
-            Expectancy value (float, 0-10 range)
-        """
-        if not closed_trades:
-            return 0.0
-
-        # Separate wins and losses
-        wins = [t['gain_pct'] for t in closed_trades if t['gain_pct'] > 0]
-        losses = [abs(t['gain_pct']) for t in closed_trades if t['gain_pct'] <= 0]
-
-        if not wins and not losses:
-            return 0.0
-
-        avg_win = np.mean(wins) if wins else 0.0
-        avg_loss = np.mean(losses) if losses else 0.0
-
-        win_rate = len(wins) / len(closed_trades)
-        loss_rate = 1.0 - win_rate
-
-        # Expectancy = (Probability of Win * Reward) - (Probability of Loss * Risk)
-        expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
-
-        return expectancy
+        """Calculate Expectancy metric for trading performance. Delegates to training.fitness."""
+        return _calculate_expectancy(closed_trades)
 
     def calculate_conviction_threshold_vector(self, agent) -> list:
         """
