@@ -322,7 +322,7 @@ except Exception as e:
         num_episodes = 5 if self.trainer.consistency_mode else 3
 
         # Log evaluation info
-        if self.trainer.multi_mode:
+        if self.trainer.multi2_mode:
             scoring_method = "median - 0.5*std (Penalized Median)"
         else:
             scoring_method = "0.4*mean + 0.6*min (pessimistic)"
@@ -378,7 +378,7 @@ except Exception as e:
                 slice_stats.append(episode_info)
 
             # Calculate final fitness
-            if self.trainer.multi_mode:
+            if self.trainer.multi2_mode:
                 final_fitness = self._penalized_median(slice_fitness)
             else:
                 final_fitness = self._pessimistic(slice_fitness)
@@ -658,7 +658,7 @@ except Exception as e:
             raise ValueError("No validation slices for this generation")
 
         validation_slices = self.trainer.current_generation_val_slices
-        use_penalized_median = self.trainer.multi_mode
+        use_penalized_median = self.trainer.multi2_mode
 
         validation_results = []
 

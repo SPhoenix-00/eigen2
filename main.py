@@ -73,6 +73,210 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
+def _update_roster_after_training(roster, member_idx, trainer, manager):
+    """
+    Update roster entry if agent improved during training.
+
+    After each agent's independent training run, check if the agent was promoted
+    to Global50. If so, update the roster entry with the new agent's info.
+
+    Args:
+        roster: The committee roster dict (modified in-place)
+        member_idx: Index of the member in the roster
+        trainer: The ERLTrainer instance that just finished training
+        manager: CommitteeManager for saving the roster
+    """
+    # Find the best Global50 entry from this run
+    best_entry = None
+    for entry in trainer.global_hof.entries:
+        if entry.run_name == trainer.run_name:
+            if best_entry is None or entry.gauntlet_score > best_entry.gauntlet_score:
+                best_entry = entry
+
+    if best_entry is not None:
+        old_member = roster['members'][member_idx]
+        roster['members'][member_idx] = {
+            'filename': best_entry.get_filename(),
+            'run_name': best_entry.run_name,
+            'agent_id': best_entry.agent_id,
+            'gauntlet_score': best_entry.gauntlet_score,
+            'roi': best_entry.roi,
+            'expectancy': best_entry.expectancy,
+            'quality_ratio': best_entry.quality_ratio,
+            'win_ratio': best_entry.win_ratio,
+            'is_maverick': best_entry.is_maverick,
+            'stats': old_member.get('stats', {}),
+        }
+        manager.save_roster(roster)
+        print(f"  Roster updated: {best_entry.get_filename()} "
+              f"(gauntlet={best_entry.gauntlet_score:.2f})")
+    else:
+        print(f"  No Global50 promotion -- roster entry unchanged")
+
+
+def run_multi_orchestrator(loader, roster, args, tee_logger):
+    """
+    New --multi orchestrator: trains each committee member as an independent run.
+
+    Non-maverick agents go through the standard --single pipeline.
+    Maverick agents go through the --single --maverick pipeline.
+    Each agent gets its own wandb run with a unique run name.
+
+    Args:
+        loader: StockDataLoader (already loaded with data)
+        roster: Committee roster dict with members
+        args: Parsed command-line arguments
+        tee_logger: TeeLogger for stdout/stderr capture
+    """
+    import gc
+    from committee import CommitteeManager, get_agent_filepath
+    from utils.cloud_sync import get_cloud_sync_from_env
+
+    context_window = roster['context_window_days']
+    manager = CommitteeManager(context_window)
+    members = roster['members']
+    cloud_sync = get_cloud_sync_from_env()
+
+    # Separate into non-maverick and maverick
+    non_mavericks = [(i, m) for i, m in enumerate(members) if not m.get('is_maverick', False)]
+    mavericks = [(i, m) for i, m in enumerate(members) if m.get('is_maverick', False)]
+
+    total_agents = len(members)
+    completed = 0
+
+    print(f"\n{'='*60}")
+    print(f"MULTI-AGENT ORCHESTRATOR")
+    print(f"{'='*60}")
+    print(f"  Non-maverick agents: {len(non_mavericks)}")
+    print(f"  Maverick agents:     {len(mavericks)}")
+    print(f"  Breakthroughs/agent: {Config.MULTI_TARGET_TURNOVERS}")
+    print(f"  Total agents:        {total_agents}")
+    print(f"{'='*60}\n")
+
+    def _train_member(member_idx, member, is_maverick):
+        """Train a single committee member as an independent run."""
+        nonlocal completed
+
+        agent_path = get_agent_filepath(member, context_window)
+        agent_label = f"{member['run_name']}_{member['agent_id']}"
+        phase_label = "MAVERICK" if is_maverick else "NON-MAVERICK"
+
+        completed += 1
+        print(f"\n{'='*60}")
+        print(f"ORCHESTRATOR: Agent {completed}/{total_agents} [{phase_label}]")
+        print(f"  Member index: {member_idx}")
+        print(f"  Agent: {agent_label}")
+        print(f"  Path: {agent_path}")
+        print(f"  Maverick: {is_maverick}")
+        print(f"{'='*60}\n")
+
+        trainer = None
+        try:
+            # Ensure agent file exists locally (download from cloud if needed)
+            if not agent_path.exists():
+                print(f"  Agent file not found locally: {agent_path.name}")
+                print(f"  Attempting to download from cloud...")
+
+                cloud_path = f"eigen2/global50/cw{context_window}/agents/{agent_path.name}"
+                agent_path.parent.mkdir(parents=True, exist_ok=True)
+
+                if cloud_sync.provider != "local":
+                    success = cloud_sync.download_file(cloud_path, str(agent_path))
+                    if success and agent_path.exists():
+                        print(f"  Downloaded: {agent_path.name}")
+                    else:
+                        raise FileNotFoundError(
+                            f"Download failed for: {agent_path}\n"
+                            f"  Cloud path: {cloud_path}\n"
+                            f"  Run 'python committee.py --mirror' to sync all committee agent files."
+                        )
+                else:
+                    raise FileNotFoundError(
+                        f"Agent not found: {agent_path}\n"
+                        f"  Cloud sync is disabled.\n"
+                        f"  Run 'python committee.py --mirror' to sync all committee agent files."
+                    )
+
+            # Create a fresh ERLTrainer for this agent
+            # Each trainer creates its own wandb run with a unique name
+            trainer = ERLTrainer(
+                loader,
+                consistency_mode=True,
+                single_agent_path=str(agent_path),
+                maverick_mode=is_maverick,
+                local_mode=args.local,
+                original_stdout=tee_logger.terminal,
+                original_stderr=tee_logger.terminal,
+            )
+
+            # Override target breakthroughs to match multi-mode expectations
+            trainer.target_breakthroughs = Config.MULTI_TARGET_TURNOVERS
+
+            # Run training (creates wandb run, trains, calls wandb.finish())
+            trainer.train()
+
+            print(f"\n{'='*60}")
+            print(f"ORCHESTRATOR: Agent {completed}/{total_agents} training complete")
+            print(f"  Agent: {agent_label}")
+            print(f"  Run name: {trainer.run_name}")
+            print(f"  Breakthroughs: {trainer.confirmed_breakthroughs}/{Config.MULTI_TARGET_TURNOVERS}")
+            print(f"{'='*60}")
+
+            # Update roster if agent was promoted to Global50
+            _update_roster_after_training(roster, member_idx, trainer, manager)
+
+        except Exception as e:
+            print(f"\n{'='*60}")
+            print(f"ORCHESTRATOR: Agent {completed}/{total_agents} FAILED")
+            print(f"  Agent: {agent_label}")
+            print(f"  Error: {e}")
+            print(f"  Continuing to next agent...")
+            print(f"{'='*60}")
+
+        finally:
+            # Cleanup to free GPU memory and resources
+            if trainer is not None:
+                del trainer
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # Phase 1: Non-maverick agents
+    if non_mavericks:
+        print(f"\n{'='*60}")
+        print(f"PHASE 1: NON-MAVERICK AGENTS ({len(non_mavericks)} agents)")
+        print(f"{'='*60}")
+
+        for member_idx, member in non_mavericks:
+            _train_member(member_idx, member, is_maverick=False)
+
+    # Phase 2: Maverick agents
+    if mavericks:
+        print(f"\n{'='*60}")
+        print(f"PHASE 2: MAVERICK AGENTS ({len(mavericks)} agents)")
+        print(f"{'='*60}")
+
+        for member_idx, member in mavericks:
+            _train_member(member_idx, member, is_maverick=True)
+
+    # Final summary
+    print(f"\n{'='*60}")
+    print(f"MULTI-AGENT ORCHESTRATOR COMPLETE")
+    print(f"{'='*60}")
+    print(f"  Total agents processed: {completed}/{total_agents}")
+    print(f"  Non-maverick: {len(non_mavericks)}")
+    print(f"  Maverick: {len(mavericks)}")
+
+    # Print final roster state
+    print(f"\n  Final roster state:")
+    for i, m in enumerate(roster['members']):
+        is_mav = m.get('is_maverick', False)
+        label = " [MAV]" if is_mav else ""
+        print(f"    Member {i}: {m['run_name']}_{m['agent_id']}{label} "
+              f"(gauntlet={m.get('gauntlet_score', 0):.2f})")
+
+    print(f"{'='*60}")
+
+
 def main():
     """Main training function."""
     # Setup logging to capture all outputs to file
@@ -146,7 +350,16 @@ def main():
         parser.add_argument(
             '--multi',
             action='store_true',
-            help='Multi-agent mode: Two-phase training of committee members. '
+            help='Multi-agent orchestrator: trains each committee member as an independent run. '
+                 'Non-maverick agents use the standard --single pipeline; maverick agents use '
+                 '--single --maverick. Each agent gets its own wandb run and unique run name. '
+                 'Requires a committee roster (run: python committee.py --draft).'
+        )
+        parser.add_argument(
+            '--multi2',
+            action='store_true',
+            help='[DEPRECATED] Legacy multi-agent mode: Two-phase training of committee members '
+                 'within a single wandb run. '
                  'Phase 1 (Non-Maverick): Train each non-maverick agent sequentially for 3 turnovers each, '
                  'then clear buffer/population. Phase 2 (Maverick): Train each maverick agent sequentially '
                  'for 3 turnovers each using maverick reward function. Requires at least one maverick in committee.'
@@ -195,7 +408,7 @@ def main():
             action='store_true',
             help='[DEBUG] Skip non-maverick phase and start directly in maverick phase. '
                  'Useful for testing maverick phase transitions without waiting for all '
-                 'non-maverick agents to complete. Requires --multi mode.'
+                 'non-maverick agents to complete. Requires --multi2 mode.'
         )
         args = parser.parse_args()
         # --------------------------------
@@ -282,13 +495,70 @@ def main():
             print(f"  Consistency mode auto-enabled")
             print(f"  Target: {Config.SINGLE_TARGET_BREAKTHROUGHS} breakthroughs of 5% each")
 
-        # Validate --force-maverick requires --multi
-        if args.force_maverick and not args.multi:
-            print(f"\n❌ ERROR: --force-maverick requires --multi mode")
+        # Validate --force-maverick requires --multi2
+        if args.force_maverick and not args.multi2:
+            print(f"\n❌ ERROR: --force-maverick requires --multi2 mode")
             sys.exit(1)
 
-        # Validate --multi mode (committee roster must exist)
+        # Validate --multi mode (new orchestrator - committee roster must exist)
         if args.multi:
+            from committee import CommitteeManager
+
+            context_window_id = f"cw{Config.CONTEXT_WINDOW_DAYS}"
+            manager = CommitteeManager(Config.CONTEXT_WINDOW_DAYS)
+            roster = manager.load_roster()
+
+            if roster is None:
+                print(f"\n❌ ERROR: No committee roster found for {context_window_id}")
+                print(f"  Run: python committee.py --draft")
+                sys.exit(1)
+
+            if len(roster.get('members', [])) != Config.COMMITTEE_SIZE:
+                print(f"\n❌ ERROR: Committee has {len(roster['members'])} members, expected {Config.COMMITTEE_SIZE}")
+                sys.exit(1)
+
+            args.multi_roster = roster
+
+            # Validate incompatible flags with --multi
+            # The orchestrator creates independent runs per agent; these per-run flags don't apply
+            incompatible = []
+            if args.resume:
+                incompatible.append('--resume')
+            if args.resume_run:
+                incompatible.append('--resume-run')
+            if args.leverage:
+                incompatible.append('--leverage')
+            if args.buffer:
+                incompatible.append('--buffer')
+            if args.cleanup:
+                incompatible.append('--cleanup')
+            if args.reset_limit:
+                incompatible.append('--reset-limit')
+            if args.heroes:
+                incompatible.append('--heroes')
+            if args.single:
+                incompatible.append('--single')
+            if args.maverick:
+                incompatible.append('--maverick')
+            if args.multi2:
+                incompatible.append('--multi2')
+            if incompatible:
+                print(f"\n❌ ERROR: --multi is incompatible with: {', '.join(incompatible)}")
+                print(f"  --multi creates independent runs per agent.")
+                print(f"  Per-run flags like --resume, --buffer, --heroes do not apply.")
+                print(f"  Maverick handling is automatic based on the committee roster.")
+                sys.exit(1)
+
+            print(f"\n🎯 MULTI-AGENT ORCHESTRATOR MODE")
+            print(f"  Committee members: {len(roster['members'])}")
+            pop_size = Config.LOCAL_POPULATION_SIZE if args.local else Config.POPULATION_SIZE
+            print(f"  Population size: {pop_size}{' (local mode)' if args.local else ' (standard)'}")
+            print(f"  Training mode: Independent runs (one wandb run per member)")
+            print(f"  Breakthroughs per agent: {Config.MULTI_TARGET_TURNOVERS}")
+            print(f"  Consistency mode: AUTO-ENABLED per agent")
+
+        # Validate --multi2 mode (legacy - committee roster must exist)
+        if args.multi2:
             from committee import CommitteeManager
 
             context_window_id = f"cw{Config.CONTEXT_WINDOW_DAYS}"
@@ -306,9 +576,9 @@ def main():
 
             # Auto-enable consistency mode for multi-agent training
             args.consistency = True
-            args.multi_roster = roster
+            args.multi2_roster = roster
 
-            print(f"\n🎯 MULTI-AGENT MODE")
+            print(f"\n🎯 MULTI-AGENT MODE (LEGACY --multi2)")
             print(f"  Committee members: {len(roster['members'])}")
             pop_size = Config.LOCAL_POPULATION_SIZE if args.local else Config.POPULATION_SIZE
             print(f"  Population size: {pop_size}{' (local mode)' if args.local else ' (standard)'}")
@@ -385,48 +655,59 @@ def main():
                 print("\n⚠ WARNING: --cleanup requires --resume or --resume-run")
                 print("Ignoring --cleanup flag.\n")
 
-        # Create trainer (pass resume_run_name and leverage flag if resuming)
-        # Pass original stdout/stderr so wandb can properly capture console output
-        trainer = ERLTrainer(
-            loader,
-            resume_run_name=resume_run_name,
-            enable_leverage=args.leverage,
-            consistency_mode=args.consistency,
-            heroes_hof_dir=args.heroes,
-            single_agent_path=getattr(args, 'single_agent_path', None),
-            buffer_storage_path=args.buffer,
-            reset_limit=args.reset_limit,
-            original_stdout=tee_logger.terminal,
-            original_stderr=tee_logger.terminal,
-            multi_mode=args.multi,
-            multi_roster=getattr(args, 'multi_roster', None),
-            maverick_mode=args.maverick,
-            local_mode=args.local,
-            force_maverick=getattr(args, 'force_maverick', False)
-        )
+        # --- Route to orchestrator or standard training ---
+        if args.multi:
+            # New --multi: per-agent orchestrator with independent wandb runs
+            run_multi_orchestrator(
+                loader=loader,
+                roster=getattr(args, 'multi_roster'),
+                args=args,
+                tee_logger=tee_logger,
+            )
+        else:
+            # Standard training path (includes --multi2 legacy mode)
+            # Create trainer (pass resume_run_name and leverage flag if resuming)
+            # Pass original stdout/stderr so wandb can properly capture console output
+            trainer = ERLTrainer(
+                loader,
+                resume_run_name=resume_run_name,
+                enable_leverage=args.leverage,
+                consistency_mode=args.consistency,
+                heroes_hof_dir=args.heroes,
+                single_agent_path=getattr(args, 'single_agent_path', None),
+                buffer_storage_path=args.buffer,
+                reset_limit=args.reset_limit,
+                original_stdout=tee_logger.terminal,
+                original_stderr=tee_logger.terminal,
+                multi2_mode=getattr(args, 'multi2', False),
+                multi2_roster=getattr(args, 'multi2_roster', None),
+                maverick_mode=args.maverick,
+                local_mode=args.local,
+                force_maverick=getattr(args, 'force_maverick', False)
+            )
 
-        # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---
-        # If resume_run_name was provided, checkpoints are automatically loaded
-        # and wandb run is reconnected during trainer initialization
-        # --------------------------------
+            # --- 2. CHECKPOINT LOADING IS NOW HANDLED IN ERLTrainer.__init__ ---
+            # If resume_run_name was provided, checkpoints are automatically loaded
+            # and wandb run is reconnected during trainer initialization
+            # --------------------------------
 
-        # Start or resume training
-        trainer.train()
+            # Start or resume training
+            trainer.train()
 
-        print("\n" + "="*60)
-        print("✓ Training Complete!")
-        print("="*60)
-        print(f"\nBest fitness achieved: {trainer.best_fitness:.2f}")
-        print(f"Total generations: {Config.NUM_GENERATIONS}")
-        print(f"Final buffer size: {len(trainer.replay_buffer)}")
+            print("\n" + "="*60)
+            print("✓ Training Complete!")
+            print("="*60)
+            print(f"\nBest fitness achieved: {trainer.best_fitness:.2f}")
+            print(f"Total generations: {Config.NUM_GENERATIONS}")
+            print(f"Final buffer size: {len(trainer.replay_buffer)}")
 
-        # Show where results are saved
-        print(f"\nResults saved to:")
-        print(f"  Checkpoints: {Config.CHECKPOINT_DIR}")
-        print(f"  Logs: {Config.LOG_DIR}")
-        print(f"  Training log: {log_file}")
-        print(f"\nView training progress:")
-        print(f"  tensorboard --logdir={Config.LOG_DIR}")
+            # Show where results are saved
+            print(f"\nResults saved to:")
+            print(f"  Checkpoints: {Config.CHECKPOINT_DIR}")
+            print(f"  Logs: {Config.LOG_DIR}")
+            print(f"  Training log: {log_file}")
+            print(f"\nView training progress:")
+            print(f"  tensorboard --logdir={Config.LOG_DIR}")
 
     finally:
         # Restore original stdout/stderr and close log file
