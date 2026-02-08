@@ -6212,17 +6212,17 @@ class ERLTrainer:
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
 
             if self.consistency_mode and not self.multi2_mode:
-                log("Top 5 by Combined Fitness - used for elite selection:", VERBOSE)
+                print("Top 5 by Combined Fitness:")
                 for i, result in enumerate(validation_results[:5]):
                     quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
-                    log(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}", VERBOSE)
+                    print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
             else:
                 mode_label = "MULTI2-MODE ROI Expansion" if self.multi2_mode else "with ROI adjustment"
-                log(f"Top 5 by Combined Fitness ({mode_label}) - used for elite selection:", VERBOSE)
+                print(f"Top 5 by Combined Fitness ({mode_label}):")
                 for i, result in enumerate(validation_results[:5]):
                     roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
                     quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
-                    log(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}", VERBOSE)
+                    print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
 
             # Update best agent if we found a better one based on combined fitness
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
