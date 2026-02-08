@@ -159,6 +159,9 @@ class ERLTrainer:
         self.leverage_generations_remaining = 0
         self.leverage_total_generations = 5  # Run leverage mode for 5 generations
 
+        # Gauntlet mode (set early so wandb init can use it)
+        self.gauntlet_mode_enabled = Config.GAUNTLET_MODE_ENABLED
+
         # Load stock names for trade reporting
         import pandas as pd
         df = pd.read_pickle(Config.DATA_PATH)
@@ -600,7 +603,7 @@ class ERLTrainer:
         self.val_slice_hash = None  # Hash of current validation slices
 
         # Gauntlet Mode - Breakthrough state machine (encapsulated in BreakthroughTracker)
-        self.gauntlet_mode_enabled = Config.GAUNTLET_MODE_ENABLED
+        # gauntlet_mode_enabled set earlier in __init__ (before wandb init)
         self.initial_single_baseline = 0.0  # Original baseline for single-agent mode (for final summary)
 
         # Breakthrough threshold, quorum, target based on mode
