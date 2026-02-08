@@ -119,6 +119,29 @@ def _update_roster_after_training(roster, member_idx, trainer, manager):
         print(f"  No Global50 promotion -- roster entry unchanged")
 
 
+def _load_multi_progress(context_window):
+    """Load orchestrator progress file for resume support."""
+    import json
+    progress_path = Path(f"global50/cw{context_window}/committee/multi_progress.json")
+    if progress_path.exists():
+        try:
+            with open(progress_path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def _save_multi_progress(context_window, progress):
+    """Save orchestrator progress file after each agent completes."""
+    import json
+    progress_dir = Path(f"global50/cw{context_window}/committee")
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = progress_dir / "multi_progress.json"
+    with open(progress_path, 'w') as f:
+        json.dump(progress, f, indent=2)
+
+
 def run_multi_orchestrator(loader, roster, args, tee_logger):
     """
     New --multi orchestrator: trains each committee member as an independent run.
@@ -127,6 +150,11 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
     Maverick agents go through the --single --maverick pipeline.
     Each agent gets its own wandb run with a unique run name.
 
+    Resume support (--multi --resume --local):
+        After each agent completes, a progress file (multi_progress.json) is written
+        to the committee directory. On resume, completed agents are skipped. If an
+        agent was mid-training when interrupted, its wandb run is resumed.
+
     Args:
         loader: StockDataLoader (already loaded with data)
         roster: Committee roster dict with members
@@ -134,6 +162,8 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
         tee_logger: TeeLogger for stdout/stderr capture
     """
     import gc
+    import json
+    from datetime import datetime
     from committee import CommitteeManager, get_agent_filepath
     from utils.cloud_sync import get_cloud_sync_from_env
 
@@ -141,13 +171,52 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
     manager = CommitteeManager(context_window)
     members = roster['members']
     cloud_sync = get_cloud_sync_from_env()
+    is_resume = getattr(args, 'resume', False)
 
-    # Separate into non-maverick and maverick
+    # Separate into non-maverick and maverick (ordered execution list)
     non_mavericks = [(i, m) for i, m in enumerate(members) if not m.get('is_maverick', False)]
     mavericks = [(i, m) for i, m in enumerate(members) if m.get('is_maverick', False)]
+    execution_order = [(i, m, False) for i, m in non_mavericks] + [(i, m, True) for i, m in mavericks]
 
     total_agents = len(members)
+
+    # --- Resume: load progress file ---
+    progress = None
+    completed_members = set()
+    in_progress_member = None  # (member_idx, run_name) of agent that was mid-training
+
+    if is_resume:
+        progress = _load_multi_progress(context_window)
+        if progress is not None:
+            completed_members = set(progress.get('completed_members', []))
+            ip = progress.get('in_progress')
+            if ip is not None:
+                in_progress_member = (ip['member_idx'], ip['run_name'])
+            print(f"\n  RESUME: Loaded multi_progress.json")
+            print(f"    Completed agents: {sorted(completed_members)}")
+            if in_progress_member:
+                print(f"    In-progress agent: member {in_progress_member[0]} "
+                      f"(run: {in_progress_member[1]})")
+        else:
+            print(f"\n  RESUME: No multi_progress.json found -- starting fresh")
+    else:
+        # Fresh run: clear any stale progress file
+        progress_path = Path(f"global50/cw{context_window}/committee/multi_progress.json")
+        if progress_path.exists():
+            progress_path.unlink()
+            print(f"\n  Cleared stale multi_progress.json from previous run")
+
+    # Initialize progress state
+    if progress is None:
+        progress = {
+            'completed_members': [],
+            'in_progress': None,
+            'started_at': str(datetime.now()),
+            'last_updated': str(datetime.now()),
+        }
+
     completed = 0
+    skipped = 0
 
     print(f"\n{'='*60}")
     print(f"MULTI-AGENT ORCHESTRATOR")
@@ -156,24 +225,57 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
     print(f"  Maverick agents:     {len(mavericks)}")
     print(f"  Breakthroughs/agent: {Config.MULTI_TARGET_TURNOVERS}")
     print(f"  Total agents:        {total_agents}")
+    if completed_members:
+        print(f"  Already completed:   {len(completed_members)} (resuming)")
     print(f"{'='*60}\n")
 
     def _train_member(member_idx, member, is_maverick):
         """Train a single committee member as an independent run."""
-        nonlocal completed
+        nonlocal completed, skipped
 
         agent_path = get_agent_filepath(member, context_window)
         agent_label = f"{member['run_name']}_{member['agent_id']}"
         phase_label = "MAVERICK" if is_maverick else "NON-MAVERICK"
 
+        # --- Resume: skip completed agents ---
+        if member_idx in completed_members:
+            skipped += 1
+            print(f"\n  SKIP: Member {member_idx} ({agent_label}) -- already completed")
+            return
+
         completed += 1
-        print(f"\n{'='*60}")
-        print(f"ORCHESTRATOR: Agent {completed}/{total_agents} [{phase_label}]")
-        print(f"  Member index: {member_idx}")
-        print(f"  Agent: {agent_label}")
-        print(f"  Path: {agent_path}")
-        print(f"  Maverick: {is_maverick}")
-        print(f"{'='*60}\n")
+        remaining = total_agents - len(completed_members) - completed + 1
+
+        # --- Resume: detect if this agent was mid-training ---
+        resume_run_name = None
+        if in_progress_member and in_progress_member[0] == member_idx:
+            resume_run_name = in_progress_member[1]
+            print(f"\n{'='*60}")
+            print(f"ORCHESTRATOR: RESUMING Agent [{phase_label}]")
+            print(f"  Member index: {member_idx}")
+            print(f"  Agent: {agent_label}")
+            print(f"  Resuming wandb run: {resume_run_name}")
+            print(f"  Remaining: {remaining}/{total_agents}")
+            print(f"{'='*60}\n")
+        else:
+            print(f"\n{'='*60}")
+            print(f"ORCHESTRATOR: Agent [{phase_label}]")
+            print(f"  Member index: {member_idx}")
+            print(f"  Agent: {agent_label}")
+            print(f"  Path: {agent_path}")
+            print(f"  Maverick: {is_maverick}")
+            print(f"  Remaining: {remaining}/{total_agents}")
+            print(f"{'='*60}\n")
+
+        # Mark this agent as in-progress BEFORE training starts
+        progress['in_progress'] = {
+            'member_idx': member_idx,
+            'run_name': None,  # Will be updated once wandb run is created
+            'agent_label': agent_label,
+            'is_maverick': is_maverick,
+        }
+        progress['last_updated'] = str(datetime.now())
+        _save_multi_progress(context_window, progress)
 
         trainer = None
         try:
@@ -202,8 +304,7 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
                         f"  Run 'python committee.py --mirror' to sync all committee agent files."
                     )
 
-            # Create a fresh ERLTrainer for this agent
-            # Each trainer creates its own wandb run with a unique name
+            # Create ERLTrainer -- resume the wandb run if we have a run name
             trainer = ERLTrainer(
                 loader,
                 consistency_mode=True,
@@ -212,16 +313,22 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
                 local_mode=args.local,
                 original_stdout=tee_logger.terminal,
                 original_stderr=tee_logger.terminal,
+                resume_run_name=resume_run_name,
             )
 
             # Override target breakthroughs to match multi-mode expectations
             trainer.target_breakthroughs = Config.MULTI_TARGET_TURNOVERS
 
+            # Update progress with the actual wandb run name (now known)
+            progress['in_progress']['run_name'] = trainer.run_name
+            progress['last_updated'] = str(datetime.now())
+            _save_multi_progress(context_window, progress)
+
             # Run training (creates wandb run, trains, calls wandb.finish())
             trainer.train()
 
             print(f"\n{'='*60}")
-            print(f"ORCHESTRATOR: Agent {completed}/{total_agents} training complete")
+            print(f"ORCHESTRATOR: Agent training complete")
             print(f"  Agent: {agent_label}")
             print(f"  Run name: {trainer.run_name}")
             print(f"  Breakthroughs: {trainer.confirmed_breakthroughs}/{Config.MULTI_TARGET_TURNOVERS}")
@@ -230,13 +337,23 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
             # Update roster if agent was promoted to Global50
             _update_roster_after_training(roster, member_idx, trainer, manager)
 
+            # Mark agent as completed in progress
+            if member_idx not in progress['completed_members']:
+                progress['completed_members'].append(member_idx)
+            progress['in_progress'] = None
+            progress['last_updated'] = str(datetime.now())
+            _save_multi_progress(context_window, progress)
+
         except Exception as e:
             print(f"\n{'='*60}")
-            print(f"ORCHESTRATOR: Agent {completed}/{total_agents} FAILED")
+            print(f"ORCHESTRATOR: Agent FAILED")
             print(f"  Agent: {agent_label}")
             print(f"  Error: {e}")
             print(f"  Continuing to next agent...")
             print(f"{'='*60}")
+
+            # On failure, keep in_progress set so resume can retry
+            # but don't add to completed_members
 
         finally:
             # Cleanup to free GPU memory and resources
@@ -246,38 +363,54 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
             torch.cuda.empty_cache()
 
     # Phase 1: Non-maverick agents
-    if non_mavericks:
+    non_mav_remaining = [t for t in execution_order if not t[2] and t[0] not in completed_members]
+    mav_remaining = [t for t in execution_order if t[2] and t[0] not in completed_members]
+
+    if non_mav_remaining:
         print(f"\n{'='*60}")
-        print(f"PHASE 1: NON-MAVERICK AGENTS ({len(non_mavericks)} agents)")
+        print(f"PHASE 1: NON-MAVERICK AGENTS "
+              f"({len(non_mav_remaining)} remaining of {len(non_mavericks)})")
         print(f"{'='*60}")
 
-        for member_idx, member in non_mavericks:
+    for member_idx, member, is_maverick in execution_order:
+        if not is_maverick:
             _train_member(member_idx, member, is_maverick=False)
 
     # Phase 2: Maverick agents
-    if mavericks:
+    if mav_remaining:
         print(f"\n{'='*60}")
-        print(f"PHASE 2: MAVERICK AGENTS ({len(mavericks)} agents)")
+        print(f"PHASE 2: MAVERICK AGENTS "
+              f"({len(mav_remaining)} remaining of {len(mavericks)})")
         print(f"{'='*60}")
 
-        for member_idx, member in mavericks:
+    for member_idx, member, is_maverick in execution_order:
+        if is_maverick:
             _train_member(member_idx, member, is_maverick=True)
 
     # Final summary
+    all_done = len(progress['completed_members']) == total_agents
     print(f"\n{'='*60}")
-    print(f"MULTI-AGENT ORCHESTRATOR COMPLETE")
+    print(f"MULTI-AGENT ORCHESTRATOR {'COMPLETE' if all_done else 'PARTIAL'}")
     print(f"{'='*60}")
-    print(f"  Total agents processed: {completed}/{total_agents}")
-    print(f"  Non-maverick: {len(non_mavericks)}")
-    print(f"  Maverick: {len(mavericks)}")
+    print(f"  Completed: {len(progress['completed_members'])}/{total_agents}")
+    print(f"  Skipped (already done): {skipped}")
+    print(f"  Trained this session: {completed}")
 
     # Print final roster state
     print(f"\n  Final roster state:")
     for i, m in enumerate(roster['members']):
         is_mav = m.get('is_maverick', False)
         label = " [MAV]" if is_mav else ""
-        print(f"    Member {i}: {m['run_name']}_{m['agent_id']}{label} "
+        done = " [DONE]" if i in progress.get('completed_members', []) else ""
+        print(f"    Member {i}: {m['run_name']}_{m['agent_id']}{label}{done} "
               f"(gauntlet={m.get('gauntlet_score', 0):.2f})")
+
+    if all_done:
+        # Clean up progress file when all agents are done
+        progress_path = Path(f"global50/cw{context_window}/committee/multi_progress.json")
+        if progress_path.exists():
+            progress_path.unlink()
+            print(f"\n  Cleaned up multi_progress.json (all agents complete)")
 
     print(f"{'='*60}")
 
@@ -310,7 +443,9 @@ def main():
             '--resume',
             action='store_true',
             help='Resume training from the last run (reads from last_run.json). '
-                 'This will download checkpoints from GCS and reconnect to the wandb run.'
+                 'This will download checkpoints from GCS and reconnect to the wandb run. '
+                 'With --multi: resumes the orchestrator loop, skipping completed agents '
+                 'and resuming the in-progress agent\'s wandb run.'
         )
         parser.add_argument(
             '--resume-run',
@@ -358,6 +493,8 @@ def main():
             help='Multi-agent orchestrator: trains each committee member as an independent run. '
                  'Non-maverick agents use the standard --single pipeline; maverick agents use '
                  '--single --maverick. Each agent gets its own wandb run and unique run name. '
+                 'Supports --resume to pause and resume the loop (completed agents are skipped, '
+                 'in-progress agent wandb run is resumed). '
                  'Requires a committee roster (run: python committee.py --draft).'
         )
         parser.add_argument(
@@ -546,11 +683,10 @@ def main():
             args.multi_roster = roster
 
             # Validate incompatible flags with --multi
+            # Note: --resume IS compatible (enables outer-loop resume via multi_progress.json)
             incompatible = []
-            if args.resume:
-                incompatible.append('--resume')
             if args.resume_run:
-                incompatible.append('--resume-run')
+                incompatible.append('--resume-run (use --resume instead for orchestrator resume)')
             if args.leverage:
                 incompatible.append('--leverage')
             if args.buffer:
@@ -570,6 +706,7 @@ def main():
             if incompatible:
                 print(f"\n❌ ERROR: --multi is incompatible with: {', '.join(incompatible)}")
                 print(f"  --multi creates independent runs per agent.")
+                print(f"  Use --multi --resume to resume a previous orchestrator run.")
                 sys.exit(1)
 
         # Validate --multi2 mode (legacy - committee roster must exist)
@@ -679,26 +816,28 @@ def main():
         log(f"\nPhase 2: ERL Training", VERBOSE)
 
         # Determine resume run name
+        # Note: --multi handles resume internally via multi_progress.json, not last_run.json
         resume_run_name = None
-        if args.resume_run:
-            # Specific run provided via --resume-run
-            resume_run_name = args.resume_run
-            print(f"Resuming from specific run: {resume_run_name}")
-        elif args.resume:
-            # Resume from last run (read from last_run.json)
-            import json
-            last_run_file = Path("last_run.json")
-            if last_run_file.exists():
-                try:
-                    with open(last_run_file, 'r') as f:
-                        last_run_info = json.load(f)
-                    resume_run_name = last_run_info.get('run_name')
-                    print(f"Resuming from last run: {resume_run_name}")
-                except Exception as e:
-                    print(f"⚠ Could not read last_run.json: {e}")
-                    print("Starting new training run instead.")
-            else:
-                print("⚠ No last_run.json found. Starting new training run.")
+        if not args.multi:
+            if args.resume_run:
+                # Specific run provided via --resume-run
+                resume_run_name = args.resume_run
+                print(f"Resuming from specific run: {resume_run_name}")
+            elif args.resume:
+                # Resume from last run (read from last_run.json)
+                import json
+                last_run_file = Path("last_run.json")
+                if last_run_file.exists():
+                    try:
+                        with open(last_run_file, 'r') as f:
+                            last_run_info = json.load(f)
+                        resume_run_name = last_run_info.get('run_name')
+                        print(f"Resuming from last run: {resume_run_name}")
+                    except Exception as e:
+                        print(f"⚠ Could not read last_run.json: {e}")
+                        print("Starting new training run instead.")
+                else:
+                    print("⚠ No last_run.json found. Starting new training run.")
 
         # Run cleanup if requested (must have a resume_run_name)
         if args.cleanup:
