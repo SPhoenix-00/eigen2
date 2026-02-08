@@ -11,31 +11,10 @@ from typing import Tuple, Optional
 import copy
 from collections import deque
 from torch.amp import autocast, GradScaler
-import json
 import os
 
 from models.networks import Actor, Critic
 from utils.config import Config
-
-# #region debug log
-DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.cursor', 'debug.log')
-def _debug_log(location, message, data, hypothesis_id=None):
-    try:
-        log_entry = {
-            "sessionId": "debug-session",
-            "runId": "pre-fix",
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(__import__('time').time() * 1000)
-        }
-        if hypothesis_id:
-            log_entry["hypothesisId"] = hypothesis_id
-        with open(DEBUG_LOG_PATH, 'a') as f:
-            f.write(json.dumps(log_entry) + '\n')
-    except:
-        pass
-# #endregion
 
 
 class DDPGAgent:
@@ -355,20 +334,7 @@ class DDPGAgent:
     
     def load(self, path: str):
         """Load agent state."""
-        # #region agent log
-        _debug_log("ddpg_agent.py:335", "load() called", {
-            "path": path,
-            "torch_version": torch.__version__,
-            "has_weights_only_param": hasattr(torch.load, '__code__') and 'weights_only' in str(torch.load.__code__.co_varnames)
-        }, "A")
-        # #endregion
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        # #region agent log
-        _debug_log("ddpg_agent.py:336", "load() torch.load succeeded", {
-            "checkpoint_keys": list(checkpoint.keys()),
-            "has_numpy_objects": any(isinstance(v, np.ndarray) or isinstance(v, np.generic) for v in checkpoint.values() if isinstance(v, (dict, list, tuple)))
-        }, "A")
-        # #endregion
         self.agent_id = checkpoint['agent_id']
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
@@ -397,31 +363,7 @@ class DDPGAgent:
         Args:
             path: Path to checkpoint file
         """
-        # #region agent log
-        _debug_log("ddpg_agent.py:365", "load_weights_only() called", {
-            "path": path,
-            "torch_version": torch.__version__,
-            "torch_version_major": int(torch.__version__.split('.')[0]) if '.' in torch.__version__ else None,
-            "torch_version_minor": int(torch.__version__.split('.')[1]) if '.' in torch.__version__ and len(torch.__version__.split('.')) > 1 else None,
-            "file_exists": os.path.exists(path) if path else False
-        }, "B")
-        # #endregion
-        try:
-            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-            # #region agent log
-            _debug_log("ddpg_agent.py:365", "load_weights_only() torch.load succeeded", {
-                "checkpoint_keys": list(checkpoint.keys()) if isinstance(checkpoint, dict) else "not_dict"
-            }, "B")
-            # #endregion
-        except Exception as e:
-            # #region agent log
-            _debug_log("ddpg_agent.py:365", "load_weights_only() torch.load failed", {
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "error_has_weights_only": "weights_only" in str(e).lower()
-            }, "B")
-            # #endregion
-            raise
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.agent_id = checkpoint['agent_id']
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])

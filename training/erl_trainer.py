@@ -1113,13 +1113,6 @@ class ERLTrainer:
         else:
             print("Local mode: Skipping shared memory (CPU-optimized evaluation)")
             self._shared_memory_names = {}  # Empty dict for compatibility
-            # #region agent log
-            try:
-                with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"erl_trainer.py:1105","message":"Local mode: _shm_metadata not initialized","data":{"local_mode":self.local_mode,"has_shm_metadata":hasattr(self,'_shm_metadata')},"timestamp":int(time.time()*1000)}) + '\n')
-            except Exception:
-                pass  # Silently fail if logging fails
-            # #endregion
             # Initialize empty _shm_metadata for local mode compatibility
             self._shm_metadata = {}
 
@@ -1288,15 +1281,6 @@ class ERLTrainer:
         Returns:
             Dict with shared memory references and other config
         """
-        # #region agent log
-        try:
-            with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
-                has_shm = hasattr(self, '_shm_metadata')
-                shm_keys = list(getattr(self, '_shm_metadata', {}).keys()) if has_shm else []
-                f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"B","location":"erl_trainer.py:1272","message":"_get_shared_env_config called","data":{"local_mode":self.local_mode,"has_shm_metadata":has_shm,"shm_metadata_keys":shm_keys},"timestamp":int(time.time()*1000)}) + '\n')
-        except Exception:
-            pass  # Silently fail if logging fails
-        # #endregion
         # Handle local mode where _shm_metadata may not exist or be empty
         shm_dict = getattr(self, '_shm_metadata', {}) or {}
         
@@ -2256,13 +2240,6 @@ class ERLTrainer:
         Reset buffer, population, and environment for maverick phase.
         Called when transitioning from non-maverick to maverick phase.
         """
-        # #region agent log
-        try:
-            with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
-                f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"C","location":"erl_trainer.py:2128","message":"_reset_for_maverick_phase called","data":{"local_mode":self.local_mode,"has_shm_metadata":hasattr(self,'_shm_metadata')},"timestamp":int(time.time()*1000)}) + '\n')
-        except Exception:
-            pass  # Silently fail if logging fails
-        # #endregion
         print(f"\n  Clearing replay buffer and resetting population...")
         
         # Clear replay buffer
@@ -2351,13 +2328,6 @@ class ERLTrainer:
             self._init_shared_memory()
             print(f"  ✓ Shared memory recreated - workers will use maverick_mode=True on next ProcessPoolExecutor")
         else:
-            # #region agent log
-            try:
-                with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
-                    f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"D","location":"erl_trainer.py:2215","message":"Local mode: ensuring _shm_metadata exists","data":{"local_mode":self.local_mode,"has_shm_metadata":hasattr(self,'_shm_metadata')},"timestamp":int(time.time()*1000)}) + '\n')
-            except Exception:
-                pass  # Silently fail if logging fails
-            # #endregion
             # Ensure _shm_metadata exists for local mode compatibility
             if not hasattr(self, '_shm_metadata'):
                 self._shm_metadata = {}
@@ -2379,13 +2349,6 @@ class ERLTrainer:
 
         num_episodes = 5
 
-        # #region agent log
-        try:
-            with open(r'd:\GitHub\eigen2\.cursor\debug.log', 'a') as f:
-                f.write(json.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"E","location":"erl_trainer.py:2234","message":"_evaluate_single_agent_for_baseline calling _get_shared_env_config","data":{"local_mode":self.local_mode,"has_shm_metadata":hasattr(self,'_shm_metadata')},"timestamp":int(time.time()*1000)}) + '\n')
-        except Exception:
-            pass  # Silently fail if logging fails
-        # #endregion
         # Prepare environment config using shared memory
         env_config = self._get_shared_env_config(
             start_idx=self.train_start_idx,
