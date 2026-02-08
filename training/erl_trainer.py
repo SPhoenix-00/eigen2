@@ -54,7 +54,7 @@ from training.fitness import (
     hash_agent,
     hash_validation_slices,
 )
-from training.breakthrough import BreakthroughState, BreakthroughCandidate
+from training.breakthrough import BreakthroughState, BreakthroughCandidate, BreakthroughTracker
 from training.episode import (
     run_episode as _run_episode,
     run_episode_batched as _run_episode_batched,
@@ -503,43 +503,47 @@ class ERLTrainer:
         self.validation_cache = {}  # Maps (agent_hash, slice_hash) → validation results
         self.val_slice_hash = None  # Hash of current validation slices
 
-        # Gauntlet Mode - Breakthrough state machine
+        # Gauntlet Mode - Breakthrough state machine (encapsulated in BreakthroughTracker)
         self.gauntlet_mode_enabled = Config.GAUNTLET_MODE_ENABLED
-        self.breakthrough_state = BreakthroughState.NORMAL
-        self.breakthrough_candidate: Optional[BreakthroughCandidate] = None
-        self.confirmed_baseline = 0.0  # Ratcheting baseline - only updated after Gauntlet confirmation
-        self.confirmed_breakthroughs = 0  # Count of confirmed breakthroughs
-        self.breakthrough_history = []  # Track breakthrough events with timestamps
-        self.stabilization_generations_elapsed = 0  # Counter for stabilization phase
         self.initial_single_baseline = 0.0  # Original baseline for single-agent mode (for final summary)
 
-        # Candidate queue and tracking (fixes Ghost Loop and Winner-Takes-All)
-        # Only used in consistency mode with heroes, where pre-trained agents are deterministic
-        self.use_candidate_queue = (self.consistency_mode and heroes_hof_dir is not None)
-        self.candidate_queue = []  # Queue of all agents that breached threshold (sorted by fitness, descending)
-        self.tested_candidate_indices = set()  # Set of agent indices that have been tested in Gauntlet
-        self.pending_baseline_update = None  # Store baseline update until all candidates exhausted
+        # Breakthrough threshold, quorum, target based on mode
+        bt_threshold = (Config.BREAKTHROUGH_THRESHOLD_CONSISTENCY
+                       if self.consistency_mode
+                       else Config.BREAKTHROUGH_THRESHOLD_NORMAL)
+        bt_quorum = (Config.BREAKTHROUGH_QUORUM_CONSISTENCY
+                    if self.consistency_mode
+                    else Config.BREAKTHROUGH_QUORUM_NORMAL)
+        bt_target = (Config.TARGET_BREAKTHROUGHS_CONSISTENCY
+                    if self.consistency_mode
+                    else Config.TARGET_BREAKTHROUGHS_NORMAL)
+
+        self.breakthrough_tracker = BreakthroughTracker(
+            gauntlet_mode_enabled=self.gauntlet_mode_enabled,
+            consistency_mode=self.consistency_mode,
+            use_candidate_queue=(self.consistency_mode and heroes_hof_dir is not None),
+            breakthrough_threshold=bt_threshold,
+            breakthrough_quorum=bt_quorum,
+            target_breakthroughs=bt_target,
+        )
+        # Backward-compatible attribute access (delegates to tracker)
+        self.breakthrough_state = self.breakthrough_tracker.state
+        self.breakthrough_candidate = self.breakthrough_tracker.candidate
+        self.confirmed_baseline = self.breakthrough_tracker.confirmed_baseline
+        self.confirmed_breakthroughs = self.breakthrough_tracker.confirmed_breakthroughs
+        self.breakthrough_history = self.breakthrough_tracker.history
+        self.stabilization_generations_elapsed = self.breakthrough_tracker.stabilization_generations_elapsed
+        self.use_candidate_queue = self.breakthrough_tracker.use_candidate_queue
+        self.candidate_queue = self.breakthrough_tracker.candidate_queue
+        self.tested_candidate_indices = self.breakthrough_tracker.tested_candidate_indices
+        self.pending_baseline_update = self.breakthrough_tracker.pending_baseline_update
+        self.breakthrough_threshold = self.breakthrough_tracker.threshold
+        self.breakthrough_quorum = self.breakthrough_tracker.quorum
+        self.target_breakthroughs = self.breakthrough_tracker.target_breakthroughs
 
         # Global50 injection pool (for heroes+consistency mode)
-        # Instead of seeding HoF with Global50 agents (which can poison the HoF),
-        # we inject mutated Global50 agents into the population until first breakthrough
-        self.global50_injection_pool = []  # Stores loaded Global50 agents for injection
-        self.global50_injection_count = 20  # Number of Global50 agents to inject per generation
-
-        # Breakthrough threshold based on mode
-        self.breakthrough_threshold = (Config.BREAKTHROUGH_THRESHOLD_CONSISTENCY
-                                      if self.consistency_mode
-                                      else Config.BREAKTHROUGH_THRESHOLD_NORMAL)
-
-        # Breakthrough quorum based on mode
-        self.breakthrough_quorum = (Config.BREAKTHROUGH_QUORUM_CONSISTENCY
-                                   if self.consistency_mode
-                                   else Config.BREAKTHROUGH_QUORUM_NORMAL)
-
-        # Target breakthroughs based on mode
-        self.target_breakthroughs = (Config.TARGET_BREAKTHROUGHS_CONSISTENCY
-                                    if self.consistency_mode
-                                    else Config.TARGET_BREAKTHROUGHS_NORMAL)
+        self.global50_injection_pool = []
+        self.global50_injection_count = 20
 
         # Hall of Fame turnover tracking (for consistency mode)
         self.hof_turnover_count = 0  # Number of complete HoF turnovers
