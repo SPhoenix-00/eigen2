@@ -285,14 +285,35 @@ class Config:
     
     @classmethod
     def display(cls):
-        """Print all configuration parameters"""
-        print("=" * 60)
-        print("Project Eigen 2 Configuration")
-        print("=" * 60)
+        """Print configuration -- compact summary to console, full dump to log file."""
+        from utils.display import log, VERBOSE, NORMAL
+        
+        # Always write full dump to log file
+        log("=" * 60, VERBOSE)
+        log("Project Eigen 2 Configuration (Full)", VERBOSE)
+        log("=" * 60, VERBOSE)
         for key, value in cls.__dict__.items():
             if not key.startswith('_') and not callable(value) and key != 'display':
-                print(f"{key:.<40} {value}")
-        print("=" * 60)
+                log(f"{key:.<40} {value}", VERBOSE)
+        log("=" * 60, VERBOSE)
+    
+    @classmethod
+    def display_compact(cls, consistency_mode: bool = False, local_mode: bool = False,
+                        gauntlet_enabled: bool = True):
+        """Print a compact 3-line config summary to console."""
+        pop_size = cls.LOCAL_POPULATION_SIZE if local_mode else cls.POPULATION_SIZE
+        mode = "consistency" if consistency_mode else "normal"
+        gauntlet = "ON" if gauntlet_enabled else "OFF"
+        bi = "Bi" if cls.LSTM_BIDIRECTIONAL else ""
+        
+        print(f"  Config: cw={cls.CONTEXT_WINDOW_DAYS}d, pop={pop_size}"
+              f"{' (local)' if local_mode else ''}, episodes={cls.EVAL_EPISODES}"
+              f", {mode}, gauntlet={gauntlet}")
+        print(f"  Trading: hold {cls.MIN_HOLDING_PERIOD}-{cls.MAX_HOLDING_PERIOD}d"
+              f", liquidation {cls.LIQUIDATION_WINDOW}d"
+              f", hurdle {cls.HURDLE_RATE*100:.1f}%")
+        print(f"  Model: CNN({cls.CNN_FILTERS}) -> {bi}LSTM({cls.LSTM_HIDDEN}x{cls.LSTM_LAYERS})"
+              f" -> Attn({cls.ATTENTION_HEADS}h) -> {cls.ACTOR_HIDDEN_DIMS}")
     
     @classmethod
     def validate(cls):

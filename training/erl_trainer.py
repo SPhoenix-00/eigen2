@@ -32,7 +32,9 @@ from erl.genetic_ops import create_next_generation, mutate
 from erl.hall_of_fame import HallOfFame
 from erl.global_hof import GlobalHallOfFame, LeagueRules
 from utils.config import Config
-from utils.display import print_generation_summary, print_final_summary, ResourceTracker
+from utils.display import (print_generation_summary, print_generation_dashboard, 
+                            print_final_summary, ResourceTracker, GenerationTracker,
+                            log, log_event, VERBOSE, NORMAL, QUIET)
 from utils.cloud_sync import get_cloud_sync_from_env
 from utils.cleanup_orphans import cleanup_orphans
 from torch.utils.data import DataLoader
@@ -291,26 +293,111 @@ class ERLTrainer:
                     )
                 else:
                     # New training run
-                    print("--- Initializing new W&B run (main.py mode) ---")
+                    log("--- Initializing new W&B run (main.py mode) ---", VERBOSE)
+                    
+                    # Build tags for run organization
+                    wandb_tags = []
+                    if self.consistency_mode:
+                        wandb_tags.append("consistency")
+                    else:
+                        wandb_tags.append("normal")
+                    if self.local_mode:
+                        wandb_tags.append("local")
+                    if self.multi2_mode:
+                        wandb_tags.append("multi")
+                    if self.gauntlet_mode_enabled:
+                        wandb_tags.append("gauntlet")
+                    if self.maverick_mode:
+                        wandb_tags.append("maverick")
+                    if getattr(self, 'single_agent_mode', False):
+                        wandb_tags.append("single")
+                    
+                    # Build group for multi-agent runs
+                    wandb_group = None
+                    if self.multi2_mode:
+                        wandb_group = f"multi-{self.multi2_member_idx}" if hasattr(self, 'multi2_member_idx') else "multi"
+                    
+                    # Build job type
+                    is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
+                    wandb_job_type = "sweep" if is_sweep else ("multi-train" if self.multi2_mode else "train")
+                    
+                    pop_size = Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE
+                    buf_size = Config.LOCAL_BUFFER_SIZE if self.local_mode else Config.BUFFER_SIZE
+                    batch_sz = Config.LOCAL_BATCH_SIZE if self.local_mode else Config.BATCH_SIZE
+                    
                     wandb.init(
                         project="eigen2-self",
-                        #name=f"erl-{Config.NUM_GENERATIONS}gen",
+                        tags=wandb_tags,
+                        group=wandb_group,
+                        job_type=wandb_job_type,
                         config={
-                            "population_size": Config.LOCAL_POPULATION_SIZE if self.local_mode else Config.POPULATION_SIZE,
+                            # Training mode
+                            "mode": "consistency" if self.consistency_mode else "normal",
+                            "local_mode": self.local_mode,
+                            "gauntlet_mode": self.gauntlet_mode_enabled,
+                            "multi_mode": self.multi2_mode,
+                            "maverick_mode": self.maverick_mode,
+                            # Key hyperparameters
+                            "context_window_days": Config.CONTEXT_WINDOW_DAYS,
+                            "population_size": pop_size,
                             "num_generations": Config.NUM_GENERATIONS,
-                            "buffer_size": Config.LOCAL_BUFFER_SIZE if self.local_mode else Config.BUFFER_SIZE,
-                            "batch_size": Config.LOCAL_BATCH_SIZE if self.local_mode else Config.BATCH_SIZE,
+                            "episode_length": Config.EPISODE_LENGTH,
+                            "eval_episodes": Config.EVAL_EPISODES,
+                            # Trading parameters
+                            "min_holding_period": Config.MIN_HOLDING_PERIOD,
+                            "max_holding_period": Config.MAX_HOLDING_PERIOD,
+                            "liquidation_window": Config.LIQUIDATION_WINDOW,
+                            "hurdle_rate": Config.HURDLE_RATE,
+                            "min_sale_target": Config.MIN_SALE_TARGET,
+                            "max_sale_target": Config.MAX_SALE_TARGET,
+                            # Model architecture
+                            "cnn_filters": Config.CNN_FILTERS,
+                            "lstm_hidden": Config.LSTM_HIDDEN,
+                            "lstm_layers": Config.LSTM_LAYERS,
+                            "lstm_bidirectional": Config.LSTM_BIDIRECTIONAL,
+                            "attention_heads": Config.ATTENTION_HEADS,
+                            "actor_hidden_dims": str(Config.ACTOR_HIDDEN_DIMS),
+                            "critic_hidden_dims": str(Config.CRITIC_HIDDEN_DIMS),
+                            # Learning rates
                             "actor_lr": Config.ACTOR_LR,
                             "critic_lr": Config.CRITIC_LR,
-                            "trading_period_days": Config.TRADING_PERIOD_DAYS,
-                            "max_holding_period": Config.MAX_HOLDING_PERIOD,
+                            "weight_decay": Config.WEIGHT_DECAY,
+                            # Evolution
+                            "mutation_rate": Config.MUTATION_RATE_CONSISTENCY if self.consistency_mode else Config.MUTATION_RATE,
+                            "mutation_std": Config.MUTATION_STD,
+                            "elite_frac": Config.ELITE_FRAC,
+                            # Replay buffer
+                            "buffer_size": buf_size,
+                            "batch_size": batch_sz,
+                            # Gauntlet
+                            "gauntlet_num_slices": Config.GAUNTLET_NUM_SLICES,
+                            "target_breakthroughs": Config.TARGET_BREAKTHROUGHS_CONSISTENCY if self.consistency_mode else Config.TARGET_BREAKTHROUGHS_NORMAL,
+                            "target_hof_turnovers": Config.TARGET_HOF_TURNOVERS,
+                            "breakthrough_threshold": Config.BREAKTHROUGH_THRESHOLD_CONSISTENCY if self.consistency_mode else Config.BREAKTHROUGH_THRESHOLD_NORMAL,
+                            # Scoring
                             "loss_penalty_multiplier": Config.CONSISTENCY_LOSS_MULTIPLIER if self.consistency_mode else 1.0,
-                            "consistency_mode": self.consistency_mode,
+                            "conviction_scaling_power": Config.CONVICTION_SCALING_POWER,
+                            "roi_adjustment_multiplier": Config.ROI_ADJUSTMENT_MULTIPLIER,
+                            # Data
                             "num_stocks": Config.NUM_INVESTABLE_STOCKS,
+                            "features_per_cell": Config.FEATURES_PER_CELL,
+                            "trading_period_days": Config.TRADING_PERIOD_DAYS,
                         },
                         resume="allow",  # Allow resuming from checkpoints
                         settings=wandb.Settings(console="wrap")
                     )
+                    
+                    # Define metric axes and summaries for cleaner portal
+                    wandb.define_metric("fitness/*", step_metric="generation")
+                    wandb.define_metric("best_agent/*", step_metric="generation")
+                    wandb.define_metric("population/*", step_metric="generation")
+                    wandb.define_metric("hof/*", step_metric="generation")
+                    wandb.define_metric("gauntlet/*", step_metric="generation")
+                    wandb.define_metric("train/*", step_metric="generation")
+                    wandb.define_metric("perf/*", step_metric="generation")
+                    wandb.define_metric("fitness/best_ever", summary="max")
+                    wandb.define_metric("best_agent/combined_fitness", summary="max")
+                    wandb.define_metric("best_agent/roi", summary="max")
 
                     # Create run-specific checkpoint directory using wandb run name
                     self.run_name = wandb.run.name
@@ -468,6 +555,15 @@ class ERLTrainer:
         self.fitness_history = []
         self.generation_times = []
         self.validation_fitness_history = []  # Track validation fitness for plateau detection
+        
+        # Generation tracker for trend display (deltas vs previous gen)
+        self.gen_tracker = GenerationTracker()
+        
+        # Training bottleneck data (populated by train_population, consumed by dashboard)
+        self.last_train_bottleneck = {}  # {compute_pct, data_load_pct, gpu_transfer_pct}
+        
+        # Collected events for dashboard display
+        self.generation_events = []
 
         # Adaptive mutation parameters
         self.plateau_threshold = 0.02  # Consider plateau if improvement < 2% over window
@@ -2448,10 +2544,9 @@ class ERLTrainer:
                     if len(batch_agents) > 0 and batch_agents[0].agent_id == 0:
                         self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses_batch), self.generation)
                         self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses_batch), self.generation)
-                        wandb.log({
-                            "train/actor_loss": np.mean(actor_losses_batch),
-                            "train/critic_loss": np.mean(critic_losses_batch),
-                        }, step=self.generation)
+                        # Store for consolidated wandb.log at end of generation
+                        self._last_actor_loss = np.mean(actor_losses_batch)
+                        self._last_critic_loss = np.mean(critic_losses_batch)
 
                     del actor_losses_batch
                     del critic_losses_batch
@@ -2520,25 +2615,31 @@ class ERLTrainer:
                 if agent.agent_id == 0:  # Log first agent as representative
                     self.writer.add_scalar('Train/Actor_Loss', np.mean(actor_losses), self.generation)
                     self.writer.add_scalar('Train/Critic_Loss', np.mean(critic_losses), self.generation)
-
-                    # Log to wandb
-                    wandb.log({
-                        "train/actor_loss": np.mean(actor_losses),
-                        "train/critic_loss": np.mean(critic_losses),
-                    }, step=self.generation)
+                    # Store for consolidated wandb.log at end of generation
+                    self._last_actor_loss = np.mean(actor_losses)
+                    self._last_critic_loss = np.mean(critic_losses)
 
                 # Explicitly clear loss lists to free memory
                 del actor_losses
                 del critic_losses
 
-            # Print instrumentation results
-            print(f"\n--- Training Bottleneck Analysis ---")
-            print(f"  Total updates: {total_updates}")
-            print(f"  Data Loading:  {t_data_load:.2f}s ({t_data_load/total_updates*1000:.1f} ms/step) - {(t_data_load/(t_data_load+t_data_transfer+t_compute))*100:.1f}%")
-            print(f"  GPU Transfer:  {t_data_transfer:.2f}s ({t_data_transfer/total_updates*1000:.1f} ms/step) - {(t_data_transfer/(t_data_load+t_data_transfer+t_compute))*100:.1f}%")
-            print(f"  Computation:   {t_compute:.2f}s ({t_compute/total_updates*1000:.1f} ms/step) - {(t_compute/(t_data_load+t_data_transfer+t_compute))*100:.1f}%")
-            print(f"  Total Active:  {t_data_load+t_data_transfer+t_compute:.2f}s")
-            print(f"------------------------------------")
+            # Store bottleneck data for dashboard + W&B
+            total_active = t_data_load + t_data_transfer + t_compute
+            if total_active > 0:
+                self.last_train_bottleneck = {
+                    'compute_pct': (t_compute / total_active) * 100,
+                    'data_load_pct': (t_data_load / total_active) * 100,
+                    'gpu_transfer_pct': (t_data_transfer / total_active) * 100,
+                }
+            
+            # Print detailed breakdown to log file only
+            log(f"\n--- Training Bottleneck Analysis ---", VERBOSE)
+            log(f"  Total updates: {total_updates}", VERBOSE)
+            log(f"  Data Loading:  {t_data_load:.2f}s ({t_data_load/total_updates*1000:.1f} ms/step) - {(t_data_load/total_active)*100:.1f}%", VERBOSE)
+            log(f"  GPU Transfer:  {t_data_transfer:.2f}s ({t_data_transfer/total_updates*1000:.1f} ms/step) - {(t_data_transfer/total_active)*100:.1f}%", VERBOSE)
+            log(f"  Computation:   {t_compute:.2f}s ({t_compute/total_updates*1000:.1f} ms/step) - {(t_compute/total_active)*100:.1f}%", VERBOSE)
+            log(f"  Total Active:  {total_active:.2f}s", VERBOSE)
+            log(f"------------------------------------", VERBOSE)
 
         # Clear GPU cache once after training all agents
         # Note: With expandable_segments=True, CUDA handles fragmentation efficiently
@@ -3796,10 +3897,10 @@ class ERLTrainer:
                     detection_generation=self.generation
                 )
 
-                # Log breakthrough detection to wandb
-                wandb.log({
-                    'gauntlet/stabilization_phase': 0,
-                }, step=self.generation)
+                # Removed: now in consolidated per-generation wandb.log
+                # wandb.log({
+                #     'gauntlet/stabilization_phase': 0,
+                # }, step=self.generation)
 
                 return True
 
@@ -3853,10 +3954,10 @@ class ERLTrainer:
                 detection_generation=self.generation
             )
 
-            # Log queue-based breakthrough detection to wandb
-            wandb.log({
-                'gauntlet/stabilization_phase': 0,
-            }, step=self.generation)
+            # Removed: now in consolidated per-generation wandb.log
+            # wandb.log({
+            #     'gauntlet/stabilization_phase': 0,
+            # }, step=self.generation)
 
             return True
 
@@ -3967,10 +4068,10 @@ class ERLTrainer:
             self.breakthrough_candidate.stabilization_start_gen = self.generation
             self.stabilization_generations_elapsed = 0
 
-            # Log stabilization start to wandb
-            wandb.log({
-                'gauntlet/stabilization_phase': 0,
-            }, step=self.generation)
+            # Removed: now in consolidated per-generation wandb.log
+            # wandb.log({
+            #     'gauntlet/stabilization_phase': 0,
+            # }, step=self.generation)
 
         elif self.breakthrough_state == BreakthroughState.STABILIZATION:
             # Progressive Stabilization: Fail fast if candidate collapses
@@ -3995,10 +4096,10 @@ class ERLTrainer:
                     print(f"  Returning to NORMAL state")
                     print(f"{'='*60}")
 
-                    # Log ghost detection to wandb
-                    wandb.log({
-                        'gauntlet/stabilization_phase': 0,
-                    }, step=self.generation)
+                    # Removed: now in consolidated per-generation wandb.log
+                    # wandb.log({
+                    #     'gauntlet/stabilization_phase': 0,
+                    # }, step=self.generation)
 
                     # Clear the current candidate
                     self.breakthrough_candidate = None
@@ -4031,10 +4132,10 @@ class ERLTrainer:
                     self.breakthrough_state = BreakthroughState.NORMAL
                     return
 
-            # Log stabilization progress to wandb
-            wandb.log({
-                'gauntlet/stabilization_phase': self.stabilization_generations_elapsed,
-            }, step=self.generation)
+            # Removed: now in consolidated per-generation wandb.log
+            # wandb.log({
+            #     'gauntlet/stabilization_phase': self.stabilization_generations_elapsed,
+            # }, step=self.generation)
 
             if self.stabilization_generations_elapsed >= Config.STABILIZATION_GENERATIONS:
                 # Stabilization complete - select current best agent for gauntlet
@@ -4045,9 +4146,10 @@ class ERLTrainer:
                 # Get the current best agent from this generation's validation
                 if validation_results is None or len(validation_results) == 0:
                     print(f"\n⚠️ WARNING: No validation results available at gauntlet entry!")
-                    wandb.log({
-                        'gauntlet/stabilization_phase': 0,
-                    }, step=self.generation)
+                    # Removed: now in consolidated per-generation wandb.log
+                    # wandb.log({
+                    #     'gauntlet/stabilization_phase': 0,
+                    # }, step=self.generation)
 
                     # Clear the current candidate
                     self.breakthrough_candidate = None
@@ -4180,10 +4282,10 @@ class ERLTrainer:
                         print(f"  No agent clears the hurdle")
                         print(f"{'='*60}")
 
-                        # Log failure to wandb
-                        wandb.log({
-                            'gauntlet/stabilization_phase': 0,
-                        }, step=self.generation)
+                        # Removed: now in consolidated per-generation wandb.log
+                        # wandb.log({
+                        #     'gauntlet/stabilization_phase': 0,
+                        # }, step=self.generation)
 
                         # Clear the current candidate
                         self.breakthrough_candidate = None
@@ -4257,10 +4359,10 @@ class ERLTrainer:
 
                 self.breakthrough_state = BreakthroughState.GAUNTLET
 
-                # Log gauntlet test start to wandb
-                wandb.log({
-                    'gauntlet/stabilization_phase': 0,
-                }, step=self.generation)
+                # Removed: now in consolidated per-generation wandb.log
+                # wandb.log({
+                #     'gauntlet/stabilization_phase': 0,
+                # }, step=self.generation)
 
                 # Run Gauntlet validation on the current best agent
                 gauntlet_results = self.run_gauntlet_validation(self.breakthrough_candidate.agent)
@@ -4484,12 +4586,12 @@ class ERLTrainer:
                         print(f"   ⓘ Agent gauntlet score: {gauntlet_score:.2f}")
                         print(f"   Global 50 min threshold: {self.global_hof.entry_threshold:.2f} | p25: {self.global_hof.gauntlet_p25:.2f}")
 
-                    # Log to wandb
-                    wandb.log({
-                        'gauntlet/confirmed_breakthroughs': self.confirmed_breakthroughs,
-                        'gauntlet/confirmed_baseline': self.confirmed_baseline,
-                        'gauntlet/stabilization_phase': 0,
-                    }, step=self.generation)
+                    # Removed: now in consolidated per-generation wandb.log
+                    # wandb.log({
+                    #     'gauntlet/confirmed_breakthroughs': self.confirmed_breakthroughs,
+                    #     'gauntlet/confirmed_baseline': self.confirmed_baseline,
+                    #     'gauntlet/stabilization_phase': 0,
+                    # }, step=self.generation)
 
                     # Return to NORMAL state
                     self.breakthrough_state = BreakthroughState.NORMAL
@@ -4510,10 +4612,10 @@ class ERLTrainer:
                     print(f"  Population keeps evolutionary progress (no snapback)")
                     print(f"{'='*60}")
 
-                    # Log to wandb
-                    wandb.log({
-                        'gauntlet/stabilization_phase': 0,
-                    }, step=self.generation)
+                    # Removed: now in consolidated per-generation wandb.log
+                    # wandb.log({
+                    #     'gauntlet/stabilization_phase': 0,
+                    # }, step=self.generation)
 
                     # SOFT PENALTY APPROACH: No population snapback
                     # The failed candidate will naturally be weeded out by selection pressure
@@ -4623,13 +4725,13 @@ class ERLTrainer:
                 print(f"\n  Next goal: All HoF agents must have ROI >= {self.hof_current_median:.2f}%")
             print(f"{'='*60}")
 
-            # Log to wandb
-            wandb.log({
-                'hof_turnover/turnover_complete': 1,
-                'hof_turnover/previous_median': previous_median,
-                'hof_turnover/current_median': self.hof_current_median,
-                'hof_turnover/count': self.hof_turnover_count,
-            }, step=self.generation)
+            # Removed: now in consolidated per-generation wandb.log
+            # wandb.log({
+            #     'hof_turnover/turnover_complete': 1,
+            #     'hof_turnover/previous_median': previous_median,
+            #     'hof_turnover/current_median': self.hof_current_median,
+            #     'hof_turnover/count': self.hof_turnover_count,
+            # }, step=self.generation)
 
     def _run_evaluation(self):
         """
@@ -5900,8 +6002,11 @@ class ERLTrainer:
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
 
-            # Print generation header with Gauntlet state
-            print(f"\n{'='*60}")
+            # Reset per-generation event list
+            self.generation_events = []
+            
+            # Print generation header (verbose only -- dashboard at end replaces this)
+            log(f"\n{'='*60}", VERBOSE)
             if self.gauntlet_mode_enabled:
                 if self.consistency_mode:
                     generations_since_turnover = gen - self.generation_at_last_turnover
@@ -5910,15 +6015,15 @@ class ERLTrainer:
                     if self.hof_current_median is not None:
                         turnover_status += f" | Median: {self.hof_current_median:.2f}%"
                     turnover_status += f" | Runway: {runway_remaining}"
-                    print(f"Generation {gen + 1} | {turnover_status} | State: {self.breakthrough_state.value}")
+                    log(f"Generation {gen + 1} | {turnover_status} | State: {self.breakthrough_state.value}", VERBOSE)
                 else:
-                    print(f"Generation {gen + 1} / {max_generations} | Breakthroughs: {self.confirmed_breakthroughs}/{self.target_breakthroughs} | State: {self.breakthrough_state.value}")
+                    log(f"Generation {gen + 1} / {max_generations} | Breakthroughs: {self.confirmed_breakthroughs}/{self.target_breakthroughs} | State: {self.breakthrough_state.value}", VERBOSE)
             else:
-                print(f"Generation {gen + 1} / {max_generations}")
-            print(f"Buffer: {len(self.replay_buffer)} / {self.replay_buffer.capacity} ({len(self.replay_buffer)/self.replay_buffer.capacity*100:.1f}%)")
+                log(f"Generation {gen + 1} / {max_generations}", VERBOSE)
+            log(f"Buffer: {len(self.replay_buffer)} / {self.replay_buffer.capacity} ({len(self.replay_buffer)/self.replay_buffer.capacity*100:.1f}%)", VERBOSE)
             if self.gauntlet_mode_enabled:
-                print(f"Confirmed Baseline: {self.confirmed_baseline:.2f}")
-            print(f"{'='*60}")
+                log(f"Confirmed Baseline: {self.confirmed_baseline:.2f}", VERBOSE)
+            log(f"{'='*60}", VERBOSE)
 
             # 1. Evaluate population (collect experiences)
             # Use LocalEvaluator in local mode for CPU-optimized execution with in-memory transitions
@@ -5947,11 +6052,11 @@ class ERLTrainer:
             max_fitness = np.max(fitness_scores)
             min_fitness = np.min(fitness_scores)
             
-            print(f"\nFitness statistics:")
-            print(f"  Mean: {mean_fitness:.2f}")
-            print(f"  Max: {max_fitness:.2f}")
-            print(f"  Min: {min_fitness:.2f}")
-            print(f"  Std: {np.std(fitness_scores):.2f}")
+            log(f"\nFitness statistics:", VERBOSE)
+            log(f"  Mean: {mean_fitness:.2f}", VERBOSE)
+            log(f"  Max: {max_fitness:.2f}", VERBOSE)
+            log(f"  Min: {min_fitness:.2f}", VERBOSE)
+            log(f"  Std: {np.std(fitness_scores):.2f}", VERBOSE)
             
             # Log to tensorboard
             self.writer.add_scalar('Fitness/Mean', mean_fitness, gen)
@@ -5963,26 +6068,7 @@ class ERLTrainer:
             if max_fitness > self.best_fitness:
                 self.best_fitness = max_fitness
 
-            # Log comprehensive fitness metrics to wandb
-            # Note: Training fitness is calculated from evaluate_population() on training data
-            # Detailed metrics like ROI, win_rate, etc. are only available after validation
-            fitness_log = {
-                "fitness/best_fitness": max_fitness,
-                "fitness/mean_fitness": mean_fitness,
-                "fitness/min_fitness": min_fitness,
-                "fitness/std_fitness": np.std(fitness_scores),
-                "fitness/best_ever": self.best_fitness,
-            }
-
-            # Add gauntlet metrics
-            if self.gauntlet_mode_enabled:
-                fitness_log.update({
-                    "gauntlet/confirmed_baseline": self.confirmed_baseline,
-                    "gauntlet/confirmed_breakthroughs": self.confirmed_breakthroughs,
-                    "gauntlet/stabilization_phase": self.stabilization_generations_elapsed if self.breakthrough_state == BreakthroughState.STABILIZATION else 0,
-                })
-
-            wandb.log(fitness_log, step=gen)
+            # Fitness and gauntlet metrics will be logged in the consolidated wandb.log at end of generation
 
             # Generate validation slices for this generation
             self.current_generation_val_slices = self.generate_validation_slices()
@@ -6111,31 +6197,29 @@ class ERLTrainer:
             if self.multi2_mode:
                 base_validation_scores = [result['base_combined_fitness'] for result in sorted(validation_results, key=lambda x: x['idx'])]
 
-            # Print summary showing training vs validation rankings
-            print(f"\n--- Validation Summary ---")
+            # Print validation summary (verbose only -- key info goes to dashboard)
+            log(f"\n--- Validation Summary ---", VERBOSE)
             if self.consistency_mode and not self.multi2_mode:
-                print("Consistency mode: WR^2 × QR × ROI × volume_scalar fitness function")
+                log("Consistency mode: WR^2 × QR × ROI × volume_scalar fitness function", VERBOSE)
             else:
-                print(f"ROI Hurdle EMA: {median_hof_roi:.2f}% (raw HoF median: {raw_median_hof_roi:.2f}%)")
-                print(f"Quality threshold: {quality_threshold:.2f}% (min gain_pct for quality trades, need {Config.ROI_CONFIDENCE_MIN_TRADES} for full bonus)")
+                log(f"ROI Hurdle EMA: {median_hof_roi:.2f}% (raw HoF median: {raw_median_hof_roi:.2f}%)", VERBOSE)
+                log(f"Quality threshold: {quality_threshold:.2f}% (min gain_pct for quality trades, need {Config.ROI_CONFIDENCE_MIN_TRADES} for full bonus)", VERBOSE)
                 if self.multi2_mode:
-                    print("🎯 MULTI-MODE: ROI Expansion enabled - agents must beat parent's ROI for bonus")
+                    log("MULTI-MODE: ROI Expansion enabled - agents must beat parent's ROI for bonus", VERBOSE)
             validation_results.sort(key=lambda x: x['combined_fitness'], reverse=True)
 
             if self.consistency_mode and not self.multi2_mode:
-                # Simplified output for consistency mode (no ROI adjustment)
-                print("Top 5 by Combined Fitness - used for elite selection:")
+                log("Top 5 by Combined Fitness - used for elite selection:", VERBOSE)
                 for i, result in enumerate(validation_results[:5]):
                     quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
-                    print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
+                    log(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f}, Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}", VERBOSE)
             else:
-                # Detailed output for standard mode and multi2-mode (with ROI adjustment)
                 mode_label = "MULTI2-MODE ROI Expansion" if self.multi2_mode else "with ROI adjustment"
-                print(f"Top 5 by Combined Fitness ({mode_label}) - used for elite selection:")
+                log(f"Top 5 by Combined Fitness ({mode_label}) - used for elite selection:", VERBOSE)
                 for i, result in enumerate(validation_results[:5]):
                     roi_adj_sign = '+' if result['roi_adjustment'] >= 0 else ''
                     quality_ratio = result['quality_count'] / result['total_trades'] if result['total_trades'] > 0 else 0.0
-                    print(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}")
+                    log(f"  {i+1}. Agent {result['idx']:2d}: Combined={result['combined_fitness']:>8.2f} (base={result['base_combined_fitness']:>7.2f}, ROI adj={roi_adj_sign}{result['roi_adjustment']:>6.2f}), Val=[mean:{result['validation_fitness_mean']:>6.2f}, min:{result['validation_fitness_min']:>6.2f}], ROI={result['roi']:>6.2f}%, QR={quality_ratio:.1%}, PnL=${result['raw_pnl']:>8.2f}, WR={result['win_rate']:.1%}", VERBOSE)
 
             # Update best agent if we found a better one based on combined fitness
             if best_val_agent_idx is not None and best_val_fitness_this_gen > self.best_validation_fitness:
@@ -6145,7 +6229,13 @@ class ERLTrainer:
                     print(f"\n⚠ WARNING: best_val_agent_idx ({best_val_agent_idx}) != top sorted agent ({top_agent_idx})")
                     print(f"   This indicates a bug in best agent selection!")
 
-                print(f"\n✓ New best! Agent {best_val_agent_idx} with Combined fitness: {best_val_fitness_this_gen:.2f} (prev: {self.best_validation_fitness:.2f})")
+                # Capture event for dashboard
+                best_roi = validation_results[0]['roi'] if validation_results else 0
+                best_wr = validation_results[0]['win_rate'] * 100 if validation_results else 0
+                self.generation_events.append(
+                    f"NEW BEST: Agent {best_val_agent_idx} Combined={best_val_fitness_this_gen:.2f} (prev: {self.best_validation_fitness:.2f}) | ROI={best_roi:.2f}% | WR={best_wr:.1f}%"
+                )
+                log(f"\n✓ New best! Agent {best_val_agent_idx} with Combined fitness: {best_val_fitness_this_gen:.2f} (prev: {self.best_validation_fitness:.2f})", VERBOSE)
                 if self.best_agent is not None:
                     del self.best_agent
                     gc.collect()
@@ -6153,14 +6243,14 @@ class ERLTrainer:
                 self.best_agent = self.population[best_val_agent_idx].clone()
 
                 # Save checkpoint immediately to update best_agent.pth
-                print("  Saving checkpoint with new best agent...")
+                log("  Saving checkpoint with new best agent...", VERBOSE)
                 self.save_checkpoint()
 
                 # Run full evaluation on best agent
-                print("  Running full evaluation (evaluate_best_agent.py)...")
+                log("  Running full evaluation (evaluate_best_agent.py)...", VERBOSE)
                 self._run_evaluation()
             else:
-                print(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}")
+                log(f"\n→ Best val fitness unchanged: {self.best_validation_fitness:.2f}", VERBOSE)
 
             # --- Gauntlet Mode Breakthrough Detection ---
             if self.gauntlet_mode_enabled and not self.multi2_mode:
@@ -6297,39 +6387,7 @@ class ERLTrainer:
             # Get the best agent's per-slice fitness scores from already-validated results
             best_agent_slice_scores = best_agent_result.get('fitness_all_slices', [])
 
-            # Log validation metrics to wandb
-            validation_log = {
-                "validation/best_fitness": best_val_fitness_this_gen,
-                "validation/best_ever": self.best_validation_fitness,
-                "validation/best_agent_roi": best_agent_roi,
-                "validation/best_agent_num_trades": best_agent_num_trades,
-                "validation/best_agent_win_rate": best_agent_win_rate,
-                "validation/best_agent_quality_ratio": best_agent_quality_ratio,
-                "validation/best_agent_expectancy": best_agent_expectancy,
-            }
-
-            # Add Gauntlet Mode metrics
-            if self.gauntlet_mode_enabled and not self.multi2_mode:
-                validation_log.update({
-                    "gauntlet/confirmed_baseline": self.confirmed_baseline,
-                    "gauntlet/confirmed_breakthroughs": self.confirmed_breakthroughs,
-                    "gauntlet/stabilization_phase": self.stabilization_generations_elapsed if self.breakthrough_state == BreakthroughState.STABILIZATION else 0,
-                })
-
-            # Add Multi2-Mode metrics (sequential training of committee members)
-            if self.multi2_mode:
-                # Log current member and overall progress
-                validation_log.update({
-                    "multi/current_member_idx": self.current_member_idx,
-                    "multi/current_member_baseline": self.member_baselines[self.current_member_idx],
-                    "multi/turnovers_completed": self.turnovers_completed,
-                    "multi/min_breakthroughs": min(self.member_breakthroughs),
-                    "multi/max_breakthroughs": max(self.member_breakthroughs),
-                    "multi/total_breakthroughs": sum(self.member_breakthroughs),
-                    "multi/avg_breakthroughs": np.mean(self.member_breakthroughs),
-                })
-
-            wandb.log(validation_log, step=gen)
+            # Validation metrics will be logged in the consolidated wandb.log at end of generation
 
             # --- Hall of Fame Admission Logic ---
             # In multi2-mode, skip HoF updates to preserve member-specific ROI hurdles
@@ -6348,7 +6406,7 @@ class ERLTrainer:
                         maverick_mode=self.maverick_mode
                     )
                     if updated_count > 0:
-                        print(f"\n🔄 Re-evaluated {updated_count}/{len(self.hall_of_fame.entries)} HoF agents with current median ({median_hof_roi:.2f}%) [EMA α={erosion_alpha:.2f}]")
+                        log(f"\n🔄 Re-evaluated {updated_count}/{len(self.hall_of_fame.entries)} HoF agents with current median ({median_hof_roi:.2f}%) [EMA α={erosion_alpha:.2f}]", VERBOSE)
 
                 # Build candidate list from all agents in this generation
                 candidates = []
@@ -6373,15 +6431,20 @@ class ERLTrainer:
                            if action == 'admitted' or action.startswith('replaced_')]
                 if admitted:
                     hof_stats = self.hall_of_fame.get_stats()
-                    print(f"\n⭐ Hall of Fame updates ({len(admitted)} changes):")
+                    # Capture event for dashboard
+                    self.generation_events.append(
+                        f"HOF: {len(admitted)} changes (worst={hof_stats['worst_score']:.2f}, best={hof_stats['best_score']:.2f})"
+                    )
+                    # Verbose detail
+                    log(f"\n⭐ Hall of Fame updates ({len(admitted)} changes):", VERBOSE)
                     for agent_idx, score, action in admitted:
                         if action == 'admitted':
-                            print(f"   + Agent {agent_idx} admitted (Combined: {score:.2f})")
+                            log(f"   + Agent {agent_idx} admitted (Combined: {score:.2f})", VERBOSE)
                         elif action.startswith('replaced_'):
                             old_score = action.replace('replaced_', '')
-                            print(f"   ↑ Agent {agent_idx} (Combined: {score:.2f}) replaced {old_score}")
-                    print(f"   HoF size: {hof_stats['size']}/{self.hall_of_fame.capacity}, "
-                          f"Worst: {hof_stats['worst_score']:.2f}, Best: {hof_stats['best_score']:.2f}")
+                            log(f"   ↑ Agent {agent_idx} (Combined: {score:.2f}) replaced {old_score}", VERBOSE)
+                    log(f"   HoF size: {hof_stats['size']}/{self.hall_of_fame.capacity}, "
+                          f"Worst: {hof_stats['worst_score']:.2f}, Best: {hof_stats['best_score']:.2f}", VERBOSE)
 
                 # Update ROI hurdle EMA after HoF changes
                 # EMA with α=0.2: converges to static target in ~5 iterations
@@ -6425,29 +6488,7 @@ class ERLTrainer:
             else:
                 hof_best_quality_ratio = 0.0
 
-            # Log comprehensive Hall of Fame and adaptive mutation metrics to wandb
-            log_data = {
-                "hall_of_fame/min_fitness": hof_stats['worst_score'],
-                "hall_of_fame/max_fitness": hof_stats['best_score'],
-                "hall_of_fame/mean_fitness": hof_stats['mean_score'],
-                "hall_of_fame/median_roi": hof_stats['median_roi'],
-                "hall_of_fame/best_roi": hof_best_roi,
-                "hall_of_fame/best_quality_ratio": hof_best_quality_ratio,
-                "hall_of_fame/best_expectancy": hof_best_expectancy,
-                "mutation/rate": self.current_mutation_rate,
-                "mutation/std": self.current_mutation_std,
-                "mutation/plateau_detected": int(self.plateau_detected),
-            }
-
-
-            # Add heroes queue tracking (for consistency mode with heroes)
-            if self.use_candidate_queue:
-                log_data.update({
-                    "heroes/queue_size": len(self.candidate_queue),
-                    "heroes/tested_count": len(self.tested_candidate_indices),
-                })
-
-            wandb.log(log_data, step=gen)
+            # HoF and mutation metrics are logged in the consolidated wandb.log at end of generation
 
             # 2. Train agents using replay buffer
             # First, wait for background transfer to complete (if running in local mode)
@@ -6487,7 +6528,7 @@ class ERLTrainer:
                     # This ensures evolve_population keeps them instead of immediately culling
                     max_fitness = np.max(fitness_scores) if len(fitness_scores) > 0 else 1.0
 
-                    print(f"\n🏆 Hall of Fame Injection: Replacing {len(hof_champions)} worst agents with champions")
+                    log(f"\n🏆 Hall of Fame Injection: Replacing {len(hof_champions)} worst agents with champions", VERBOSE)
                     for i, (worst_idx, champion) in enumerate(zip(worst_indices, hof_champions)):
                         # Clone the champion and assign it a new agent ID
                         champion_copy = champion.clone()
@@ -6509,7 +6550,7 @@ class ERLTrainer:
                             max_val_fitness = np.max(validation_scores) if len(validation_scores) > 0 else max_fitness
                             validation_scores[worst_idx] = max_val_fitness
 
-                        print(f"   Agent {worst_idx}: Fitness {old_fitness:.2f} → HoF Champion (Score: {max_fitness:.2f})")
+                        log(f"   Agent {worst_idx}: Fitness {old_fitness:.2f} → HoF Champion (Score: {max_fitness:.2f})", VERBOSE)
 
             # 3. Check for plateau and adjust mutation adaptively (FIX 3: MOVED BEFORE evolve_population)
             # This must happen BEFORE evolution because:
@@ -6547,56 +6588,97 @@ class ERLTrainer:
 
             # 6. Cleanup orphaned buffer files every 5 generations
             if (gen + 1) % 5 == 0:
-                print(f"\n--- Cleaning up orphaned buffer files (Generation {gen + 1}) ---")
+                log(f"\n--- Cleaning up orphaned buffer files (Generation {gen + 1}) ---", VERBOSE)
                 try:
                     cleanup_result = cleanup_orphans(
                         run_name=self.run_name,
                         dry_run=False,
-                        verbose=False  # Keep output minimal during training
+                        verbose=False
                     )
                     if cleanup_result['success'] and cleanup_result['orphaned_count'] > 0:
                         deleted = cleanup_result['deleted_count']
                         orphaned = cleanup_result['orphaned_count']
-                        print(f"  ✓ Cleaned up {deleted}/{orphaned} orphaned buffer files")
+                        log(f"  ✓ Cleaned up {deleted}/{orphaned} orphaned buffer files", VERBOSE)
                     elif cleanup_result['success']:
-                        print(f"  ✓ No orphaned files found - buffer storage is clean")
+                        log(f"  ✓ No orphaned files found - buffer storage is clean", VERBOSE)
                     else:
-                        print(f"  ⚠ Cleanup failed: {cleanup_result.get('error', 'unknown error')}")
+                        log(f"  ⚠ Cleanup failed: {cleanup_result.get('error', 'unknown error')}", VERBOSE)
                 except Exception as e:
-                    print(f"  ⚠ Cleanup error: {e}")
-                    print("  Continuing training...")
+                    log(f"  ⚠ Cleanup error: {e}", VERBOSE)
+                    log("  Continuing training...", VERBOSE)
 
             # Generation time
             gen_time = time.time() - gen_start_time
             self.generation_times.append(gen_time)
             
-            # Print timing breakdown
-            print(f"\n--- Generation Timing Breakdown ---")
-            print(f"  Evaluation: {t_eval_end - t_eval_start:.2f}s ({((t_eval_end - t_eval_start)/gen_time)*100:.1f}%)")
-            print(f"  Validation: {t_val_end - t_val_start:.2f}s ({((t_val_end - t_val_start)/gen_time)*100:.1f}%)")
-            print(f"  Training:   {t_train_end - t_train_start:.2f}s ({((t_train_end - t_train_start)/gen_time)*100:.1f}%)")
-            print(f"  Evolution:  {t_evolve_end - t_evolve_start:.2f}s ({((t_evolve_end - t_evolve_start)/gen_time)*100:.1f}%)")
-            print(f"  Total:      {gen_time:.2f}s")
-            print(f"-----------------------------------\n")
+            # Verbose timing breakdown (still goes to log file)
+            log(f"\n--- Generation Timing Breakdown ---", VERBOSE)
+            log(f"  Evaluation: {t_eval_end - t_eval_start:.2f}s ({((t_eval_end - t_eval_start)/gen_time)*100:.1f}%)", VERBOSE)
+            log(f"  Validation: {t_val_end - t_val_start:.2f}s ({((t_val_end - t_val_start)/gen_time)*100:.1f}%)", VERBOSE)
+            log(f"  Training:   {t_train_end - t_train_start:.2f}s ({((t_train_end - t_train_start)/gen_time)*100:.1f}%)", VERBOSE)
+            log(f"  Evolution:  {t_evolve_end - t_evolve_start:.2f}s ({((t_evolve_end - t_evolve_start)/gen_time)*100:.1f}%)", VERBOSE)
+            log(f"  Total:      {gen_time:.2f}s", VERBOSE)
+            log(f"-----------------------------------\n", VERBOSE)
 
             # Get final resource stats for this generation
             self.resource_tracker.update()
             resource_stats = self.resource_tracker.get_current_stats()
 
-            # Prepare gauntlet info for display
+            # ================================================================
+            # CONSOLIDATED DASHBOARD + W&B LOGGING
+            # ================================================================
+            
+            # --- Build best agent info ---
+            best_agent_info = None
+            if validation_results:
+                ba = validation_results[0]  # Already sorted by combined_fitness
+                ba_qr = (ba['quality_count'] / ba['total_trades'] * 100) if ba['total_trades'] > 0 else 0.0
+                # Calculate wins/losses from win_rate and total_trades
+                ba_wins = int(ba['win_rate'] * ba['total_trades'])
+                ba_losses = ba['total_trades'] - ba_wins
+                best_agent_info = {
+                    'idx': ba['idx'],
+                    'combined_fitness': ba['combined_fitness'],
+                    'roi': ba['roi'],
+                    'win_rate': ba['win_rate'] * 100,  # Convert to percentage
+                    'num_wins': ba_wins,
+                    'num_losses': ba_losses,
+                    'quality_ratio': ba_qr,
+                    'quality_count': ba['quality_count'],
+                    'total_trades': ba['total_trades'],
+                    'expectancy': ba['expectancy'],
+                    'pnl': ba['raw_pnl'],
+                }
+            
+            # --- Build population health info ---
+            population_rois = [r['roi'] for r in validation_results] if validation_results else []
+            population_win_rates = [r['win_rate'] * 100 for r in validation_results] if validation_results else []
+            positive_count = sum(1 for f in fitness_scores if f > 0)
+            population_info = {
+                'positive_count': positive_count,
+                'mean_roi': float(np.mean(population_rois)) if population_rois else 0.0,
+                'mean_win_rate': float(np.mean(population_win_rates)) if population_win_rates else 0.0,
+            }
+            
+            # --- Build HoF info ---
+            hof_stats = self.hall_of_fame.get_stats()
+            hof_info = {
+                'size': hof_stats['size'],
+                'capacity': self.hall_of_fame.capacity,
+                'best': hof_stats['best_score'],
+                'worst': hof_stats['worst_score'],
+                'median_roi': hof_stats['median_roi'],
+                'roi_hurdle_ema': self.roi_hurdle_ema if self.roi_hurdle_ema is not None else 0.0,
+            }
+            
+            # --- Build gauntlet info ---
             gauntlet_info = None
             if self.gauntlet_mode_enabled:
-                # Calculate stabilization progress if in stabilization state
                 stab_progress = None
                 if self.breakthrough_state == BreakthroughState.STABILIZATION:
                     stab_progress = (self.stabilization_generations_elapsed, Config.STABILIZATION_GENERATIONS)
-
-                # Get Hall of Fame stats
-                hof_stats = self.hall_of_fame.get_stats()
-
-                # Get Global Hall of Fame stats
                 global_hof_stats = self.global_hof.get_stats()
-
+                
                 gauntlet_info = {
                     'gauntlet_enabled': True,
                     'consistency_mode': self.consistency_mode,
@@ -6613,57 +6695,149 @@ class ERLTrainer:
                     'breakthrough_history': self.breakthrough_history,
                     'global_hof_enabled': global_hof_stats['enabled'],
                     'global_hof_size': global_hof_stats['size'],
-                    'global_hof_threshold': global_hof_stats['entry_threshold']
+                    'global_hof_threshold': global_hof_stats['entry_threshold'],
                 }
-
-                # Add queue size if using candidate queue (heroes mode)
+                if self.consistency_mode:
+                    generations_since_turnover = gen - self.generation_at_last_turnover
+                    gauntlet_info['runway_remaining'] = Config.MAX_GENERATIONS_GAUNTLET - generations_since_turnover
                 if self.use_candidate_queue:
                     gauntlet_info['queue_size'] = len(self.candidate_queue)
-
-            # Print comprehensive generation summary with resource stats
-            print_generation_summary(
+            
+            # --- Build timing info ---
+            timing_info = {
+                'eval_time': t_eval_end - t_eval_start,
+                'val_time': t_val_end - t_val_start,
+                'train_time': t_train_end - t_train_start,
+                'evolve_time': t_evolve_end - t_evolve_start,
+            }
+            timing_info.update({
+                'train_compute_pct': self.last_train_bottleneck.get('compute_pct', 0),
+                'train_data_load_pct': self.last_train_bottleneck.get('data_load_pct', 0),
+                'train_gpu_transfer_pct': self.last_train_bottleneck.get('gpu_transfer_pct', 0),
+            })
+            
+            # --- Track trends (deltas vs previous generation) ---
+            tracker_metrics = {
+                'best_combined_fitness': best_agent_info['combined_fitness'] if best_agent_info else 0,
+                'best_roi': best_agent_info['roi'] if best_agent_info else 0,
+                'best_win_rate': best_agent_info['win_rate'] if best_agent_info else 0,
+                'best_quality_ratio': best_agent_info['quality_ratio'] if best_agent_info else 0,
+                'best_expectancy': best_agent_info['expectancy'] if best_agent_info else 0,
+                'best_pnl': best_agent_info['pnl'] if best_agent_info else 0,
+                'mean_fitness': float(np.mean(fitness_scores)),
+                'positive_count': positive_count,
+                'mean_roi': population_info['mean_roi'],
+                'mean_win_rate': population_info['mean_win_rate'],
+                'roi_hurdle_ema': self.roi_hurdle_ema if self.roi_hurdle_ema is not None else 0,
+            }
+            deltas = self.gen_tracker.update(tracker_metrics)
+            
+            # --- Print the dashboard ---
+            print_generation_dashboard(
                 gen=gen,
                 total_gens=Config.NUM_GENERATIONS,
                 fitness_scores=fitness_scores,
-                pop_stats=pop_stats,
                 buffer_size=len(self.replay_buffer),
-                best_fitness=self.best_validation_fitness,  # Use validation fitness for "best ever"
                 gen_time=gen_time,
                 avg_gen_time=np.mean(self.generation_times) if self.generation_times else 0,
-                resource_stats=resource_stats,
+                best_agent_info=best_agent_info,
+                population_info=population_info,
+                hof_info=hof_info,
                 gauntlet_info=gauntlet_info,
-                local_mode=self.local_mode
+                timing_info=timing_info,
+                resource_stats=resource_stats,
+                deltas=deltas,
+                local_mode=self.local_mode,
+                events=self.generation_events,
             )
 
-            # Show progress plot every 5 generations
-            # if (gen + 1) % 5 == 0:
-            #     plot_fitness_progress(self.fitness_history)
-            #     # CRITICAL FIX: Close matplotlib figures to prevent memory leak (~100MB per plot)
-            #     plt.close('all')
-
-            # Buffer stats and generation time
+            # --- Consolidated W&B logging (single call per generation) ---
             buffer_stats = self.replay_buffer.get_stats()
             self.writer.add_scalar('Buffer/Size', buffer_stats['size'], gen)
             self.writer.add_scalar('Buffer/Utilization', buffer_stats['utilization'], gen)
-
-            # Log timing and buffer metrics to wandb
-            wandb_log_data = {
-                "training/generation_time": gen_time,
-                "buffer/size": buffer_stats['size'],
-                "buffer/utilization": buffer_stats['utilization'],
+            
+            gen_wandb = {
+                # Generation step
+                "generation": gen,
+                # Fitness
+                "fitness/best": max_fitness,
+                "fitness/mean": mean_fitness,
+                "fitness/min": min_fitness,
+                "fitness/std": float(np.std(fitness_scores)),
+                "fitness/best_ever": self.best_validation_fitness,
+                # Best agent
+                "best_agent/combined_fitness": best_agent_info['combined_fitness'] if best_agent_info else 0,
+                "best_agent/roi": best_agent_info['roi'] if best_agent_info else 0,
+                "best_agent/win_rate": best_agent_info['win_rate'] if best_agent_info else 0,
+                "best_agent/quality_ratio": best_agent_info['quality_ratio'] if best_agent_info else 0,
+                "best_agent/expectancy": best_agent_info['expectancy'] if best_agent_info else 0,
+                "best_agent/pnl": best_agent_info['pnl'] if best_agent_info else 0,
+                "best_agent/num_trades": best_agent_info['total_trades'] if best_agent_info else 0,
+                # Population
+                "population/positive_count": positive_count,
+                "population/mean_roi": population_info['mean_roi'],
+                "population/mean_win_rate": population_info['mean_win_rate'],
+                "population/fitness_std": float(np.std(fitness_scores)),
+                # Train
+                "train/actor_loss": getattr(self, '_last_actor_loss', 0),
+                "train/critic_loss": getattr(self, '_last_critic_loss', 0),
+                "train/mutation_rate": self.current_mutation_rate,
+                "train/mutation_std": self.current_mutation_std,
+                "train/buffer_size": buffer_stats['size'],
+                "train/buffer_utilization": buffer_stats['utilization'],
+                # HoF
+                "hof/size": hof_stats['size'],
+                "hof/best": hof_stats['best_score'],
+                "hof/worst": hof_stats['worst_score'],
+                "hof/mean": hof_stats['mean_score'],
+                "hof/median_roi": hof_stats['median_roi'],
+                "hof/roi_hurdle_ema": self.roi_hurdle_ema if self.roi_hurdle_ema is not None else 0,
+                "hof/turnover_count": self.hof_turnover_count,
+                # Performance
+                "perf/generation_time": gen_time,
+                "perf/eval_time": timing_info['eval_time'],
+                "perf/val_time": timing_info['val_time'],
+                "perf/train_time": timing_info['train_time'],
+                "perf/evolve_time": timing_info['evolve_time'],
+                "perf/train_compute_pct": timing_info['train_compute_pct'],
+                "perf/train_data_load_pct": timing_info['train_data_load_pct'],
+                "perf/train_gpu_transfer_pct": timing_info['train_gpu_transfer_pct'],
+                "perf/gpu_peak_memory_gb": resource_stats.get('peak_vram_gb', 0),
             }
-
-            # Add Global HoF stats if enabled
+            
+            # Gauntlet metrics (logged every gen as state values, not sparse events)
+            if self.gauntlet_mode_enabled:
+                gen_wandb.update({
+                    "gauntlet/baseline": self.confirmed_baseline,
+                    "gauntlet/breakthroughs": self.confirmed_breakthroughs,
+                    "gauntlet/state": self.stabilization_generations_elapsed if self.breakthrough_state == BreakthroughState.STABILIZATION else 0,
+                })
+            
+            # Global HoF
             if self.global_hof.enabled:
                 global_hof_stats = self.global_hof.get_stats()
-                wandb_log_data.update({
-                    'global_hof/size': global_hof_stats['size'],
-                    'global_hof/entry_threshold': global_hof_stats['entry_threshold'],
-                    'global_hof/best_score': global_hof_stats['best_score'],
-                    'global_hof/mean_score': global_hof_stats['mean_score'],
+                gen_wandb.update({
+                    "hof/global_size": global_hof_stats['size'],
+                    "hof/global_threshold": global_hof_stats['entry_threshold'],
+                    "hof/global_best": global_hof_stats['best_score'],
                 })
-
-            wandb.log(wandb_log_data, step=gen)
+            
+            # Multi-mode metrics
+            if self.multi2_mode:
+                gen_wandb.update({
+                    "multi/current_member_idx": self.current_member_idx,
+                    "multi/turnovers_completed": self.turnovers_completed,
+                    "multi/total_breakthroughs": sum(self.member_breakthroughs),
+                })
+            
+            # Heroes queue
+            if self.use_candidate_queue:
+                gen_wandb.update({
+                    "heroes/queue_size": len(self.candidate_queue),
+                    "heroes/tested_count": len(self.tested_candidate_indices),
+                })
+            
+            wandb.log(gen_wandb, step=gen)
 
             # Clear GPU cache and run garbage collection to prevent memory leaks
             if torch.cuda.is_available():
@@ -6673,32 +6847,15 @@ class ERLTrainer:
             # Leverage mode tracking - decrement counter and deactivate after 5 generations
             if self.leverage_mode_active:
                 self.leverage_generations_remaining -= 1
-                print(f"\n📊 Leverage mode: {self.leverage_generations_remaining} generations remaining")
-
-                # Log leverage mode countdown to wandb
-                wandb.log({
-                    'leverage/countdown': self.leverage_generations_remaining,
-                }, step=gen)
+                log(f"\n📊 Leverage mode: {self.leverage_generations_remaining} generations remaining", VERBOSE)
 
                 if self.leverage_generations_remaining <= 0:
-                    print("\n" + "="*60)
-                    print("✓ LEVERAGE MODE COMPLETE")
-                    print("="*60)
-                    print("Resetting all agents to normal training (1.0x coefficients)")
-
-                    # Reset leverage multiplier for all agents
+                    self.generation_events.append("LEVERAGE MODE COMPLETE - resuming normal training")
+                    log("\n✓ LEVERAGE MODE COMPLETE - Resetting all agents to 1.0x coefficients", VERBOSE)
                     for agent in self.population:
                         agent.actor.leverage_multiplier = 1.0
                         agent.actor_target.leverage_multiplier = 1.0
-
                     self.leverage_mode_active = False
-                    print("✓ Resumed normal training")
-                    print("="*60 + "\n")
-
-                    # Log leverage mode deactivation to wandb
-                    wandb.log({
-                        'leverage/active': 0,
-                    }, step=gen)
 
             # 🔍 Print memory trend every generation
             # if (gen + 1) % 1 == 0:  # Every generation

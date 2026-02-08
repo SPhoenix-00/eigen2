@@ -77,8 +77,8 @@ python -c "from google.cloud import storage; client = storage.Client(); bucket =
 ```bash
 wandb login
 # Paste API key from: https://wandb.ai/authorize
-# 7deffe6a4942dc629a3327c7df7be882859d638c
-# $env:WANDB_API_KEY="7deffe6a4942dc629a3327c7df7be882859d638c"
+# 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
+# $env:WANDB_API_KEY="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"
 
 ```
 
@@ -269,6 +269,49 @@ tmux attach -t training
 # Scroll through past output
 Ctrl+B, then [
 ```
+
+---
+
+## Console Output and Verbosity
+
+Training output defaults to a clean **dashboard mode** that shows only the metrics that matter. Full verbose detail is always captured in the log file (`evaluation_results/training_log_*.txt`).
+
+### Verbosity Flags
+
+| Flag | Level | Behavior |
+|------|-------|----------|
+| *(default)* | NORMAL | Clean per-generation dashboard with best agent profile, population health, HoF, loop timing, and trend deltas |
+| `-v` / `--verbose` | VERBOSE | Full legacy output (all detail printed to console) |
+| `-q` / `--quiet` | QUIET | Errors and warnings only (good for background/unattended runs) |
+
+```bash
+python main.py --local                 # Clean dashboard (default)
+python main.py --local -v              # Full verbose output
+python main.py --local -q              # Quiet mode (background runs)
+```
+
+### Per-Generation Dashboard
+
+Each generation prints a structured dashboard (~20 lines) showing:
+
+- **Best Agent**: Combined fitness, ROI, win rate (W/L), quality ratio, expectancy, PnL -- with deltas vs previous generation
+- **Population Health**: Fitness distribution, positive agent count, mean ROI, mean win rate
+- **Hall of Fame**: Size, best/worst scores, median ROI, hurdle EMA
+- **Loop Performance**: Phase timing breakdown (eval/val/train/evolve), training bottleneck split (compute/data_load/gpu_transfer), GPU memory, ETA
+- **Events**: Highlighted lines for breakthroughs, new bests, HoF changes, turnovers
+
+### W&B Portal
+
+Metrics are logged under clean namespaces with proper `define_metric()` axes:
+- `fitness/` -- Population fitness distribution
+- `best_agent/` -- Best agent's full trading profile
+- `population/` -- Population health (positive count, mean ROI/WR)
+- `hof/` -- Hall of Fame state + Global 50
+- `gauntlet/` -- Gauntlet state machine (logged every gen, not sparse events)
+- `train/` -- Actor/critic loss, mutation rate, buffer
+- `perf/` -- Phase timing breakdown, training bottleneck split, GPU memory
+
+Runs are tagged with mode labels (`consistency`, `local`, `multi`, `gauntlet`, `maverick`) and grouped for multi-agent runs.
 
 ---
 

@@ -433,35 +433,45 @@ class StockDataLoader:
         
         return normalized.astype(np.float32)
     
-    def load_and_prepare(self) -> Tuple[np.ndarray, dict]:
+    def load_and_prepare(self, quiet: bool = False) -> Tuple[np.ndarray, dict]:
         """
         Convenience method to run full data loading pipeline.
+
+        Args:
+            quiet: If True, suppress verbose output (for repeat loads in multi-agent mode).
 
         Returns:
             Tuple of (data_array, normalization_stats)
         """
-        print("="*60)
-        print("Data Loading Pipeline")
-        print("="*60)
-
-        # Load CSV
-        self.load_csv()
-
-        # Extract features
-        self.extract_features()
-
-        # Create train/val split
-        self.create_train_val_split()
-
-        # Compute normalization stats
-        stats = self.compute_normalization_stats()
-
-        # Store as attribute for easy access
-        self.normalization_stats = stats
-
-        print("\n" + "="*60)
-        print("Data loading complete!")
-        print("="*60)
+        from utils.display import log, VERBOSE, NORMAL
+        
+        if quiet:
+            # Suppress all output during loading (still goes to log file)
+            import contextlib, io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.load_csv()
+                self.extract_features()
+                self.create_train_val_split()
+                stats = self.compute_normalization_stats()
+            # Write captured output to log file only
+            log(buf.getvalue(), VERBOSE)
+            self.normalization_stats = stats
+            total_days = self.data_array.shape[0] if self.data_array is not None else 0
+            total_cols = self.data_array.shape[1] if self.data_array is not None else 0
+            print(f"  Data loaded ({total_days} days, {total_cols} cols)")
+        else:
+            print("="*60)
+            print("Data Loading Pipeline")
+            print("="*60)
+            self.load_csv()
+            self.extract_features()
+            self.create_train_val_split()
+            stats = self.compute_normalization_stats()
+            self.normalization_stats = stats
+            print("\n" + "="*60)
+            print("Data loading complete!")
+            print("="*60)
 
         return self.data_array, stats
 

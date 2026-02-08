@@ -22,7 +22,12 @@ from utils.cleanup_orphans import cleanup_orphans
 
 
 class TeeLogger:
-    """Logger that writes to both file and stdout."""
+    """Logger that writes to both file and stdout.
+    
+    The log_file attribute is publicly accessible so that the log() utility
+    in utils/display.py can write file-only messages (verbose detail that
+    shouldn't clutter the console).
+    """
 
     def __init__(self, filepath: Path):
         """
@@ -410,7 +415,28 @@ def main():
                  'Useful for testing maverick phase transitions without waiting for all '
                  'non-maverick agents to complete. Requires --multi2 mode.'
         )
+        parser.add_argument(
+            '-v', '--verbose',
+            action='store_true',
+            help='Verbose output: show all detail (legacy behavior). '
+                 'Default is clean dashboard mode with noise suppressed.'
+        )
+        parser.add_argument(
+            '-q', '--quiet',
+            action='store_true',
+            help='Quiet output: errors and warnings only. '
+                 'Good for background/unattended runs. Full detail still goes to log file.'
+        )
         args = parser.parse_args()
+
+        # Set verbosity level
+        from utils.display import set_verbosity, QUIET, NORMAL, VERBOSE
+        if args.verbose:
+            set_verbosity(VERBOSE)
+        elif args.quiet:
+            set_verbosity(QUIET)
+        else:
+            set_verbosity(NORMAL)
         # --------------------------------
 
         # Auto-detect global50 directory if --heroes was used without a path
@@ -520,7 +546,6 @@ def main():
             args.multi_roster = roster
 
             # Validate incompatible flags with --multi
-            # The orchestrator creates independent runs per agent; these per-run flags don't apply
             incompatible = []
             if args.resume:
                 incompatible.append('--resume')
@@ -545,17 +570,7 @@ def main():
             if incompatible:
                 print(f"\n❌ ERROR: --multi is incompatible with: {', '.join(incompatible)}")
                 print(f"  --multi creates independent runs per agent.")
-                print(f"  Per-run flags like --resume, --buffer, --heroes do not apply.")
-                print(f"  Maverick handling is automatic based on the committee roster.")
                 sys.exit(1)
-
-            print(f"\n🎯 MULTI-AGENT ORCHESTRATOR MODE")
-            print(f"  Committee members: {len(roster['members'])}")
-            pop_size = Config.LOCAL_POPULATION_SIZE if args.local else Config.POPULATION_SIZE
-            print(f"  Population size: {pop_size}{' (local mode)' if args.local else ' (standard)'}")
-            print(f"  Training mode: Independent runs (one wandb run per member)")
-            print(f"  Breakthroughs per agent: {Config.MULTI_TARGET_TURNOVERS}")
-            print(f"  Consistency mode: AUTO-ENABLED per agent")
 
         # Validate --multi2 mode (legacy - committee roster must exist)
         if args.multi2:
@@ -591,7 +606,7 @@ def main():
         # NOTE: Seed will be set AFTER wandb init in ERLTrainer to ensure unique seeds per run
         # This prevents parallel runs from having identical behavior
 
-        # Display configuration
+        # Display configuration (compact to console, full to log file)
         Config.display()
 
         # Validate configuration
@@ -599,17 +614,69 @@ def main():
             print("\n❌ Configuration validation failed!")
             return
 
-        print("\n" + "="*60)
-        print("Phase 1: Data Loading")
-        print("="*60)
+        # --- Compact Startup Summary ---
+        from utils.display import log, VERBOSE, NORMAL, get_verbosity
+        
+        is_multi = args.multi
+        is_multi2 = getattr(args, 'multi2', False)
+        is_single = args.single is not None
+        is_local = args.local
+        is_consistency = args.consistency
+        is_maverick = args.maverick
+        
+        if is_multi:
+            roster = getattr(args, 'multi_roster')
+            non_mav = sum(1 for m in roster['members'] if not m.get('is_maverick', False))
+            mav = len(roster['members']) - non_mav
+            mode_str = "Multi-Agent Orchestrator"
+            members_str = f"{len(roster['members'])} members ({non_mav} non-maverick + {mav} maverick)"
+        elif is_single:
+            mode_str = "Single Agent Refinement"
+            members_str = getattr(args, 'single_agent_path', '?').split('\\')[-1].split('/')[-1]
+        elif is_multi2:
+            mode_str = "Multi-Agent (Legacy)"
+            members_str = f"{len(getattr(args, 'multi2_roster', {}).get('members', []))} members"
+        else:
+            mode_str = "Standard Training"
+            members_str = None
+        
+        pop_size = Config.LOCAL_POPULATION_SIZE if is_local else Config.POPULATION_SIZE
+        
+        print(f"\n{'='*60}")
+        print(f"Eigen 2 | {mode_str}")
+        print(f"{'='*60}")
+        if members_str:
+            print(f"  Agent: {members_str}")
+        print(f"  Mode: {'consistency (1.5x loss)' if is_consistency else 'normal'}"
+              f"{'  |  maverick' if is_maverick else ''}")
+        print(f"  Population: {pop_size}{' (local)' if is_local else ''}"
+              f"  |  Gauntlet: {'ON' if Config.GAUNTLET_MODE_ENABLED else 'OFF'}"
+              f" ({Config.GAUNTLET_NUM_SLICES} slices)")
+        if is_consistency:
+            print(f"  Target: {Config.TARGET_HOF_TURNOVERS} HoF turnovers"
+                  f"  |  Fallback: {Config.MAX_GENERATIONS_GAUNTLET} gens")
+        else:
+            target_bt = Config.TARGET_BREAKTHROUGHS_NORMAL
+            print(f"  Target: {target_bt} breakthroughs"
+                  f"  |  Fallback: {Config.MAX_GENERATIONS_GAUNTLET} gens")
+        Config.display_compact(consistency_mode=is_consistency, local_mode=is_local,
+                               gauntlet_enabled=Config.GAUNTLET_MODE_ENABLED)
+        
+        # GPU info
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            print(f"  Device: {gpu_name} ({gpu_mem:.0f} GB)")
+        else:
+            print(f"  Device: CPU (no CUDA)")
+        print(f"{'='*60}")
 
         # Load data
+        log(f"\nPhase 1: Data Loading", VERBOSE)
         loader = StockDataLoader()
         data_array, stats = loader.load_and_prepare()
 
-        print("\n" + "="*60)
-        print("Phase 2: ERL Training")
-        print("="*60)
+        log(f"\nPhase 2: ERL Training", VERBOSE)
 
         # Determine resume run name
         resume_run_name = None

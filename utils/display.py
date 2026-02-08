@@ -1,15 +1,113 @@
 """
 Display utilities for Project Eigen 2
-Pretty printing and progress visualization
+Pretty printing, progress visualization, and structured logging
 """
 
 import os
+import sys
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Dict
 from utils.config import Config
 import psutil
 import torch
 import shutil
+
+
+# ============================================================
+# Verbosity Levels
+# ============================================================
+QUIET = 0    # Errors/warnings only
+NORMAL = 1   # Dashboard + key events
+VERBOSE = 2  # Full detail (legacy behavior)
+
+_verbosity = NORMAL
+
+
+def set_verbosity(level: int):
+    """Set the global verbosity level."""
+    global _verbosity
+    _verbosity = level
+
+
+def get_verbosity() -> int:
+    """Get the current verbosity level."""
+    return _verbosity
+
+
+def log(msg: str = "", level: int = NORMAL):
+    """
+    Print to console if level <= verbosity, always write to log file.
+    
+    Args:
+        msg: Message to print
+        level: Verbosity level required for console output
+    """
+    if level <= _verbosity:
+        print(msg)
+    else:
+        # Write to log file only (if TeeLogger is active)
+        stdout = sys.stdout
+        if hasattr(stdout, 'log_file') and not stdout.log_file.closed:
+            stdout.log_file.write(msg + '\n')
+            stdout.log_file.flush()
+
+
+def log_event(msg: str):
+    """Print a highlighted event line (always shown at NORMAL+)."""
+    log(f"  >>> {msg}", NORMAL)
+
+
+# ============================================================
+# Generation Tracker for Trend Display
+# ============================================================
+class GenerationTracker:
+    """Tracks metrics across generations for trend display."""
+    
+    def __init__(self):
+        self.prev: Dict[str, float] = {}
+        self.best_ever: Dict[str, float] = {}
+    
+    def update(self, metrics: dict) -> dict:
+        """
+        Store current metrics and return deltas vs previous generation.
+        
+        Args:
+            metrics: Current generation's metrics
+            
+        Returns:
+            dict of deltas (key -> delta value)
+        """
+        deltas = {}
+        for key, val in metrics.items():
+            if isinstance(val, (int, float)) and not np.isnan(val) and not np.isinf(val):
+                if key in self.prev:
+                    deltas[key] = val - self.prev[key]
+                # Track all-time bests (higher is better for most metrics)
+                if key not in self.best_ever or val > self.best_ever[key]:
+                    self.best_ever[key] = val
+        self.prev = {k: v for k, v in metrics.items() 
+                     if isinstance(v, (int, float)) and not np.isnan(v) and not np.isinf(v)}
+        return deltas
+    
+    def format_delta(self, key: str, deltas: dict, fmt: str = ".2f", 
+                     suffix: str = "", invert: bool = False) -> str:
+        """
+        Format a delta value with arrow indicator.
+        
+        Args:
+            key: Metric key
+            deltas: Dict of deltas from update()
+            fmt: Format string for the number
+            suffix: Suffix like '%' or '$'
+            invert: If True, negative is good (e.g., for losses)
+        """
+        if key not in deltas:
+            return ""
+        d = deltas[key]
+        if abs(d) < 0.001:
+            return f"  ={suffix}"
+        sign = "+" if d > 0 else ""
+        return f"  {sign}{d:{fmt}}{suffix}"
 
 
 class ResourceTracker:
@@ -119,98 +217,235 @@ def plot_fitness_progress(fitness_history: List[List[float]]):
     print("="*60)
 
 
-def _print_progress_and_eta(gen: int, total_gens: int, avg_gen_time: float, gauntlet_info: Optional[dict] = None):
-    """
-    Print progress and ETA information based on training mode.
+def _fmt_time(seconds: float) -> str:
+    """Format seconds into a human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"
 
+
+def print_generation_dashboard(gen: int, total_gens: int,
+                               fitness_scores: List[float],
+                               buffer_size: int,
+                               gen_time: float,
+                               avg_gen_time: float,
+                               best_agent_info: Optional[dict] = None,
+                               population_info: Optional[dict] = None,
+                               hof_info: Optional[dict] = None,
+                               gauntlet_info: Optional[dict] = None,
+                               timing_info: Optional[dict] = None,
+                               resource_stats: Optional[dict] = None,
+                               deltas: Optional[dict] = None,
+                               local_mode: bool = False,
+                               events: Optional[List[str]] = None):
+    """
+    Print a structured per-generation dashboard.
+    
+    This replaces the old print_generation_summary and the scattered prints
+    throughout the generation loop. All information is consolidated here.
+    
     Args:
-        gen: Current generation number
-        total_gens: Total number of generations (fallback limit)
-        avg_gen_time: Average time per generation
-        gauntlet_info: Optional gauntlet/consistency mode information
+        gen: Current generation (0-indexed)
+        total_gens: Fallback generation limit
+        fitness_scores: Population fitness scores
+        buffer_size: Current replay buffer size
+        gen_time: Time for this generation
+        avg_gen_time: Average generation time
+        best_agent_info: Dict with best agent's trading profile:
+            - combined_fitness, roi, win_rate, num_wins, num_losses,
+              quality_ratio, quality_count, total_trades, expectancy, pnl
+        population_info: Dict with population health:
+            - positive_count, mean_roi, mean_win_rate
+        hof_info: Dict with Hall of Fame state:
+            - size, capacity, best, worst, median_roi, roi_hurdle_ema
+        gauntlet_info: Dict with gauntlet state (same as before)
+        timing_info: Dict with phase breakdown:
+            - eval_time, val_time, train_time, evolve_time
+            - train_compute_pct, train_data_load_pct, train_gpu_transfer_pct
+        resource_stats: Dict with resource usage
+        deltas: Dict of metric deltas from GenerationTracker.update()
+        local_mode: Whether running in local mode
+        events: List of event strings to highlight
     """
-    remaining = total_gens - (gen + 1)
+    deltas = deltas or {}
+    
+    def _delta(key, fmt=".2f", suffix="", pct=False):
+        """Format delta for a metric key."""
+        if key not in deltas:
+            return ""
+        d = deltas[key]
+        if abs(d) < 0.001:
+            return ""
+        sign = "+" if d > 0 else ""
+        if pct:
+            return f"  {sign}{d:{fmt}}%"
+        return f"  {sign}{d:{fmt}}{suffix}"
 
-    # Check if we're in gauntlet or consistency mode
+    # ---- Header ----
+    header_parts = [f"Gen {gen+1}/{total_gens}"]
+    
     if gauntlet_info and gauntlet_info.get('gauntlet_enabled'):
         consistency_mode = gauntlet_info.get('consistency_mode', False)
-
         if consistency_mode:
-            # Consistency mode: progress based on HoF turnovers
-            current_turnovers = gauntlet_info.get('hof_turnover_count', 0)
-            target_turnovers = gauntlet_info.get('target_hof_turnovers', 2)
-
-            print(f"\n  🎯 CONSISTENCY PROGRESS")
-            print(f"  HoF Turnovers:     {current_turnovers:>12} / {target_turnovers}")
-
-            if current_turnovers < target_turnovers:
-                turnovers_needed = target_turnovers - current_turnovers
-                print(f"  Turnovers Needed:  {turnovers_needed:>12}")
-                print(f"  Est. ETA:          {'Unknown':>11}  (depends on performance)")
-            else:
-                print(f"  Status:            {'🏆 Complete!':>11}")
-
-            # Show fallback generation limit
-            print(f"\n  Fallback Limit:    {remaining:>12} generations remaining")
-            if remaining > 0:
-                eta_seconds = avg_gen_time * remaining
-                eta_minutes = eta_seconds / 60
-                eta_hours = eta_seconds / 3600
-                print(f"  Max Time Left:     {eta_minutes:>11.1f}m  ({eta_hours:.1f}h)")
+            turnovers = gauntlet_info.get('hof_turnover_count', 0)
+            target = gauntlet_info.get('target_hof_turnovers', 3)
+            runway = gauntlet_info.get('runway_remaining', '?')
+            header_parts.append(f"Turnover {turnovers}/{target}")
+            header_parts.append(f"Runway {runway}")
         else:
-            # Normal gauntlet mode: progress based on breakthroughs
-            current_breakthroughs = gauntlet_info.get('confirmed_breakthroughs', 0)
-            target_breakthroughs = gauntlet_info.get('target_breakthroughs', 4)
+            bt = gauntlet_info.get('confirmed_breakthroughs', 0)
+            bt_target = gauntlet_info.get('target_breakthroughs', 4)
+            header_parts.append(f"BT {bt}/{bt_target}")
+        
+        state = gauntlet_info.get('breakthrough_state', 'NORMAL')
+        header_parts.append(f"State: {state}")
+    
+    header_parts.append(_fmt_time(gen_time))
+    
+    print(f"\n{'='*70}")
+    print(f"  {' | '.join(header_parts)}")
+    print(f"{'='*70}")
+    
+    # ---- Best Agent ----
+    if best_agent_info:
+        ba = best_agent_info
+        combined = ba.get('combined_fitness', 0)
+        roi = ba.get('roi', 0)
+        wr = ba.get('win_rate', 0)
+        wins = ba.get('num_wins', 0)
+        losses = ba.get('num_losses', 0)
+        qr = ba.get('quality_ratio', 0)
+        qc = ba.get('quality_count', 0)
+        tt = ba.get('total_trades', 0)
+        exp = ba.get('expectancy', 0)
+        pnl = ba.get('pnl', 0)
+        
+        print(f"\n  BEST AGENT (Agent {ba.get('idx', '?')})")
+        print(f"  {'-'*55}")
+        print(f"  Combined Fitness: {combined:>10.2f}{_delta('best_combined_fitness')}")
+        print(f"  ROI:              {roi:>9.2f}%{_delta('best_roi', pct=True)}")
+        print(f"  Win Rate:         {wr:>9.1f}%   ({wins}W / {losses}L){_delta('best_win_rate', '.1f', '%')}")
+        print(f"  Quality Ratio:    {qr:>9.1f}%   ({qc}/{tt} trades){_delta('best_quality_ratio', '.1f', '%')}")
+        print(f"  Expectancy:       {exp:>10.2f}   per trade{_delta('best_expectancy')}")
+        print(f"  PnL:              ${pnl:>9.2f}{_delta('best_pnl', '.2f', '')}")
 
-            print(f"\n  🎯 BREAKTHROUGH PROGRESS")
-            print(f"  Confirmed:         {current_breakthroughs:>12} / {target_breakthroughs}")
+    # ---- Population Health ----
+    mean_fit = np.mean(fitness_scores) if len(fitness_scores) > 0 else 0
+    max_fit = np.max(fitness_scores) if len(fitness_scores) > 0 else 0
+    std_fit = np.std(fitness_scores) if len(fitness_scores) > 0 else 0
+    pop_size = len(fitness_scores)
+    
+    print(f"\n  POPULATION ({pop_size} agents)")
+    print(f"  {'-'*55}")
+    print(f"  Fitness:   best={max_fit:>8.2f}  mean={mean_fit:>8.2f}  std={std_fit:>7.2f}{_delta('mean_fitness', '.2f', ' mean')}")
+    
+    if population_info:
+        pos_count = population_info.get('positive_count', 0)
+        mean_roi = population_info.get('mean_roi', 0)
+        mean_wr = population_info.get('mean_win_rate', 0)
+        pos_pct = (pos_count / pop_size * 100) if pop_size > 0 else 0
+        print(f"  Positive:  {pos_count}/{pop_size} agents ({pos_pct:.0f}%){_delta('positive_count', '.0f', ' agents')}")
+        print(f"  Mean ROI:  {mean_roi:>8.2f}%{_delta('mean_roi', '.2f', '%')}     Mean WR: {mean_wr:>5.1f}%{_delta('mean_win_rate', '.1f', '%')}")
 
-            if current_breakthroughs < target_breakthroughs:
-                breakthroughs_needed = target_breakthroughs - current_breakthroughs
-                print(f"  Needed:            {breakthroughs_needed:>12}")
+    # ---- Hall of Fame ----
+    if hof_info:
+        hi = hof_info
+        print(f"\n  HALL OF FAME")
+        print(f"  {'-'*55}")
+        print(f"  Size: {hi.get('size', 0)}/{hi.get('capacity', 10)}"
+              f"  |  Best: {hi.get('best', 0):.2f}  Worst: {hi.get('worst', 0):.2f}")
+        median_roi = hi.get('median_roi', 0)
+        hurdle = hi.get('roi_hurdle_ema', 0)
+        print(f"  Median ROI: {median_roi:.2f}%  |  ROI Hurdle EMA: {hurdle:.2f}%{_delta('roi_hurdle_ema', '.2f', '%')}")
+        
+        # Global HoF
+        if gauntlet_info and gauntlet_info.get('global_hof_enabled'):
+            g_size = gauntlet_info.get('global_hof_size', 0)
+            g_thresh = gauntlet_info.get('global_hof_threshold', float('-inf'))
+            thresh_str = f"{g_thresh:.2f}" if g_thresh != float('-inf') else "Open"
+            print(f"  Global 50: {g_size}/50  |  Entry: {thresh_str}")
 
-                # Estimate ETA based on breakthrough history if available
-                history = gauntlet_info.get('breakthrough_history', [])
-                if len(history) >= 2:
-                    # Calculate average generations between breakthroughs
-                    gen_diffs = []
-                    for i in range(1, len(history)):
-                        gen_diffs.append(history[i].get('generation', 0) - history[i-1].get('generation', 0))
-                    avg_gens_per_breakthrough = np.mean(gen_diffs)
-
-                    est_gens_remaining = avg_gens_per_breakthrough * breakthroughs_needed
-                    est_time_seconds = est_gens_remaining * avg_gen_time
-                    est_time_minutes = est_time_seconds / 60
-                    est_time_hours = est_time_seconds / 3600
-
-                    print(f"  Est. Gens Left:    {est_gens_remaining:>11.1f}  (based on {len(history)} breakthroughs)")
-                    print(f"  Est. ETA:          {est_time_minutes:>11.1f}m  ({est_time_hours:.1f}h)")
-                else:
-                    print(f"  Est. ETA:          {'Unknown':>11}  (insufficient data)")
-            else:
-                print(f"  Status:            {'🏆 Complete!':>11}")
-
-            # Show fallback generation limit
-            print(f"\n  Fallback Limit:    {remaining:>12} generations remaining")
-            if remaining > 0:
-                eta_seconds = avg_gen_time * remaining
-                eta_minutes = eta_seconds / 60
-                eta_hours = eta_seconds / 3600
-                print(f"  Max Time Left:     {eta_minutes:>11.1f}m  ({eta_hours:.1f}h)")
+    # ---- Gauntlet State (when not NORMAL) ----
+    if gauntlet_info and gauntlet_info.get('gauntlet_enabled'):
+        state = gauntlet_info.get('breakthrough_state', 'NORMAL')
+        if state != 'NORMAL':
+            print(f"\n  GAUNTLET: {state}")
+            print(f"  {'-'*55}")
+            baseline = gauntlet_info.get('confirmed_baseline', 0)
+            print(f"  Baseline: {baseline:.2f}")
+            if state == 'STABILIZATION':
+                stab = gauntlet_info.get('stabilization_progress')
+                if stab:
+                    c, t = stab
+                    bar = '█' * c + '░' * (t - c)
+                    print(f"  Progress: [{bar}] {c}/{t}")
+            queue = gauntlet_info.get('queue_size')
+            if queue is not None:
+                print(f"  Queue: {queue} candidates")
+    
+    # ---- Loop Performance ----
+    print(f"\n  LOOP PERFORMANCE")
+    print(f"  {'-'*55}")
+    
+    if timing_info:
+        ti = timing_info
+        et = ti.get('eval_time', 0)
+        vt = ti.get('val_time', 0)
+        tt = ti.get('train_time', 0)
+        ev = ti.get('evolve_time', 0)
+        total = et + vt + tt + ev
+        if total > 0:
+            print(f"  Eval: {_fmt_time(et)} ({et/total*100:.0f}%)"
+                  f"  |  Val: {_fmt_time(vt)} ({vt/total*100:.0f}%)"
+                  f"  |  Train: {_fmt_time(tt)} ({tt/total*100:.0f}%)"
+                  f"  |  Evolve: {_fmt_time(ev)} ({ev/total*100:.0f}%)")
+        
+        # Training bottleneck breakdown (if available)
+        comp_pct = ti.get('train_compute_pct', 0)
+        load_pct = ti.get('train_data_load_pct', 0)
+        xfer_pct = ti.get('train_gpu_transfer_pct', 0)
+        if comp_pct > 0 or load_pct > 0:
+            print(f"  Train split: compute={comp_pct:.0f}%  data_load={load_pct:.0f}%  gpu_xfer={xfer_pct:.0f}%")
+    
+    # Buffer + GPU
+    buffer_capacity = Config.LOCAL_BUFFER_SIZE if local_mode else Config.BUFFER_SIZE
+    buf_pct = buffer_size / buffer_capacity * 100 if buffer_capacity > 0 else 0
+    gpu_str = ""
+    if resource_stats and 'peak_vram_gb' in resource_stats:
+        gpu_str = f"  |  GPU: {resource_stats['peak_vram_gb']:.2f} GB peak"
+    print(f"  Buffer: {buffer_size:,}/{buffer_capacity:,} ({buf_pct:.0f}%){gpu_str}")
+    
+    # ETA
+    remaining = total_gens - (gen + 1)
+    if gauntlet_info and gauntlet_info.get('gauntlet_enabled'):
+        consistency_mode = gauntlet_info.get('consistency_mode', False)
+        if consistency_mode:
+            runway = gauntlet_info.get('runway_remaining', remaining)
+            if isinstance(runway, (int, float)) and runway > 0 and avg_gen_time > 0:
+                eta = _fmt_time(avg_gen_time * runway)
+                print(f"  Max ETA: {eta} ({runway} gens remaining)")
+        else:
+            if remaining > 0 and avg_gen_time > 0:
+                eta = _fmt_time(avg_gen_time * remaining)
+                print(f"  ETA: {eta} ({remaining} gens remaining)")
     else:
-        # Traditional fixed-generation mode
-        print(f"\n  Remaining Gens:    {remaining:>12}")
+        if remaining > 0 and avg_gen_time > 0:
+            eta = _fmt_time(avg_gen_time * remaining)
+            print(f"  ETA: {eta} ({remaining} gens remaining)")
 
-        # Only show ETA if there are remaining generations
-        if remaining > 0:
-            eta_seconds = avg_gen_time * remaining
-            eta_minutes = eta_seconds / 60
-            eta_hours = eta_seconds / 3600
-            print(f"  ETA:               {eta_minutes:>11.1f}m  ({eta_hours:.1f}h)")
-        else:
-            print(f"  ETA:               {'Complete':>11}  (0.0h)")
+    # ---- Events ----
+    if events:
+        print()
+        for event in events:
+            print(f"  >>> {event}")
+    
+    print(f"\n{'='*70}")
 
 
+# Keep old function signature as a thin wrapper for backward compatibility
 def print_generation_summary(gen: int, total_gens: int,
                              fitness_scores: List[float],
                              pop_stats: dict,
@@ -221,139 +456,16 @@ def print_generation_summary(gen: int, total_gens: int,
                              resource_stats: Optional[dict] = None,
                              gauntlet_info: Optional[dict] = None,
                              local_mode: bool = False):
-    """
-    Print a comprehensive summary of the generation.
-
-    Args:
-        gen: Current generation number
-        total_gens: Total number of generations
-        fitness_scores: Fitness scores for this generation
-        pop_stats: Population statistics dictionary
-        buffer_size: Current replay buffer size
-        best_fitness: Best fitness ever achieved
-        gen_time: Time taken for this generation
-        avg_gen_time: Average time per generation
-        resource_stats: Optional dictionary with resource usage statistics
-        gauntlet_info: Optional dictionary with gauntlet/consistency mode info:
-            - gauntlet_enabled: bool
-            - consistency_mode: bool
-            - breakthrough_state: str (e.g., 'NORMAL', 'STABILIZATION', 'GAUNTLET')
-            - confirmed_baseline: float
-            - confirmed_breakthroughs: int
-            - target_breakthroughs: int
-            - hof_turnover_count: int
-            - target_hof_turnovers: int
-            - hof_current_median: float or None
-            - hof_size: int (current number of agents in Hall of Fame)
-            - hof_capacity: int (maximum Hall of Fame size)
-            - queue_size: int or None (number of candidates in queue, heroes mode only)
-            - stabilization_progress: tuple (current, total) or None
-            - breakthrough_history: list of breakthrough events
-    """
-    # Calculated metrics removed as they are no longer displayed
-
-    
-    print("\n" + "="*70)
-    print(f"{'GENERATION ' + str(gen+1) + ' / ' + str(total_gens):^70}")
-    print("="*70)
-    
-    # Fitness section removed as per user request for streamlining
-    
-    # Gauntlet State Machine section (if in gauntlet mode)
-    if gauntlet_info and gauntlet_info.get('gauntlet_enabled'):
-        print("\n🎮 GAUNTLET STATE")
-        print("-" * 70)
-
-        state = gauntlet_info.get('breakthrough_state', 'UNKNOWN')
-        confirmed_baseline = gauntlet_info.get('confirmed_baseline', 0.0)
-        consistency_mode = gauntlet_info.get('consistency_mode', False)
-
-        # State indicator with visual progress
-        state_icons = {
-            'NORMAL': '🔵 NORMAL',
-            'DETECTION': '🟡 DETECTION',
-            'STABILIZATION': '🟠 STABILIZATION',
-            'GAUNTLET': '🔴 GAUNTLET',
-            'CONFIRMED': '🟢 CONFIRMED',
-            'REJECTED': '⚫ REJECTED'
-        }
-        print(f"  Current State:     {state_icons.get(state, state):>12}")
-        print(f"  Baseline:          {confirmed_baseline:>12.2f}")
-
-        # State-specific progress information
-        if state == 'STABILIZATION':
-            stab_progress = gauntlet_info.get('stabilization_progress')
-            if stab_progress:
-                current, total = stab_progress
-                progress_bar = '█' * current + '░' * (total - current)
-                print(f"  Stab Progress:     [{progress_bar}] {current}/{total}")
-
-        # Consistency mode: show HoF turnover info
-        if consistency_mode:
-            current_turnovers = gauntlet_info.get('hof_turnover_count', 0)
-            target_turnovers = gauntlet_info.get('target_hof_turnovers', 2)
-            hof_median = gauntlet_info.get('hof_current_median')
-            hof_size = gauntlet_info.get('hof_size', 0)
-            hof_capacity = gauntlet_info.get('hof_capacity', 10)
-
-            print(f"  HoF Size:          {hof_size:>12} / {hof_capacity}")
-            print(f"  HoF Turnovers:     {current_turnovers:>12} / {target_turnovers}")
-            if hof_median is not None:
-                print(f"  HoF Median ROI:    {hof_median:>11.2f}%")
-
-            # Show queue size if using candidate queue (heroes mode)
-            queue_size = gauntlet_info.get('queue_size')
-            if queue_size is not None:
-                print(f"  Queue Size:        {queue_size:>12}")
-        else:
-            # Normal gauntlet mode: show breakthrough count
-            current_breakthroughs = gauntlet_info.get('confirmed_breakthroughs', 0)
-            target_breakthroughs = gauntlet_info.get('target_breakthroughs', 4)
-            hof_size = gauntlet_info.get('hof_size', 0)
-            hof_capacity = gauntlet_info.get('hof_capacity', 10)
-
-            print(f"  Breakthroughs:     {current_breakthroughs:>12} / {target_breakthroughs}")
-            print(f"  HoF Size:          {hof_size:>12} / {hof_capacity}")
-
-            # Show queue size if using candidate queue (heroes mode)
-            queue_size = gauntlet_info.get('queue_size')
-            if queue_size is not None:
-                print(f"  Queue Size:        {queue_size:>12}")
-
-        # Global Hall of Fame section (if enabled)
-        global_hof_enabled = gauntlet_info.get('global_hof_enabled', False)
-        if global_hof_enabled:
-            global_hof_size = gauntlet_info.get('global_hof_size', 0)
-            global_hof_threshold = gauntlet_info.get('global_hof_threshold', float('-inf'))
-
-            print("\n🌍 GLOBAL HALL OF FAME")
-            print("-" * 70)
-            print(f"  Status:            {'ENABLED ✓' if global_hof_enabled else 'DISABLED'}")
-            print(f"  Current Size:      {global_hof_size:>12} / 50")
-            if global_hof_threshold != float('-inf'):
-                print(f"  Entry Threshold:   {global_hof_threshold:>12.2f}  (Rank #50)")
-            else:
-                print(f"  Entry Threshold:   {'None (Open)':>12}")
-
-    # Trading section removed as per user request for streamlining
-
-    # System section
-    print("\n⚙️  SYSTEM STATUS")
-    print("-" * 70)
-    # Show correct buffer capacity based on mode
-    buffer_capacity = Config.LOCAL_BUFFER_SIZE if local_mode else Config.BUFFER_SIZE
-    print(f"  Replay Buffer:     {buffer_size:>12,} / {buffer_capacity:,}")
-    # Show correct minimum based on mode
-    is_sweep = os.environ.get("WANDB_SWEEP_ID") is not None
-    min_size = Config.get_min_buffer_size(local_mode=local_mode, is_sweep=is_sweep)
-    print(f"  Buffer Ready:      {' '*10}{'✓ Yes' if buffer_size >= min_size else '✗ No (needs ' + str(min_size-buffer_size) + ' more)'}")
-    print(f"  Generation Time:   {gen_time:>11.1f}s")
-    print(f"  Avg Gen Time:      {avg_gen_time:>11.1f}s")
-
-    # Progress and ETA - context-aware based on training mode
-    _print_progress_and_eta(gen, total_gens, avg_gen_time, gauntlet_info)
-
-    print("\n" + "="*70)
+    """Legacy wrapper -- calls new dashboard with available data."""
+    print_generation_dashboard(
+        gen=gen, total_gens=total_gens,
+        fitness_scores=fitness_scores,
+        buffer_size=buffer_size,
+        gen_time=gen_time, avg_gen_time=avg_gen_time,
+        gauntlet_info=gauntlet_info,
+        resource_stats=resource_stats,
+        local_mode=local_mode,
+    )
 
 
 def visualize_gauntlet_slices(fitness_scores: List[float], mean_score: float, min_score: float,
