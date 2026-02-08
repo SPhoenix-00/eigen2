@@ -19,15 +19,7 @@ import math
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-from multiprocessing import shared_memory
-if sys.platform != 'win32':
-    from multiprocessing import resource_tracker
-from collections import OrderedDict
-
-# Maximum number of agents to cache per worker to prevent memory leaks
-# During evolution, agents mutate every generation, so old cache entries become stale
-_WORKER_CACHE_MAX_SIZE = 50
-
+# shared_memory and resource_tracker moved to training.workers
 # Suppress common library warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='gymnasium')
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.cuda.amp')
@@ -71,493 +63,22 @@ from training.validation_slices import (
     generate_validation_slices as _generate_validation_slices,
     generate_gauntlet_slices as _generate_gauntlet_slices,
 )
+from training.workers import (
+    _init_worker,
+    _run_episode_worker,
+    _run_validation_worker,
+    _cache_agent,
+    _get_cached_agent,
+    SharedMemoryManager,
+)
 
 
 # NumpyEncoder moved to training.fitness (re-exported above)
+# Worker functions and globals moved to training.workers (re-exported above)
+# _WORKER_CACHE_MAX_SIZE, _init_worker, _cache_agent, _get_cached_agent,
+# _run_episode_worker, _run_validation_worker all live in training.workers now.
 
 
-# Global variables for worker processes
-_worker_env_config = None  # Shared environment configuration
-_worker_env = None  # Reusable environment instance (created once per worker)
-_worker_agent_cache = None  # Cache of reconstructed agents {state_hash: agent}
-_worker_shm_refs = []  # Keep references to shared memory objects to prevent cleanup
-
-
-def _init_worker(env_config):
-    """
-    Initializer function for worker processes.
-
-    This is called once per worker when the ProcessPoolExecutor starts.
-    Stores the env_config in a global variable so it doesn't need to be
-    pickled with every task (significant performance improvement).
-
-    OPTIMIZATION: Uses shared memory for large numpy arrays to avoid serialization.
-    The env_config contains shared memory names instead of actual arrays, and we
-    reconstruct the arrays from shared memory here (zero-copy).
-
-    Args:
-        env_config: Environment configuration dict with shared memory refs for arrays
-    """
-    global _worker_env_config, _worker_env, _worker_agent_cache, _worker_shm_refs
-
-    # Reconstruct arrays from shared memory if using shared memory mode
-    if 'shm_data_array_name' in env_config:
-        # Shared memory mode - reconstruct arrays from shared memory (zero-copy)
-        shm_data = shared_memory.SharedMemory(name=env_config['shm_data_array_name'])
-        shm_data_full = shared_memory.SharedMemory(name=env_config['shm_data_array_full_name'])
-
-        # Keep references to prevent garbage collection
-        _worker_shm_refs = [shm_data, shm_data_full]
-
-        # Reconstruct numpy arrays from shared memory buffers
-        data_array = np.ndarray(
-            env_config['data_array_shape'],
-            dtype=env_config['data_array_dtype'],
-            buffer=shm_data.buf
-        )
-        data_array_full = np.ndarray(
-            env_config['data_array_full_shape'],
-            dtype=env_config['data_array_full_dtype'],
-            buffer=shm_data_full.buf
-        )
-
-        # Build actual env_config for TradingEnvironment
-        actual_env_config = {
-            'data_array': data_array,
-            'data_array_full': data_array_full,
-            'dates': env_config['dates'],
-            'normalization_stats': env_config['normalization_stats'],
-            'start_idx': env_config['start_idx'],
-            'end_idx': env_config['end_idx'],
-            'trading_end_idx': env_config['trading_end_idx'],
-            'is_training': env_config.get('is_training', True),
-            'consistency_mode': env_config.get('consistency_mode', False),
-            'gauntlet_mode': env_config.get('gauntlet_mode', False),
-            'maverick_mode': env_config.get('maverick_mode', False)
-        }
-        _worker_env_config = actual_env_config
-    else:
-        # Legacy mode - arrays passed directly (fallback)
-        _worker_env_config = env_config
-
-    # Create ONE environment per worker that will be reused for all tasks
-    # This avoids recreating the environment ~10 times per worker
-    from environment.trading_env import TradingEnvironment
-    _worker_env = TradingEnvironment(**_worker_env_config)
-
-    # Cache for reconstructed agents to avoid rebuilding same agent multiple times
-    # Key: hash of agent_state, Value: DDPGAgent instance
-    # Uses OrderedDict for LRU eviction - most recently used items are moved to end
-    _worker_agent_cache = OrderedDict()
-
-
-def _cache_agent(state_hash, agent):
-    """
-    Add an agent to the LRU cache with size limit enforcement.
-
-    Uses OrderedDict for LRU semantics - entries are ordered by insertion/access time.
-    When cache exceeds _WORKER_CACHE_MAX_SIZE, the oldest entries are evicted.
-
-    Args:
-        state_hash: Hash key for the agent state
-        agent: DDPGAgent instance to cache
-    """
-    global _worker_agent_cache
-
-    # Evict oldest entries if cache is at capacity
-    while len(_worker_agent_cache) >= _WORKER_CACHE_MAX_SIZE:
-        # popitem(last=False) removes the oldest (first) entry
-        _worker_agent_cache.popitem(last=False)
-
-    _worker_agent_cache[state_hash] = agent
-
-
-def _get_cached_agent(state_hash):
-    """
-    Retrieve an agent from cache, updating LRU order if found.
-
-    Args:
-        state_hash: Hash key to look up
-
-    Returns:
-        DDPGAgent if found, None otherwise
-    """
-    global _worker_agent_cache
-
-    if state_hash in _worker_agent_cache:
-        # Move to end to mark as recently used (LRU semantics)
-        _worker_agent_cache.move_to_end(state_hash)
-        return _worker_agent_cache[state_hash]
-    return None
-
-
-def _run_episode_worker(args):
-    """
-    Worker function for parallel episode execution.
-
-    OPTIMIZED: Reuses environment and caches agents per worker to minimize overhead.
-
-    This function runs in a separate process, so it must:
-    1. Reconstruct the agent from CPU state dicts (cached for reuse)
-    2. Reuse the worker's environment instance (created once in initializer)
-    3. Run the episode independently
-    4. Write transitions directly to disk (parallel I/O)
-
-    Args:
-        args: Tuple of (agent_state, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start)
-              Note: env_config, env, and agent_cache are accessed from globals (set by initializer)
-
-    Returns:
-        Tuple of (fitness, episode_info, transition_file_paths)
-    """
-    global _worker_env_config, _worker_env, _worker_agent_cache
-    agent_state, start_idx, end_idx, training, seed, buffer_storage_path, file_id_start = args
-
-    # Set worker-specific seed for reproducibility
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    # OPTIMIZATION: Check agent cache first before reconstructing
-    # Create a hashable key from agent state (using actor weights as proxy)
-    import hashlib
-    actor_bytes = str(agent_state['actor']).encode()
-    state_hash = hashlib.md5(actor_bytes).hexdigest()
-
-    # Use LRU cache with size limit to prevent memory leaks during evolution
-    agent = _get_cached_agent(state_hash)
-    if agent is None:
-        # Reconstruct agent from state dict (agents with CUDA tensors are not picklable)
-        from models.ddpg_agent import DDPGAgent
-        agent = DDPGAgent(agent_id=0)
-        agent.actor.load_state_dict(agent_state['actor'])
-        agent.critic.load_state_dict(agent_state['critic'])
-        agent.actor.eval()
-        agent.critic.eval()
-        _cache_agent(state_hash, agent)
-
-    # OPTIMIZATION: Reuse worker's environment instead of creating new one
-    env = _worker_env
-
-    # Run episode
-    trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-    env.set_training_mode(training)
-    state, _ = env.reset(start_idx=start_idx, end_idx=end_idx, trading_end_idx=trading_end_idx)
-
-    cumulative_reward = 0.0
-    steps = 0
-    transition_file_paths = []
-
-    # Write transitions directly to disk during episode (parallel I/O)
-    # Note: We save to buffer regardless of training flag (noise) - this enables "Elite Demonstration"
-    # where Elites contribute high-quality off-policy examples to help the Critic learn
-    if buffer_storage_path:
-        from pathlib import Path
-        import pickle
-        import gzip
-
-        storage_path = Path(buffer_storage_path)
-        file_id = file_id_start
-
-        while True:
-            # Select action
-            action = agent.select_action(state, add_noise=training)
-
-            # Take step
-            next_state, reward, terminated, truncated, info = env.step(action)
-
-            # Write transition directly to disk (parallel I/O across all workers)
-            transition = {
-                'state': state.astype(np.float32),
-                'action': action.astype(np.float32),
-                'reward': reward,
-                'next_state': next_state.astype(np.float32),
-                'done': float(terminated or truncated)
-            }
-
-            file_path = storage_path / f"transition_{file_id}.pkl.gz"
-            try:
-                # Check if file already exists (can happen if resuming after crash mid-generation)
-                if file_path.exists():
-                    # Skip to next ID to avoid overwriting
-                    file_id += 1
-                    file_path = storage_path / f"transition_{file_id}.pkl.gz"
-
-                with gzip.open(file_path, 'wb', compresslevel=1) as f:
-                    pickle.dump(transition, f, protocol=pickle.HIGHEST_PROTOCOL)
-                transition_file_paths.append(str(file_path))
-                file_id += 1
-            except Exception as e:
-                print(f"⚠ Worker failed to write transition {file_path}: {e}")
-
-            cumulative_reward += reward
-            steps += 1
-            state = next_state
-
-            if terminated or truncated:
-                break
-    else:
-        # No training mode or no buffer - just run episode without saving transitions
-        while True:
-            action = agent.select_action(state, add_noise=training)
-            next_state, reward, terminated, truncated, info = env.step(action)
-
-            cumulative_reward += reward
-            steps += 1
-            state = next_state
-
-            if terminated or truncated:
-                break
-
-    # Get episode summary
-    episode_summary = env.get_episode_summary()
-    episode_summary['steps'] = steps
-
-    # Calculate final fitness
-    final_fitness = float(cumulative_reward)
-    # Apply zero trades penalty from episode summary (mode-specific)
-    if episode_summary['num_trades'] == 0:
-        final_fitness -= episode_summary['zero_trades_penalty']
-
-    # Apply win rate bonus if enough trades and win rate above threshold
-    if episode_summary['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:
-        win_rate_pct = episode_summary['win_rate'] * 100.0  # Convert to percentage
-        if win_rate_pct > Config.WIN_RATE_BONUS_THRESHOLD:
-            bonus = (win_rate_pct - Config.WIN_RATE_BONUS_THRESHOLD) ** 2
-            final_fitness += bonus
-            episode_summary['win_rate_bonus'] = bonus
-        else:
-            episode_summary['win_rate_bonus'] = 0.0
-    else:
-        episode_summary['win_rate_bonus'] = 0.0
-
-    return final_fitness, episode_summary, transition_file_paths
-
-
-def _run_validation_worker(args):
-    """
-    Worker function for parallel validation execution.
-
-    OPTIMIZED: Reuses environment and caches agents per worker to minimize overhead.
-
-    Validates a single agent across all validation slices (typically 7).
-    Similar to _run_episode_worker but focused on validation-only tasks.
-
-    Args:
-        args: Tuple of (agent_state, validation_slices, quality_threshold, seed, use_penalized_median)
-              Note: env_config, env, and agent_cache are accessed from globals
-              use_penalized_median: If True, use Penalized Median (median - 0.5*std) instead of
-                                    pessimistic (0.4*mean + 0.6*min) aggregation
-
-    Returns:
-        Dict with validation results (fitness, metrics, etc.)
-    """
-    global _worker_env_config, _worker_env, _worker_agent_cache
-    agent_state, validation_slices, quality_threshold, seed, use_penalized_median = args
-
-    # Set worker-specific seed for reproducibility
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    # OPTIMIZATION: Check agent cache first before reconstructing
-    import hashlib
-    actor_bytes = str(agent_state['actor']).encode()
-    state_hash = hashlib.md5(actor_bytes).hexdigest()
-
-    # Use LRU cache with size limit to prevent memory leaks during evolution
-    agent = _get_cached_agent(state_hash)
-    if agent is None:
-        # Reconstruct agent from state dict
-        from models.ddpg_agent import DDPGAgent
-        agent = DDPGAgent(agent_id=0)
-        # Use GPU if available (with fewer workers, GPU OOM is avoided)
-        # Each worker process gets its own GPU context, but with limited workers we stay within memory
-        target_device = Config.DEVICE  # Use GPU if available, CPU otherwise
-        agent.move_to_device(target_device, recreate_optimizers=False)
-        agent.actor.load_state_dict(agent_state['actor'])
-        agent.critic.load_state_dict(agent_state['critic'])
-        agent.actor.eval()
-        agent.critic.eval()
-        _cache_agent(state_hash, agent)
-    else:
-        # Ensure cached agent is in eval mode
-        agent.actor.eval()
-        agent.critic.eval()
-        # Ensure cached agent is on correct device (may have been created with different device)
-        target_device = Config.DEVICE
-        if agent.device != target_device:
-            agent.move_to_device(target_device, recreate_optimizers=False)
-
-    # OPTIMIZATION: Reuse worker's environment instead of creating new one
-    env = _worker_env
-
-    # Run agent on all validation slices
-    slice_results = []
-    all_closed_trades = []
-
-    for start_idx, end_idx, _ in validation_slices:
-        # Run episode using TIME-TRAVEL BATCHING (same optimization as local mode)
-        # This pre-fetches all states and does batch inference, then replays actions
-        trading_end_idx = start_idx + Config.TRADING_PERIOD_DAYS
-        num_trading_steps = Config.TRADING_PERIOD_DAYS
-        
-        env.set_training_mode(False)
-        env.reset(start_idx=start_idx, end_idx=end_idx, trading_end_idx=trading_end_idx)
-
-        # Pre-fetch all states and batch inference (chunked for memory efficiency)
-        trading_states = env.get_batch_observations(start_idx, num_trading_steps)
-        with torch.no_grad():
-            # Process in chunks to avoid OOM (similar to local mode)
-            # Agent uses GPU if available (with fewer workers, GPU memory is manageable)
-            chunk_size = 16
-            action_chunks = []
-            for i in range(0, num_trading_steps, chunk_size):
-                chunk = trading_states[i:i+chunk_size]
-                action_chunks.append(agent.select_actions_batch(chunk, add_noise=False))
-            trading_actions = np.concatenate(action_chunks, axis=0)
-
-        cumulative_reward = 0.0
-        steps = 0
-
-        # Fast replay trading period
-        for i in range(num_trading_steps):
-            _, reward, terminated, truncated, _ = env.step(trading_actions[i])
-            cumulative_reward += reward
-            steps += 1
-            if terminated or truncated:
-                break
-
-        # Settlement period
-        if not (terminated or truncated):
-            dummy_action = np.zeros((Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM), dtype=np.float32)
-            while True:
-                _, reward, terminated, truncated, _ = env.step(dummy_action)
-                cumulative_reward += reward
-                steps += 1
-                if terminated or truncated:
-                    break
-
-        # Get episode summary
-        episode_info = env.get_episode_summary()
-        episode_info['steps'] = steps
-
-        # Calculate fitness for this slice
-        fitness = float(cumulative_reward)
-
-        # Apply zero trades penalty
-        if episode_info['num_trades'] == 0:
-            fitness -= episode_info['zero_trades_penalty']
-
-        # Apply win rate bonus if applicable
-        if episode_info['num_trades'] >= Config.WIN_RATE_BONUS_MIN_TRADES:
-            win_rate_pct = episode_info['win_rate'] * 100.0
-            if win_rate_pct > Config.WIN_RATE_BONUS_THRESHOLD:
-                bonus = (win_rate_pct - Config.WIN_RATE_BONUS_THRESHOLD) ** 2
-                fitness += bonus
-                episode_info['win_rate_bonus'] = bonus
-            else:
-                episode_info['win_rate_bonus'] = 0.0
-        else:
-            episode_info['win_rate_bonus'] = 0.0
-
-        # Apply zero-trades gradient (for agents that don't trade)
-        if episode_info['num_trades'] == 0:
-            max_coeff = episode_info.get('max_coefficient_during_episode', 0.0)
-            fitness = fitness + max_coeff
-
-        slice_results.append({
-            'fitness': fitness,
-            'win_rate': episode_info['win_rate'],
-            'num_trades': episode_info['num_trades'],
-            'num_wins': episode_info['num_wins'],
-            'num_losses': episode_info['num_losses'],
-            'avg_reward_per_trade': episode_info['avg_reward_per_trade'],
-            'raw_pnl': episode_info.get('raw_pnl', 0.0),
-            'total_investment': episode_info.get('total_investment', 0.0),
-            'peak_capital_employed': episode_info.get('peak_capital_employed', 0.0)
-        })
-
-        # Collect closed trades
-        if 'closed_trades' in episode_info and episode_info['closed_trades']:
-            all_closed_trades.extend(episode_info['closed_trades'])
-
-    # Calculate aggregated validation fitness
-    fitness_scores = [result['fitness'] for result in slice_results]
-    mean_score = np.mean(fitness_scores)
-    min_score = np.min(fitness_scores)
-
-    if use_penalized_median:
-        # Penalized Median: median - (0.5 * std)
-        # Rewards consistent performance, penalizes volatility
-        median_score = np.median(fitness_scores)
-        std_score = np.std(fitness_scores)
-        validation_fitness = float(median_score - (0.5 * std_score))
-    else:
-        # Pessimistic: 0.4*mean + 0.6*min
-        validation_fitness = (0.4 * mean_score) + (0.6 * min_score)
-
-    # Aggregate metrics
-    total_raw_pnl = sum([r['raw_pnl'] for r in slice_results])
-    total_investment = sum([r['total_investment'] for r in slice_results])  # Legacy cumulative
-    # Pooled ROI: sum of peak capitals (slices are parallel/independent scenarios)
-    # This answers: "For every dollar of max drawdown capacity across all scenarios, how much profit?"
-    total_peak_capital = sum([r['peak_capital_employed'] for r in slice_results])
-    roi = (total_raw_pnl / total_peak_capital * 100) if total_peak_capital > 0 else 0.0
-
-    total_wins = sum([r['num_wins'] for r in slice_results])
-    total_losses = sum([r['num_losses'] for r in slice_results])
-    total_trades = total_wins + total_losses
-    global_win_rate = (total_wins / total_trades) if total_trades > 0 else 0.0
-
-    # Calculate quality metrics
-    quality_count = 0
-    quality_roi_sum = 0.0
-    if quality_threshold is not None and all_closed_trades:
-        for trade in all_closed_trades:
-            gain_pct = trade.get('gain_pct', 0.0)
-            if gain_pct >= quality_threshold:
-                quality_count += 1
-                quality_roi_sum += gain_pct
-
-    quality_roi = (quality_roi_sum / quality_count) if quality_count > 0 else 0.0
-
-    sample_trade = all_closed_trades[0] if all_closed_trades else None
-
-    # Calculate expectancy from all closed trades
-    # Expectancy = (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
-    if not all_closed_trades:
-        expectancy = 0.0
-    else:
-        wins = [t['gain_pct'] for t in all_closed_trades if t['gain_pct'] > 0]
-        losses = [abs(t['gain_pct']) for t in all_closed_trades if t['gain_pct'] <= 0]
-
-        if not wins and not losses:
-            expectancy = 0.0
-        else:
-            avg_win = np.mean(wins) if wins else 0.0
-            avg_loss = np.mean(losses) if losses else 0.0
-            win_rate_calc = len(wins) / len(all_closed_trades)
-            loss_rate = 1.0 - win_rate_calc
-            expectancy = (win_rate_calc * avg_win) - (loss_rate * avg_loss)
-
-    return {
-        'fitness': validation_fitness,
-        'fitness_all_slices': fitness_scores,  # For debugging
-        'fitness_mean': mean_score,
-        'fitness_min': min_score,
-        'roi': roi,
-        'num_trades': int(np.mean([r['num_trades'] for r in slice_results])),  # Mean trades per slice
-        'num_wins': int(np.mean([r['num_wins'] for r in slice_results])),
-        'num_losses': int(np.mean([r['num_losses'] for r in slice_results])),
-        'avg_reward_per_trade': np.mean([r['avg_reward_per_trade'] for r in slice_results]),
-        'raw_pnl': total_raw_pnl,  # Total raw P&L across slices
-        'total_investment': total_investment,  # Total investment across slices
-        'total_trades': total_trades,  # Total across all slices
-        'win_rate': global_win_rate,
-        'expectancy': expectancy,  # Expectancy metric: (Win Rate × Avg Win %) − (Loss Rate × Avg Loss %)
-        'quality_count': quality_count,
-        'quality_roi': quality_roi,
-        'sample_trade': sample_trade
-    }
 
 
 # BreakthroughState and BreakthroughCandidate moved to training.breakthrough (re-exported above)
@@ -1140,150 +661,38 @@ class ERLTrainer:
             print(f"⚠ Could not write last_run.json: {e}")
 
     def _init_shared_memory(self):
-        """
-        Initialize shared memory blocks for data arrays used by parallel workers.
-
-        This eliminates the serialization overhead when spawning workers by storing
-        the large numpy arrays in shared memory. Workers can then access the data
-        directly without copying (zero-copy access).
-
-        Creates:
-        - shm_data_array: Shared memory for reduced feature array (for observations)
-        - shm_data_array_full: Shared memory for full feature array (for rewards)
-        """
-        # Store references to prevent garbage collection
-        self._shm_blocks = []
-
-        # Create shared memory for data_array (reduced features for model)
-        data_array = self.data_loader.data_array
-        self._shm_data_array = shared_memory.SharedMemory(
-            create=True,
-            size=data_array.nbytes
-        )
-        # Copy data into shared memory
-        shm_data_view = np.ndarray(
-            data_array.shape,
-            dtype=data_array.dtype,
-            buffer=self._shm_data_array.buf
-        )
-        shm_data_view[:] = data_array[:]
-        self._shm_blocks.append(self._shm_data_array)
-        # Register with resource tracker for crash-safe cleanup (prevents zombie segments)
-        # Note: resource_tracker is POSIX-only, not available on Windows
-        if sys.platform != 'win32':
-            resource_tracker.register(self._shm_data_array.name, "shared_memory")
-
-        # Create shared memory for data_array_full (full features for environment)
-        data_array_full = self.data_loader.data_array_full
-        self._shm_data_array_full = shared_memory.SharedMemory(
-            create=True,
-            size=data_array_full.nbytes
-        )
-        # Copy data into shared memory
-        shm_full_view = np.ndarray(
-            data_array_full.shape,
-            dtype=data_array_full.dtype,
-            buffer=self._shm_data_array_full.buf
-        )
-        shm_full_view[:] = data_array_full[:]
-        self._shm_blocks.append(self._shm_data_array_full)
-        # Register with resource tracker for crash-safe cleanup (prevents zombie segments)
-        # Note: resource_tracker is POSIX-only, not available on Windows
-        if sys.platform != 'win32':
-            resource_tracker.register(self._shm_data_array_full.name, "shared_memory")
-
-        # Store metadata for workers
-        self._shm_metadata = {
-            'shm_data_array_name': self._shm_data_array.name,
-            'data_array_shape': data_array.shape,
-            'data_array_dtype': str(data_array.dtype),
-            'shm_data_array_full_name': self._shm_data_array_full.name,
-            'data_array_full_shape': data_array_full.shape,
-            'data_array_full_dtype': str(data_array_full.dtype),
-        }
-
-        data_mb = data_array.nbytes / (1024 * 1024)
-        full_mb = data_array_full.nbytes / (1024 * 1024)
-        print(f"  ✓ Shared memory initialized: {data_mb:.1f}MB + {full_mb:.1f}MB = {data_mb + full_mb:.1f}MB total")
+        """Initialize shared memory. Delegates to SharedMemoryManager."""
+        self.shm_manager = SharedMemoryManager(self.data_loader, local_mode=self.local_mode)
+        self._shm_metadata = self.shm_manager._shm_metadata
+        self._shm_blocks = self.shm_manager._shm_blocks
 
     def _cleanup_shared_memory(self):
-        """
-        Clean up shared memory blocks when trainer is done.
-
-        IMPORTANT: Must be called before trainer exits to avoid memory leaks.
-        Shared memory persists beyond process lifetime if not explicitly freed.
-        """
-        if hasattr(self, '_shm_blocks'):
-            for shm in self._shm_blocks:
-                try:
-                    shm.close()
-                    shm.unlink()  # Remove the shared memory block
-                except Exception as e:
-                    print(f"⚠ Error cleaning up shared memory: {e}")
+        """Clean up shared memory. Delegates to SharedMemoryManager."""
+        if hasattr(self, 'shm_manager'):
+            self.shm_manager.cleanup()
             self._shm_blocks = []
-            print("✓ Shared memory cleaned up")
 
     def __del__(self):
-        """Destructor - ensure shared memory is cleaned up even if train() doesn't complete."""
+        """Destructor - ensure shared memory is cleaned up."""
         try:
             self._cleanup_shared_memory()
         except Exception:
-            pass  # Ignore errors during destruction
+            pass
 
     def _get_shared_env_config(self, start_idx: int, end_idx: int, trading_end_idx: int,
                                is_training: bool = True, gauntlet_mode: bool = False) -> dict:
-        """
-        Build environment config dict using shared memory references.
-
-        This config is passed to worker initializers and contains shared memory
-        names instead of actual arrays, eliminating serialization overhead.
-
-        Args:
-            start_idx: Episode start index
-            end_idx: Episode end index
-            trading_end_idx: Last day to open new positions
-            is_training: Whether environment is in training mode
-            gauntlet_mode: Whether to use soft zero-trades penalty (for stabilization/gauntlet)
-
-        Returns:
-            Dict with shared memory references and other config
-        """
-        # Handle local mode where _shm_metadata may not exist or be empty
-        shm_dict = getattr(self, '_shm_metadata', {}) or {}
-        
-        # In local mode, include actual arrays instead of shared memory references
-        # This is needed for worker processes that don't use shared memory
-        if self.local_mode or not shm_dict:
-            return {
-                # Include actual arrays for local mode or when shared memory not available
-                'data_array': self.data_loader.data_array,
-                'data_array_full': self.data_loader.data_array_full,
-                # Small data that must be pickled (but fast)
-                'dates': self.data_loader.dates,
-                'normalization_stats': self.normalization_stats,
-                'start_idx': start_idx,
-                'end_idx': end_idx,
-                'trading_end_idx': trading_end_idx,
-                'is_training': is_training,
-                'consistency_mode': self.consistency_mode,
-                'gauntlet_mode': gauntlet_mode,
-                'maverick_mode': self.maverick_mode
-            }
-        else:
-            return {
-                # Shared memory references (no serialization needed)
-                **shm_dict,
-                # Small data that must be pickled (but fast)
-                'dates': self.data_loader.dates,
-                'normalization_stats': self.normalization_stats,
-                'start_idx': start_idx,
-                'end_idx': end_idx,
-                'trading_end_idx': trading_end_idx,
-                'is_training': is_training,
-                'consistency_mode': self.consistency_mode,
-                'gauntlet_mode': gauntlet_mode,
-                'maverick_mode': self.maverick_mode
-            }
+        """Build environment config dict. Delegates to SharedMemoryManager."""
+        manager = getattr(self, 'shm_manager', None)
+        if manager is None:
+            manager = SharedMemoryManager(self.data_loader, local_mode=True)
+        return manager.get_env_config(
+            self.data_loader, self.normalization_stats,
+            start_idx, end_idx, trading_end_idx,
+            is_training=is_training,
+            consistency_mode=self.consistency_mode,
+            gauntlet_mode=gauntlet_mode,
+            maverick_mode=self.maverick_mode,
+        )
 
     def _create_dataloader(self):
         """
