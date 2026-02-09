@@ -800,12 +800,12 @@ class OnDiskReplayBuffer(IterableDataset):
 
     def __iter__(self):
         """
-        Memory-Safe Cache & Drain Iterator (Diagnostic Mode).
+        Memory-Safe Cache & Drain Iterator.
         """
         import random
         import time as time_module
 
-        # INCREASED: 5000 items * 350KB = ~1.7GB RAM.
+        # 5000 items * 350KB = ~1.7GB RAM.
         # Larger cache = fewer disk hits = less overhead.
         TARGET_CACHE_SIZE = 5000
 
@@ -819,7 +819,12 @@ class OnDiskReplayBuffer(IterableDataset):
             if len(local_cache) < self.training_batch_size:
                 # Calculate how many files we need to reach target
                 current_size = len(local_cache)
-                needed_items = TARGET_CACHE_SIZE - current_size
+                # First refill (empty cache): load only 2-3 batches so first next() returns quickly.
+                # Otherwise the training loop blocks on disk I/O and appears "stuck" at 0%.
+                if current_size == 0:
+                    needed_items = min(TARGET_CACHE_SIZE, 3 * self.training_batch_size)
+                else:
+                    needed_items = TARGET_CACHE_SIZE - current_size
 
                 # Use actual chunk size estimate
                 chunk_size = getattr(self, '_chunk_size', 64)
@@ -827,6 +832,10 @@ class OnDiskReplayBuffer(IterableDataset):
 
                 # Cap at available files in buffer
                 files_needed = min(files_needed, len(self.buffer))
+                # Cap files per refill to prevent blocking the main thread for 15+ seconds
+                # (with num_workers=0 on Windows, the iterator runs synchronously)
+                MAX_FILES_PER_REFILL = 10
+                files_needed = min(files_needed, MAX_FILES_PER_REFILL)
 
                 if files_needed > 0 and len(self.buffer) > 0:
                     # Pick random files
@@ -834,7 +843,6 @@ class OnDiskReplayBuffer(IterableDataset):
 
                     loaded_count = 0
                     error_count = 0
-                    start_time = time_module.time()
 
                     for i in indices:
                         path = self.buffer[i]

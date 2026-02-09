@@ -32,7 +32,11 @@ from dataclasses import dataclass
 
 from utils.config import Config
 from models.ddpg_agent import DDPGAgent
-from training.fitness import calculate_expectancy as _calculate_expectancy
+from training.fitness import (
+    calculate_expectancy as _calculate_expectancy,
+    aggregate_agent_stats,
+    aggregate_population_stats,
+)
 
 
 @dataclass
@@ -423,7 +427,7 @@ except Exception as e:
             self._start_background_transfer()
 
         # Aggregate population stats
-        aggregate_stats = self.trainer._aggregate_population_stats(all_episode_stats, fitness_scores)
+        aggregate_stats = aggregate_population_stats(all_episode_stats, fitness_scores)
 
         return fitness_scores, aggregate_stats
 
@@ -909,4 +913,4 @@ except Exception as e:
 
     def _aggregate_stats(self, slice_stats: List[Dict]) -> Dict:
         """Aggregate episode stats across slices."""
-        return self.trainer._aggregate_agent_stats(slice_stats)
+        return aggregate_agent_stats(slice_stats)
