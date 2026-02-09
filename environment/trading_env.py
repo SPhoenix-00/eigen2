@@ -286,7 +286,57 @@ class TradingEnvironment(gym.Env):
             info = self._get_info()
         
         return obs, step_reward, terminated, truncated, info
-    
+
+    def fast_step(self, action: np.ndarray) -> Tuple[float, bool, bool]:
+        """
+        Execute one time step WITHOUT computing observation or info.
+
+        Use this when the caller has pre-fetched observations via
+        get_batch_observations() and only needs (reward, terminated, truncated).
+        Skipping _get_observation() (which allocates a [151,117,5] array and
+        optionally generates noise) and _get_info() (which allocates a dict)
+        saves significant time — especially over 125+ steps per episode.
+
+        Args:
+            action: Array of shape [108, 2] with [coefficient, sale_target] per stock
+
+        Returns:
+            Tuple of (reward, terminated, truncated)
+        """
+        step_reward = 0.0
+
+        # Track if we have any positions today
+        had_positions_today = len(self.open_positions) > 0
+
+        # 1. Check existing positions for exits
+        step_reward += self._update_positions()
+
+        # 2. Process new action (if any)
+        position_opened = self._process_action(action)
+        step_reward += position_opened['reward'] if isinstance(position_opened, dict) else 0.0
+
+        # 3. Apply inaction penalty if no positions held
+        has_positions_now = len(self.open_positions) > 0
+        if not has_positions_now and not had_positions_today:
+            step_reward -= Config.INACTION_PENALTY
+            self.days_without_positions += 1
+        else:
+            self.days_with_positions += 1
+
+        # 4. Update cumulative reward
+        self.cumulative_reward += step_reward
+        self.episode_rewards.append(step_reward)
+
+        # 5. Move to next day
+        self.current_idx += 1
+
+        # 6. Check if episode is done
+        terminated = self.current_idx >= self.end_idx
+        if terminated:
+            self.current_idx = self.end_idx - 1  # Go back to last valid index (same as step())
+
+        return step_reward, terminated, False
+
     def _get_observation(self) -> np.ndarray:
         """
         Get current observation (raw context window).

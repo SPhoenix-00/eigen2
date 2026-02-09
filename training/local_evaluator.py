@@ -70,6 +70,21 @@ class TransitionBatch:
         self.dones[idx] = done
         self.count += 1
 
+    def add_batch(self, states: np.ndarray, actions: np.ndarray,
+                  rewards: np.ndarray, next_states: np.ndarray, dones: np.ndarray) -> int:
+        """Add a batch of transitions in one go (bulk slice copy). Much faster than per-step add."""
+        n = len(rewards)
+        if n == 0 or self.count + n > len(self.rewards):
+            return 0
+        end = self.count + n
+        self.states[self.count:end] = states
+        self.actions[self.count:end] = actions
+        self.rewards[self.count:end] = rewards
+        self.next_states[self.count:end] = next_states
+        self.dones[self.count:end] = dones
+        self.count = end
+        return n
+
     def get_valid(self) -> Dict[str, np.ndarray]:
         """Return only the filled portion of the buffer."""
         n = self.count
@@ -309,6 +324,13 @@ except Exception as e:
         """
         Evaluate all agents in population with GPU-accelerated batch inference.
 
+        Why evaluation is slower than validation (despite 5 vs 10 slices):
+        - Evaluation collects transitions for the replay buffer (per-step copies + optional
+          buffer flush wait), and computes triad_fitness per episode. Validation only
+          runs episodes and aggregates scores (no transition collection).
+        - So evaluation does more work per slice; validation runs more slices but each
+          is lighter.
+
         Returns:
             Tuple of (fitness_scores, aggregate_stats)
         """
@@ -462,33 +484,49 @@ except Exception as e:
                 trading_actions = np.concatenate(action_chunks, axis=0)
 
         # 4. FAST REPLAY - Step environment to compute rewards
+        # Uses fast_step() which skips _get_observation() and _get_info() since
+        # observations are pre-fetched. This eliminates ~125 wasted [151,117,5]
+        # array allocations per episode (plus noise generation in training mode).
         cumulative_reward = 0.0
         steps = 0
+        terminated = False
+        truncated = False
+        # Pre-allocate for batched transition add (avoids 125× per-step buffer.add overhead)
+        if collect_transitions:
+            ep_rewards = np.zeros(num_trading_steps, dtype=np.float32)
+            ep_dones = np.zeros(num_trading_steps, dtype=np.float32)
 
         # A. Trading Period (actions pre-computed)
         for i in range(num_trading_steps):
-            _, reward, terminated, truncated, _ = env.step(trading_actions[i])
+            reward, terminated, truncated = env.fast_step(trading_actions[i])
 
             if collect_transitions:
-                next_state = trading_states[i + 1] if i < num_trading_steps - 1 else env._get_observation()
-                self.transition_buffer.add(
-                    state=trading_states[i],
-                    action=trading_actions[i],
-                    reward=reward,
-                    next_state=next_state,
-                    done=float(terminated or truncated)
-                )
+                ep_rewards[i] = reward
+                ep_dones[i] = float(terminated or truncated)
 
             cumulative_reward += reward
             steps += 1
             if terminated or truncated:
                 break
 
+        # Batched add: one bulk copy per episode instead of per-step (much faster)
+        if collect_transitions and steps > 0:
+            batch_next = np.empty((steps,) + trading_states.shape[1:], dtype=np.float32)
+            batch_next[:-1] = trading_states[1:steps]
+            batch_next[-1] = env._get_observation()
+            self.transition_buffer.add_batch(
+                trading_states[:steps],
+                trading_actions[:steps],
+                ep_rewards[:steps],
+                batch_next,
+                ep_dones[:steps],
+            )
+
         # B. Settlement Period
         if not (terminated or truncated):
             dummy_action = np.zeros((Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM), dtype=np.float32)
             while True:
-                _, reward, terminated, truncated, _ = env.step(dummy_action)
+                reward, terminated, truncated = env.fast_step(dummy_action)
                 cumulative_reward += reward
                 steps += 1
                 if terminated or truncated:
@@ -814,10 +852,13 @@ except Exception as e:
 
         cumulative_reward = 0.0
         steps = 0
+        terminated = False
+        truncated = False
 
-        # Fast replay trading period
+        # Fast replay trading period — use fast_step() to skip wasted
+        # _get_observation() and _get_info() (observations are pre-fetched)
         for i in range(num_trading_steps):
-            _, reward, terminated, truncated, _ = env.step(trading_actions[i])
+            reward, terminated, truncated = env.fast_step(trading_actions[i])
             cumulative_reward += reward
             steps += 1
             if terminated or truncated:
@@ -827,7 +868,7 @@ except Exception as e:
         if not (terminated or truncated):
             dummy_action = np.zeros((Config.NUM_INVESTABLE_STOCKS, Config.ACTION_DIM), dtype=np.float32)
             while True:
-                _, reward, terminated, truncated, _ = env.step(dummy_action)
+                reward, terminated, truncated = env.fast_step(dummy_action)
                 cumulative_reward += reward
                 steps += 1
                 if terminated or truncated:
