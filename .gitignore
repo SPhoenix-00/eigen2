@@ -42,3 +42,6 @@ nul
 committee_results/
 evaluation_results/
 /global50/
+
+# Inference runtime state
+inference/trading_state.json

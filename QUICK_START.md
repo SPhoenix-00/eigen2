@@ -24,6 +24,13 @@ python main.py --local --resume      # Resume with local mode
 python main.py --maverick --resume   # Resume maverick training
 ```
 
+**Live inference (after training):**
+```bash
+python inference.py --start                       # Start trading episode
+python inference.py --daily daily_update.json     # Feed daily data, get orders
+python inference.py --status                      # Check portfolio
+```
+
 ---
 
 ## Setup Commands
@@ -364,6 +371,70 @@ See [EVALUATION_GUIDE.md](EVALUATION_GUIDE.md) for detailed usage and output for
 ## Recent Fixes
 
 **Population diversity (clone/mutate, 2026-02):** Fixed agents being identical (no variability) when initializing from a single seed. Cause: `DDPGAgent.clone()` could leave parameter tensors sharing storage with the source, so genetic mutation was not applied to independent copies. Fixes: (1) `clone()` now loads from an explicitly cloned state dict (`detach().clone().to(device)` per tensor) so the new agent's parameters never share storage. (2) `mutate()` in `erl/genetic_ops.py` uses in-place `param.data.add_(...)`, explicit device/dtype for RNG, and a runtime check that actor weights actually change; if not, it raises. Files: `models/ddpg_agent.py`, `erl/genetic_ops.py`.
+
+---
+
+## Live Inference (`inference.py`)
+
+Run the committee on live data to generate daily buy/sell orders. The engine tracks open positions locally and outputs actionable orders for the next market open.
+
+> **All day counts are in trading days** (weekends/holidays excluded). Holding periods, episode length, and `days_held` all count trading days only.
+
+### Start a New Episode
+
+```bash
+# Start from the last available date in the dataset:
+python inference.py --start
+
+# Start from a specific date:
+python inference.py --start 2026-02-09
+```
+
+This loads the full pickle as baseline data, loads all 9 committee agents, and creates an empty episode at `inference/trading_state.json`.
+
+### Daily Inference
+
+Each trading day, prepare a JSON file with the day's data and run:
+
+```bash
+python inference.py --daily daily_update_20260210.json
+```
+
+The engine will:
+1. Append the new row to the in-memory data arrays
+2. Update existing positions (check target hits via day High, forced exits at 30 trading days)
+3. Run committee consensus on the new observation
+4. Output buy/sell orders for the next market open
+5. Save updated state
+
+### Daily Update JSON Format
+
+Each stock column provides all 9 features: `[Open, Close, High, Low, RSI, MACD, MACD_Signal, Trix, xDiffDMA]` — matching `process_eigen_data.py` output.
+
+```json
+{
+  "date": "2026-02-10",
+  "columns": {
+    "SPX_INDEX": [4500.0, 4520.0, 4530.0, 4490.0, 55.2, 12.5, 11.8, 0.045, 15.3],
+    "DFAC": [25.10, 25.30, 25.45, 25.05, 62.1, 0.15, 0.12, 0.003, 0.25]
+  }
+}
+```
+
+### Check Portfolio Status
+
+```bash
+python inference.py --status    # Current positions and stats
+python inference.py --history   # Closed trade history
+```
+
+### Position Lifecycle (mirrors training environment)
+
+| Phase | Trading Days | Behavior |
+|-------|-------------|----------|
+| **Hold** | 1-20 | Cannot sell (minimum holding period) |
+| **Liquidation window** | 21-29 | Sells if day High >= target price |
+| **Forced exit** | 30 | Market sell at close price |
 
 ---
 
