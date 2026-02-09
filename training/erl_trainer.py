@@ -469,7 +469,7 @@ class ERLTrainer:
                     self.run_name = self.resume_run_name  # Use the provided name
 
                     # Update last_run.json with the resumed run info
-                    self._write_last_run_file()
+                    self.checkpoint_manager.write_last_run_file(wandb.run.name, wandb.run.id)
 
                     # Suppress W&B step order warnings when resuming
                     # (W&B's internal step counter may be ahead of our resume point)
@@ -593,7 +593,7 @@ class ERLTrainer:
                     self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
                     # Write last_run.json for easy resume
-                    self._write_last_run_file()
+                    self.checkpoint_manager.write_last_run_file(wandb.run.name, wandb.run.id)
             else:
                 print("--- W&B run already active (sweep_runner.py mode) ---")
                 # Create run-specific checkpoint directory using wandb run name
@@ -922,9 +922,7 @@ class ERLTrainer:
         # print("\n🔍 Taking baseline memory snapshot...")
         # log_memory("Trainer initialized (baseline)", show_objects=True)
 
-    def _write_last_run_file(self):
-        """Write last_run.json to root directory. Delegates to CheckpointManager."""
-        self.checkpoint_manager.write_last_run_file(wandb.run.name, wandb.run.id)
+    # _write_last_run_file removed — callers use self.checkpoint_manager.write_last_run_file() directly.
 
     def _init_shared_memory(self):
         """Initialize shared memory. Delegates to SharedMemoryManager."""
@@ -1460,7 +1458,7 @@ class ERLTrainer:
 
         # Generate validation slices before running validation
         self.current_generation_val_slices = self.generate_validation_slices()
-        self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
+        self.val_slice_hash = hash_validation_slices(self.current_generation_val_slices)
 
         # Run full validation to establish self-referential baselines
         # Note: validate_population_parallel returns raw validation metrics
@@ -2102,11 +2100,11 @@ class ERLTrainer:
         # Calculate fitness using appropriate aggregator
         if self.multi2_mode:
             # Penalized Median for multi2-mode (consistent with Gauntlet/committee.py)
-            final_fitness = self._calculate_penalized_median_fitness(slice_fitness_scores)
+            final_fitness = calculate_penalized_median_fitness(slice_fitness_scores)
             aggregation_method = "Penalized Median"
         else:
             # Pessimistic for single/heroes mode
-            final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+            final_fitness = calculate_pessimistic_fitness(slice_fitness_scores)
             aggregation_method = "Pessimistic"
 
         print(f"  Slice scores: {[f'{s:.2f}' for s in slice_fitness_scores]}")
@@ -2148,13 +2146,8 @@ class ERLTrainer:
             self.val_start_idx, self.val_end_idx,
         )
 
-    def _hash_agent(self, agent: DDPGAgent) -> str:
-        """Create hash of agent's weights for caching."""
-        return hash_agent(agent)
-
-    def _hash_validation_slices(self, slices: List[Tuple[int, int, int]]) -> str:
-        """Hash validation slices configuration."""
-        return hash_validation_slices(slices)
+    # _hash_agent and _hash_validation_slices removed — callers use
+    # hash_agent() and hash_validation_slices() from training.fitness directly.
 
     def calculate_triad_fitness(self, stats: Dict) -> float:
         """Triad 3.0: Maverick Selectivity & Gradient Update. Delegates to training.fitness."""
@@ -2176,21 +2169,9 @@ class ERLTrainer:
             global_hof=getattr(self, 'global_hof', None),
         )
 
-    def _calculate_pessimistic_fitness(self, slice_fitness_scores: List[float]) -> float:
-        """Calculate fitness using pessimistic aggregator (0.4*mean + 0.6*min)."""
-        return calculate_pessimistic_fitness(slice_fitness_scores)
-
-    def _calculate_penalized_median_fitness(self, slice_fitness_scores: List[float]) -> float:
-        """Calculate fitness using Penalized Median scoring: Median - (0.5 * StdDev)."""
-        return calculate_penalized_median_fitness(slice_fitness_scores)
-
-    def _aggregate_agent_stats(self, slice_episode_stats: List[Dict]) -> Dict:
-        """Aggregate episode statistics across all training slices for a single agent."""
-        return aggregate_agent_stats(slice_episode_stats)
-
-    def _aggregate_population_stats(self, all_episode_stats: List[Dict], fitness_scores: List[float]) -> Dict:
-        """Aggregate statistics across all agents in the population."""
-        return aggregate_population_stats(all_episode_stats, fitness_scores)
+    # _calculate_pessimistic_fitness, _calculate_penalized_median_fitness,
+    # _aggregate_agent_stats, _aggregate_population_stats removed —
+    # callers use functions from training.fitness directly.
 
     def evaluate_population(self) -> Tuple[List[float], Dict]:
         """
@@ -2281,19 +2262,19 @@ class ERLTrainer:
                 # This weaves the slices together into one "career"
                 final_fitness = self.calculate_holographic_fitness(all_slices_closed_trades)
             elif self.multi2_mode:
-                final_fitness = self._calculate_penalized_median_fitness(slice_fitness_scores)
+                final_fitness = calculate_penalized_median_fitness(slice_fitness_scores)
             else:
-                final_fitness = self._calculate_pessimistic_fitness(slice_fitness_scores)
+                final_fitness = calculate_pessimistic_fitness(slice_fitness_scores)
             fitness_scores.append(final_fitness)
 
             # Aggregate episode stats across all training slices for this agent
-            all_episode_stats.append(self._aggregate_agent_stats(slice_episode_stats))
+            all_episode_stats.append(aggregate_agent_stats(slice_episode_stats))
 
         # Ensure fitness_scores are all plain floats
         fitness_scores = [float(f) for f in fitness_scores]
 
         # Aggregate statistics across all agents
-        aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
+        aggregate_stats = aggregate_population_stats(all_episode_stats, fitness_scores)
 
         # In local mode, batch-write all collected transitions to disk
         if self.local_mode and transition_collector:
@@ -2479,13 +2460,13 @@ class ERLTrainer:
                     # This weaves the slices together into one "career"
                     final_fitness = self.calculate_holographic_fitness(all_slices_closed_trades)
                 elif self.multi2_mode:
-                    final_fitness = self._calculate_penalized_median_fitness(slice_fitness)
+                    final_fitness = calculate_penalized_median_fitness(slice_fitness)
                 else:
-                    final_fitness = self._calculate_pessimistic_fitness(slice_fitness)
+                    final_fitness = calculate_pessimistic_fitness(slice_fitness)
                 fitness_scores.append(final_fitness)
 
                 # Aggregate stats for this agent
-                all_episode_stats.append(self._aggregate_agent_stats(slice_stats))
+                all_episode_stats.append(aggregate_agent_stats(slice_stats))
 
             # Ensure fitness_scores are all plain floats
             fitness_scores = [float(f) for f in fitness_scores]
@@ -2564,7 +2545,7 @@ class ERLTrainer:
                 print("  No transitions collected this generation")
 
             # Aggregate statistics across all agents
-            aggregate_stats = self._aggregate_population_stats(all_episode_stats, fitness_scores)
+            aggregate_stats = aggregate_population_stats(all_episode_stats, fitness_scores)
 
         # Clean up
         del all_episode_stats
@@ -3262,9 +3243,8 @@ class ERLTrainer:
         if self.turnovers_completed >= Config.MULTI_TARGET_TURNOVERS:
             print(f"\n✓ MULTI-MODE TRAINING COMPLETE!")
 
-    def calculate_expectancy(self, closed_trades):
-        """Calculate Expectancy metric for trading performance. Delegates to training.fitness."""
-        return _calculate_expectancy(closed_trades)
+    # calculate_expectancy removed — callers use _calculate_expectancy()
+    # from training.fitness directly. External consumers import from training.fitness.
 
     def calculate_conviction_threshold_vector(self, agent) -> list:
         """
@@ -3429,7 +3409,7 @@ class ERLTrainer:
         global_win_rate = total_wins / total_trades if total_trades > 0 else 0.0
 
         # Calculate Expectancy metric from all closed trades
-        expectancy = self.calculate_expectancy(all_closed_trades)
+        expectancy = _calculate_expectancy(all_closed_trades)
 
         # Calculate quality count if threshold provided (to avoid returning full closed_trades list)
         quality_count = 0
@@ -3469,7 +3449,7 @@ class ERLTrainer:
         Returns:
             Validation results (from cache or fresh evaluation)
         """
-        agent_hash = self._hash_agent(agent)
+        agent_hash = hash_agent(agent)
         slice_hash = self.val_slice_hash
         # Include quality_threshold in cache key to handle different thresholds
         threshold_key = f"{quality_threshold:.4f}" if quality_threshold is not None else "none"
@@ -3520,7 +3500,7 @@ class ERLTrainer:
         agent_indices_to_validate = []
 
         for idx, agent in enumerate(self.population):
-            agent_hash = self._hash_agent(agent)
+            agent_hash = hash_agent(agent)
             cache_key = f"{agent_hash}_{slice_hash}_{threshold_key}"
 
             if cache_key in self.validation_cache:
@@ -3763,7 +3743,7 @@ class ERLTrainer:
         total_trades = total_wins + total_losses
         global_win_rate = total_wins / total_trades if total_trades > 0 else 0.0
 
-        expectancy = self.calculate_expectancy(all_closed_trades)
+        expectancy = _calculate_expectancy(all_closed_trades)
 
         # Calculate quality_count (trades with gain >= quality threshold)
         # Use the current quality threshold (HoF median ROI or config default)
@@ -5577,7 +5557,7 @@ class ERLTrainer:
             # Generate validation slices for re-evaluation
             print("Generating validation slices for re-evaluation...")
             self.current_generation_val_slices = self.generate_validation_slices()
-            self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
+            self.val_slice_hash = hash_validation_slices(self.current_generation_val_slices)
 
             # Re-evaluate population on training data
             print("\nRe-evaluating population on training data...")
@@ -6097,7 +6077,7 @@ class ERLTrainer:
 
             # Generate validation slices for this generation
             self.current_generation_val_slices = self.generate_validation_slices()
-            self.val_slice_hash = self._hash_validation_slices(self.current_generation_val_slices)
+            self.val_slice_hash = hash_validation_slices(self.current_generation_val_slices)
 
             best_val_fitness_this_gen = float('-inf')
             best_val_agent_idx = None

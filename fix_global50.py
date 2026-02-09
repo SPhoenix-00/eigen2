@@ -36,7 +36,9 @@ from models.ddpg_agent import DDPGAgent
 from erl.global_hof import GlobalHallOfFame, LeagueRules, GlobalHoFEntry
 from utils.config import Config
 from utils.cloud_sync import get_cloud_sync_from_env
-from training.erl_trainer import ERLTrainer
+from training.fitness import calculate_expectancy
+from training.episode import run_episode_batched
+from training.validation_slices import generate_gauntlet_slices
 
 
 class Global50Fixer:
@@ -137,15 +139,7 @@ class Global50Fixer:
             self.normalization_stats
         )
 
-        self.gauntlet_helper.generate_gauntlet_slices = ERLTrainer.generate_gauntlet_slices.__get__(
-            self.gauntlet_helper, GauntletHelper
-        )
-        self.gauntlet_helper.run_episode_batched = ERLTrainer.run_episode_batched.__get__(
-            self.gauntlet_helper, GauntletHelper
-        )
-        self.gauntlet_helper.calculate_expectancy = ERLTrainer.calculate_expectancy.__get__(
-            self.gauntlet_helper, GauntletHelper
-        )
+        # Functions imported directly from extracted training modules (no more __get__ hack)
 
     def get_agent_roi_from_scoresheet(self, filename: str, from_archive: bool = True) -> float:
         """
@@ -264,7 +258,12 @@ class Global50Fixer:
             agent_name: Name for logging
             is_maverick: If True, disables consistency mode (maverick agents are incompatible with consistency mode)
         """
-        gauntlet_slices = self.gauntlet_helper.generate_gauntlet_slices()
+        gauntlet_slices = generate_gauntlet_slices(
+            self.gauntlet_helper.train_start_idx,
+            self.gauntlet_helper.train_end_idx,
+            self.gauntlet_helper.val_start_idx,
+            self.gauntlet_helper.val_end_idx,
+        )
 
         slice_results = []
         all_closed_trades = []
@@ -279,7 +278,7 @@ class Global50Fixer:
         self.gauntlet_helper.eval_env.set_gauntlet_mode(True)
 
         for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
-            fitness, episode_info = self.gauntlet_helper.run_episode_batched(
+            fitness, episode_info = run_episode_batched(
                 agent=agent,
                 env=self.gauntlet_helper.eval_env,
                 start_idx=start_idx,
@@ -368,7 +367,7 @@ class Global50Fixer:
         win_rate = float((total_wins / total_trades * 100) if total_trades > 0 else 0.0)
 
         # Use ERLTrainer's calculate_expectancy method
-        expectancy = float(self.gauntlet_helper.calculate_expectancy(all_closed_trades))
+        expectancy = float(calculate_expectancy(all_closed_trades))
 
         # Calculate quality_count (trades with gain >= Config.ROI_QUALITY_THRESHOLD)
         # This is the threshold used for confidence factor in ROI adjustment

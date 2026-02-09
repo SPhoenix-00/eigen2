@@ -100,7 +100,11 @@ from models.ddpg_agent import DDPGAgent
 from erl.global_hof import GlobalHallOfFame, LeagueRules, GlobalHoFEntry
 from utils.config import Config
 from utils.cloud_sync import get_cloud_sync_from_env
-from training.erl_trainer import ERLTrainer, BreakthroughState
+from training.erl_trainer import ERLTrainer
+from training.breakthrough import BreakthroughState
+from training.fitness import calculate_triad_fitness, calculate_expectancy
+from training.episode import run_episode_batched
+from training.validation_slices import generate_gauntlet_slices
 
 
 class TeeLogger:
@@ -264,19 +268,7 @@ class AgentEvaluator:
         self.gauntlet_helper.quality_threshold = Config.ROI_QUALITY_THRESHOLD  # Default: 7.5%
         self.gauntlet_helper.global_hof = self.global_hof  # Reference to global_hof for proximity gradient
 
-        # Bind ERLTrainer methods to our helper object
-        self.gauntlet_helper.generate_gauntlet_slices = ERLTrainer.generate_gauntlet_slices.__get__(
-            self.gauntlet_helper, GauntletHelper
-        )
-        self.gauntlet_helper.run_episode_batched = ERLTrainer.run_episode_batched.__get__(
-            self.gauntlet_helper, GauntletHelper
-        )
-        self.gauntlet_helper.calculate_expectancy = ERLTrainer.calculate_expectancy.__get__(
-            self.gauntlet_helper, GauntletHelper
-        )
-        self.gauntlet_helper.calculate_triad_fitness = ERLTrainer.calculate_triad_fitness.__get__(
-            self.gauntlet_helper, GauntletHelper
-        )
+        # Functions imported directly from extracted training modules (no more __get__ hack)
 
     def discover_agents(self, agent_dir: Path) -> List[Path]:
         """
@@ -319,7 +311,12 @@ class AgentEvaluator:
         Returns:
             List of tuples: (start_idx, end_idx, trading_end_idx)
         """
-        return self.gauntlet_helper.generate_gauntlet_slices()
+        return generate_gauntlet_slices(
+            self.gauntlet_helper.train_start_idx,
+            self.gauntlet_helper.train_end_idx,
+            self.gauntlet_helper.val_start_idx,
+            self.gauntlet_helper.val_end_idx,
+        )
 
     def run_gauntlet(self, agent: DDPGAgent, agent_name: str, is_maverick: bool = False) -> Tuple[float, dict]:
         """
@@ -363,7 +360,7 @@ class AgentEvaluator:
         for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
             # Use ERLTrainer's optimized batched inference
             # Note: training=False so replay_buffer is not used
-            raw_fitness, episode_info = self.gauntlet_helper.run_episode_batched(
+            raw_fitness, episode_info = run_episode_batched(
                 agent=agent,
                 env=self.gauntlet_helper.eval_env,
                 start_idx=start_idx,
@@ -376,7 +373,15 @@ class AgentEvaluator:
             # This ensures global50.py --eval scores agents the same way as main.py training
             # The raw_fitness from run_episode_batched is cumulative_reward, but training
             # uses calculate_triad_fitness(episode_info) which applies Triad 3.0 formula
-            triad_fitness = self.gauntlet_helper.calculate_triad_fitness(episode_info)
+            triad_fitness = calculate_triad_fitness(
+                episode_info,
+                maverick_mode=self.gauntlet_helper.maverick_mode,
+                consistency_mode=self.gauntlet_helper.consistency_mode,
+                quality_threshold=self.gauntlet_helper.quality_threshold,
+                roi_hurdle_pct=0.0,
+                breakthrough_state=self.gauntlet_helper.breakthrough_state,
+                global_hof=self.gauntlet_helper.global_hof,
+            )
 
             slice_results.append({
                 'fitness': triad_fitness,  # Use triad_fitness instead of raw_fitness
@@ -459,7 +464,7 @@ class AgentEvaluator:
         win_rate = float((total_wins / total_trades * 100) if total_trades > 0 else 0.0)
 
         # Use ERLTrainer's calculate_expectancy method
-        expectancy = float(self.gauntlet_helper.calculate_expectancy(all_closed_trades))
+        expectancy = float(calculate_expectancy(all_closed_trades))
 
         # Calculate quality_count (trades with gain >= Config.ROI_QUALITY_THRESHOLD)
         # This is the threshold used for confidence factor in ROI adjustment

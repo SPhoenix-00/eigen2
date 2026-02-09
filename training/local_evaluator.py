@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 from utils.config import Config
 from models.ddpg_agent import DDPGAgent
+from training.fitness import calculate_expectancy as _calculate_expectancy
 
 
 @dataclass
@@ -779,7 +780,7 @@ except Exception as e:
         total_trades = total_wins + total_losses
         global_win_rate = total_wins / total_trades if total_trades > 0 else 0.0
 
-        expectancy = self.trainer.calculate_expectancy(all_closed_trades)
+        expectancy = _calculate_expectancy(all_closed_trades)
 
         quality_count = 0
         if quality_threshold is not None:

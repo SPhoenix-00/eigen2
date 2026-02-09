@@ -27,7 +27,7 @@ from data.loader import StockDataLoader
 from environment.trading_env import TradingEnvironment
 from models.ddpg_agent import DDPGAgent
 from utils.config import Config
-from training.erl_trainer import ERLTrainer
+from training.validation_slices import generate_gauntlet_slices as _generate_gauntlet_slices
 
 
 @dataclass
@@ -165,32 +165,19 @@ class ContextWindowComparator:
 
     def generate_gauntlet_slices(self) -> List[Tuple[int, int, int]]:
         """
-        Generate gauntlet validation slices using the ORIGINAL ERLTrainer method.
-
-        This delegates to ERLTrainer.generate_gauntlet_slices() to ensure
-        100% identical logic to actual G50 evaluation.
+        Generate gauntlet validation slices using the extracted training.validation_slices module.
 
         Returns:
             List of (start_idx, end_idx, trading_end_idx) tuples
         """
-        # Import here to avoid circular dependency
-        from training.erl_trainer import ERLTrainer
+        train_start_idx = Config.CONTEXT_WINDOW_DAYS
+        train_end_idx = len(self.data_loader.train_indices)
+        val_start_idx = len(self.data_loader.train_indices)
+        val_end_idx = val_start_idx + len(self.data_loader.val_indices)
 
-        # Use a dummy trainer just to call the static-ish method
-        # We need to create a minimal trainer instance with required attributes
-        dummy_trainer = ERLTrainer.__new__(ERLTrainer)
-        dummy_trainer.data_loader = self.data_loader
+        slices = _generate_gauntlet_slices(train_start_idx, train_end_idx, val_start_idx, val_end_idx)
 
-        # Set training and validation ranges (same as ERLTrainer.__init__)
-        dummy_trainer.train_start_idx = Config.CONTEXT_WINDOW_DAYS
-        dummy_trainer.train_end_idx = len(self.data_loader.train_indices)
-        dummy_trainer.val_start_idx = len(self.data_loader.train_indices)
-        dummy_trainer.val_end_idx = dummy_trainer.val_start_idx + len(self.data_loader.val_indices)
-
-        # Call the original method
-        slices = dummy_trainer.generate_gauntlet_slices()
-
-        print(f"   Gauntlet: {len(slices)} slices total (using ERLTrainer.generate_gauntlet_slices)")
+        print(f"   Gauntlet: {len(slices)} slices total (using training.validation_slices)")
         return slices
 
     def evaluate_agent_with_context(self, agent: DDPGAgent, context_window_days: int,
@@ -482,7 +469,7 @@ def main():
         print("\n⚔️  GAUNTLET MODE: Using exact G50 validation methodology")
         print("   - 10 slices from training data (generalization test)")
         print("   - 10 slices from validation data (held-out test)")
-        print("   - Same slice generation as ERLTrainer.generate_gauntlet_slices()")
+        print("   - Same slice generation as training.validation_slices.generate_gauntlet_slices()")
 
     if args.test_all_g50:
         # Test all G50 agents

@@ -32,7 +32,9 @@ from environment.trading_env import TradingEnvironment
 from models.ddpg_agent import DDPGAgent
 from utils.config import Config
 from utils.display import visualize_gauntlet_slices
-from training.erl_trainer import ERLTrainer
+from training.fitness import calculate_expectancy
+from training.episode import run_episode_batched
+from training.validation_slices import generate_gauntlet_slices
 
 
 class GauntletRunner:
@@ -129,16 +131,7 @@ class GauntletRunner:
         self.helper.eval_env = self.eval_env
         self.helper.replay_buffer = None  # Not needed for validation
 
-        # Bind methods
-        self.helper.generate_gauntlet_slices = ERLTrainer.generate_gauntlet_slices.__get__(
-            self.helper, GauntletHelper
-        )
-        self.helper.run_episode_batched = ERLTrainer.run_episode_batched.__get__(
-            self.helper, GauntletHelper
-        )
-        self.helper.calculate_expectancy = ERLTrainer.calculate_expectancy.__get__(
-            self.helper, GauntletHelper
-        )
+        # Functions imported directly from extracted training modules (no more __get__ hack)
 
     def discover_agents(self) -> List[Tuple[Path, dict]]:
         """
@@ -216,7 +209,12 @@ class GauntletRunner:
         print(f"{'='*70}")
 
         # Generate gauntlet slices (10 training + 10 validation)
-        gauntlet_slices = self.helper.generate_gauntlet_slices()
+        gauntlet_slices = generate_gauntlet_slices(
+            self.helper.train_start_idx,
+            self.helper.train_end_idx,
+            self.helper.val_start_idx,
+            self.helper.val_end_idx,
+        )
         num_training_slices = sum(1 for s in gauntlet_slices if s[0] < self.val_start_idx)
         num_val_slices = len(gauntlet_slices) - num_training_slices
         print(f"Testing on {len(gauntlet_slices)} slices ({num_training_slices} training + {num_val_slices} validation)")
@@ -234,7 +232,7 @@ class GauntletRunner:
         # Evaluate each slice
         for i, (start_idx, end_idx, _) in enumerate(gauntlet_slices):
             # Use ERLTrainer's optimized batched inference
-            fitness, episode_info = self.helper.run_episode_batched(
+            fitness, episode_info = run_episode_batched(
                 agent=agent,
                 env=self.eval_env,
                 start_idx=start_idx,
@@ -304,7 +302,7 @@ class GauntletRunner:
         win_rate = float((total_wins / total_trades * 100) if total_trades > 0 else 0.0)
 
         # Calculate expectancy using ERLTrainer's method
-        expectancy = float(self.helper.calculate_expectancy(all_closed_trades))
+        expectancy = float(calculate_expectancy(all_closed_trades))
 
         # Calculate quality_count (trades with gain >= Config.ROI_QUALITY_THRESHOLD)
         quality_threshold = Config.ROI_QUALITY_THRESHOLD
