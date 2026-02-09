@@ -1263,10 +1263,10 @@ class GlobalHallOfFame:
                         print(f"  ⚠ Failed to download Global 50 agent: {filename}")
                         continue
 
-                # Load agent
+                # Load agent (weights only: fresh optimizers avoid slowdown from stale momentum/memory layout)
                 try:
                     agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
-                    agent.load(str(local_agent_path))
+                    agent.load_weights_only(str(local_agent_path))
                     agents.append(agent)
                 except Exception as e:
                     print(f"  ⚠ Failed to load Global 50 agent: {e}")
@@ -1424,10 +1424,10 @@ class GlobalHallOfFame:
                         print(f"  ⚠ Failed to download fallback agent: {filename}")
                         continue
 
-                # Load agent
+                # Load agent (weights only: fresh optimizers avoid slowdown from stale momentum/memory layout)
                 try:
                     agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
-                    agent.load(str(local_agent_path))
+                    agent.load_weights_only(str(local_agent_path))
                     agents.append(agent)
                 except Exception as e:
                     print(f"  ⚠ Failed to load fallback agent {filename}: {e}")
