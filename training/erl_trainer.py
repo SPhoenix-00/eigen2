@@ -74,6 +74,7 @@ from training.workers import (
     SharedMemoryManager,
 )
 from training.checkpoint import CheckpointManager
+from training.multi_agent import MultiAgentOrchestrator
 
 
 # NumpyEncoder moved to training.fitness (re-exported above)
@@ -131,29 +132,32 @@ class ERLTrainer:
         self.local_mode = local_mode  # Local mode: sequential execution and serialized disk writes
         self.force_maverick = force_maverick  # Skip non-maverick phase (DEBUG mode)
 
-        # Multi-agent committee mode (sequential training of each member)
+        # Multi-agent committee mode (state encapsulated in MultiAgentOrchestrator)
         self.multi2_mode = multi2_mode
         self.multi2_roster = multi2_roster
         if multi2_mode:
             self.num_committee_members = Config.COMMITTEE_SIZE  # 9
-            self.member_breakthroughs = [0] * self.num_committee_members  # Breakthroughs per member
-            self.member_baselines = [0.0] * self.num_committee_members  # Original scores
-            self.turnovers_completed = 0
-            self.current_member_idx = 0  # Which committee member we're currently training
-            self.multi2_generation_offset = 0  # Track total generations across all members
-            self.member_training_start_gen = 0  # Track when current member started training for warmup enforcement
-            # Stuck detection for multi2-mode (post-warmup)
-            self.multi2_parent_agent = None  # Reference to the parent agent for parent mutant injection
-            self.multi2_gens_since_improvement = 0  # Generations since last improvement (post-warmup)
-            self.multi2_best_score_for_member = float('-inf')  # Best score seen for current member
-            # Phase tracking for maverick/non-maverick separation
-            self.multi2_phase = 'non_maverick'  # 'non_maverick' or 'maverick'
-            self.non_maverick_members = []  # List of member indices that are non-maverick
-            self.maverick_members = []  # List of member indices that are maverick
-            self.current_non_maverick_idx = 0  # Index into non_maverick_members list
-            self.current_maverick_idx = 0  # Index into maverick_members list
-            self.non_maverick_turnovers_per_agent = []  # Track turnovers per non-maverick agent
-            self.maverick_turnovers_per_agent = []  # Track turnovers per maverick agent
+            self.multi_orchestrator = MultiAgentOrchestrator(
+                num_committee_members=self.num_committee_members,
+                roster=multi2_roster,
+            )
+            # Backward-compatible attribute access (delegates to orchestrator)
+            self.member_breakthroughs = self.multi_orchestrator.member_breakthroughs
+            self.member_baselines = self.multi_orchestrator.member_baselines
+            self.turnovers_completed = self.multi_orchestrator.turnovers_completed
+            self.current_member_idx = self.multi_orchestrator.current_member_idx
+            self.multi2_generation_offset = self.multi_orchestrator.generation_offset
+            self.member_training_start_gen = self.multi_orchestrator.member_training_start_gen
+            self.multi2_parent_agent = self.multi_orchestrator.parent_agent
+            self.multi2_gens_since_improvement = self.multi_orchestrator.gens_since_improvement
+            self.multi2_best_score_for_member = self.multi_orchestrator.best_score_for_member
+            self.multi2_phase = self.multi_orchestrator.phase
+            self.non_maverick_members = self.multi_orchestrator.non_maverick_members
+            self.maverick_members = self.multi_orchestrator.maverick_members
+            self.current_non_maverick_idx = self.multi_orchestrator.current_non_maverick_idx
+            self.current_maverick_idx = self.multi_orchestrator.current_maverick_idx
+            self.non_maverick_turnovers_per_agent = self.multi_orchestrator.non_maverick_turnovers_per_agent
+            self.maverick_turnovers_per_agent = self.multi_orchestrator.maverick_turnovers_per_agent
 
         # Leverage mode tracking
         self.leverage_mode_active = False
