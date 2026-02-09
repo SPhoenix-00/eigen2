@@ -45,7 +45,6 @@ from training.local_evaluator import LocalEvaluator
 
 # Phase 1 extractions - import from focused modules
 from training.fitness import (
-    NumpyEncoder,
     calculate_triad_fitness as _calculate_triad_fitness,
     calculate_holographic_fitness as _calculate_holographic_fitness,
     calculate_pessimistic_fitness,
@@ -77,8 +76,8 @@ from training.checkpoint import CheckpointManager
 from training.multi_agent import MultiAgentOrchestrator
 
 
-# NumpyEncoder moved to training.fitness (re-exported above)
-# Worker functions and globals moved to training.workers (re-exported above)
+# NumpyEncoder lives in training.fitness (used by CheckpointManager)
+# Worker functions and globals live in training.workers
 # _WORKER_CACHE_MAX_SIZE, _init_worker, _cache_agent, _get_cached_agent,
 # _run_episode_worker, _run_validation_worker all live in training.workers now.
 
@@ -93,6 +92,194 @@ class ERLTrainer:
     Evolutionary Reinforcement Learning Trainer.
     Manages population, training, and evolution.
     """
+
+    # ── Properties delegating to BreakthroughTracker ─────────────────────
+    # These ensure reads/writes go through self.breakthrough_tracker, not stale
+    # value copies. Without these, assignments like self.breakthrough_state = X
+    # would create a local attribute that shadows the tracker, causing desync.
+    # See: training/breakthrough.py::BreakthroughTracker for the canonical state.
+
+    @property
+    def breakthrough_state(self):
+        return self.breakthrough_tracker.state
+
+    @breakthrough_state.setter
+    def breakthrough_state(self, value):
+        self.breakthrough_tracker.state = value
+
+    @property
+    def breakthrough_candidate(self):
+        return self.breakthrough_tracker.candidate
+
+    @breakthrough_candidate.setter
+    def breakthrough_candidate(self, value):
+        self.breakthrough_tracker.candidate = value
+
+    @property
+    def confirmed_baseline(self):
+        return self.breakthrough_tracker.confirmed_baseline
+
+    @confirmed_baseline.setter
+    def confirmed_baseline(self, value):
+        self.breakthrough_tracker.confirmed_baseline = value
+
+    @property
+    def confirmed_breakthroughs(self):
+        return self.breakthrough_tracker.confirmed_breakthroughs
+
+    @confirmed_breakthroughs.setter
+    def confirmed_breakthroughs(self, value):
+        self.breakthrough_tracker.confirmed_breakthroughs = value
+
+    @property
+    def breakthrough_history(self):
+        return self.breakthrough_tracker.history
+
+    @breakthrough_history.setter
+    def breakthrough_history(self, value):
+        self.breakthrough_tracker.history = value
+
+    @property
+    def stabilization_generations_elapsed(self):
+        return self.breakthrough_tracker.stabilization_generations_elapsed
+
+    @stabilization_generations_elapsed.setter
+    def stabilization_generations_elapsed(self, value):
+        self.breakthrough_tracker.stabilization_generations_elapsed = value
+
+    @property
+    def use_candidate_queue(self):
+        return self.breakthrough_tracker.use_candidate_queue
+
+    @use_candidate_queue.setter
+    def use_candidate_queue(self, value):
+        self.breakthrough_tracker.use_candidate_queue = value
+
+    @property
+    def candidate_queue(self):
+        return self.breakthrough_tracker.candidate_queue
+
+    @candidate_queue.setter
+    def candidate_queue(self, value):
+        self.breakthrough_tracker.candidate_queue = value
+
+    @property
+    def tested_candidate_indices(self):
+        return self.breakthrough_tracker.tested_candidate_indices
+
+    @tested_candidate_indices.setter
+    def tested_candidate_indices(self, value):
+        self.breakthrough_tracker.tested_candidate_indices = value
+
+    @property
+    def pending_baseline_update(self):
+        return self.breakthrough_tracker.pending_baseline_update
+
+    @pending_baseline_update.setter
+    def pending_baseline_update(self, value):
+        self.breakthrough_tracker.pending_baseline_update = value
+
+    @property
+    def breakthrough_threshold(self):
+        return self.breakthrough_tracker.threshold
+
+    @breakthrough_threshold.setter
+    def breakthrough_threshold(self, value):
+        self.breakthrough_tracker.threshold = value
+
+    @property
+    def breakthrough_quorum(self):
+        return self.breakthrough_tracker.quorum
+
+    @breakthrough_quorum.setter
+    def breakthrough_quorum(self, value):
+        self.breakthrough_tracker.quorum = value
+
+    @property
+    def target_breakthroughs(self):
+        return self.breakthrough_tracker.target_breakthroughs
+
+    @target_breakthroughs.setter
+    def target_breakthroughs(self, value):
+        self.breakthrough_tracker.target_breakthroughs = value
+
+    # ── Properties delegating to MultiAgentOrchestrator ──────────────────
+    # Same pattern. These properties are only accessed in multi2_mode code paths
+    # (guarded by `if self.multi2_mode:`), so self.multi_orchestrator is guaranteed
+    # to exist when they are called.
+    # See: training/multi_agent.py::MultiAgentOrchestrator for the canonical state.
+
+    @property
+    def current_member_idx(self):
+        return self.multi_orchestrator.current_member_idx
+
+    @current_member_idx.setter
+    def current_member_idx(self, value):
+        self.multi_orchestrator.current_member_idx = value
+
+    @property
+    def turnovers_completed(self):
+        return self.multi_orchestrator.turnovers_completed
+
+    @turnovers_completed.setter
+    def turnovers_completed(self, value):
+        self.multi_orchestrator.turnovers_completed = value
+
+    @property
+    def member_training_start_gen(self):
+        return self.multi_orchestrator.member_training_start_gen
+
+    @member_training_start_gen.setter
+    def member_training_start_gen(self, value):
+        self.multi_orchestrator.member_training_start_gen = value
+
+    @property
+    def multi2_gens_since_improvement(self):
+        return self.multi_orchestrator.gens_since_improvement
+
+    @multi2_gens_since_improvement.setter
+    def multi2_gens_since_improvement(self, value):
+        self.multi_orchestrator.gens_since_improvement = value
+
+    @property
+    def multi2_best_score_for_member(self):
+        return self.multi_orchestrator.best_score_for_member
+
+    @multi2_best_score_for_member.setter
+    def multi2_best_score_for_member(self, value):
+        self.multi_orchestrator.best_score_for_member = value
+
+    @property
+    def multi2_phase(self):
+        return self.multi_orchestrator.phase
+
+    @multi2_phase.setter
+    def multi2_phase(self, value):
+        self.multi_orchestrator.phase = value
+
+    @property
+    def current_non_maverick_idx(self):
+        return self.multi_orchestrator.current_non_maverick_idx
+
+    @current_non_maverick_idx.setter
+    def current_non_maverick_idx(self, value):
+        self.multi_orchestrator.current_non_maverick_idx = value
+
+    @property
+    def current_maverick_idx(self):
+        return self.multi_orchestrator.current_maverick_idx
+
+    @current_maverick_idx.setter
+    def current_maverick_idx(self, value):
+        self.multi_orchestrator.current_maverick_idx = value
+
+    @property
+    def multi2_parent_agent(self):
+        return self.multi_orchestrator.parent_agent
+
+    @multi2_parent_agent.setter
+    def multi2_parent_agent(self, value):
+        self.multi_orchestrator.parent_agent = value
 
     def __init__(self, data_loader: StockDataLoader, resume_run_name: str = None, enable_leverage: bool = False,
                  consistency_mode: bool = False, heroes_hof_dir: str = None, single_agent_path: str = None,
@@ -141,23 +328,16 @@ class ERLTrainer:
                 num_committee_members=self.num_committee_members,
                 roster=multi2_roster,
             )
-            # Backward-compatible attribute access (delegates to orchestrator)
+            # NOTE: Immutable multi2_* attributes are now @property delegates (see top of class).
+            # Mutable list references below are genuine shared references (not value copies):
             self.member_breakthroughs = self.multi_orchestrator.member_breakthroughs
             self.member_baselines = self.multi_orchestrator.member_baselines
-            self.turnovers_completed = self.multi_orchestrator.turnovers_completed
-            self.current_member_idx = self.multi_orchestrator.current_member_idx
-            self.multi2_generation_offset = self.multi_orchestrator.generation_offset
-            self.member_training_start_gen = self.multi_orchestrator.member_training_start_gen
-            self.multi2_parent_agent = self.multi_orchestrator.parent_agent
-            self.multi2_gens_since_improvement = self.multi_orchestrator.gens_since_improvement
-            self.multi2_best_score_for_member = self.multi_orchestrator.best_score_for_member
-            self.multi2_phase = self.multi_orchestrator.phase
+            self.member_starting_rois = self.multi_orchestrator.member_starting_rois
             self.non_maverick_members = self.multi_orchestrator.non_maverick_members
             self.maverick_members = self.multi_orchestrator.maverick_members
-            self.current_non_maverick_idx = self.multi_orchestrator.current_non_maverick_idx
-            self.current_maverick_idx = self.multi_orchestrator.current_maverick_idx
             self.non_maverick_turnovers_per_agent = self.multi_orchestrator.non_maverick_turnovers_per_agent
             self.maverick_turnovers_per_agent = self.multi_orchestrator.maverick_turnovers_per_agent
+            # NOTE: multi2_parent_agent is now a @property delegate (see top of class).
 
         # Leverage mode tracking
         self.leverage_mode_active = False
@@ -633,20 +813,8 @@ class ERLTrainer:
             breakthrough_quorum=bt_quorum,
             target_breakthroughs=bt_target,
         )
-        # Backward-compatible attribute access (delegates to tracker)
-        self.breakthrough_state = self.breakthrough_tracker.state
-        self.breakthrough_candidate = self.breakthrough_tracker.candidate
-        self.confirmed_baseline = self.breakthrough_tracker.confirmed_baseline
-        self.confirmed_breakthroughs = self.breakthrough_tracker.confirmed_breakthroughs
-        self.breakthrough_history = self.breakthrough_tracker.history
-        self.stabilization_generations_elapsed = self.breakthrough_tracker.stabilization_generations_elapsed
-        self.use_candidate_queue = self.breakthrough_tracker.use_candidate_queue
-        self.candidate_queue = self.breakthrough_tracker.candidate_queue
-        self.tested_candidate_indices = self.breakthrough_tracker.tested_candidate_indices
-        self.pending_baseline_update = self.breakthrough_tracker.pending_baseline_update
-        self.breakthrough_threshold = self.breakthrough_tracker.threshold
-        self.breakthrough_quorum = self.breakthrough_tracker.quorum
-        self.target_breakthroughs = self.breakthrough_tracker.target_breakthroughs
+        # NOTE: All breakthrough_* attributes are now @property delegates to self.breakthrough_tracker.
+        # See property definitions at top of class. No value copies needed here.
 
         # Global50 injection pool (for heroes+consistency mode)
         self.global50_injection_pool = []
