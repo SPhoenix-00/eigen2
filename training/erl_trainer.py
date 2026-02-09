@@ -73,6 +73,7 @@ from training.workers import (
     _get_cached_agent,
     SharedMemoryManager,
 )
+from training.checkpoint import CheckpointManager
 
 
 # NumpyEncoder moved to training.fitness (re-exported above)
@@ -423,6 +424,9 @@ class ERLTrainer:
         print(f"Checkpoints: {self.checkpoint_dir}")
         print(f"W&B run: {wandb.run.name} (ID: {wandb.run.id})")
 
+        # Initialize CheckpointManager for file I/O
+        self.checkpoint_manager = CheckpointManager(self.checkpoint_dir, self.cloud_sync)
+
         # Initialize Hall of Fame (now that checkpoint_dir is set)
         print("Initializing Hall of Fame (capacity: 10)...")
         self.hall_of_fame = HallOfFame(capacity=10, checkpoint_dir=self.checkpoint_dir)
@@ -747,21 +751,8 @@ class ERLTrainer:
         # log_memory("Trainer initialized (baseline)", show_objects=True)
 
     def _write_last_run_file(self):
-        """Write last_run.json to root directory for easy resume."""
-        last_run_info = {
-            'run_name': wandb.run.name,
-            'run_id': wandb.run.id,  # W&B run ID (from URL)
-            'project': 'eigen2-self',
-            'timestamp': time.time()
-        }
-
-        last_run_file = Path("last_run.json")
-        try:
-            with open(last_run_file, 'w') as f:
-                json.dump(last_run_info, f, indent=2)
-            print(f"✓ Wrote run info to {last_run_file}")
-        except Exception as e:
-            print(f"⚠ Could not write last_run.json: {e}")
+        """Write last_run.json to root directory. Delegates to CheckpointManager."""
+        self.checkpoint_manager.write_last_run_file(wandb.run.name, wandb.run.id)
 
     def _init_shared_memory(self):
         """Initialize shared memory. Delegates to SharedMemoryManager."""
@@ -4964,37 +4955,12 @@ class ERLTrainer:
                 print(f"Mutation STD:  {self.current_mutation_std:.4f}")
                 print(f"{'='*60}\n")
 
-    def save_checkpoint(self):
-        """Saves the entire training state to a checkpoint directory."""
-        checkpoint_dir = self.checkpoint_dir
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n--- Saving Checkpoint (Gen {self.generation + 1}) ---")
-
-        # 1. Save best agent
-        if self.best_agent is not None:
-            best_path = checkpoint_dir / "best_agent.pth"
-            self.best_agent.save(str(best_path))
-        
-        # 2. Save population
-        pop_dir = checkpoint_dir / "population"
-        pop_dir.mkdir(exist_ok=True)
-        for agent in self.population:
-            agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
-            agent.save(str(agent_path))
-        
-        # 3. Save the replay buffer every 5 generations (overwrites previous)
-        if (self.generation + 1) % 5 == 0:
-            buffer_path = checkpoint_dir / "replay_buffer.pkl"
-            print(f"  Saving on-disk buffer metadata ({len(self.replay_buffer)} paths)...")
-            self.replay_buffer.save(str(buffer_path))
-            # The main cloud_sync (line 1175) will now pick up this small file.
-
-        # 4. Save the trainer state
-        trainer_state = {
+    def _build_trainer_state_dict(self) -> dict:
+        """Build the complete trainer state dict for checkpoint serialization."""
+        return {
             'generation': self.generation,
-            'best_fitness': self.best_fitness,  # Best training fitness
-            'best_validation_fitness': self.best_validation_fitness,  # Best validation fitness
+            'best_fitness': self.best_fitness,
+            'best_validation_fitness': self.best_validation_fitness,
             'validation_fitness_history': self.validation_fitness_history,
             'current_mutation_rate': self.current_mutation_rate,
             'current_mutation_std': self.current_mutation_std,
@@ -5016,13 +4982,10 @@ class ERLTrainer:
                 'turnovers_completed': self.turnovers_completed,
                 'member_breakthroughs': self.member_breakthroughs,
                 'member_training_start_gen': self.member_training_start_gen,
-                # We save these to ensure continuity, though load_multi2_agents recalculates them
                 'member_baselines': self.member_baselines,
                 'member_starting_rois': getattr(self, 'member_starting_rois', []),
-                # Stuck detection state
                 'multi_gens_since_improvement': getattr(self, 'multi_gens_since_improvement', 0),
                 'multi_best_score_for_member': getattr(self, 'multi_best_score_for_member', float('-inf')),
-                # Phase tracking for maverick/non-maverick separation
                 'multi_phase': getattr(self, 'multi_phase', 'non_maverick'),
                 'non_maverick_members': getattr(self, 'non_maverick_members', []),
                 'maverick_members': getattr(self, 'maverick_members', []),
@@ -5040,7 +5003,6 @@ class ERLTrainer:
             'breakthrough_history': self.breakthrough_history,
             'stabilization_generations_elapsed': self.stabilization_generations_elapsed,
 
-            # Breakthrough candidate state (includes agent_idx, spike_score, detection_gen, etc.)
             'breakthrough_candidate': {
                 'agent_idx': self.breakthrough_candidate.agent_idx,
                 'spike_score': self.breakthrough_candidate.spike_score,
@@ -5049,18 +5011,17 @@ class ERLTrainer:
                 'gauntlet_score': self.breakthrough_candidate.gauntlet_score,
             } if self.breakthrough_candidate is not None else None,
 
-            # Heroes queue state (for consistency mode with heroes)
             'use_candidate_queue': self.use_candidate_queue,
-            'candidate_queue': self.candidate_queue,  # List of {idx, fitness, agent_id} dicts
-            'tested_candidate_indices': list(self.tested_candidate_indices),  # Convert set to list for JSON
+            'candidate_queue': self.candidate_queue,
+            'tested_candidate_indices': list(self.tested_candidate_indices),
             'pending_baseline_update': self.pending_baseline_update,
 
-            # Hall of Fame turnover tracking (for consistency mode)
+            # Hall of Fame turnover tracking
             'hof_turnover_count': self.hof_turnover_count,
             'hof_current_median': self.hof_current_median,
             'generation_at_last_turnover': self.generation_at_last_turnover,
 
-            # Configuration mode flags (for proper restoration context)
+            # Configuration mode flags
             'consistency_mode': self.consistency_mode,
             'enable_leverage': self.enable_leverage,
             'breakthrough_threshold': self.breakthrough_threshold,
@@ -5068,32 +5029,23 @@ class ERLTrainer:
             'target_breakthroughs': self.target_breakthroughs,
             'target_hof_turnovers': self.target_hof_turnovers,
 
-            # Normalization stats (to avoid recomputing on resume)
+            # Normalization stats
             'normalization_stats': {
                 'mean': self.normalization_stats['mean'].tolist(),
                 'std': self.normalization_stats['std'].tolist()
             }
         }
-        state_path = checkpoint_dir / "trainer_state.json"
-        temp_path = checkpoint_dir / "trainer_state.tmp"
-        try:
-            with open(temp_path, 'w') as f:
-                json.dump(trainer_state, f, indent=4, cls=NumpyEncoder)
-            # Atomic replace
-            temp_path.replace(state_path)
-        except Exception as e:
-            print(f"⚠ Failed to save trainer state: {e}")
 
-        # 5. Save Hall of Fame
-        if self.hall_of_fame is not None and len(self.hall_of_fame) > 0:
-            self.hall_of_fame.save()
-            hof_stats = self.hall_of_fame.get_stats()
-            print(f"  Saved Hall of Fame ({hof_stats['size']} champions)")
+    def save_checkpoint(self):
+        """Saves the entire training state. Delegates I/O to CheckpointManager."""
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n--- Saving Checkpoint (Gen {self.generation + 1}) ---")
 
-        # Sync to cloud storage in background (non-blocking)
-        self.cloud_sync.sync_checkpoints(str(checkpoint_dir), background=True,
-                                        exclude_patterns=["buffer_storage"])
-        print(f"✓ Saved & syncing to cloud")
+        self.checkpoint_manager.save_agents(self.population, self.best_agent)
+        self.checkpoint_manager.save_buffer(self.replay_buffer, self.generation)
+        self.checkpoint_manager.save_trainer_state(self._build_trainer_state_dict())
+        self.checkpoint_manager.save_hof(self.hall_of_fame)
+        self.checkpoint_manager.sync_to_cloud()
 
     def load_checkpoint(self):
         """Loads the entire training state from the checkpoint directory."""
@@ -5509,190 +5461,88 @@ class ERLTrainer:
             print("\n⚡ Skipping re-evaluation on resume (SKIP_REEVALUATION_ON_RESUME=True)")
             print("   Set to False in config.py if reward function changed")
 
+    def _build_gauntlet_snapshot_dict(self) -> dict:
+        """Build a state dict specifically for gauntlet snapshots (resets some fields)."""
+        return {
+            'generation': self.generation,
+            'best_fitness': self.best_fitness,
+            'best_validation_fitness': self.best_validation_fitness,
+            'validation_fitness_history': self.validation_fitness_history,
+            'current_mutation_rate': self.current_mutation_rate,
+            'current_mutation_std': self.current_mutation_std,
+            'plateau_detected': self.plateau_detected,
+            'leverage_mode_active': self.leverage_mode_active,
+            'leverage_generations_remaining': self.leverage_generations_remaining,
+            'roi_hurdle_ema': self.roi_hurdle_ema,
+            'gauntlet_mode_enabled': self.gauntlet_mode_enabled,
+            'breakthrough_state': BreakthroughState.NORMAL.value,  # Always restore to NORMAL
+            'confirmed_baseline': self.confirmed_baseline,
+            'confirmed_breakthroughs': self.confirmed_breakthroughs,
+            'breakthrough_history': self.breakthrough_history,
+            'stabilization_generations_elapsed': 0,  # Reset stabilization counter
+            'candidate_queue': self.candidate_queue.copy() if hasattr(self.candidate_queue, 'copy') else list(self.candidate_queue),
+            'tested_candidate_indices': list(self.tested_candidate_indices),
+            'pending_baseline_update': self.pending_baseline_update,
+            'hof_turnover_count': self.hof_turnover_count,
+            'hof_current_median': self.hof_current_median,
+            'generation_at_last_turnover': self.generation_at_last_turnover,
+        }
+
     def save_gauntlet_snapshot(self):
-        """
-        Save a snapshot of the trainer state before entering the Gauntlet.
-        Currently used for debugging and safety backup purposes.
-
-        NOTE: Snapshots are no longer used for automatic restoration on Gauntlet failure.
-        The soft penalty approach allows the population to keep evolutionary progress.
-
-        The snapshot includes:
-        - Population (all agents)
-        - Hall of Fame
-        - Trainer state (generation, fitness, mutation rates, etc.)
-
-        Note: Replay buffer is NOT saved in snapshot to save time/space.
-        """
-        try:
-            snapshot_dir = self.checkpoint_dir / "gauntlet_snapshot"
-            snapshot_dir.mkdir(parents=True, exist_ok=True)
-
-            print(f"\n📸 Saving Gauntlet Snapshot (Gen {self.generation})...")
-
-            # 1. Save population
-            pop_dir = snapshot_dir / "population"
-            pop_dir.mkdir(exist_ok=True)
-            for agent in self.population:
-                agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
-                agent.save(str(agent_path))
-
-            # 2. Save trainer state
-            trainer_state = {
-                'generation': self.generation,
-                'best_fitness': self.best_fitness,
-                'best_validation_fitness': self.best_validation_fitness,
-                'validation_fitness_history': self.validation_fitness_history,
-                'current_mutation_rate': self.current_mutation_rate,
-                'current_mutation_std': self.current_mutation_std,
-                'plateau_detected': self.plateau_detected,
-                'leverage_mode_active': self.leverage_mode_active,
-                'leverage_generations_remaining': self.leverage_generations_remaining,
-                'roi_hurdle_ema': self.roi_hurdle_ema,
-                # Gauntlet Mode state (save pre-detection state)
-                'gauntlet_mode_enabled': self.gauntlet_mode_enabled,
-                'breakthrough_state': BreakthroughState.NORMAL.value,  # Always restore to NORMAL
-                'confirmed_baseline': self.confirmed_baseline,
-                'confirmed_breakthroughs': self.confirmed_breakthroughs,
-                'breakthrough_history': self.breakthrough_history,
-                'stabilization_generations_elapsed': 0,  # Reset stabilization counter
-                # Queue-based candidate tracking (save for debugging)
-                'candidate_queue': self.candidate_queue.copy(),  # Preserve queue state
-                'tested_candidate_indices': list(self.tested_candidate_indices),  # Convert set to list for JSON
-                'pending_baseline_update': self.pending_baseline_update,
-                # Hall of Fame turnover tracking (for consistency mode)
-                'hof_turnover_count': self.hof_turnover_count,
-                'hof_current_median': self.hof_current_median,
-                'generation_at_last_turnover': self.generation_at_last_turnover,
-            }
-            state_path = snapshot_dir / "trainer_state.json"
-            with open(state_path, 'w') as f:
-                json.dump(trainer_state, f, indent=4, cls=NumpyEncoder)
-
-            # 3. Save Hall of Fame (copy the current HoF directory)
-            if self.hall_of_fame is not None and len(self.hall_of_fame) > 0:
-                # Save HoF metadata
-                hof_snapshot_path = snapshot_dir / "hall_of_fame.json"
-                import shutil
-                hof_source = self.hall_of_fame.hof_dir / "hall_of_fame.json"
-                if hof_source.exists():
-                    shutil.copy(hof_source, hof_snapshot_path)
-
-                # Copy HoF agent files
-                hof_agents_dir = snapshot_dir / "hof_agents"
-                hof_agents_dir.mkdir(exist_ok=True)
-                for entry in self.hall_of_fame.entries:
-                    agent_path = self.hall_of_fame.hof_dir / f"hof_agent_{entry.agent_id}.pth"
-                    if agent_path.exists():
-                        dest_path = hof_agents_dir / f"hof_agent_{entry.agent_id}.pth"
-                        shutil.copy(agent_path, dest_path)
-
-            print(f"✓ Snapshot saved to {snapshot_dir}")
-
-        except Exception as e:
-            print(f"⚠ FAILED TO SAVE GAUNTLET SNAPSHOT: {e}")
-            print(f"  Continuing training anyway...")
+        """Save a snapshot before entering Gauntlet. Delegates I/O to CheckpointManager."""
+        self.checkpoint_manager.save_gauntlet_snapshot(
+            population=self.population,
+            state_dict=self._build_gauntlet_snapshot_dict(),
+            hall_of_fame=self.hall_of_fame,
+            generation=self.generation,
+        )
 
     def restore_gauntlet_snapshot(self):
-        """
-        Restore the trainer state from the Gauntlet snapshot.
-
-        NOTE: This function is retained for manual debugging but is NO LONGER
-        automatically called when a Gauntlet fails. The soft penalty approach
-        allows the population to keep their evolutionary progress instead of
-        resetting to the past.
-
-        Restores:
-        - Population (all agents)
-        - Hall of Fame
-        - Trainer state (generation, fitness, mutation rates, etc.)
-        """
-        snapshot_dir = self.checkpoint_dir / "gauntlet_snapshot"
-
-        if not snapshot_dir.exists():
+        """Restore trainer state from Gauntlet snapshot. Delegates I/O to CheckpointManager."""
+        if not self.checkpoint_manager.gauntlet_snapshot_exists():
             print("⚠ No Gauntlet snapshot found - cannot restore")
             return
 
         print(f"\n🔄 RESTORING Gauntlet Snapshot (Manual Restore)...")
         print(f"{'='*60}")
-        print(f"  NOTE: This is a manual/debug restore operation")
-        print(f"  Reverting to pre-Gauntlet state")
-        print(f"{'='*60}")
 
         # 1. Restore Population
-        pop_dir = snapshot_dir / "population"
-        if pop_dir.exists():
-            try:
-                for i, agent in enumerate(self.population):
-                    agent_path = pop_dir / f"agent_{agent.agent_id}.pth"
-                    if agent_path.exists():
-                        agent.load(str(agent_path))
-                print(f"✓ Restored {len(self.population)} agents to pre-Gauntlet state")
-            except Exception as e:
-                print(f"❌ Error restoring population: {e}")
+        self.checkpoint_manager.load_gauntlet_snapshot_agents(self.population)
 
         # 2. Restore Trainer State
-        state_path = snapshot_dir / "trainer_state.json"
-        if state_path.exists():
-            try:
-                with open(state_path, 'r') as f:
-                    trainer_state = json.load(f)
+        trainer_state = self.checkpoint_manager.load_gauntlet_snapshot_state()
+        if trainer_state:
+            self.best_fitness = trainer_state.get('best_fitness', float('-inf'))
+            self.best_validation_fitness = trainer_state.get('best_validation_fitness', float('-inf'))
+            self.validation_fitness_history = trainer_state.get('validation_fitness_history', [])
+            self.current_mutation_rate = trainer_state.get('current_mutation_rate', Config.MUTATION_RATE)
+            self.current_mutation_std = trainer_state.get('current_mutation_std', Config.MUTATION_STD)
+            self.plateau_detected = trainer_state.get('plateau_detected', False)
+            self.leverage_mode_active = trainer_state.get('leverage_mode_active', False)
+            self.leverage_generations_remaining = trainer_state.get('leverage_generations_remaining', 0)
+            self.roi_hurdle_ema = trainer_state.get('roi_hurdle_ema', None)
 
-                # Restore all relevant state
-                self.best_fitness = trainer_state.get('best_fitness', float('-inf'))
-                self.best_validation_fitness = trainer_state.get('best_validation_fitness', float('-inf'))
-                self.validation_fitness_history = trainer_state.get('validation_fitness_history', [])
-                self.current_mutation_rate = trainer_state.get('current_mutation_rate', Config.MUTATION_RATE)
-                self.current_mutation_std = trainer_state.get('current_mutation_std', Config.MUTATION_STD)
-                self.plateau_detected = trainer_state.get('plateau_detected', False)
-                self.leverage_mode_active = trainer_state.get('leverage_mode_active', False)
-                self.leverage_generations_remaining = trainer_state.get('leverage_generations_remaining', 0)
-                self.roi_hurdle_ema = trainer_state.get('roi_hurdle_ema', None)
+            # Gauntlet state is always restored to NORMAL
+            self.breakthrough_state = BreakthroughState.NORMAL
+            self.breakthrough_candidate = None
+            self.stabilization_generations_elapsed = 0
 
-                # Gauntlet state is always restored to NORMAL
-                self.breakthrough_state = BreakthroughState.NORMAL
-                self.breakthrough_candidate = None
-                self.stabilization_generations_elapsed = 0
+            self.candidate_queue = trainer_state.get('candidate_queue', [])
+            self.tested_candidate_indices = set(trainer_state.get('tested_candidate_indices', []))
+            self.pending_baseline_update = trainer_state.get('pending_baseline_update', None)
 
-                # Restore queue-based candidate tracking (critical for Ghost Loop prevention)
-                self.candidate_queue = trainer_state.get('candidate_queue', [])
-                self.tested_candidate_indices = set(trainer_state.get('tested_candidate_indices', []))
-                self.pending_baseline_update = trainer_state.get('pending_baseline_update', None)
+            self.hof_turnover_count = trainer_state.get('hof_turnover_count', 0)
+            self.hof_current_median = trainer_state.get('hof_current_median', None)
+            self.generation_at_last_turnover = trainer_state.get('generation_at_last_turnover', 0)
 
-                # Restore Hall of Fame turnover tracking (for consistency mode)
-                self.hof_turnover_count = trainer_state.get('hof_turnover_count', 0)
-                self.hof_current_median = trainer_state.get('hof_current_median', None)
-                self.generation_at_last_turnover = trainer_state.get('generation_at_last_turnover', 0)
-
-                print(f"✓ Restored trainer state")
-                if self.candidate_queue:
-                    print(f"  ✓ Restored candidate queue ({len(self.candidate_queue)} candidates)")
-                    print(f"  ✓ Restored tested set ({len(self.tested_candidate_indices)} agents already tested)")
-                if self.hof_turnover_count > 0:
-                    print(f"  ✓ Restored HoF turnover tracking ({self.hof_turnover_count} turnovers)")
-            except Exception as e:
-                print(f"❌ Error restoring trainer state: {e}")
+            print(f"✓ Restored trainer state")
+            if self.candidate_queue:
+                print(f"  ✓ Restored candidate queue ({len(self.candidate_queue)} candidates)")
+            if self.hof_turnover_count > 0:
+                print(f"  ✓ Restored HoF turnover tracking ({self.hof_turnover_count} turnovers)")
 
         # 3. Restore Hall of Fame
-        hof_snapshot_path = snapshot_dir / "hall_of_fame.json"
-        hof_agents_dir = snapshot_dir / "hof_agents"
-        if hof_snapshot_path.exists() and hof_agents_dir.exists():
-            try:
-                import shutil
-                # Restore HoF metadata
-                hof_dest = self.hall_of_fame.hof_dir / "hall_of_fame.json"
-                shutil.copy(hof_snapshot_path, hof_dest)
-
-                # Restore HoF agent files
-                for agent_file in hof_agents_dir.glob("hof_agent_*.pth"):
-                    dest_path = self.hall_of_fame.hof_dir / agent_file.name
-                    shutil.copy(agent_file, dest_path)
-
-                # Reload Hall of Fame from restored files
-                self.hall_of_fame.load()
-                print(f"✓ Restored Hall of Fame ({len(self.hall_of_fame.entries)} champions)")
-            except Exception as e:
-                print(f"❌ Error restoring Hall of Fame: {e}")
+        self.checkpoint_manager.restore_gauntlet_hof(self.hall_of_fame)
 
         print(f"✓ Manual Restore Complete - Population restored to snapshot state")
         print(f"{'='*60}\n")
