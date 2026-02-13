@@ -22,15 +22,18 @@ class DDPGAgent:
     DDPG Agent with Actor-Critic networks and target networks.
     """
     
-    def __init__(self, agent_id: int = 0):
+    def __init__(self, agent_id: int = 0, device: torch.device = None):
         """
         Initialize DDPG agent.
 
         Args:
             agent_id: Unique identifier for this agent (used in population)
+            device: Device to create networks on. Defaults to Config.DEVICE (GPU if available).
+                    Pass torch.device('cpu') to create on CPU (e.g. for injection/cloning
+                    where GPU allocation would leak VRAM).
         """
         self.agent_id = agent_id
-        self.device = Config.DEVICE
+        self.device = device if device is not None else Config.DEVICE
         self.is_elite = False  # Track if this agent is an elite (for replay buffer diversity)
         
         # Actor networks
@@ -381,7 +384,9 @@ class DDPGAgent:
     
     def clone(self) -> 'DDPGAgent':
         """Create a deep copy of this agent with independent parameter tensors."""
-        new_agent = DDPGAgent(agent_id=self.agent_id)
+        # Clone onto same device as source to avoid unnecessary GPU allocations.
+        # During injection, source is on CPU so clone stays on CPU too.
+        new_agent = DDPGAgent(agent_id=self.agent_id, device=self.device)
         target_device = new_agent.device
 
         # Load from explicitly cloned state dict so parameters never share storage with source.

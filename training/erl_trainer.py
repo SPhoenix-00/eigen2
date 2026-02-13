@@ -2616,12 +2616,6 @@ class ERLTrainer:
             print(f"Buffer not ready: {len(self.replay_buffer)} / {min_size}")
             return
 
-        # After Global 50 injection, reset batch iterator so training doesn't stall on a stale iterator.
-        if getattr(self, '_global50_injected_this_generation', False) and self.local_mode:
-            self.batch_iterator = None
-            self._global50_injected_this_generation = False
-            print("  [Training] Reset batch iterator after Global 50 injection (fresh data stream)")
-
         # Initialize batch iterator if not already created
         if self.batch_iterator is None:
             print("Starting DataLoader workers for async batch prefetching...")
@@ -2697,6 +2691,7 @@ class ERLTrainer:
             # - Fewer gradient steps (8 vs 32)
             # - Accumulation steps set via Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
             local_accumulation_steps = Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
+            profile_local_train = os.environ.get("EIGEN_PROFILE_LOCAL_TRAIN", "0") == "1"
             print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {gradient_steps} steps/agent (batch_size={Config.LOCAL_BATCH_SIZE}, accum={local_accumulation_steps})")
 
             # Train agents in this batch by PRE-FETCHING data once for all agents
@@ -2706,10 +2701,19 @@ class ERLTrainer:
                     batch_start = batch_idx * LOCAL_TRAINING_BATCH_SIZE
                     batch_end = min(batch_start + LOCAL_TRAINING_BATCH_SIZE, len(self.population))
                     batch_agents = self.population[batch_start:batch_end]
+                    batch_wall_start = time.time()
+                    t_move_in = 0.0
+                    t_data_load = 0.0
+                    t_data_transfer = 0.0
+                    t_compute = 0.0
+                    t_move_out = 0.0
+                    total_updates = 0
 
                     # Move batch of agents to GPU (with optimizer recreation)
+                    t0 = time.time()
                     for agent in batch_agents:
                         agent.move_to_device(Config.DEVICE, recreate_optimizers=True)
+                    t_move_in += (time.time() - t0)
 
                     actor_losses_batch = []
                     critic_losses_batch = []
@@ -2719,14 +2723,22 @@ class ERLTrainer:
                     for step in range(gradient_steps):
                         for accum_step in range(local_accumulation_steps):
                             # Use DataLoader iterator (has async prefetching)
+                            t0 = time.time()
                             batch_cpu = next(self.batch_iterator)
+                            t1 = time.time()
                             batch = {k: v.to(Config.DEVICE, non_blocking=True) for k, v in batch_cpu.items()}
+                            t2 = time.time()
+                            t_data_load += (t1 - t0)
+                            t_data_transfer += (t2 - t1)
 
                             is_last_accum = (accum_step == local_accumulation_steps - 1)
                             
                             # Train all agents on this shared batch
                             for agent in batch_agents:
+                                t3 = time.time()
                                 critic_loss, actor_loss = agent.update(batch, accumulate=not is_last_accum)
+                                t_compute += (time.time() - t3)
+                                total_updates += 1
 
                                 if agent.agent_id == 0:
                                     attention_weights = agent.actor.get_attention_weights()
@@ -2750,10 +2762,21 @@ class ERLTrainer:
                     del critic_losses_batch
                 
                     # Move batch of agents back to CPU (with optimizer recreation to free GPU memory)
+                    t0 = time.time()
                     for agent in batch_agents:
                         agent.move_to_device(cpu_device, recreate_optimizers=True)
+                    t_move_out += (time.time() - t0)
 
                     torch.cuda.empty_cache()
+                    batch_wall = time.time() - batch_wall_start
+                    if profile_local_train:
+                        updates_per_sec = (total_updates / t_compute) if t_compute > 0 else 0.0
+                        print(
+                            f"  [TrainTiming][Batch {batch_idx + 1}/{num_batches}] "
+                            f"wall={batch_wall:.1f}s move_in={t_move_in:.1f}s load={t_data_load:.1f}s "
+                            f"transfer={t_data_transfer:.1f}s compute={t_compute:.1f}s move_out={t_move_out:.1f}s "
+                            f"updates={total_updates} upd/s={updates_per_sec:.2f}"
+                        )
                     
                     # Update progress bar by number of agents processed
                     pbar.update(len(batch_agents))
@@ -5062,9 +5085,6 @@ class ERLTrainer:
                     torch.cuda.empty_cache()
 
                 print(f"  ✓ Injected {injected_count} agents into slots {replaced_slots} (mutation rate: {mutation_rate:.2f})")
-                # Reset training batch iterator so next train_population() uses a fresh iterator.
-                # Reusing the same iterator after injection can cause training to stall (blocked on next()).
-                self._global50_injected_this_generation = True
             else:
                 print(f"  ⚠ Global 50 injection skipped (failed to load agents)")
         else:

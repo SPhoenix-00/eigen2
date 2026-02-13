@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import threading
+import torch
 import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
@@ -561,18 +562,16 @@ class GlobalHallOfFame:
                 # List all directories under eigen2/global50/
                 prefix = f"{self.cloud_sync.project_name}/global50/"
                 blobs = self.cloud_sync.bucket.list_blobs(prefix=prefix, delimiter='/')
-
-                # Extract context window IDs from directory names (use .prefixes on iterator, not .pages)
-                for prefix_path in (blobs.prefixes or []):
-                    # prefix_path looks like "eigen2/global50/cw151/" or "eigen2/global50/cw504/"
-                    dir_name = prefix_path.rstrip('/').split('/')[-1]
-                    if dir_name.startswith('cw'):
-                        try:
-                            window_days = int(dir_name[2:])  # Extract number from "cw504"
-                            if window_days != self.league_rules.context_window_days:
-                                available_windows.append(window_days)
-                        except ValueError:
-                            pass  # Skip if not a valid number
+                for page in blobs.pages:
+                    for prefix_path in page.prefixes:
+                        dir_name = prefix_path.rstrip('/').split('/')[-1]
+                        if dir_name.startswith('cw'):
+                            try:
+                                window_days = int(dir_name[2:])
+                                if window_days != self.league_rules.context_window_days:
+                                    available_windows.append(window_days)
+                            except ValueError:
+                                pass
 
                 print(f"  Found {len(available_windows)} context window leagues in bucket: {sorted(available_windows)}")
             except Exception as e:
@@ -1262,9 +1261,12 @@ class GlobalHallOfFame:
                         print(f"  ⚠ Failed to download Global 50 agent: {filename}")
                         continue
 
-                # Load agent (weights only: fresh optimizers avoid slowdown from stale momentum/memory layout)
+                # Load agent on CPU (weights only: fresh optimizers avoid slowdown from stale momentum)
+                # CRITICAL: Create on CPU to prevent GPU memory leak during injection.
+                # Each agent + its clone in mutate() would allocate 8 networks on GPU.
+                # With 10 agents that's ~2.7 GB of leaked VRAM, starving training.
                 try:
-                    agent = DDPGAgent(agent_id=-1)  # Temporary ID, will be reassigned
+                    agent = DDPGAgent(agent_id=-1, device=torch.device('cpu'))
                     agent.load_weights_only(str(local_agent_path))
                     agents.append(agent)
                 except Exception as e:

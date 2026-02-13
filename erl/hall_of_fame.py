@@ -368,8 +368,11 @@ class HallOfFame:
         for entry in sampled_entries:
             agent_path = self.hof_dir / f"hof_agent_{entry.agent_id}.pth"
             if agent_path.exists():
-                # Create new agent with fresh optimizers
-                agent = DDPGAgent(agent_id=entry.agent_id)
+                # Create new agent on CPU with fresh optimizers to avoid GPU memory leak.
+                # These agents will be cloned/mutated before being placed in the population,
+                # and the population is moved to GPU in batches during training.
+                import torch
+                agent = DDPGAgent(agent_id=entry.agent_id, device=torch.device('cpu'))
                 # Load only network weights, not optimizer states
                 agent.load_weights_only(str(agent_path))
                 agents.append(agent)

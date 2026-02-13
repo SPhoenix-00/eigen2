@@ -1015,6 +1015,19 @@ class OnDiskReplayBuffer(IterableDataset):
                 new_buffer.total_transitions = len(new_buffer.buffer) * chunk_size
                 print(f"  ⚠️ Old checkpoint format - estimated {new_buffer.total_transitions} transitions from {len(new_buffer.buffer)} chunks")
 
+            # Remove stale paths that no longer exist on disk.
+            # Stale entries can make iterator refills repeatedly fail and appear "stuck".
+            if len(new_buffer.buffer) > 0:
+                existing_paths = [p for p in new_buffer.buffer if Path(p).exists()]
+                missing_count = len(new_buffer.buffer) - len(existing_paths)
+                if missing_count > 0:
+                    from collections import deque
+                    new_buffer.buffer = deque(existing_paths, maxlen=new_buffer.capacity)
+                    estimated_removed = missing_count * chunk_size
+                    new_buffer.total_transitions = max(0, new_buffer.total_transitions - estimated_removed)
+                    print(f"  ⚠️ Removed {missing_count} missing chunk paths from buffer metadata")
+                    print(f"     Adjusted transition count to ~{new_buffer.total_transitions}")
+
             print(f"  ✓ Buffer metadata loaded ({len(new_buffer.buffer)} chunks, {new_buffer.total_transitions} transitions).")
             
             # Verify that the files and storage path still exist

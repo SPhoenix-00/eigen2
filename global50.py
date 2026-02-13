@@ -1093,7 +1093,6 @@ class AgentEvaluator:
             if self.cloud_sync.provider == "gcs":
                 # List all blobs under global50/
                 blobs = self.cloud_sync.bucket.list_blobs(prefix=cloud_global50_prefix, delimiter='/')
-                # Get prefixes (subdirectories)
                 for prefix in blobs.prefixes:
                     # prefix looks like "eigen2/global50/cw151/"
                     cw_id = prefix.rstrip('/').split('/')[-1]
