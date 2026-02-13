@@ -562,18 +562,17 @@ class GlobalHallOfFame:
                 prefix = f"{self.cloud_sync.project_name}/global50/"
                 blobs = self.cloud_sync.bucket.list_blobs(prefix=prefix, delimiter='/')
 
-                # Extract context window IDs from directory names
-                for page in blobs.pages:
-                    for prefix_path in page.prefixes:
-                        # Extract directory name (e.g., "cw504" from "eigen2/global50/cw504/")
-                        dir_name = prefix_path.rstrip('/').split('/')[-1]
-                        if dir_name.startswith('cw'):
-                            try:
-                                window_days = int(dir_name[2:])  # Extract number from "cw504"
-                                if window_days != self.league_rules.context_window_days:
-                                    available_windows.append(window_days)
-                            except ValueError:
-                                pass  # Skip if not a valid number
+                # Extract context window IDs from directory names (use .prefixes on iterator, not .pages)
+                for prefix_path in (blobs.prefixes or []):
+                    # prefix_path looks like "eigen2/global50/cw151/" or "eigen2/global50/cw504/"
+                    dir_name = prefix_path.rstrip('/').split('/')[-1]
+                    if dir_name.startswith('cw'):
+                        try:
+                            window_days = int(dir_name[2:])  # Extract number from "cw504"
+                            if window_days != self.league_rules.context_window_days:
+                                available_windows.append(window_days)
+                        except ValueError:
+                            pass  # Skip if not a valid number
 
                 print(f"  Found {len(available_windows)} context window leagues in bucket: {sorted(available_windows)}")
             except Exception as e:

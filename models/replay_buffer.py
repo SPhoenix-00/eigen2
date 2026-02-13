@@ -811,8 +811,9 @@ class OnDiskReplayBuffer(IterableDataset):
 
         local_cache = []
 
-        # Track Consecutive Failures
+        # Track Consecutive Failures (cap to avoid infinite stall when all refills fail)
         consecutive_failures = 0
+        MAX_CONSECUTIVE_REFILL_FAILURES = 200
 
         while True:
             # 1. REFILL PHASE
@@ -866,6 +867,11 @@ class OnDiskReplayBuffer(IterableDataset):
                         consecutive_failures = 0
                     else:
                         consecutive_failures += 1
+                        if consecutive_failures >= MAX_CONSECUTIVE_REFILL_FAILURES:
+                            raise RuntimeError(
+                                f"Replay buffer iterator: {consecutive_failures} consecutive refill failures. "
+                                "Buffer files may be missing or unreadable. Check buffer_storage directory."
+                            )
                         if consecutive_failures % 10 == 0:
                             print(f"Warning: Buffer refill failed {consecutive_failures} times in a row. Buffer size: {len(self.buffer)}")
                         time_module.sleep(0.1)
@@ -901,7 +907,7 @@ class OnDiskReplayBuffer(IterableDataset):
                     continue
             else:
                 # Buffer is empty or waiting for data
-                time.sleep(0.1)
+                time_module.sleep(0.1)
 
     def __len__(self) -> int:
         """Return actual transition count (not chunk count)."""

@@ -49,6 +49,7 @@ from training.fitness import (
     calculate_holographic_fitness as _calculate_holographic_fitness,
     calculate_pessimistic_fitness,
     calculate_penalized_median_fitness,
+    calculate_recency_weighted_fitness,
     aggregate_agent_stats,
     aggregate_population_stats,
     calculate_expectancy as _calculate_expectancy,
@@ -318,6 +319,7 @@ class ERLTrainer:
         self.maverick_mode = maverick_mode  # Maverick training mode (aggressive reward functions)
         self.local_mode = local_mode  # Local mode: sequential execution and serialized disk writes
         self.force_maverick = force_maverick  # Skip non-maverick phase (DEBUG mode)
+        self.recency_anchor = False  # Set True by --multi orchestrator to pin last episode to most recent data
 
         # Multi-agent committee mode (state encapsulated in MultiAgentOrchestrator)
         self.multi2_mode = multi2_mode
@@ -467,9 +469,7 @@ class ERLTrainer:
                         )
 
                     self.run_name = self.resume_run_name  # Use the provided name
-
-                    # Update last_run.json with the resumed run info
-                    self.checkpoint_manager.write_last_run_file(wandb.run.name, wandb.run.id)
+                    # NOTE: last_run.json is written below, after CheckpointManager is created
 
                     # Suppress W&B step order warnings when resuming
                     # (W&B's internal step counter may be ahead of our resume point)
@@ -591,9 +591,7 @@ class ERLTrainer:
                     self.run_name = wandb.run.name
                     self.checkpoint_dir = Config.CHECKPOINT_DIR / self.run_name
                     self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Write last_run.json for easy resume
-                    self.checkpoint_manager.write_last_run_file(wandb.run.name, wandb.run.id)
+                    # NOTE: last_run.json is written below, after CheckpointManager is created
             else:
                 print("--- W&B run already active (sweep_runner.py mode) ---")
                 # Create run-specific checkpoint directory using wandb run name
@@ -610,6 +608,9 @@ class ERLTrainer:
 
         # Initialize CheckpointManager for file I/O
         self.checkpoint_manager = CheckpointManager(self.checkpoint_dir, self.cloud_sync)
+
+        # Write last_run.json for easy resume (must come after CheckpointManager init)
+        self.checkpoint_manager.write_last_run_file(wandb.run.name, wandb.run.id)
 
         # Initialize Hall of Fame (now that checkpoint_dir is set)
         print("Initializing Hall of Fame (capacity: 10)...")
@@ -2202,6 +2203,8 @@ class ERLTrainer:
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
+        if self.recency_anchor:
+            print(f"Recency anchor: last episode pinned to most recent data, weight={Config.MULTI_RECENCY_WEIGHT:.0%}")
 
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
@@ -2221,7 +2224,7 @@ class ERLTrainer:
             # NEW: Collector for Holographic Scoring (Mavericks only)
             all_slices_closed_trades = []
 
-            for _ in range(num_episodes):
+            for ep_idx in range(num_episodes):
                 # Calculate episode indices - SAMPLE FROM TRAINING DATA ONLY
                 # Training episodes must not touch validation set
                 # Need: context (504) + trading (125) + settlement (30) = 659 days total
@@ -2231,8 +2234,12 @@ class ERLTrainer:
                 if max_start <= self.train_start_idx:
                     raise ValueError(f"Not enough training data: need {total_days_needed} days")
 
-                # Random start from training range only (excludes validation set)
-                start_idx = np.random.randint(self.train_start_idx, max_start)
+                # Recency anchor: pin the LAST episode to the most recent training data
+                if self.recency_anchor and ep_idx == num_episodes - 1:
+                    start_idx = max_start
+                else:
+                    # Random start from training range only (excludes validation set)
+                    start_idx = np.random.randint(self.train_start_idx, max_start)
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
 
                 # Run episode using persistent eval_env (CRITICAL FIX: prevents memory leak)
@@ -2260,7 +2267,16 @@ class ERLTrainer:
             if self.maverick_mode:
                 # USE HOLOGRAPHIC FITNESS FOR MAVERICKS
                 # This weaves the slices together into one "career"
+                # (Recency anchor still pins the last episode, but holographic merges all trades)
                 final_fitness = self.calculate_holographic_fitness(all_slices_closed_trades)
+            elif self.recency_anchor and len(slice_fitness_scores) >= 2:
+                # Recency-weighted: separate the pinned last score from the random base scores
+                recency_score = slice_fitness_scores[-1]
+                base_scores = slice_fitness_scores[:-1]
+                aggregator = "penalized_median" if self.multi2_mode else "pessimistic"
+                final_fitness = calculate_recency_weighted_fitness(
+                    base_scores, recency_score, Config.MULTI_RECENCY_WEIGHT, aggregator
+                )
             elif self.multi2_mode:
                 final_fitness = calculate_penalized_median_fitness(slice_fitness_scores)
             else:
@@ -2312,6 +2328,8 @@ class ERLTrainer:
 
         print(f"\n--- Generation {self.generation + 1}: Evaluating Population (Parallel) ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
+        if self.recency_anchor:
+            print(f"Recency anchor: last episode pinned to most recent data, weight={Config.MULTI_RECENCY_WEIGHT:.0%}")
 
         # Count elite vs exploratory agents for logging
         num_elites = sum(1 for a in self.population if a.is_elite)
@@ -2341,10 +2359,15 @@ class ERLTrainer:
             }
 
             for slice_idx in range(num_episodes):  # num_episodes slices per agent
-                # Calculate random start indices
+                # Calculate start indices
                 total_days_needed = Config.CONTEXT_WINDOW_DAYS + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
                 max_start = self.train_end_idx - total_days_needed
-                start_idx = np.random.randint(self.train_start_idx, max_start)
+
+                # Recency anchor: pin the LAST episode to the most recent training data
+                if self.recency_anchor and slice_idx == num_episodes - 1:
+                    start_idx = max_start
+                else:
+                    start_idx = np.random.randint(self.train_start_idx, max_start)
                 end_idx = start_idx + Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
 
                 # Create unique seed for this task for reproducibility
@@ -2397,6 +2420,7 @@ class ERLTrainer:
             for future in as_completed(futures):
                 task_idx = futures[future]
                 agent_idx = task_idx // num_episodes  # Each agent has num_episodes slices
+                slice_idx = task_idx % num_episodes   # Which episode within the agent
 
                 try:
                     # raw_fitness is the sum of rewards from env (good for RL, bad for Evolution)
@@ -2405,8 +2429,8 @@ class ERLTrainer:
                     # Calculate Structural Fitness for Evolution
                     triad_fitness = self.calculate_triad_fitness(episode_info)
 
-                    # Store triad_fitness instead of raw_fitness
-                    fitness_by_agent[agent_idx].append((triad_fitness, episode_info))
+                    # Store triad_fitness, episode_info, and slice_idx (needed for recency anchor)
+                    fitness_by_agent[agent_idx].append((triad_fitness, episode_info, slice_idx))
 
                     # Collect transition file paths from exploratory agents
                     if transition_file_paths:
@@ -2420,7 +2444,7 @@ class ERLTrainer:
                     # Use penalty fitness for failed episodes
                     fitness_by_agent[agent_idx].append((-10000.0, {
                         'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
-                    }))
+                    }, slice_idx))
                     completed_tasks += 1
                 except Exception as e:
                     print(f"\n⚠ Worker EXCEPTION for agent {agent_idx} task {task_idx} (task {completed_tasks+1}/{len(tasks)}): {e}")
@@ -2431,7 +2455,7 @@ class ERLTrainer:
                     # Use penalty fitness for failed episodes
                     fitness_by_agent[agent_idx].append((-10000.0, {
                         'num_trades': 0, 'num_wins': 0, 'num_losses': 0, 'win_rate': 0.0
-                    }))
+                    }, slice_idx))
                     completed_tasks += 1
 
                 # Update progress bar when an agent completes all its slices
@@ -2445,20 +2469,41 @@ class ERLTrainer:
             fitness_scores = []
             all_episode_stats = []
 
+            recency_ep = num_episodes - 1  # Index of the recency-anchored episode
+
             for agent_slices in fitness_by_agent:
-                slice_fitness = [f for f, _ in agent_slices]
-                slice_stats = [info for _, info in agent_slices]
+                slice_fitness = [f for f, _, _s in agent_slices]
+                slice_stats = [info for _, info, _s in agent_slices]
 
                 # --- SCORING SELECTION ---
                 if self.maverick_mode:
                     # USE HOLOGRAPHIC FITNESS FOR MAVERICKS
                     # Collect all closed trades from all slices for this agent
+                    # (Recency anchor still pins the last episode, but holographic merges all trades)
                     all_slices_closed_trades = []
                     for episode_info in slice_stats:
                         if 'closed_trades' in episode_info and episode_info['closed_trades']:
                             all_slices_closed_trades.extend(episode_info['closed_trades'])
                     # This weaves the slices together into one "career"
                     final_fitness = self.calculate_holographic_fitness(all_slices_closed_trades)
+                elif self.recency_anchor and len(agent_slices) >= 2:
+                    # Recency-weighted: separate the pinned last score from the random base scores
+                    # Results arrive out of order, so identify recency by slice_idx
+                    recency_score = None
+                    base_scores = []
+                    for f, _info, s_idx in agent_slices:
+                        if s_idx == recency_ep:
+                            recency_score = f
+                        else:
+                            base_scores.append(f)
+                    # Fallback: if recency episode not found (shouldn't happen), use last element
+                    if recency_score is None:
+                        recency_score = slice_fitness[-1]
+                        base_scores = slice_fitness[:-1]
+                    aggregator = "penalized_median" if self.multi2_mode else "pessimistic"
+                    final_fitness = calculate_recency_weighted_fitness(
+                        base_scores, recency_score, Config.MULTI_RECENCY_WEIGHT, aggregator
+                    )
                 elif self.multi2_mode:
                     final_fitness = calculate_penalized_median_fitness(slice_fitness)
                 else:
@@ -2570,6 +2615,12 @@ class ERLTrainer:
             min_size = Config.get_min_buffer_size(local_mode=self.local_mode, is_sweep=is_sweep)
             print(f"Buffer not ready: {len(self.replay_buffer)} / {min_size}")
             return
+
+        # After Global 50 injection, reset batch iterator so training doesn't stall on a stale iterator.
+        if getattr(self, '_global50_injected_this_generation', False) and self.local_mode:
+            self.batch_iterator = None
+            self._global50_injected_this_generation = False
+            print("  [Training] Reset batch iterator after Global 50 injection (fresh data stream)")
 
         # Initialize batch iterator if not already created
         if self.batch_iterator is None:
@@ -5011,6 +5062,9 @@ class ERLTrainer:
                     torch.cuda.empty_cache()
 
                 print(f"  ✓ Injected {injected_count} agents into slots {replaced_slots} (mutation rate: {mutation_rate:.2f})")
+                # Reset training batch iterator so next train_population() uses a fresh iterator.
+                # Reusing the same iterator after injection can cause training to stall (blocked on next()).
+                self._global50_injected_this_generation = True
             else:
                 print(f"  ⚠ Global 50 injection skipped (failed to load agents)")
         else:
