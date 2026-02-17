@@ -137,7 +137,8 @@ def evaluate_committee_on_slice(members: list, loader, stats,
 
 def run_validation(manager, loader, stats, holdout_info,
                    context_window_days: int, members_override: list = None,
-                   conviction_percentile: int = None, skip_exports: bool = False) -> dict:
+                   conviction_percentile: int = None, skip_exports: bool = False,
+                   quiet: bool = False) -> dict:
     """
     Run 5-slice validation on the committee: 3 slices on validation data, 2 slices on holdout data.
 
@@ -150,12 +151,14 @@ def run_validation(manager, loader, stats, holdout_info,
         members_override: Optional pre-computed members list (for A/B testing)
         conviction_percentile: Optional percentile override (recalculates thresholds if provided)
         skip_exports: If True, skip CSV/XLSX export and cloud upload
+        quiet: If True, skip header and detailed results printing (for batch/swap use)
 
     Returns validation results dict with comprehensive metrics.
     """
-    print("\n" + "="*60)
-    print("PHASE 2: VALIDATION (3 Val Slices + 2 Holdout Slices)")
-    print("="*60)
+    if not quiet:
+        print("\n" + "="*60)
+        print("PHASE 2: VALIDATION (3 Val Slices + 2 Holdout Slices)")
+        print("="*60)
 
     roster = manager.load_roster()
     if roster is None:
@@ -188,12 +191,13 @@ def run_validation(manager, loader, stats, holdout_info,
     val_days = val_end_idx - val_start_idx + 1
     holdout_days = holdout_end_idx - holdout_start_idx + 1
 
-    print(f"\n  Episode length: {episode_length} days ({Config.TRADING_PERIOD_DAYS} trading + {Config.SETTLEMENT_PERIOD_DAYS} settlement)")
-    print(f"  Validation range: indices {val_start_idx} to {val_end_idx} ({val_days} days)")
-    print(f"    → 3 episodes of {episode_length} days each")
-    print(f"  Holdout range: indices {holdout_start_idx} to {holdout_end_idx} ({holdout_days} days)")
-    print(f"    → 2 episodes of {episode_length} days each")
-    print(f"  Total slices: {num_slices}")
+    if not quiet:
+        print(f"\n  Episode length: {episode_length} days ({Config.TRADING_PERIOD_DAYS} trading + {Config.SETTLEMENT_PERIOD_DAYS} settlement)")
+        print(f"  Validation range: indices {val_start_idx} to {val_end_idx} ({val_days} days)")
+        print(f"    → 3 episodes of {episode_length} days each")
+        print(f"  Holdout range: indices {holdout_start_idx} to {holdout_end_idx} ({holdout_days} days)")
+        print(f"    → 2 episodes of {episode_length} days each")
+        print(f"  Total slices: {num_slices}")
 
     results = {
         'individual_agents': [],
@@ -214,9 +218,10 @@ def run_validation(manager, loader, stats, holdout_info,
     }
 
     # Validate individual agents on each slice
-    print(f"\nValidating {len(members)} individual agents...")
+    if not quiet:
+        print(f"\nValidating {len(members)} individual agents...")
 
-    for member in tqdm(members, desc="Agents"):
+    for member in tqdm(members, desc="Agents", disable=quiet):
         entry = member
         filepath = get_agent_filepath(entry, context_window_days)
 
@@ -270,7 +275,8 @@ def run_validation(manager, loader, stats, holdout_info,
         results['individual_agents'].append(agent_results)
 
     # Validate committee consensus on each slice
-    print(f"\nValidating committee consensus...")
+    if not quiet:
+        print(f"\nValidating committee consensus...")
 
     all_committee_closed_trades = []
 
@@ -328,7 +334,8 @@ def run_validation(manager, loader, stats, holdout_info,
     results['consensus_summary'] = aggregate_consensus_stats(all_consensus_stats)
 
     # Print comprehensive results
-    _print_validation_results(results)
+    if not quiet:
+        _print_validation_results(results)
 
     return results
 

@@ -567,11 +567,27 @@ class AgentEvaluator:
             # Check if qualifies for Global 50 (now includes CV as 4th criterion)
             if self.global_hof.should_promote(gauntlet_score, metrics['roi'], metrics['expectancy'], metrics['cv'], is_maverick=is_maverick):
                 result['qualified'] = True
+                result['is_maverick'] = is_maverick
+                # Store thresholds that were in effect (for --agent-dir recap)
+                if is_maverick and self.global_hof.maverick_count > 0:
+                    result['thresholds'] = {
+                        'gauntlet': self.global_hof.maverick_entry_threshold,
+                        'roi': self.global_hof.maverick_roi_threshold,
+                        'expectancy': self.global_hof.maverick_expectancy_threshold,
+                        'cv': self.global_hof.maverick_cv_threshold,
+                    }
+                else:
+                    result['thresholds'] = {
+                        'gauntlet': self.global_hof.entry_threshold,
+                        'roi': self.global_hof.roi_threshold,
+                        'expectancy': self.global_hof.expectancy_threshold,
+                        'cv': self.global_hof.cv_threshold,
+                    }
                 print(f"\n   Agent QUALIFIES for Global 50!")
-                print(f"   Gauntlet Threshold: {self.global_hof.entry_threshold:.2f}")
-                print(f"   ROI Threshold: {self.global_hof.roi_threshold:.2f}%")
-                print(f"   Expectancy Threshold: {self.global_hof.expectancy_threshold:.4f}")
-                print(f"   CV Threshold: {self.global_hof.cv_threshold:.3f} (max allowed)")
+                print(f"   Gauntlet Threshold: {result['thresholds']['gauntlet']:.2f}")
+                print(f"   ROI Threshold: {result['thresholds']['roi']:.2f}%")
+                print(f"   Expectancy Threshold: {result['thresholds']['expectancy']:.4f}")
+                print(f"   CV Threshold: {result['thresholds']['cv']:.3f} (max allowed)")
                 print(f"   Attempting promotion...")
 
                 # Attempt promotion
@@ -4235,9 +4251,10 @@ class AgentEvaluator:
         print("EVALUATION SUMMARY")
         print("="*70)
 
+        results = [r for r in results if r is not None]
         total = len(results)
-        successful = sum(1 for r in results if r['success'])
-        promoted = sum(1 for r in results if r['promoted'])
+        successful = sum(1 for r in results if r.get('success'))
+        promoted = sum(1 for r in results if r.get('promoted'))
         failed = total - successful
 
         print(f"\nTotal Agents:      {total:>10}")
@@ -4249,10 +4266,29 @@ class AgentEvaluator:
             print(f"\nPromoted Agents (efficiency-adjusted gauntlet scores):")
             print("-" * 70)
             for r in results:
-                if r['promoted']:
+                if r.get('promoted'):
                     maverick_tag = " [M]" if r.get('is_maverick', False) else ""
-                    trades = r.get('total_trades', r.get('metrics', {}).get('total_trades', 0))
+                    trades = r.get('total_trades', (r.get('metrics') or {}).get('total_trades', 0))
                     print(f"  {r['agent_name']:.<50} {r['gauntlet_score']:>10.2f}  Trades: {trades:>6}{maverick_tag}")
+
+            # Recap: promoted agents with stats and thresholds they overcame
+            promoted_with_thresholds = [r for r in results if r.get('promoted') and r.get('thresholds')]
+            if promoted_with_thresholds:
+                print(f"\n{'='*70}")
+                print("PROMOTION RECAP (stats and thresholds overcome)")
+                print("="*70)
+                for r in promoted_with_thresholds:
+                    maverick_tag = " [Maverick]" if r.get('is_maverick', False) else ""
+                    th = r['thresholds']
+                    g = r.get('gauntlet_score')
+                    roi = r.get('roi')
+                    exp = r.get('expectancy')
+                    cv = r.get('cv')
+                    trades = r.get('total_trades', (r.get('metrics') or {}).get('total_trades', 0))
+                    print(f"\n  {r['agent_name']}{maverick_tag}")
+                    print(f"    Stats:     Gauntlet={g:.2f}  ROI={roi:.2f}%  Expectancy={exp:.2f}  CV={cv:.3f}  Trades={trades}")
+                    print(f"    Thresholds overcome: Gauntlet > {th['gauntlet']:.2f}  ROI > {th['roi']:.2f}%  Expectancy > {th['expectancy']:.4f}  CV < {th['cv']:.3f}")
+                print("="*70)
 
         if self.global_hof.enabled:
             stats = self.global_hof.get_stats()

@@ -268,7 +268,7 @@ class Config:
     COMMITTEE_EARLY_STOP = 5  # Stop expanding pool after N consecutive non-improvements
     COMMITTEE_CORRELATION_EXPONENT = 2  # Exponent for correlation penalty: (1 - avg_corr^exp)
     COMMITTEE_VALIDATION_SLICES = 5  # Number of holdout slices for validation
-    COMMITTEE_QUORUM = 3  # Number of committee members required to agree for a trade
+    COMMITTEE_QUORUM = 4  # Number of committee members required to agree for a trade
     COMMITTEE_VETO_COUNT = 5  # Number of silent members needed to veto a trade
     COMMITTEE_VETO_THRESHOLD = 0.75  # Coefficient threshold below which a member is considered "silent" for veto purposes
 

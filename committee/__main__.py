@@ -23,6 +23,7 @@ from committee.utils import (
     parse_date_input, parse_date_flexible, find_date_index,
     calculate_expectancy, format_quality_ratio,
     build_member_data, build_metrics_result, enrich_closed_trades,
+    generate_validation_slices,
 )
 from committee.manager import CommitteeManager
 from committee.agent import (
@@ -36,18 +37,23 @@ from committee.optimization import (
 from committee.validation import (
     run_validation, run_validation_sweep,
     run_quorum_sweep, run_conviction_sweep, run_combined_sweep,
-    evaluate_committee_on_slice,
+    evaluate_committee_on_slice, evaluate_agent_on_slice,
 )
 
 
 # --- Phase 1: Draft Day ---
 
-def run_draft(manager, loader, stats, holdout_info, deep=False, require_maverick=False):
+def run_draft(manager, loader, stats, holdout_info, deep=False, exhaustive=False, require_maverick=False):
     """
     Phase 1: Select committee from Global50 using coefficient correlation optimization.
 
     IMPORTANT: Correlation is calculated on VALIDATION data (not holdout) to prevent
     data leakage. The holdout period remains unseen until Phase 2 validation.
+
+    Args:
+        deep: If True, use automatic correlation refinement + slice improvement (top N candidates).
+        exhaustive: If True, slice improvement tests ALL Global50 candidates (--draft-deep2).
+        require_maverick: Force exactly one maverick in committee.
     """
     print("\n" + "="*60)
     print("PHASE 1: DRAFT DAY (Global50 Selection)")
@@ -95,7 +101,8 @@ def run_draft(manager, loader, stats, holdout_info, deep=False, require_maverick
     )
 
     # 4. Optimize committee selection
-    result = optimize_committee(entries, corr_matrix, require_maverick=should_enforce_maverick)
+    result = optimize_committee(entries, corr_matrix, require_maverick=should_enforce_maverick,
+                                exhaustive=exhaustive)
 
     if result is None:
         print("❌ Optimization failed")
@@ -157,6 +164,55 @@ def run_draft(manager, loader, stats, holdout_info, deep=False, require_maverick
         else:
             print(f"  ⚠ {e['run_name']}_{e['agent_id']}: No coefficient data available")
 
+    # Phase 1c: Slice-based improvement (deep mode only)
+    if deep and len(members_with_stats) == len(committee_indices):
+        slice_top_n = None if exhaustive else 5
+        improved_members, improved_indices = run_slice_improvement_pass(
+            members_with_stats, entries, coefficients, valid_indices,
+            corr_matrix, list(committee_indices), loader, stats,
+            holdout_info, context_window_days,
+            require_maverick=should_enforce_maverick,
+            top_n_candidates=slice_top_n,
+        )
+
+        if improved_indices != list(committee_indices):
+            members_with_stats = improved_members
+            committee_indices = tuple(improved_indices)
+            committee_members = [entries[i] for i in committee_indices]
+
+            final_obj, final_score_sum, final_avg_corr, final_max_corr = committee_objective(
+                committee_indices, entries, corr_matrix
+            )
+
+            n = len(committee_indices)
+            committee_corr = np.zeros((n, n))
+            for i in range(n):
+                for j in range(n):
+                    committee_corr[i, j] = corr_matrix[committee_indices[i], committee_indices[j]]
+
+    # Phase 1d: Maverick rotation (deep mode only, when maverick constraint active)
+    if deep and should_enforce_maverick:
+        rotated_members, rotated_indices = run_maverick_rotation(
+            members_with_stats, entries, coefficients, valid_indices,
+            corr_matrix, list(committee_indices), loader, stats,
+            holdout_info, context_window_days,
+        )
+
+        if rotated_indices != list(committee_indices):
+            members_with_stats = rotated_members
+            committee_indices = tuple(rotated_indices)
+            committee_members = [entries[i] for i in committee_indices]
+
+            final_obj, final_score_sum, final_avg_corr, final_max_corr = committee_objective(
+                committee_indices, entries, corr_matrix
+            )
+
+            n = len(committee_indices)
+            committee_corr = np.zeros((n, n))
+            for i in range(n):
+                for j in range(n):
+                    committee_corr[i, j] = corr_matrix[committee_indices[i], committee_indices[j]]
+
     roster_data = {
         'committee_size': len(members_with_stats),
         'members': members_with_stats,
@@ -212,6 +268,367 @@ def run_draft(manager, loader, stats, holdout_info, deep=False, require_maverick
     print(f"  Max Pair Correlation: {final_max_corr:.3f}")
 
     return roster_data
+
+
+def run_slice_improvement_pass(members_with_stats, entries, coefficients, valid_indices,
+                                corr_matrix, committee_indices, loader, stats,
+                                holdout_info, context_window_days,
+                                require_maverick=False, max_rounds=5, top_n_candidates=5):
+    """
+    Phase 1c: Slice-based committee improvement.
+
+    After correlation refinement, evaluates the committee on validation slices,
+    finds the worst-performing slice, identifies the weakest member on that slice,
+    and tries replacing them with candidates from the Global50 pool that improve
+    overall mean fitness across all slices.
+
+    Args:
+        members_with_stats: List of member dicts with conviction thresholds
+        entries: Full list of Global50 entries
+        coefficients: Pre-computed coefficient dict {index: 1D array} from correlation step
+        valid_indices: Validation data indices (for reshaping coefficients)
+        corr_matrix: Full NxN correlation matrix
+        committee_indices: Current committee indices (list of ints into entries)
+        loader: StockDataLoader instance
+        stats: Normalization stats
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+        require_maverick: If True, preserve maverick type on swaps
+        max_rounds: Maximum improvement rounds
+        top_n_candidates: Number of top candidates to evaluate per round, or None for all
+
+    Returns:
+        (improved_members, improved_indices) — possibly unchanged if no improvement
+    """
+    episode_length = Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+    slices = generate_validation_slices(holdout_info, episode_length)
+    num_stocks = Config.NUM_INVESTABLE_STOCKS
+    num_days = len(valid_indices)
+
+    current_members = list(members_with_stats)
+    current_indices = list(committee_indices)
+
+    exhaustive = top_n_candidates is None
+    mode_label = "Exhaustive" if exhaustive else "Deep"
+
+    print(f"\n{'='*60}")
+    print(f"PHASE 1c: SLICE-BASED IMPROVEMENT ({mode_label})")
+    print(f"{'='*60}")
+    print(f"  Max rounds: {max_rounds}")
+    print(f"  Candidates per round: {'ALL' if exhaustive else top_n_candidates}")
+    print(f"  Validation slices: {len(slices)}")
+
+    swap_count = 0
+
+    for round_num in range(1, max_rounds + 1):
+        print(f"\n  {'─'*56}")
+        print(f"  Round {round_num}/{max_rounds}")
+        print(f"  {'─'*56}")
+
+        # 1. Evaluate committee on all slices
+        print(f"    Evaluating committee on {len(slices)} slices...")
+        slice_results = []
+        for sl in slices:
+            metrics = evaluate_committee_on_slice(
+                current_members, loader, stats, context_window_days,
+                sl['start'], sl['end']
+            )
+            slice_results.append({
+                'index': sl['index'],
+                'type': sl['type'],
+                'start': sl['start'],
+                'end': sl['end'],
+                'fitness': metrics.get('fitness', 0.0),
+                'roi': metrics.get('roi', 0.0),
+                'num_trades': metrics.get('num_trades', 0),
+            })
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        mean_fitness = np.mean([sr['fitness'] for sr in slice_results])
+
+        for sr in slice_results:
+            print(f"      Slice {sr['index']} ({sr['type']}): "
+                  f"fitness={sr['fitness']:.2f}, roi={sr['roi']:.2f}%")
+        print(f"      Mean fitness: {mean_fitness:.2f}")
+
+        # 2. Find worst slice
+        worst_slice = min(slice_results, key=lambda x: x['fitness'])
+        worst_sl = slices[worst_slice['index']]
+        print(f"\n    Worst slice: {worst_slice['index']} ({worst_slice['type']}) "
+              f"fitness={worst_slice['fitness']:.2f}")
+
+        # 3. Evaluate each member individually on worst slice to find weakest
+        print(f"    Evaluating {len(current_members)} agents individually on worst slice...")
+        agent_performances = []
+        for i, member in enumerate(current_members):
+            filepath = get_agent_filepath(member, context_window_days)
+            agent_metrics = evaluate_agent_on_slice(
+                filepath, loader, stats, worst_sl['start'], worst_sl['end']
+            )
+            maverick_tag = " [M]" if member.get('is_maverick', False) else ""
+            agent_performances.append({
+                'member_idx': i,
+                'name': f"{member['run_name']}_{member['agent_id']}{maverick_tag}",
+                'fitness': agent_metrics.get('fitness', 0.0),
+                'is_maverick': member.get('is_maverick', False),
+            })
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        agent_performances.sort(key=lambda x: x['fitness'])
+
+        print(f"    Agent ranking on slice {worst_slice['index']}:")
+        for ap in agent_performances:
+            marker = " <<< weakest" if ap is agent_performances[0] else ""
+            print(f"      {ap['name']}: fitness={ap['fitness']:.2f}{marker}")
+
+        weakest = agent_performances[0]
+
+        # 4. Find candidate replacements ranked by objective function
+        weak_idx = weakest['member_idx']
+        weak_is_maverick = weakest['is_maverick']
+
+        remaining_global = [idx for i, idx in enumerate(current_indices) if i != weak_idx]
+
+        candidates = []
+        for cand_idx in range(len(entries)):
+            if cand_idx in current_indices:
+                continue
+            if corr_matrix[cand_idx, cand_idx] != 1.0:
+                continue
+            if coefficients.get(cand_idx) is None:
+                continue
+
+            cand_is_maverick = entries[cand_idx].get('is_maverick', False)
+            if require_maverick and cand_is_maverick != weak_is_maverick:
+                continue
+
+            trial_indices = tuple(sorted(remaining_global + [cand_idx]))
+            obj, _, _, _ = committee_objective(trial_indices, entries, corr_matrix)
+            candidates.append({
+                'idx': cand_idx,
+                'objective': obj,
+                'entry': entries[cand_idx],
+            })
+
+        candidates.sort(key=lambda x: x['objective'], reverse=True)
+        if top_n_candidates is not None:
+            candidates = candidates[:top_n_candidates]
+
+        if not candidates:
+            print(f"    No valid candidates found. Stopping.")
+            break
+
+        scope = "ALL" if top_n_candidates is None else f"top {len(candidates)}"
+        print(f"\n    Testing {scope} ({len(candidates)}) candidates to replace {weakest['name']}...")
+
+        # 5. Evaluate each candidate via full committee simulation on all slices
+        best_candidate = None
+        best_mean_fitness = mean_fitness
+        best_new_members = None
+        best_new_indices = None
+
+        for c in candidates:
+            cand_coeffs_1d = coefficients[c['idx']]
+            cand_coeffs_2d = cand_coeffs_1d.reshape(num_days, num_stocks)
+            conviction_vec = calculate_agent_stats_vectorized(cand_coeffs_2d)
+            new_member = build_member_data(c['entry'], conviction_vec)
+
+            modified_members = list(current_members)
+            modified_members[weak_idx] = new_member
+
+            modified_indices = list(current_indices)
+            modified_indices[weak_idx] = c['idx']
+
+            cand_fitnesses = []
+            for sl in slices:
+                metrics = evaluate_committee_on_slice(
+                    modified_members, loader, stats, context_window_days,
+                    sl['start'], sl['end']
+                )
+                cand_fitnesses.append(metrics.get('fitness', 0.0))
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            cand_mean = np.mean(cand_fitnesses)
+            cand_name = f"{c['entry']['run_name']}_{c['entry']['agent_id']}"
+            maverick_tag = " [M]" if c['entry'].get('is_maverick', False) else ""
+            delta = cand_mean - mean_fitness
+            print(f"      {cand_name}{maverick_tag}: mean_fitness={cand_mean:.2f} ({delta:+.2f})")
+
+            if cand_mean > best_mean_fitness:
+                best_mean_fitness = cand_mean
+                best_candidate = c
+                best_new_members = modified_members
+                best_new_indices = modified_indices
+
+        # 6. Accept or stop
+        if best_candidate is not None:
+            improvement = best_mean_fitness - mean_fitness
+            cand_name = f"{best_candidate['entry']['run_name']}_{best_candidate['entry']['agent_id']}"
+            swap_count += 1
+            print(f"\n    ✓ Swap #{swap_count}: {weakest['name']} → {cand_name}")
+            print(f"      Mean fitness: {mean_fitness:.2f} → {best_mean_fitness:.2f} "
+                  f"({improvement:+.2f})")
+            current_members = best_new_members
+            current_indices = best_new_indices
+        else:
+            print(f"\n    No candidate improves overall mean fitness. Stopping.")
+            break
+
+    print(f"\n{'='*60}")
+    print(f"SLICE IMPROVEMENT COMPLETE: {swap_count} swap(s)")
+    print(f"{'='*60}")
+
+    return current_members, current_indices
+
+
+def run_maverick_rotation(members_with_stats, entries, coefficients, valid_indices,
+                           corr_matrix, committee_indices, loader, stats,
+                           holdout_info, context_window_days):
+    """
+    Phase 1d: Maverick rotation.
+
+    With only a handful of mavericks in the Global50 pool (MAVERICK_CAP=5),
+    exhaustively test each one in the maverick slot to find which maverick
+    maximizes overall mean fitness across validation slices.
+
+    Args:
+        members_with_stats: Current member dicts with conviction thresholds
+        entries: Full list of Global50 entries
+        coefficients: Pre-computed coefficient dict {index: 1D array}
+        valid_indices: Validation data indices (for reshaping coefficients)
+        corr_matrix: Full NxN correlation matrix
+        committee_indices: Current committee indices (list of ints into entries)
+        loader: StockDataLoader instance
+        stats: Normalization stats
+        holdout_info: Holdout period info dict
+        context_window_days: Context window size
+
+    Returns:
+        (updated_members, updated_indices) — possibly unchanged if current maverick is optimal
+    """
+    episode_length = Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+    slices = generate_validation_slices(holdout_info, episode_length)
+    num_stocks = Config.NUM_INVESTABLE_STOCKS
+    num_days = len(valid_indices)
+
+    current_members = list(members_with_stats)
+    current_indices = list(committee_indices)
+
+    # Find current maverick in committee
+    current_mav_member_idx = None
+    current_mav_global_idx = None
+    for i, (member, global_idx) in enumerate(zip(current_members, current_indices)):
+        if member.get('is_maverick', False):
+            current_mav_member_idx = i
+            current_mav_global_idx = global_idx
+            break
+
+    if current_mav_member_idx is None:
+        print("\n  No maverick in current committee. Skipping maverick rotation.")
+        return current_members, current_indices
+
+    current_mav_entry = entries[current_mav_global_idx]
+    current_mav_name = f"{current_mav_entry['run_name']}_{current_mav_entry['agent_id']}"
+
+    # Find all other valid mavericks in Global50
+    other_mavericks = []
+    for idx, entry in enumerate(entries):
+        if (entry.get('is_maverick', False) and
+                idx != current_mav_global_idx and
+                corr_matrix[idx, idx] == 1.0 and
+                coefficients.get(idx) is not None):
+            other_mavericks.append(idx)
+
+    print(f"\n{'='*60}")
+    print("PHASE 1d: MAVERICK ROTATION")
+    print(f"{'='*60}")
+    print(f"  Current maverick: {current_mav_name} [M]")
+    print(f"  Alternative mavericks to test: {len(other_mavericks)}")
+
+    if not other_mavericks:
+        print("  No other valid mavericks available. Current maverick retained.")
+        return current_members, current_indices
+
+    # Evaluate baseline (current committee) on all slices
+    print(f"\n  Evaluating current committee (baseline)...")
+    baseline_fitnesses = []
+    for sl in slices:
+        metrics = evaluate_committee_on_slice(
+            current_members, loader, stats, context_window_days,
+            sl['start'], sl['end']
+        )
+        baseline_fitnesses.append(metrics.get('fitness', 0.0))
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    baseline_mean = np.mean(baseline_fitnesses)
+
+    per_slice_baseline = ", ".join(f"{f:.1f}" for f in baseline_fitnesses)
+    print(f"    {current_mav_name} [M] (current): "
+          f"mean={baseline_mean:.2f}  [{per_slice_baseline}]")
+
+    # Test each alternative maverick
+    print(f"\n  Testing {len(other_mavericks)} alternative mavericks...")
+
+    best_mean = baseline_mean
+    best_mav_idx = current_mav_global_idx
+    best_members = None
+    best_indices = None
+
+    for mav_idx in other_mavericks:
+        mav_entry = entries[mav_idx]
+        mav_name = f"{mav_entry['run_name']}_{mav_entry['agent_id']}"
+
+        # Build conviction thresholds for this maverick
+        coeffs_1d = coefficients[mav_idx]
+        coeffs_2d = coeffs_1d.reshape(num_days, num_stocks)
+        conviction_vec = calculate_agent_stats_vectorized(coeffs_2d)
+        new_member = build_member_data(mav_entry, conviction_vec)
+
+        # Build modified committee
+        modified_members = list(current_members)
+        modified_members[current_mav_member_idx] = new_member
+        modified_indices = list(current_indices)
+        modified_indices[current_mav_member_idx] = mav_idx
+
+        # Evaluate on all slices
+        mav_fitnesses = []
+        for sl in slices:
+            metrics = evaluate_committee_on_slice(
+                modified_members, loader, stats, context_window_days,
+                sl['start'], sl['end']
+            )
+            mav_fitnesses.append(metrics.get('fitness', 0.0))
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        mav_mean = np.mean(mav_fitnesses)
+        delta = mav_mean - baseline_mean
+
+        per_slice = ", ".join(f"{f:.1f}" for f in mav_fitnesses)
+        print(f"    {mav_name} [M]: mean={mav_mean:.2f} ({delta:+.2f})  [{per_slice}]")
+
+        if mav_mean > best_mean:
+            best_mean = mav_mean
+            best_mav_idx = mav_idx
+            best_members = modified_members
+            best_indices = modified_indices
+
+    # Report results
+    print(f"\n  {'─'*56}")
+    if best_mav_idx != current_mav_global_idx:
+        best_entry = entries[best_mav_idx]
+        best_name = f"{best_entry['run_name']}_{best_entry['agent_id']}"
+        improvement = best_mean - baseline_mean
+        print(f"  ✓ Maverick swap: {current_mav_name} → {best_name}")
+        print(f"    Mean fitness: {baseline_mean:.2f} → {best_mean:.2f} ({improvement:+.2f})")
+        return best_members, best_indices
+    else:
+        print(f"  Current maverick ({current_mav_name}) is already optimal.")
+        return current_members, current_indices
 
 
 # --- Simulation ---
@@ -505,11 +922,18 @@ def update_conviction_percentile(manager, loader, stats, holdout_info,
         return False
 
 
-def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap):
-    """Find best replacement candidates for a specific committee member."""
+def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap, focus_slices=None):
+    """Find best replacement candidates for a specific committee member.
+
+    Args:
+        focus_slices: Optional list of slice indices (e.g. [0, 3]) to focus improvement on.
+                      When set, candidates are ranked by mean fitness improvement on those slices.
+    """
     print("\n" + "="*60)
     print(f"COMMITTEE AGENT SWAP EVALUATION")
     print(f"Target: {agent_to_swap}")
+    if focus_slices is not None:
+        print(f"Focus Slices: {focus_slices}")
     print("="*60)
 
     roster = manager.load_roster()
@@ -617,6 +1041,22 @@ def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap):
 
     baseline_agg = baseline_results['committee_aggregate']
 
+    # Validate focus_slices against actual slice count
+    if focus_slices is not None:
+        ep_len = Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+        all_slices_check = generate_validation_slices(holdout_info, ep_len)
+        known_indices = set(s['index'] for s in all_slices_check)
+        invalid_slices = [s for s in focus_slices if s not in known_indices]
+        if invalid_slices:
+            print(f"❌ Invalid slice indices: {invalid_slices}. Valid: {sorted(known_indices)}")
+            return
+
+        print(f"\n🎯 FOCUS MODE: optimising for slice(s) {focus_slices}")
+        for s in all_slices_check:
+            if s['index'] in focus_slices:
+                bs = baseline_results['committee_slices'][s['index']]
+                print(f"  Slice {s['index']} ({s['type']}): baseline fitness={bs['fitness']:.2f}, roi={bs['roi']:.2f}%")
+
     # Validate top candidates
     top_n = min(10, len(candidates))
     print(f"\n{'='*60}")
@@ -648,18 +1088,53 @@ def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap):
 
         validation_results = run_validation(
             manager, loader, stats, holdout_info, manager.context_window_days,
-            members_override=modified_members, conviction_percentile=None
+            members_override=modified_members, conviction_percentile=None,
+            quiet=True, skip_exports=True
         )
 
         if validation_results:
             candidate_validation_results.append({
                 'rank': rank + 1, 'candidate': c, 'entry': e,
-                'agent_id': eid, 'results': validation_results['committee_aggregate']
+                'agent_id': eid, 'results': validation_results['committee_aggregate'],
+                'committee_slices': validation_results['committee_slices'],
             })
 
-    # Display comparison
+    # Re-rank by focused-slice improvement when focus_slices is active
+    if focus_slices is not None and candidate_validation_results:
+        baseline_slices_for_focus = baseline_results['committee_slices']
+        focused_baseline_fit = np.mean([baseline_slices_for_focus[i]['fitness'] for i in focus_slices])
+        focused_baseline_roi = np.mean([baseline_slices_for_focus[i]['roi'] for i in focus_slices])
+
+        for cvr in candidate_validation_results:
+            cand_slices = cvr['committee_slices']
+            focused_new_fit = np.mean([cand_slices[i]['fitness'] for i in focus_slices])
+            focused_new_roi = np.mean([cand_slices[i]['roi'] for i in focus_slices])
+            cvr['focused_delta_fitness'] = focused_new_fit - focused_baseline_fit
+            cvr['focused_delta_roi'] = focused_new_roi - focused_baseline_roi
+            cvr['focused_fitness'] = focused_new_fit
+            cvr['focused_roi'] = focused_new_roi
+
+        candidate_validation_results.sort(key=lambda x: x['focused_delta_fitness'], reverse=True)
+        for i, cvr in enumerate(candidate_validation_results):
+            cvr['rank'] = i + 1
+
+        print(f"\n{'='*60}")
+        print(f"FOCUSED SLICE IMPACT (slices {focus_slices})")
+        print(f"{'='*60}")
+        print(f"  Baseline focused fitness: {focused_baseline_fit:.2f}  |  focused ROI: {focused_baseline_roi:.2f}%")
+        print(f"\n{'Rank':<5} {'Agent':<25} {'FocFit':<10} {'ΔFocFit':<10} {'FocROI':<10} {'ΔFocROI':<10} {'AllFit':<10} {'ΔAllFit':<10}")
+        print("-" * 100)
+        for cvr in candidate_validation_results:
+            agg = cvr['results']
+            delta_all = agg['mean_fitness'] - baseline_agg['mean_fitness']
+            print(f"{cvr['rank']:<5} {cvr['agent_id']:<25} "
+                  f"{cvr['focused_fitness']:<10.2f} {cvr['focused_delta_fitness']:<+10.2f} "
+                  f"{cvr['focused_roi']:<10.2f}% {cvr['focused_delta_roi']:<+10.2f} "
+                  f"{agg['mean_fitness']:<10.2f} {delta_all:<+10.2f}")
+
+    # Display comparison (overall)
     print(f"\n{'='*60}")
-    print("CANDIDATE IMPACT ANALYSIS")
+    print("CANDIDATE IMPACT ANALYSIS (all slices)")
     print(f"{'='*60}")
 
     baseline_avg_corr = roster.get('correlation', {}).get('average', 0.0)
@@ -680,63 +1155,396 @@ def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap):
               f"{agg['mean_win_rate']*100:<9.2f}% {agg['mean_roi']:<7.2f}% "
               f"{c['avg_corr']:<10.4f} {agg['total_trades']:<8}")
 
-    # Interactive Swap
+    # Outgoing agent index (roster order = baseline individual_agents order)
+    outgoing_index = next((i for i, mid in enumerate(current_ids) if mid == agent_to_swap), None)
+    if outgoing_index is None:
+        print("❌ Outgoing agent not found in roster.")
+        return
+    outgoing_slice_metrics = baseline_results['individual_agents'][outgoing_index]['slice_metrics']
+
+    episode_length = Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+    slices = generate_validation_slices(holdout_info, episode_length)
+    baseline_slices = baseline_results['committee_slices']
+
+    def _print_per_slice_for_candidate(cvr):
+        """Print per-slice agent (out vs cand) and committee (curr vs new) for one candidate."""
+        chosen = cvr['candidate']
+        chosen_entry = cvr['entry']
+        cand_id = cvr['agent_id']
+        new_committee_slices = cvr.get('committee_slices', [])
+
+        # Candidate agent per-slice (evaluate now)
+        print(f"\n  Evaluating candidate agent on each slice...")
+        cand_filepath = get_agent_filepath(chosen_entry, manager.context_window_days)
+        cand_slice_metrics = []
+        for sl in slices:
+            metrics = evaluate_agent_on_slice(cand_filepath, loader, stats, sl['start'], sl['end'])
+            cand_slice_metrics.append({
+                'slice': sl['index'], 'slice_type': sl['type'],
+                'fitness': metrics.get('fitness', 0.0), 'roi': metrics.get('roi', 0.0),
+                'num_trades': metrics.get('num_trades', 0),
+            })
+
+        focus_set = set(focus_slices) if focus_slices else set()
+
+        print(f"\n  PER-SLICE: OUTGOING AGENT vs CANDIDATE AGENT")
+        print(f"  (Out: {agent_to_swap}  →  Cand: {cand_id})")
+        print("-" * 80)
+        print(f"  {'':3} {'Slice':<8} {'Type':<12} {'Out Fit':<10} {'Cand Fit':<10} {'Out ROI':<10} {'Cand ROI':<10} {'Out Tr':<8} {'Cand Tr':<8}")
+        print("-" * 80)
+        for sl, out_m, cand_m in zip(slices, outgoing_slice_metrics, cand_slice_metrics):
+            marker = ">>>" if sl['index'] in focus_set else "   "
+            print(f"  {marker} {sl['index']:<8} {sl['type']:<12} {out_m['fitness']:<10.2f} {cand_m['fitness']:<10.2f} "
+                  f"{out_m['roi']:<10.2f}% {cand_m['roi']:<10.2f}% {out_m.get('num_trades', 0):<8} {cand_m['num_trades']:<8}")
+        print("-" * 80)
+
+        print(f"\n  PER-SLICE: CURRENT COMMITTEE vs NEW COMMITTEE")
+        print("-" * 80)
+        print(f"  {'':3} {'Slice':<8} {'Type':<12} {'Curr Fit':<10} {'New Fit':<10} {'Curr ROI':<10} {'New ROI':<10} {'Curr Tr':<8} {'New Tr':<8}")
+        print("-" * 80)
+        for bs, ns in zip(baseline_slices, new_committee_slices):
+            marker = ">>>" if bs['slice'] in focus_set else "   "
+            print(f"  {marker} {bs['slice']:<8} {bs['slice_type']:<12} {bs['fitness']:<10.2f} {ns['fitness']:<10.2f} "
+                  f"{bs['roi']:<10.2f}% {ns['roi']:<10.2f}% {bs.get('num_trades', 0):<8} {ns.get('num_trades', 0):<8}")
+        print("-" * 80)
+
+    # Interactive Swap: pick rank → see per-slice → confirm or pick another
     print(f"\n{'='*60}")
     print("SWAP SELECTION")
     print(f"{'='*60}")
+    print("Enter a candidate rank to see per-slice comparison (agent vs agent, committee vs committee),")
+    print("then confirm swap or pick another rank.")
 
-    choice = input(f"\nEnter candidate rank (1-{top_n}) to swap, or Enter to cancel: ")
-    if not choice.isdigit():
-        print("Cancelled.")
-        return
+    while True:
+        choice = input(f"\nEnter candidate rank (1-{top_n}) to see details and swap, or Enter to cancel: ").strip()
+        if not choice:
+            print("Cancelled.")
+            return
+        if not choice.isdigit():
+            print(f"Invalid input. Enter a number 1-{top_n} or Enter to cancel.")
+            continue
+        rank = int(choice)
+        if rank < 1 or rank > top_n:
+            print(f"Invalid rank. Enter 1-{top_n} or Enter to cancel.")
+            continue
 
-    rank = int(choice)
-    if 1 <= rank <= top_n:
         cvr = next((c for c in candidate_validation_results if c['rank'] == rank), None)
-        if cvr:
+        if not cvr:
+            cvr = {
+                'rank': rank, 'candidate': candidates[rank - 1], 'entry': candidates[rank - 1]['entry'],
+                'agent_id': f"{candidates[rank - 1]['entry']['run_name']}_{candidates[rank - 1]['entry']['agent_id']}",
+                'results': None, 'committee_slices': [],
+            }
+            # We need committee_slices for this candidate; we only have them for top_n. So cvr should always be in candidate_validation_results.
+            print(f"❌ No validation data for rank {rank}. Choose 1-{top_n}.")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"CANDIDATE RANK {rank}: {cvr['agent_id']}")
+        print(f"{'='*60}")
+        _print_per_slice_for_candidate(cvr)
+
+        confirm = input("\nConfirm swap with this candidate? (y/n): ").strip().lower()
+        if confirm == 'y':
             chosen = cvr['candidate']
             chosen_entry = cvr['entry']
+
+            print(f"\nSwapping {agent_to_swap} ➔ {chosen_entry['run_name']}_{chosen_entry['agent_id']}...")
+
+            chosen_coeffs = coefficients[chosen['index']]
+            num_days = len(valid_indices)
+            num_stocks = Config.NUM_INVESTABLE_STOCKS
+            chosen_coeffs_2d = chosen_coeffs.reshape(num_days, num_stocks)
+            conviction_vec = calculate_agent_stats_vectorized(chosen_coeffs_2d)
+
+            new_member = build_member_data(chosen_entry, conviction_vec)
+
+            new_roster_members = []
+            for m in roster['members']:
+                mid = f"{m['run_name']}_{m['agent_id']}"
+                if mid == agent_to_swap:
+                    new_roster_members.append(new_member)
+                else:
+                    new_roster_members.append(m)
+
+            roster['members'] = new_roster_members
+            roster['aggregate_score'] = chosen['score']
+            roster['objective_value'] = chosen['objective']
+            roster['correlation']['average'] = chosen['avg_corr']
+            roster['correlation']['max_pair'] = chosen['max_corr']
+            roster['last_updated'] = str(datetime.now())
+
+            new_indices = tuple(sorted(base_indices + [chosen['index']]))
+            n_new = len(new_indices)
+            sub_matrix = np.zeros((n_new, n_new))
+            for r in range(n_new):
+                for c_col in range(n_new):
+                    sub_matrix[r, c_col] = corr_matrix[new_indices[r], new_indices[c_col]]
+
+            roster['correlation']['matrix'] = sub_matrix.tolist()
+            manager.save_roster(roster, sub_matrix)
+            print("✓ Swap complete!")
+            return
+        # n or anything else: pick another rank (loop continues)
+        print("Pick another candidate rank to compare, or Enter to cancel.")
+
+
+def run_diagnose_slice(manager, loader, stats, holdout_info, focus_slices):
+    """
+    Diagnose problematic validation slices.
+
+    Runs baseline validation then analyses the focused slices:
+    1. Committee performance on the slice(s).
+    2. Individual agent breakdown (sorted worst-to-best).
+    3. Consensus stats for the slice(s).
+    4. Focused quorum/conviction mini-sweep on just those slices.
+    5. Automated recommendation (regime / agent / parameter problem).
+    """
+    context_window_days = manager.context_window_days
+
+    episode_length = Config.TRADING_PERIOD_DAYS + Config.SETTLEMENT_PERIOD_DAYS
+    slices = generate_validation_slices(holdout_info, episode_length)
+    known_indices = set(s['index'] for s in slices)
+    invalid = [s for s in focus_slices if s not in known_indices]
+    if invalid:
+        print(f"❌ Invalid slice indices: {invalid}. Valid: {sorted(known_indices)}")
+        return
+
+    print("\n" + "="*70)
+    print("SLICE DIAGNOSIS")
+    print("="*70)
+    print(f"  Context Window: {context_window_days} days")
+    print(f"  Target Slices:  {focus_slices}")
+    for sl in slices:
+        if sl['index'] in focus_slices:
+            start_date = loader.dates[sl['start']]
+            end_date = loader.dates[sl['end'] - 1]
+            print(f"    Slice {sl['index']} ({sl['type']}): indices {sl['start']}-{sl['end']-1}  "
+                  f"[{start_date} to {end_date}]")
+
+    # --- Run baseline validation to get per-agent and per-slice data ---
+    print(f"\n{'='*70}")
+    print("RUNNING BASELINE VALIDATION")
+    print(f"{'='*70}")
+    baseline_results = run_validation(
+        manager, loader, stats, holdout_info, context_window_days,
+        members_override=None, conviction_percentile=None,
+        quiet=True, skip_exports=True,
+    )
+    if not baseline_results:
+        print("❌ Failed to run baseline validation")
+        return
+
+    # === Section 1: Committee performance on focused slices ===
+    print(f"\n{'='*70}")
+    print("1. COMMITTEE PERFORMANCE ON TARGET SLICES")
+    print(f"{'='*70}")
+    print(f"\n  {'Slice':<8} {'Type':<12} {'Fitness':<10} {'ROI':<10} {'WinRate':<10} {'Trades':<8} {'Wins':<6} {'Losses':<8}")
+    print("-" * 80)
+    for sl_idx in focus_slices:
+        cs = baseline_results['committee_slices'][sl_idx]
+        print(f"  {cs['slice']:<8} {cs['slice_type']:<12} {cs['fitness']:<10.2f} "
+              f"{cs['roi']:<10.2f}% {cs['win_rate']*100:<9.1f}% {cs['num_trades']:<8} "
+              f"{cs.get('num_wins', 0):<6} {cs.get('num_losses', 0):<8}")
+    print("-" * 80)
+
+    # === Section 2: Individual agent breakdown per focused slice ===
+    print(f"\n{'='*70}")
+    print("2. INDIVIDUAL AGENT BREAKDOWN (sorted worst-to-best)")
+    print(f"{'='*70}")
+
+    roster = manager.load_roster()
+    members = roster['members']
+    individual_agents = baseline_results['individual_agents']
+
+    for sl_idx in focus_slices:
+        sl_info = slices[sl_idx]
+        print(f"\n  --- Slice {sl_idx} ({sl_info['type']}) ---")
+        print(f"  {'Agent':<30} {'Fitness':<10} {'ROI':<10} {'Trades':<8} {'WinRate':<10}")
+        print("  " + "-" * 68)
+
+        agent_performances = []
+        for i, agent in enumerate(individual_agents):
+            sm = agent['slice_metrics'][sl_idx]
+            m = members[i]
+            maverick_tag = " [M]" if m.get('is_maverick', False) else ""
+            name = f"{m['run_name']}_{m['agent_id']}{maverick_tag}"
+            agent_performances.append({
+                'name': name, 'fitness': sm['fitness'],
+                'roi': sm['roi'], 'num_trades': sm['num_trades'],
+                'win_rate': sm['win_rate'],
+            })
+
+        agent_performances.sort(key=lambda x: x['fitness'])
+        for ap in agent_performances:
+            worst_marker = " <<< worst" if ap is agent_performances[0] else ""
+            print(f"  {ap['name']:<30} {ap['fitness']:<10.2f} {ap['roi']:<10.2f}% "
+                  f"{ap['num_trades']:<8} {ap['win_rate']*100:<9.1f}%{worst_marker}")
+        print("  " + "-" * 68)
+
+    # === Section 3: Consensus stats for focused slices ===
+    print(f"\n{'='*70}")
+    print("3. CONSENSUS STATS FOR TARGET SLICES")
+    print(f"{'='*70}")
+
+    for sl_idx in focus_slices:
+        cs = baseline_results['committee_slices'][sl_idx]
+        con = cs.get('consensus_stats', {})
+        print(f"\n  --- Slice {sl_idx} ({cs['slice_type']}) ---")
+        if 'note' in con:
+            print(f"  {con['note']}")
         else:
-            chosen = candidates[rank-1]
-            chosen_entry = chosen['entry']
+            print(f"  Unanimity Rate:      {con.get('unanimity_pct', 0):.1f}%")
+            print(f"  Min Consensus Rate:  {con.get('min_consensus_pct', 0):.1f}%")
+            print(f"  Avg Votes/Trade:     {con.get('avg_consensus_votes', 0):.2f}")
+            print(f"  Trades by Quorum:    {con.get('trades_by_quorum', 0)}")
+            print(f"  Trades by Conviction:{con.get('trades_by_conviction', 0)}")
+            print(f"  Trades Vetoed:       {con.get('trades_vetoed', 0)}")
 
-        print(f"\nSwapping {agent_to_swap} ➔ {chosen_entry['run_name']}_{chosen_entry['agent_id']}...")
+    # === Section 4: Focused quorum/conviction mini-sweep ===
+    print(f"\n{'='*70}")
+    print("4. QUORUM / CONVICTION MINI-SWEEP (on target slices only)")
+    print(f"{'='*70}")
 
-        chosen_coeffs = coefficients[chosen['index']]
-        num_days = len(valid_indices)
-        num_stocks = Config.NUM_INVESTABLE_STOCKS
-        chosen_coeffs_2d = chosen_coeffs.reshape(num_days, num_stocks)
-        conviction_vec = calculate_agent_stats_vectorized(chosen_coeffs_2d)
+    quorum_values = [2, 3, 4, 5]
+    conviction_percentiles = [90, 95, 99]
 
-        new_member = build_member_data(chosen_entry, conviction_vec)
+    original_quorum = Config.COMMITTEE_QUORUM
+    focused_slices_list = [slices[i] for i in focus_slices]
 
-        new_roster_members = []
-        for m in roster['members']:
-            mid = f"{m['run_name']}_{m['agent_id']}"
-            if mid == agent_to_swap:
-                new_roster_members.append(new_member)
+    sweep_results = []
+    current_combo = (original_quorum, 95)
+
+    print(f"\n  Testing {len(quorum_values)} quorum x {len(conviction_percentiles)} conviction combos "
+          f"on {len(focus_slices)} slice(s)...")
+
+    for q in quorum_values:
+        for pct in conviction_percentiles:
+            Config.COMMITTEE_QUORUM = q
+
+            if pct != 95:
+                sweep_members = recalculate_conviction_thresholds(
+                    members, loader, stats, holdout_info, context_window_days, pct
+                )
             else:
-                new_roster_members.append(m)
+                sweep_members = members
 
-        roster['members'] = new_roster_members
-        roster['aggregate_score'] = chosen['score']
-        roster['objective_value'] = chosen['objective']
-        roster['correlation']['average'] = chosen['avg_corr']
-        roster['correlation']['max_pair'] = chosen['max_corr']
-        roster['last_updated'] = str(datetime.now())
+            slice_fitnesses = []
+            slice_rois = []
+            slice_trades = []
 
-        new_indices = tuple(sorted(base_indices + [chosen['index']]))
-        n_new = len(new_indices)
-        sub_matrix = np.zeros((n_new, n_new))
-        for r in range(n_new):
-            for c_col in range(n_new):
-                sub_matrix[r, c_col] = corr_matrix[new_indices[r], new_indices[c_col]]
+            for sl in focused_slices_list:
+                metrics = evaluate_committee_on_slice(
+                    sweep_members, loader, stats, context_window_days,
+                    sl['start'], sl['end']
+                )
+                slice_fitnesses.append(metrics.get('fitness', 0.0))
+                slice_rois.append(metrics.get('roi', 0.0))
+                slice_trades.append(metrics.get('num_trades', 0))
 
-        roster['correlation']['matrix'] = sub_matrix.tolist()
-        manager.save_roster(roster, sub_matrix)
-        print("✓ Swap complete!")
+            mean_fit = np.mean(slice_fitnesses)
+            mean_roi = np.mean(slice_rois)
+            total_trades = sum(slice_trades)
+
+            is_current = (q == current_combo[0] and pct == current_combo[1])
+            sweep_results.append({
+                'quorum': q, 'pct': pct,
+                'fitness': mean_fit, 'roi': mean_roi,
+                'trades': total_trades, 'is_current': is_current,
+            })
+
+    Config.COMMITTEE_QUORUM = original_quorum
+
+    sweep_results.sort(key=lambda x: x['fitness'], reverse=True)
+    best_sweep = sweep_results[0]
+
+    print(f"\n  {'Quorum':<8} {'ConvP':<8} {'Fitness':<10} {'ROI':<10} {'Trades':<8} {'Note'}")
+    print("-" * 60)
+    for sr in sweep_results:
+        note = ""
+        if sr['is_current']:
+            note = "<<< current"
+        if sr is best_sweep and not sr['is_current']:
+            note = "<<< best for slice"
+        elif sr is best_sweep and sr['is_current']:
+            note = "<<< current (best)"
+        print(f"  {sr['quorum']:<8} P{sr['pct']:<7} {sr['fitness']:<10.2f} {sr['roi']:<10.2f}% {sr['trades']:<8} {note}")
+    print("-" * 60)
+
+    # === Section 5: Recommendation ===
+    print(f"\n{'='*70}")
+    print("5. RECOMMENDATION")
+    print(f"{'='*70}")
+
+    all_agent_fitnesses = []
+    for sl_idx in focus_slices:
+        for agent in individual_agents:
+            sm = agent['slice_metrics'][sl_idx]
+            all_agent_fitnesses.append(sm['fitness'])
+
+    per_agent_mean_fit = []
+    for i, agent in enumerate(individual_agents):
+        mean_f = np.mean([agent['slice_metrics'][sl_idx]['fitness'] for sl_idx in focus_slices])
+        per_agent_mean_fit.append((i, mean_f))
+
+    per_agent_mean_fit.sort(key=lambda x: x[1])
+    mean_all = np.mean([f for _, f in per_agent_mean_fit])
+    std_all = np.std([f for _, f in per_agent_mean_fit]) if len(per_agent_mean_fit) > 1 else 0.0
+
+    worst_idx, worst_fit = per_agent_mean_fit[0]
+    worst_member = members[worst_idx]
+    worst_name = f"{worst_member['run_name']}_{worst_member['agent_id']}"
+    worst_maverick = " [M]" if worst_member.get('is_maverick', False) else ""
+
+    all_negative = all(f < 0 for _, f in per_agent_mean_fit)
+    worst_is_outlier = (std_all > 0) and (worst_fit < (mean_all - 2 * std_all))
+
+    current_result = next(sr for sr in sweep_results if sr['is_current'])
+    best_improvement = best_sweep['fitness'] - current_result['fitness']
+
+    slices_str = ','.join(str(s) for s in focus_slices)
+
+    if all_negative:
+        print(f"\n  REGIME PROBLEM")
+        print(f"  All {len(per_agent_mean_fit)} agents have negative mean fitness on the target slice(s).")
+        print(f"  Mean individual fitness: {mean_all:.2f}")
+        print(f"  This is likely a hostile market regime. No committee change will fix it.")
+        if best_improvement > 0:
+            print(f"\n  However, parameter tuning can reduce the damage:")
+            print(f"  Best combo: quorum={best_sweep['quorum']}, conviction=P{best_sweep['pct']} "
+                  f"(fitness improvement: {best_improvement:+.2f})")
+            print(f"  Run: python -m committee --sweep-both \"{','.join(str(q) for q in quorum_values)}:"
+                  f"{','.join(str(p) for p in conviction_percentiles)}\" to check impact on all slices.")
+    elif worst_is_outlier:
+        print(f"\n  AGENT PROBLEM")
+        print(f"  {worst_name}{worst_maverick} is a significant outlier (fitness: {worst_fit:.2f}, "
+              f"mean: {mean_all:.2f}, std: {std_all:.2f}).")
+        print(f"  This agent is dragging down the committee on the target slice(s).")
+        print(f"\n  Suggested fix:")
+        print(f"  python -m committee --swap-agent \"{worst_name}\" --focus-slices \"{slices_str}\"")
+    elif best_improvement > 2.0:
+        print(f"\n  PARAMETER PROBLEM")
+        print(f"  Tuning quorum/conviction significantly improves the target slice(s).")
+        print(f"  Best combo: quorum={best_sweep['quorum']}, conviction=P{best_sweep['pct']} "
+              f"(fitness improvement: {best_improvement:+.2f})")
+        print(f"\n  Suggested fix:")
+        print(f"  Run: python -m committee --sweep-both \"{','.join(str(q) for q in quorum_values)}:"
+              f"{','.join(str(p) for p in conviction_percentiles)}\" to check impact on all slices.")
     else:
-        print(f"❌ Invalid rank. Please enter a number between 1 and {top_n}.")
+        print(f"\n  MIXED / NO CLEAR FIX")
+        print(f"  No single agent is a clear outlier (worst: {worst_name}{worst_maverick} at {worst_fit:.2f}, "
+              f"mean: {mean_all:.2f}).")
+        print(f"  Parameter tuning improvement is modest ({best_improvement:+.2f}).")
+        print(f"\n  Consider:")
+        print(f"  1. Multi-agent swap: try replacing the bottom 2-3 performers one at a time.")
+        print(f"     Weakest: {worst_name}{worst_maverick} ({worst_fit:.2f})")
+        second_worst_idx, second_worst_fit = per_agent_mean_fit[1]
+        second_worst_m = members[second_worst_idx]
+        second_worst_name = f"{second_worst_m['run_name']}_{second_worst_m['agent_id']}"
+        print(f"     2nd weakest: {second_worst_name} ({second_worst_fit:.2f})")
+        print(f"  2. Accept partial loss on this regime if overall committee performance is healthy.")
+
+    print("\n" + "="*70)
 
 
 def print_committee_stats(manager):
@@ -858,8 +1666,10 @@ def main():
                         help='Run Phase 1: Draft committee from Global50')
     parser.add_argument('--draft-deep', action='store_true',
                         help='Run Phase 1 with automatic deep refinement (no manual swaps)')
+    parser.add_argument('--draft-deep2', action='store_true',
+                        help='Like --draft-deep but slice improvement tests ALL Global50 candidates (exhaustive)')
     parser.add_argument('--maverick', action='store_true',
-                        help='Force exactly one maverick agent in committee (use with --draft or --draft-deep)')
+                        help='Force exactly one maverick agent in committee (use with --draft, --draft-deep, or --draft-deep2)')
     parser.add_argument('--validate', action='store_true',
                         help='Run Phase 2: Validate on holdout slices')
     parser.add_argument('--verify-only', action='store_true',
@@ -886,13 +1696,21 @@ def main():
                         help='Sweep both quorum and conviction (grid search). Format: "quorums:percentiles"')
     parser.add_argument('--swap-agent', type=str, default=None,
                         help='Evaluate and swap a specific agent (e.g. "run-name_id")')
+    parser.add_argument('--focus-slices', type=str, default=None,
+                        help='Focus swap search on specific slices, comma-separated (e.g., "0,3"). '
+                             'Candidates are ranked by improvement on these slices. Use with --swap-agent.')
+    parser.add_argument('--diagnose-slice', type=str, default=None,
+                        help='Diagnose problematic slices: agent breakdown, consensus stats, '
+                             'quorum/conviction mini-sweep, and recommendation. '
+                             'Comma-separated slice indices (e.g., "0,3").')
     args = parser.parse_args()
 
     has_action = any([
-        args.draft, args.draft_deep, args.validate, args.verify_only, args.stats,
-        args.mirror, args.update_maverick_flags, args.update_conviction is not None,
-        args.simulate, args.sweep_quorum, args.sweep_conviction,
-        args.sweep_both, args.swap_agent,
+        args.draft, args.draft_deep, args.draft_deep2, args.validate, args.verify_only,
+        args.stats, args.mirror, args.update_maverick_flags,
+        args.update_conviction is not None, args.simulate,
+        args.sweep_quorum, args.sweep_conviction,
+        args.sweep_both, args.swap_agent, args.diagnose_slice,
     ])
 
     if not has_action:
@@ -946,6 +1764,12 @@ def main():
         print("\n✓ Verification complete.")
         exit(0)
 
+    # Handle --diagnose-slice
+    if args.diagnose_slice:
+        diag_slices = [int(s.strip()) for s in args.diagnose_slice.split(',')]
+        run_diagnose_slice(manager, loader, stats, holdout_info, diag_slices)
+        exit(0)
+
     # Handle --update-conviction
     if args.update_conviction is not None:
         if not (1.0 <= args.update_conviction <= 100.0):
@@ -956,17 +1780,22 @@ def main():
 
     # Handle --swap-agent
     if args.swap_agent:
-        run_swap_agent(manager, loader, stats, holdout_info, args.swap_agent)
+        focus_slices = None
+        if args.focus_slices:
+            focus_slices = [int(s.strip()) for s in args.focus_slices.split(',')]
+        run_swap_agent(manager, loader, stats, holdout_info, args.swap_agent, focus_slices=focus_slices)
         exit(0)
 
     # Validate --maverick is used with draft
-    if args.maverick and not (args.draft or args.draft_deep):
-        print("❌ --maverick must be used with --draft or --draft-deep")
+    if args.maverick and not (args.draft or args.draft_deep or args.draft_deep2):
+        print("❌ --maverick must be used with --draft, --draft-deep, or --draft-deep2")
         exit(1)
 
-    if args.draft or args.draft_deep:
+    if args.draft or args.draft_deep or args.draft_deep2:
         roster = run_draft(manager, loader, stats, holdout_info,
-                          deep=args.draft_deep, require_maverick=args.maverick)
+                          deep=(args.draft_deep or args.draft_deep2),
+                          exhaustive=args.draft_deep2,
+                          require_maverick=args.maverick)
         if roster and args.validate:
             gc.collect()
             torch.cuda.empty_cache()

@@ -256,27 +256,36 @@ def find_best_swap_candidate(committee_indices: tuple, drop_idx: int, entries: l
 
 # --- Optimization ---
 
-def optimize_committee(entries: list, corr_matrix: np.ndarray, require_maverick: bool = False) -> dict:
+def optimize_committee(entries: list, corr_matrix: np.ndarray,
+                       require_maverick: bool = False, exhaustive: bool = False) -> dict:
     """
     Find optimal committee using incremental exhaustive search.
 
-    Algorithm:
-    1. Start with top K agents (COMMITTEE_TOP_K_INITIAL)
-    2. Exhaustive search for best COMMITTEE_SIZE combination
-    3. Expand pool by 1 agent, re-optimize
-    4. Stop after COMMITTEE_EARLY_STOP consecutive non-improvements
+    Standard mode (exhaustive=False):
+        1. Start with top K agents (COMMITTEE_TOP_K_INITIAL)
+        2. Exhaustive search for best COMMITTEE_SIZE combination
+        3. Expand pool by 1 agent, re-optimize
+        4. Stop after COMMITTEE_EARLY_STOP consecutive non-improvements
+
+    Exhaustive mode (exhaustive=True) with maverick constraint:
+        Per-maverick optimization: each of the 5 mavericks is tested as the
+        fixed maverick slot while the remaining non-maverick slots are optimized
+        from a much larger pool with more patient early stopping.
+
+    Exhaustive mode without maverick constraint:
+        Same incremental approach but with a larger initial pool and more patient
+        early stopping.
 
     Args:
         entries: List of Global50 entry dicts
         corr_matrix: Full NxN correlation matrix
-        require_maverick: If True, only consider combinations with at least one maverick
+        require_maverick: If True, only consider combinations with exactly one maverick
+        exhaustive: If True, use broader search (--draft-deep2)
 
     Returns:
         Dict with best committee info
     """
     committee_size = Config.COMMITTEE_SIZE
-    initial_pool = Config.COMMITTEE_TOP_K_INITIAL
-    early_stop = Config.COMMITTEE_EARLY_STOP
 
     valid_entries = [i for i in range(len(entries)) if corr_matrix[i, i] == 1.0]
 
@@ -298,8 +307,22 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray, require_maverick:
         print(f"❌ Not enough valid agents ({len(valid_entries)}) for committee of {committee_size}")
         return None
 
+    # Per-maverick exhaustive search
+    if exhaustive and require_maverick:
+        return _optimize_per_maverick(entries, corr_matrix, valid_entries, committee_size)
+
+    # Incremental search — expanded params for exhaustive mode
+    if exhaustive:
+        initial_pool = min(35, len(valid_entries))
+        early_stop = 15
+    else:
+        initial_pool = Config.COMMITTEE_TOP_K_INITIAL
+        early_stop = Config.COMMITTEE_EARLY_STOP
+
+    mode_label = "Exhaustive" if exhaustive else "Incremental"
+
     print(f"\n{'='*60}")
-    print(f"COMMITTEE OPTIMIZATION")
+    print(f"COMMITTEE OPTIMIZATION ({mode_label})")
     print(f"{'='*60}")
     print(f"  Committee Size: {committee_size}")
     print(f"  Initial Pool: top {initial_pool} agents")
@@ -321,16 +344,27 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray, require_maverick:
 
     while consecutive_failures < early_stop and current_pool_size <= len(valid_entries):
         iteration += 1
-        pool = valid_entries[:current_pool_size]
 
-        num_combos = comb(len(pool), committee_size)
-
-        print(f"\n  Iteration {iteration}: Pool size {current_pool_size}, "
-              f"searching {num_combos:,} combinations...")
+        if iteration == 1:
+            pool = valid_entries[:current_pool_size]
+            num_combos = comb(len(pool), committee_size)
+            combo_gen = combinations(pool, committee_size)
+            print(f"\n  Iteration {iteration}: Pool size {current_pool_size}, "
+                  f"searching {num_combos:,} combinations...")
+        else:
+            new_agent = valid_entries[current_pool_size - 1]
+            prev_pool = valid_entries[:current_pool_size - 1]
+            num_combos = comb(len(prev_pool), committee_size - 1)
+            combo_gen = (
+                tuple(sorted(partial + (new_agent,)))
+                for partial in combinations(prev_pool, committee_size - 1)
+            )
+            print(f"\n  Iteration {iteration}: +agent #{current_pool_size}, "
+                  f"{num_combos:,} new combinations...")
 
         improved = False
 
-        for combo in combinations(pool, committee_size):
+        for combo in combo_gen:
             if require_maverick:
                 maverick_count = sum(1 for i in combo if entries[i].get('is_maverick', False))
                 if maverick_count != 1:
@@ -372,6 +406,156 @@ def optimize_committee(entries: list, corr_matrix: np.ndarray, require_maverick:
         'avg_correlation': best_avg_corr,
         'max_correlation': best_max_corr,
     }
+
+
+def _optimize_per_maverick(entries: list, corr_matrix: np.ndarray,
+                            valid_entries: list, committee_size: int) -> dict:
+    """
+    Per-maverick exhaustive optimization for --draft-deep2.
+
+    Fixes each maverick in the committee one at a time and runs an incremental
+    exhaustive search for the best (committee_size - 1) non-maverick combination.
+    This ensures every maverick gets a fair shot — not just whichever happened
+    to land in the initial top-K pool.
+
+    Uses a larger initial pool (top 30 non-mavericks) and more patient early
+    stopping (10 consecutive non-improvements) than the standard search.
+
+    Args:
+        entries: Full Global50 entry list
+        corr_matrix: Full NxN correlation matrix
+        valid_entries: Pre-filtered list of valid agent indices
+        committee_size: Target committee size
+
+    Returns:
+        Dict with best committee info, or None if optimization failed
+    """
+    valid_mavericks = [i for i in valid_entries if entries[i].get('is_maverick', False)]
+    valid_non_mavericks = [i for i in valid_entries if not entries[i].get('is_maverick', False)]
+
+    non_mav_slots = committee_size - 1
+    initial_pool_nm = min(30, len(valid_non_mavericks))
+    early_stop_nm = 10
+
+    print(f"\n{'='*60}")
+    print(f"COMMITTEE OPTIMIZATION (Per-Maverick Exhaustive)")
+    print(f"{'='*60}")
+    print(f"  Committee Size: {committee_size}")
+    print(f"  Mavericks to test: {len(valid_mavericks)}")
+    print(f"  Non-maverick pool: {len(valid_non_mavericks)}")
+    print(f"  Non-maverick slots: {non_mav_slots}")
+    print(f"  Per-maverick initial pool: top {initial_pool_nm} non-mavericks")
+    print(f"  Per-maverick early stop: {early_stop_nm} consecutive non-improvements")
+
+    total_combos_estimate = len(valid_mavericks) * comb(initial_pool_nm, non_mav_slots)
+    print(f"  Estimated combinations (first pass): {total_combos_estimate:,}")
+
+    best_overall = None
+    best_obj_overall = float('-inf')
+
+    for mav_num, mav_idx in enumerate(valid_mavericks, 1):
+        mav_entry = entries[mav_idx]
+        mav_name = f"{mav_entry['run_name']}_{mav_entry['agent_id']}"
+
+        print(f"\n  {'─'*56}")
+        print(f"  Maverick {mav_num}/{len(valid_mavericks)}: {mav_name} "
+              f"(score={mav_entry['gauntlet_score']:.2f})")
+        print(f"  {'─'*56}")
+
+        best_committee_for_mav = None
+        best_obj_for_mav = float('-inf')
+        best_score_for_mav = 0
+        best_avg_corr_for_mav = 0
+        best_max_corr_for_mav = 0
+        consecutive_failures = 0
+        current_pool_size = min(initial_pool_nm, len(valid_non_mavericks))
+
+        iteration = 0
+
+        while consecutive_failures < early_stop_nm and current_pool_size <= len(valid_non_mavericks):
+            iteration += 1
+
+            if iteration == 1:
+                pool = valid_non_mavericks[:current_pool_size]
+                num_combos = comb(len(pool), non_mav_slots)
+                nm_combo_gen = combinations(pool, non_mav_slots)
+                print(f"    Iter {iteration}: pool {current_pool_size}, "
+                      f"{num_combos:,} combinations...")
+            else:
+                new_agent = valid_non_mavericks[current_pool_size - 1]
+                prev_pool = valid_non_mavericks[:current_pool_size - 1]
+                num_combos = comb(len(prev_pool), non_mav_slots - 1)
+                nm_combo_gen = (
+                    partial + (new_agent,)
+                    for partial in combinations(prev_pool, non_mav_slots - 1)
+                )
+                print(f"    Iter {iteration}: +agent #{current_pool_size}, "
+                      f"{num_combos:,} new combinations...")
+
+            improved = False
+
+            for nm_combo in nm_combo_gen:
+                combo = tuple(sorted(nm_combo + (mav_idx,)))
+                obj, score_sum, avg_corr, max_corr = committee_objective(
+                    combo, entries, corr_matrix
+                )
+
+                if obj > best_obj_for_mav:
+                    best_obj_for_mav = obj
+                    best_committee_for_mav = combo
+                    best_score_for_mav = score_sum
+                    best_avg_corr_for_mav = avg_corr
+                    best_max_corr_for_mav = max_corr
+                    improved = True
+
+            if improved:
+                consecutive_failures = 0
+                print(f"      ✓ Best: obj={best_obj_for_mav:.2f}, "
+                      f"score={best_score_for_mav:.2f}, "
+                      f"avg_corr={best_avg_corr_for_mav:.3f}, "
+                      f"max_corr={best_max_corr_for_mav:.3f}")
+            else:
+                consecutive_failures += 1
+                print(f"      No improvement ({consecutive_failures}/{early_stop_nm})")
+
+            current_pool_size += 1
+
+        if best_committee_for_mav is not None:
+            if best_obj_for_mav > best_obj_overall:
+                best_obj_overall = best_obj_for_mav
+                best_overall = {
+                    'committee_indices': best_committee_for_mav,
+                    'objective': best_obj_for_mav,
+                    'score_sum': best_score_for_mav,
+                    'avg_correlation': best_avg_corr_for_mav,
+                    'max_correlation': best_max_corr_for_mav,
+                }
+                print(f"  ★ New overall best! obj={best_obj_overall:.2f}")
+            else:
+                print(f"    Best for this maverick: {best_obj_for_mav:.2f} "
+                      f"(overall best: {best_obj_overall:.2f})")
+
+    if best_overall is None:
+        print("❌ Per-maverick optimization failed")
+        return None
+
+    # Report selected maverick
+    selected_mav = [i for i in best_overall['committee_indices']
+                     if entries[i].get('is_maverick', False)]
+    selected_mav_entry = entries[selected_mav[0]] if selected_mav else None
+
+    print(f"\n{'='*60}")
+    print(f"OPTIMIZATION COMPLETE (Per-Maverick Exhaustive)")
+    print(f"{'='*60}")
+    print(f"  Final Objective: {best_overall['objective']:.2f}")
+    print(f"  Aggregate Score: {best_overall['score_sum']:.2f}")
+    print(f"  Avg Correlation: {best_overall['avg_correlation']:.3f}")
+    print(f"  Max Pair Correlation: {best_overall['max_correlation']:.3f}")
+    if selected_mav_entry:
+        print(f"  Selected Maverick: {selected_mav_entry['run_name']}_"
+              f"{selected_mav_entry['agent_id']} [M]")
+
+    return best_overall
 
 
 # --- Refinement ---
