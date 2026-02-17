@@ -7,6 +7,7 @@ Committee Production Engine for Project Eigen 2 (Global50 Edition)
 
 USAGE:
   python -m committee --verify-only   # Check data split only
+  python -m committee --stats         # Display committee roster statistics
   python -m committee --draft         # Phase 1: Select committee from Global50
   python -m committee --validate      # Phase 2: Validate on holdout slices
   python -m committee --mirror        # Sync roster, correlation, and agent files

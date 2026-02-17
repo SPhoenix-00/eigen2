@@ -798,116 +798,161 @@ class OnDiskReplayBuffer(IterableDataset):
             'dones': torch.FloatTensor(dones)
         }
 
+    @staticmethod
+    def _load_chunk(path):
+        """Load a single gzip chunk file. Used by background prefetch threads.
+        gzip decompression (zlib C extension) releases the GIL, enabling real
+        parallelism across threads for the I/O-heavy portion of loading."""
+        try:
+            with gzip.open(path, 'rb') as f:
+                data = pickle.load(f)
+            if isinstance(data, list):
+                return data
+            else:
+                return [data]
+        except Exception:
+            return None
+
     def __iter__(self):
         """
-        Memory-Safe Cache & Drain Iterator.
+        Background-Prefetch Iterator.
+
+        Uses a pool of background threads to continuously load chunks from disk
+        while the main thread (GPU) trains. This overlaps disk I/O with compute,
+        preventing the GPU from stalling on gzip decompression of large chunks.
+
+        Architecture:
+          - N background threads read random chunks from self.buffer (gzip+pickle)
+          - Loaded transitions are placed into a thread-safe queue
+          - Main thread drains the queue into a local cache and yields batches
+          - gzip decompression releases the GIL, so threads achieve real parallelism
         """
         import random
         import time as time_module
+        import threading
+        import queue as queue_module
 
-        # 5000 items * 350KB = ~1.7GB RAM.
-        # Larger cache = fewer disk hits = less overhead.
-        TARGET_CACHE_SIZE = 5000
+        PREFETCH_WORKERS = 3
+        # Keep enough transitions in the queue to sustain ~8 training steps without refill.
+        # Each chunk has ~64 transitions. Queue of 20 chunks = ~1280 transitions = 32 batches.
+        CHUNK_QUEUE_MAXSIZE = 20
+        DRAIN_BATCH_SIZE = self.training_batch_size
+        MAX_WAIT_SECONDS = 120
 
         local_cache = []
+        chunk_queue = queue_module.Queue(maxsize=CHUNK_QUEUE_MAXSIZE)
+        stop_event = threading.Event()
 
-        # Track Consecutive Failures (cap to avoid infinite stall when all refills fail)
-        consecutive_failures = 0
-        MAX_CONSECUTIVE_REFILL_FAILURES = 200
-
-        while True:
-            # 1. REFILL PHASE
-            if len(local_cache) < self.training_batch_size:
-                # Calculate how many files we need to reach target
-                current_size = len(local_cache)
-                # First refill (empty cache): load only 2-3 batches so first next() returns quickly.
-                # Otherwise the training loop blocks on disk I/O and appears "stuck" at 0%.
-                if current_size == 0:
-                    needed_items = min(TARGET_CACHE_SIZE, 3 * self.training_batch_size)
-                else:
-                    needed_items = TARGET_CACHE_SIZE - current_size
-
-                # Use actual chunk size estimate
-                chunk_size = getattr(self, '_chunk_size', 64)
-                files_needed = max(1, needed_items // chunk_size)
-
-                # Cap at available files in buffer
-                files_needed = min(files_needed, len(self.buffer))
-                # Cap files per refill to prevent blocking the main thread for 15+ seconds
-                # (with num_workers=0 on Windows, the iterator runs synchronously)
-                MAX_FILES_PER_REFILL = 10
-                files_needed = min(files_needed, MAX_FILES_PER_REFILL)
-
-                if files_needed > 0 and len(self.buffer) > 0:
-                    # Pick random files
-                    indices = np.random.choice(len(self.buffer), files_needed, replace=True)
-
-                    loaded_count = 0
-                    error_count = 0
-
-                    for i in indices:
-                        path = self.buffer[i]
-                        try:
-                            with gzip.open(path, 'rb') as f:
-                                data = pickle.load(f)
-
-                            # Handle both chunks (list) and legacy (dict)
-                            if isinstance(data, list):
-                                local_cache.extend(data)
-                            else:
-                                local_cache.append(data)
-                            loaded_count += 1
-                        except Exception:
-                            error_count += 1
-                            continue
-
-                    # Shuffle to ensure IID data for training
-                    if loaded_count > 0:
-                        random.shuffle(local_cache)
-                        consecutive_failures = 0
-                    else:
-                        consecutive_failures += 1
-                        if consecutive_failures >= MAX_CONSECUTIVE_REFILL_FAILURES:
-                            raise RuntimeError(
-                                f"Replay buffer iterator: {consecutive_failures} consecutive refill failures. "
-                                "Buffer files may be missing or unreadable. Check buffer_storage directory."
-                            )
-                        if consecutive_failures % 10 == 0:
-                            print(f"Warning: Buffer refill failed {consecutive_failures} times in a row. Buffer size: {len(self.buffer)}")
-                        time_module.sleep(0.1)
-
-                else:
-                    # Buffer is empty, wait for data
+        def _prefetch_worker():
+            """Background worker: continuously loads random chunks into the queue."""
+            while not stop_event.is_set():
+                buf_len = len(self.buffer)
+                if buf_len == 0:
                     time_module.sleep(0.5)
                     continue
 
-            # 2. YIELD PHASE
-            if len(local_cache) >= self.training_batch_size:
-                # Pop batch from cache (Fast RAM operation)
-                batch_data = [local_cache.pop() for _ in range(self.training_batch_size)]
-
-                try:
-                    # Stack into Numpy (CPU)
-                    states = np.stack([t['state'] for t in batch_data])
-                    actions = np.stack([t['action'] for t in batch_data])
-                    rewards = np.array([t['reward'] for t in batch_data]).reshape(-1, 1)
-                    next_states = np.stack([t['next_state'] for t in batch_data])
-                    dones = np.array([t['done'] for t in batch_data]).reshape(-1, 1)
-
-                    # Yield Tensors (DataLoader will move to GPU)
-                    yield {
-                        'states': torch.FloatTensor(states),
-                        'actions': torch.FloatTensor(actions),
-                        'rewards': torch.FloatTensor(rewards),
-                        'next_states': torch.FloatTensor(next_states),
-                        'dones': torch.FloatTensor(dones)
-                    }
-                except Exception as e:
-                    print(f"Error collating batch: {e}")
+                if chunk_queue.qsize() >= CHUNK_QUEUE_MAXSIZE:
+                    time_module.sleep(0.05)
                     continue
-            else:
-                # Buffer is empty or waiting for data
-                time_module.sleep(0.1)
+
+                idx = np.random.randint(buf_len)
+                path = self.buffer[idx]
+                result = OnDiskReplayBuffer._load_chunk(path)
+                if result is not None:
+                    try:
+                        chunk_queue.put(result, timeout=2.0)
+                    except queue_module.Full:
+                        pass
+                else:
+                    time_module.sleep(0.01)
+
+        # Start background prefetch threads
+        threads = []
+        for _ in range(PREFETCH_WORKERS):
+            t = threading.Thread(target=_prefetch_worker, daemon=True)
+            t.start()
+            threads.append(t)
+
+        # Pre-warm: block until we have enough data for the first few batches
+        warmup_target = min(3 * DRAIN_BATCH_SIZE, 200)
+        warmup_start = time_module.time()
+        while len(local_cache) < warmup_target:
+            try:
+                chunk_data = chunk_queue.get(timeout=30.0)
+                local_cache.extend(chunk_data)
+            except queue_module.Empty:
+                if len(self.buffer) == 0:
+                    time_module.sleep(0.5)
+                    continue
+                break
+        warmup_elapsed = time_module.time() - warmup_start
+        if warmup_elapsed > 2.0:
+            print(f"  [Buffer] Pre-warmed cache with {len(local_cache)} transitions in {warmup_elapsed:.1f}s")
+
+        try:
+            while True:
+                # 1. REFILL from background queue (non-blocking drain)
+                if len(local_cache) < DRAIN_BATCH_SIZE:
+                    # Blocking wait — we need at least one batch
+                    wait_start = time_module.time()
+                    while len(local_cache) < DRAIN_BATCH_SIZE:
+                        try:
+                            timeout = max(0.1, MAX_WAIT_SECONDS - (time_module.time() - wait_start))
+                            chunk_data = chunk_queue.get(timeout=timeout)
+                            local_cache.extend(chunk_data)
+                        except queue_module.Empty:
+                            elapsed = time_module.time() - wait_start
+                            if elapsed >= MAX_WAIT_SECONDS:
+                                raise RuntimeError(
+                                    f"Replay buffer iterator: waited {elapsed:.0f}s for data but queue is empty. "
+                                    f"Buffer has {len(self.buffer)} chunks. Check buffer_storage directory."
+                                )
+                            continue
+                    wait_elapsed = time_module.time() - wait_start
+                    if wait_elapsed > 5.0:
+                        print(f"  [Buffer] WARNING: waited {wait_elapsed:.1f}s for refill (cache was {len(local_cache) - DRAIN_BATCH_SIZE} items)")
+                else:
+                    # Non-blocking drain: grab any available chunks to keep cache full
+                    drained = 0
+                    while drained < 5:
+                        try:
+                            chunk_data = chunk_queue.get_nowait()
+                            local_cache.extend(chunk_data)
+                            drained += 1
+                        except queue_module.Empty:
+                            break
+
+                # Shuffle periodically for IID training data
+                if len(local_cache) > DRAIN_BATCH_SIZE * 2:
+                    random.shuffle(local_cache)
+
+                # 2. YIELD PHASE
+                if len(local_cache) >= DRAIN_BATCH_SIZE:
+                    batch_data = [local_cache.pop() for _ in range(DRAIN_BATCH_SIZE)]
+
+                    try:
+                        states = np.stack([t['state'] for t in batch_data])
+                        actions = np.stack([t['action'] for t in batch_data])
+                        rewards = np.array([t['reward'] for t in batch_data]).reshape(-1, 1)
+                        next_states = np.stack([t['next_state'] for t in batch_data])
+                        dones = np.array([t['done'] for t in batch_data]).reshape(-1, 1)
+
+                        yield {
+                            'states': torch.FloatTensor(states),
+                            'actions': torch.FloatTensor(actions),
+                            'rewards': torch.FloatTensor(rewards),
+                            'next_states': torch.FloatTensor(next_states),
+                            'dones': torch.FloatTensor(dones)
+                        }
+                    except Exception as e:
+                        print(f"Error collating batch: {e}")
+                        continue
+                else:
+                    time_module.sleep(0.05)
+        finally:
+            stop_event.set()
+            for t in threads:
+                t.join(timeout=5.0)
 
     def __len__(self) -> int:
         """Return actual transition count (not chunk count)."""

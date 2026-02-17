@@ -21,12 +21,21 @@ from utils.config import Config
 from utils.cleanup_orphans import cleanup_orphans
 
 
+def _is_tqdm_final_line(line: str) -> bool:
+    """True if line looks like tqdm's 100% completed bar (with timing)."""
+    return '100%' in line and ('|' in line or 'it/s' in line or 'it]' in line)
+
+
 class TeeLogger:
     """Logger that writes to both file and stdout.
     
     The log_file attribute is publicly accessible so that the log() utility
     in utils/display.py can write file-only messages (verbose detail that
     shouldn't clutter the console).
+    Flushes the log file after every write so training_log_{timestamp}.txt
+    is updated as you step through, not only at the end.
+    tqdm progress bars: only the final 100% line (with averages) is written
+    to the log to avoid a massive file; terminal still shows live progress.
     """
 
     def __init__(self, filepath: Path):
@@ -34,16 +43,28 @@ class TeeLogger:
         Initialize TeeLogger.
 
         Args:
-            filepath: Path to the log file
+            filepath: Path to the log file (e.g. training_log_{timestamp}.txt)
         """
         self.terminal = sys.stdout
         self.log_file = open(filepath, 'w', encoding='utf-8', buffering=1)  # Line buffered
 
     def write(self, message):
-        """Write message to both terminal and file."""
+        """Write message to terminal; to log only if not an in-progress tqdm bar."""
         self.terminal.write(message)
-        self.log_file.write(message)
-        self.log_file.flush()  # Ensure immediate write to disk
+        self.terminal.flush()
+
+        # Log file: skip in-progress tqdm updates, keep only the final 100% line
+        if '\r' in message:
+            # tqdm overwrites with \r; take the last segment (current state)
+            last = message.split('\r')[-1].strip()
+            if _is_tqdm_final_line(last):
+                self.log_file.write(last + '\n')
+                self.log_file.flush()
+            # else: in-progress bar (23%, 24%, ...) -> don't write to log
+        else:
+            # No \r: normal output (prints, etc.) -> write to log
+            self.log_file.write(message)
+            self.log_file.flush()
 
     def flush(self):
         """Flush both outputs."""
@@ -319,6 +340,9 @@ def run_multi_orchestrator(loader, roster, args, tee_logger):
             # Override target breakthroughs to match multi-mode expectations
             trainer.target_breakthroughs = Config.MULTI_TARGET_TURNOVERS
 
+            # Enable recency anchor: pin last evaluation episode to most recent training data
+            trainer.recency_anchor = Config.MULTI_RECENCY_ANCHOR
+
             # Update progress with the actual wandb run name (now known)
             progress['in_progress']['run_name'] = trainer.run_name
             progress['last_updated'] = str(datetime.now())
@@ -422,11 +446,11 @@ def main():
     log_dir = Path("evaluation_results")
     log_dir.mkdir(exist_ok=True)
 
-    # Create timestamped log file
+    # Create timestamped log file (unbuffered so it updates as we step through)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"training_log_{timestamp}.txt"
 
-    # Redirect stdout to both terminal and log file
+    # Redirect stdout/stderr to both terminal and log file
     tee_logger = TeeLogger(log_file)
     sys.stdout = tee_logger
     sys.stderr = tee_logger  # Also capture error messages

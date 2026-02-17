@@ -34,6 +34,7 @@ from utils.config import Config
 from models.ddpg_agent import DDPGAgent
 from training.fitness import (
     calculate_expectancy as _calculate_expectancy,
+    calculate_recency_weighted_fitness,
     aggregate_agent_stats,
     aggregate_population_stats,
 )
@@ -356,6 +357,8 @@ except Exception as e:
 
         print(f"\n--- Generation {self.trainer.generation + 1}: Evaluating Population (Local/{self.target_device.type.upper()}) ---")
         print(f"Multi-slice evaluation: {num_episodes} slices per agent, scoring = {scoring_method}")
+        if self.trainer.recency_anchor:
+            print(f"Recency anchor: last episode pinned to most recent data, weight={Config.MULTI_RECENCY_WEIGHT:.0%}")
 
         num_elites = sum(1 for a in self.population if a.is_elite)
         print(f"Elite Demonstration: {num_elites} elites + {len(self.population) - num_elites} exploratory")
@@ -370,6 +373,11 @@ except Exception as e:
             self.max_start,
             size=(len(self.population), num_episodes)
         )
+
+        # Recency anchor: overwrite the last episode column so every agent
+        # evaluates on the most recent training data
+        if self.trainer.recency_anchor:
+            all_starts[:, -1] = self.max_start
 
         fitness_scores = []
         all_episode_stats = []
@@ -405,7 +413,15 @@ except Exception as e:
                 slice_stats.append(episode_info)
 
             # Calculate final fitness
-            if self.trainer.multi2_mode:
+            if self.trainer.recency_anchor and len(slice_fitness) >= 2:
+                # Recency-weighted: separate the pinned last score from the random base scores
+                recency_score = slice_fitness[-1]
+                base_scores = slice_fitness[:-1]
+                aggregator = "penalized_median" if self.trainer.multi2_mode else "pessimistic"
+                final_fitness = calculate_recency_weighted_fitness(
+                    base_scores, recency_score, Config.MULTI_RECENCY_WEIGHT, aggregator
+                )
+            elif self.trainer.multi2_mode:
                 final_fitness = self._penalized_median(slice_fitness)
             else:
                 final_fitness = self._pessimistic(slice_fitness)

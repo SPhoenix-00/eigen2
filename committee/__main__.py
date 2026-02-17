@@ -739,6 +739,116 @@ def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap):
         print(f"❌ Invalid rank. Please enter a number between 1 and {top_n}.")
 
 
+def print_committee_stats(manager):
+    """
+    Load committee_roster.json and display comprehensive statistics.
+    Same pattern as global50.py --stats.
+    """
+    roster = manager.load_roster()
+    print("\n" + "="*70)
+    print("COMMITTEE STATISTICS")
+    print("="*70)
+    print(f"Context Window: {manager.context_window_days} days ({manager.context_window_id})")
+
+    if roster is None:
+        print("\n❌ Committee roster not found.")
+        print("   Run with --draft first, or --mirror to download from cloud.")
+        print("="*70)
+        return
+
+    members = roster.get('members', [])
+    if not members:
+        print("\n⚠ No members in committee (empty roster)")
+        print("="*70)
+        return
+
+    def calc_stats(values):
+        if not values:
+            return {'min': 0, 'max': 0, 'mean': 0}
+        return {
+            'min': min(values),
+            'max': max(values),
+            'mean': np.mean(values),
+        }
+
+    num_mavericks = sum(1 for m in members if m.get('is_maverick', False))
+    gauntlet_scores = [m.get('gauntlet_score', 0) for m in members]
+    rois = [m.get('roi', 0) for m in members]
+    expectancies = [m.get('expectancy', 0) for m in members]
+    quality_ratios = [m.get('quality_ratio', 0) for m in members]
+    win_ratios = [m.get('win_ratio', 0) for m in members]
+
+    g_stats = calc_stats(gauntlet_scores)
+    roi_stats = calc_stats(rois)
+    exp_stats = calc_stats(expectancies)
+    q_stats = calc_stats(quality_ratios)
+    w_stats = calc_stats(win_ratios)
+
+    corr = roster.get('correlation', {})
+    avg_corr = corr.get('average', 0)
+    max_corr = corr.get('max_pair', 0)
+    obj = roster.get('objective_value', 0)
+    agg = roster.get('aggregate_score', 0)
+    conv_pct = roster.get('conviction_percentile', 95)
+    generated = roster.get('generated_at', 'N/A')
+    last_updated = roster.get('last_updated', 'N/A')
+
+    print(f"\n📊 OVERVIEW")
+    print("-" * 70)
+    print(f"  Roster:          {manager.local_roster_path}")
+    print(f"  Total Members:   {len(members):>4}")
+    print(f"  Mavericks [M]:    {num_mavericks:>4} ({100*num_mavericks/len(members):.1f}%)")
+    print(f"  Conviction Pct:  {conv_pct:>4}")
+    print(f"  Generated:       {generated}")
+    print(f"  Last Updated:    {last_updated}")
+
+    print(f"\n📋 AGENTS IN ROSTER")
+    print("-" * 70)
+    for i, m in enumerate(members, 1):
+        maverick_tag = " [M]" if m.get('is_maverick', False) else ""
+        name = f"{m['run_name']}_{m['agent_id']}{maverick_tag}"
+        print(f"  {i:>2}. {name}")
+
+    print(f"\n🎯 CORRELATION & OBJECTIVE")
+    print("-" * 70)
+    print(f"  Avg Correlation: {avg_corr:>10.3f}")
+    print(f"  Max Pair Corr:   {max_corr:>10.3f}")
+    print(f"  Objective Value: {obj:>10.2f}")
+    print(f"  Aggregate Score: {agg:>10.2f}")
+
+    print(f"\n🎯 GAUNTLET SCORE (per member)")
+    print("-" * 70)
+    print(f"  Min:               {g_stats['min']:>10.2f}")
+    print(f"  Max:               {g_stats['max']:>10.2f}")
+    print(f"  Mean:              {g_stats['mean']:>10.2f}")
+
+    print(f"\n📈 ROI % (per member)")
+    print("-" * 70)
+    print(f"  Min:               {roi_stats['min']:>10.2f}")
+    print(f"  Max:               {roi_stats['max']:>10.2f}")
+    print(f"  Mean:              {roi_stats['mean']:>10.2f}")
+
+    print(f"\n📈 EXPECTANCY (per member)")
+    print("-" * 70)
+    print(f"  Min:               {exp_stats['min']:>10.2f}")
+    print(f"  Max:               {exp_stats['max']:>10.2f}")
+    print(f"  Mean:              {exp_stats['mean']:>10.2f}")
+
+    print(f"\n📊 QUALITY RATIO (per member)")
+    print("-" * 70)
+    print(f"  Min:               {q_stats['min']:>10.3f}")
+    print(f"  Max:               {q_stats['max']:>10.3f}")
+    print(f"  Mean:              {q_stats['mean']:>10.3f}")
+
+    print(f"\n📊 WIN RATIO (per member)")
+    print("-" * 70)
+    print(f"  Min:               {w_stats['min']:>10.3f}")
+    print(f"  Max:               {w_stats['max']:>10.3f}")
+    print(f"  Mean:              {w_stats['mean']:>10.3f}")
+
+    print("\n" + "="*70)
+
+
 # --- CLI ---
 
 def main():
@@ -754,6 +864,8 @@ def main():
                         help='Run Phase 2: Validate on holdout slices')
     parser.add_argument('--verify-only', action='store_true',
                         help='Only verify data split')
+    parser.add_argument('--stats', action='store_true',
+                        help='Display comprehensive statistics about the current committee roster.')
     parser.add_argument('--mirror', action='store_true',
                         help='Check cloud sync status, download missing files')
     parser.add_argument('--update-maverick-flags', action='store_true',
@@ -777,7 +889,7 @@ def main():
     args = parser.parse_args()
 
     has_action = any([
-        args.draft, args.draft_deep, args.validate, args.verify_only,
+        args.draft, args.draft_deep, args.validate, args.verify_only, args.stats,
         args.mirror, args.update_maverick_flags, args.update_conviction is not None,
         args.simulate, args.sweep_quorum, args.sweep_conviction,
         args.sweep_both, args.swap_agent,
@@ -799,6 +911,11 @@ def main():
     if manager.cloud_sync.provider != "local":
         print(f"  Bucket: {manager.cloud_sync.bucket_name}")
         print(f"  Cloud Path: {manager.cloud_committee_base}/")
+
+    # Handle --stats mode (no data loading needed)
+    if args.stats:
+        print_committee_stats(manager)
+        exit(0)
 
     # Handle --mirror mode (no data loading needed)
     if args.mirror:

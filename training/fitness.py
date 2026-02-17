@@ -341,6 +341,41 @@ def calculate_penalized_median_fitness(slice_fitness_scores: List[float]) -> flo
     return median_score - (0.5 * std_score)
 
 
+def calculate_recency_weighted_fitness(
+    base_scores: List[float],
+    recency_score: float,
+    recency_weight: float,
+    aggregator: str = "pessimistic",
+) -> float:
+    """
+    Blend a recency-anchored episode score with the aggregated base scores.
+
+    The last evaluation episode is pinned to the most recent training data and
+    scored separately. The remaining episodes are aggregated using the specified
+    method, then the two components are blended:
+
+        final = recency_weight * recency_score + (1 - recency_weight) * base_agg
+
+    Args:
+        base_scores: Fitness scores from the random (non-recency) episodes.
+        recency_score: Fitness score from the recency-anchored episode.
+        recency_weight: Weight for the recency score (0-1). The base scores
+                        share the remaining (1 - recency_weight).
+        aggregator: Aggregation method for base scores.
+                    "pessimistic" -> 0.4*mean + 0.6*min
+                    "penalized_median" -> median - 0.5*std
+
+    Returns:
+        Blended fitness score (float).
+    """
+    if aggregator == "penalized_median":
+        base_agg = calculate_penalized_median_fitness(base_scores)
+    else:
+        base_agg = calculate_pessimistic_fitness(base_scores)
+
+    return float(recency_weight * recency_score + (1.0 - recency_weight) * base_agg)
+
+
 def aggregate_agent_stats(slice_episode_stats: List[Dict]) -> Dict:
     """
     Aggregate episode statistics across all training slices for a single agent.

@@ -2618,7 +2618,10 @@ class ERLTrainer:
 
         # Initialize batch iterator if not already created
         if self.batch_iterator is None:
-            print("Starting DataLoader workers for async batch prefetching...")
+            if self.local_mode:
+                print("Initializing batch iterator (background prefetch threads)...")
+            else:
+                print("Starting DataLoader workers for async batch prefetching...")
             self.batch_iterator = iter(self.replay_dataloader)
 
         # Check if buffer is full for the first time and we haven't saved it yet
@@ -2691,7 +2694,6 @@ class ERLTrainer:
             # - Fewer gradient steps (8 vs 32)
             # - Accumulation steps set via Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
             local_accumulation_steps = Config.LOCAL_GRADIENT_ACCUMULATION_STEPS
-            profile_local_train = os.environ.get("EIGEN_PROFILE_LOCAL_TRAIN", "0") == "1"
             print(f"  [Local Mode] Training {num_batches} batches of {LOCAL_TRAINING_BATCH_SIZE} agents, {gradient_steps} steps/agent (batch_size={Config.LOCAL_BATCH_SIZE}, accum={local_accumulation_steps})")
 
             # Train agents in this batch by PRE-FETCHING data once for all agents
@@ -2720,9 +2722,9 @@ class ERLTrainer:
 
                     # INVERTED LOOP: Step -> Data -> Agents
                     # Fetch data ONCE per step, feed to ALL agents
+                    slow_step_count = 0
                     for step in range(gradient_steps):
                         for accum_step in range(local_accumulation_steps):
-                            # Use DataLoader iterator (has async prefetching)
                             t0 = time.time()
                             batch_cpu = next(self.batch_iterator)
                             t1 = time.time()
@@ -2730,6 +2732,12 @@ class ERLTrainer:
                             t2 = time.time()
                             t_data_load += (t1 - t0)
                             t_data_transfer += (t2 - t1)
+
+                            step_load_time = t1 - t0
+                            if step_load_time > 10.0:
+                                slow_step_count += 1
+                                if slow_step_count <= 3:
+                                    print(f"    [SLOW] Batch {batch_idx+1} step {step}: data load took {step_load_time:.1f}s")
 
                             is_last_accum = (accum_step == local_accumulation_steps - 1)
                             
@@ -2769,14 +2777,15 @@ class ERLTrainer:
 
                     torch.cuda.empty_cache()
                     batch_wall = time.time() - batch_wall_start
-                    if profile_local_train:
-                        updates_per_sec = (total_updates / t_compute) if t_compute > 0 else 0.0
-                        print(
-                            f"  [TrainTiming][Batch {batch_idx + 1}/{num_batches}] "
-                            f"wall={batch_wall:.1f}s move_in={t_move_in:.1f}s load={t_data_load:.1f}s "
-                            f"transfer={t_data_transfer:.1f}s compute={t_compute:.1f}s move_out={t_move_out:.1f}s "
-                            f"updates={total_updates} upd/s={updates_per_sec:.2f}"
-                        )
+                    updates_per_sec = (total_updates / t_compute) if t_compute > 0 else 0.0
+                    print(
+                        f"  [Batch {batch_idx + 1}/{num_batches}] "
+                        f"wall={batch_wall:.1f}s  load={t_data_load:.1f}s compute={t_compute:.1f}s "
+                        f"move_in={t_move_in:.1f}s move_out={t_move_out:.1f}s "
+                        f"({updates_per_sec:.1f} upd/s)"
+                    )
+                    if slow_step_count > 3:
+                        print(f"    ({slow_step_count} total slow data-load steps in this batch)")
                     
                     # Update progress bar by number of agents processed
                     pbar.update(len(batch_agents))

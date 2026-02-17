@@ -171,6 +171,8 @@ class Config:
     # Rotates to next member after each breakthrough (5% improvement)
     MULTI_BREAKTHROUGH_THRESHOLD = 0.05  # 5% improvement over member's baseline score
     MULTI_TARGET_TURNOVERS = 3           # End after 3 complete turnovers (all 9 members get 3 breakthroughs each)
+    MULTI_RECENCY_ANCHOR = True          # Pin last evaluation episode to most recent training data
+    MULTI_RECENCY_WEIGHT = 0.35          # Weight for recency episode score (rest share 1 - this)
 
     # Maverick mode - aggressive training mode with FOMO/ROI-First reward functions
     # Used to produce aggressive signal generators that break committee inaction
