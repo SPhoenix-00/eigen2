@@ -1688,7 +1688,7 @@ def main():
                         help=f'Override quorum threshold (default: {Config.COMMITTEE_QUORUM})')
     parser.add_argument('--sweep-quorum', type=str, default=None,
                         help='Sweep multiple quorum values, comma-separated (e.g., "2,3,4,5")')
-    parser.add_argument('--conviction-percentile', type=int, default=None,
+    parser.add_argument('--conviction-percentile', type=float, default=None,
                         help='Override conviction percentile threshold (default: 95)')
     parser.add_argument('--sweep-conviction', type=str, default=None,
                         help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99,99.9")')

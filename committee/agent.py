@@ -126,7 +126,6 @@ class CommitteeAgent:
         is_quorum = vote_counts >= Config.COMMITTEE_QUORUM
 
         # 2. Conviction Check (Stock-Specific Override)
-        # Conviction = agent exceeds their own P99 threshold for that stock
         conviction_thresholds = np.array([
             m['stats']['conviction_threshold_vector'] for m in self.members
         ])  # [num_members, num_stocks]
@@ -185,7 +184,6 @@ class CommitteeAgent:
             self.consensus_history['min_consensus_count'] += int(min_consensus)
 
             # Trades by Quorum vs Conviction (MUTUALLY EXCLUSIVE)
-            # For trades that actually happened, determine which mechanism approved them
             # If quorum was met, credit quorum (even if conviction also triggered)
             # Only credit conviction for trades where quorum was NOT met (conviction "rescues")
             is_quorum_trade = is_quorum & stocks_to_count
@@ -210,22 +208,22 @@ class CommitteeAgent:
                 self.consensus_history['avg_votes_per_trade'].append(float(avg_votes))
 
         # 5. Signal Aggregation
-        # For approved trades, average coefficients from ALL supporting agents
-        # (both standard voters AND conviction agents)
+        # Quorum trades: average only standard voters (coeff >= threshold).
+        # Conviction-only trades: average all effective supporters (voters + conviction agents).
+        # This prevents sub-threshold conviction agents from diluting quorum trades.
         final_coeffs = np.zeros(num_stocks, dtype=np.float32)
 
         for stock_idx in range(num_stocks):
             if should_trade[stock_idx]:
-                # Get all agents who support this trade (vote OR conviction)
-                # This ensures the conviction specialist is included in the average
-                supporting_agents_mask = effective_votes[:, stock_idx]  # Boolean mask
+                if is_quorum[stock_idx]:
+                    supporting_agents_mask = votes[:, stock_idx]
+                else:
+                    supporting_agents_mask = effective_votes[:, stock_idx]
 
                 if np.any(supporting_agents_mask):
-                    # Average coefficients from all supporting agents
                     supporting_coeffs = all_coeffs[supporting_agents_mask, stock_idx]
                     final_coeffs[stock_idx] = np.mean(supporting_coeffs)
                 else:
-                    # Fallback to threshold (shouldn't happen, but safety)
                     final_coeffs[stock_idx] = Config.COEFFICIENT_THRESHOLD
 
         return final_coeffs
@@ -275,13 +273,15 @@ class CommitteeAgent:
 # --- Conviction Threshold Calculation ---
 
 def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray,
-                                      percentile: int = 95) -> np.ndarray:
+                                      percentile: float = 95) -> np.ndarray:
     """
     Calculates the Nth percentile conviction threshold for each stock.
 
-    CRITICAL: Only considers coefficients that would actually trigger a trade
-    (>= Config.COEFFICIENT_THRESHOLD). Including non-trading noise (< 1.0) drags
-    the percentile down, allowing sub-threshold signals to masquerade as 'high conviction'.
+    Uses CONVICTION_COEFFICIENT_FLOOR (not COEFFICIENT_THRESHOLD) so that
+    conviction thresholds can fall below the global trade threshold. This allows
+    agents with sub-threshold but personally-high coefficients to trigger conviction
+    without having a standard vote, making the conviction percentile parameter
+    meaningful at all quorum levels.
 
     Args:
         agent_coeff_history_2d: Numpy array [Days, Stocks] for a single agent
@@ -293,39 +293,27 @@ def calculate_agent_stats_vectorized(agent_coeff_history_2d: np.ndarray,
     days, num_stocks = agent_coeff_history_2d.shape
     threshold_vector = np.zeros(num_stocks, dtype=np.float32)
 
-    # Filter: Only look at coefficients that are actual trades
-    # We use Config.COEFFICIENT_THRESHOLD (1.0) as the floor
-    valid_trades_mask = agent_coeff_history_2d >= Config.COEFFICIENT_THRESHOLD
-    all_active = agent_coeff_history_2d[valid_trades_mask]
+    floor = Config.CONVICTION_COEFFICIENT_FLOOR
 
-    # Calculate Global percentile fallback
-    # If the agent has NEVER traded (or very rarely), we set a high fallback
-    # so it cannot easily trigger conviction on noise.
+    valid_mask = agent_coeff_history_2d >= floor
+    all_active = agent_coeff_history_2d[valid_mask]
+
     if len(all_active) > 0:
         global_threshold = np.percentile(all_active, percentile)
     else:
-        # Agent is a ghost (no trades > 1.0). Set threshold to infinity to disable conviction.
         global_threshold = 100.0
 
     for i in range(num_stocks):
-        # Extract history for this specific stock
         stock_coeffs = agent_coeff_history_2d[:, i]
-
-        # Only calculate percentile based on actual trades for this stock
-        active_coeffs = stock_coeffs[stock_coeffs >= Config.COEFFICIENT_THRESHOLD]
+        active_coeffs = stock_coeffs[stock_coeffs >= floor]
 
         if len(active_coeffs) >= 20:
-            # Sufficient history for this stock
-            # For very high percentiles (>= 99.0), ensure we have enough data points
-            # to avoid edge cases in percentile calculation
             min_points_for_high_percentile = max(20, int(100 / (100 - percentile)) if percentile >= 99.0 else 20)
             if len(active_coeffs) >= min_points_for_high_percentile:
                 threshold_vector[i] = np.percentile(active_coeffs, percentile)
             else:
-                # Not enough points for reliable high percentile, use max value instead
                 threshold_vector[i] = np.max(active_coeffs) if len(active_coeffs) > 0 else global_threshold
         else:
-            # Insufficient history, fallback to global threshold
             threshold_vector[i] = global_threshold
 
     return threshold_vector
