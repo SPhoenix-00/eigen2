@@ -40,8 +40,8 @@ Usage:
     python global50.py --eval                              # Re-evaluate all agents
     python global50.py --trim                              # Interactive trim (prompts for thresholds)
     python global50.py --archive-fill                      # Fill Global 50 from archive
-    python global50.py --cleanup                           # Archive orphan agents
-    python global50.py --cleanup-dry-run                   # Report orphans (no changes)
+    python global50.py --cleanup                           # Dedupe agents, unique names, then archive orphans
+    python global50.py --cleanup-dry-run                   # Report what would be done (no changes)
     python global50.py --reactivate                        # Reactivate agents between archive and long-term-archive
     python global50.py --stats                             # Display comprehensive statistics
     python global50.py --stats-all                         # Display all agents in global50, archive, and long-term-archive
@@ -55,8 +55,8 @@ Options:
     --eval              Re-evaluate all agents with efficiency-adjusted gauntlet scoring.
     --trim              Interactive trim mode: prompts for gauntlet, ROI, expectancy, and trades thresholds.
     --archive-fill      Fill Global 50 from archive. Evaluates archived agents and promotes qualifying ones.
-    --cleanup           Find and archive orphan agents (files in agents/ not in global50.json).
-    --cleanup-dry-run   Like --cleanup but only reports orphans without archiving them.
+    --cleanup           Remove duplicate agents, unique run_name, broken links (global50 + archive), then archive orphans.
+    --cleanup-dry-run   Like --cleanup but only reports what would be done (no changes).
     --reactivate        Reactivate agents: move qualifying agents from long-term-archive to archive,
                         and move non-qualifying agents from archive to long-term-archive.
     --stats             Display comprehensive statistics about the current Global 50 agents.
@@ -71,8 +71,8 @@ Options:
 Examples:
     python global50.py --eval                              # Update all metrics (with efficiency gating)
     python global50.py --trim                              # Interactive trim
-    python global50.py --cleanup-dry-run                   # Preview orphan cleanup
-    python global50.py --cleanup                           # Archive orphan agents
+    python global50.py --cleanup-dry-run                   # Preview cleanup (dedupe, names, orphans)
+    python global50.py --cleanup                           # Apply cleanup
     python global50.py --stats                             # Display statistics
     python global50.py --stats --cw 504                     # Display statistics for cw504
     python global50.py --stats-all                         # Display all agents in all locations
@@ -85,9 +85,12 @@ Examples:
 """
 
 import argparse
+import hashlib
+import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import torch
 import numpy as np
 from datetime import datetime
@@ -1723,41 +1726,275 @@ class AgentEvaluator:
         print(f"\n✓ Local now matches cloud")
         print(f"   Local: {self.global_hof.local_dir}")
 
+    def _file_hash_for_entry(self, entry: GlobalHoFEntry) -> Optional[str]:
+        """Compute SHA256 hash of an entry's .pth file (local or downloaded from cloud). Returns None if file missing."""
+        fn = entry.get_filename()
+        local_path = self.global_hof.local_agents_dir / fn
+        cloud_path = f"{self.global_hof.cloud_base}/agents/{fn}" if self.global_hof.enabled else None
+        path_to_hash = local_path
+        temp_path = None
+        if not local_path.exists() and cloud_path and self.cloud_sync.file_exists(cloud_path):
+            fd, temp_path = tempfile.mkstemp(suffix=".pth")
+            try:
+                os.close(fd)
+                self.cloud_sync.download_file(cloud_path, temp_path, silent=True)
+                path_to_hash = temp_path
+            except Exception:
+                if temp_path and Path(temp_path).exists():
+                    try:
+                        Path(temp_path).unlink()
+                    except Exception:
+                        pass
+                return None
+        if not path_to_hash or not Path(path_to_hash).exists():
+            return None
+        try:
+            h = hashlib.sha256()
+            with open(path_to_hash, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+        finally:
+            if temp_path and Path(temp_path).exists():
+                try:
+                    Path(temp_path).unlink()
+                except Exception:
+                    pass
+
     def cleanup_orphan_agents(self, dry_run: bool = True) -> dict:
         """
-        Find and archive orphan agents (files in agents/ not listed in global50.json).
-
-        These orphans occur when agents are evicted from the top 50 but their .pth
-        files weren't properly deleted from cloud storage.
+        Cleanup Global 50: remove duplicate agents (genuine = same content, name-only = same roster key),
+        assign unique run_name per agent, remove broken links in global50 and in archive (entries/scoresheets
+        whose .pth is missing locally and on cloud), then archive orphan .pth files (not in global50.json).
 
         Args:
-            dry_run: If True, only report orphans without archiving them
+            dry_run: If True, only report what would be done; no ledger or file changes.
 
         Returns:
             Dictionary with cleanup statistics
         """
         print(f"\n{'='*70}")
-        print("Orphan Agent Cleanup")
+        print("Global 50 Cleanup")
         print(f"{'='*70}")
-        print(f"Mode: {'DRY RUN (report only)' if dry_run else 'CLEANUP (will archive orphans)'}")
+        print(f"Mode: {'DRY RUN (report only)' if dry_run else 'CLEANUP (will apply changes)'}")
 
         if not self.global_hof.enabled:
             print("⚠ Global 50 not enabled (local mode or disabled)")
             return {'success': False, 'error': 'not_enabled'}
 
-        # Step 1: Get list of valid agents from global50.json
+        # Step 1: Load ledger
         print("\n1. Loading global50.json...")
         self.global_hof._download_global_ledger()
         self.global_hof._load_local_ledger()
 
-        valid_filenames = set()
-        for entry in self.global_hof.entries:
-            valid_filenames.add(entry.get_filename())
+        entries = list(self.global_hof.entries)
+        if not entries:
+            print("   No entries. Skipping duplicate/name fix.")
+            valid_filenames = set()
+        else:
+            # Step 2: Compute hashes and detect duplicates
+            print("\n2. Checking for duplicate agents (content and name)...")
+            entry_hashes: Dict[int, str] = {}  # id(entry) -> hash
+            hash_to_entries: Dict[str, List[GlobalHoFEntry]] = {}
+            for i, entry in enumerate(entries):
+                h = self._file_hash_for_entry(entry)
+                if h is not None:
+                    entry_hashes[id(entry)] = h
+                    hash_to_entries.setdefault(h, []).append(entry)
 
-        print(f"   Found {len(valid_filenames)} valid agents in global50.json")
+            # Genuine duplicates: same content (hash), keep one per hash
+            genuine_remove = 0
+            kept_by_hash: Dict[str, GlobalHoFEntry] = {}
+            for h, group in hash_to_entries.items():
+                best = max(group, key=lambda e: e.gauntlet_score)
+                kept_by_hash[h] = best
+                genuine_remove += len(group) - 1
 
-        # Step 2: List all .pth files in cloud agents/ directory
-        print("\n2. Listing agent files in cloud storage...")
+            # Name-only duplicates: same (run_name, agent_id), keep one per key.
+            # Include entries that are the kept one for their hash, or have no hash (file missing; keep in roster).
+            key_to_entries: Dict[Tuple[str, int], List[GlobalHoFEntry]] = {}
+            for entry in entries:
+                h = entry_hashes.get(id(entry))
+                if h is not None and kept_by_hash.get(h) != entry:
+                    continue  # dropped as genuine duplicate (same content, different entry kept)
+                key = (entry.run_name, entry.agent_id)
+                key_to_entries.setdefault(key, []).append(entry)
+            name_only_remove = 0
+            deduped: List[GlobalHoFEntry] = []
+            for key, group in key_to_entries.items():
+                best = max(group, key=lambda e: e.gauntlet_score)
+                deduped.append(best)
+                name_only_remove += len(group) - 1
+
+            deduped.sort(key=lambda e: e.gauntlet_score, reverse=True)
+            total_removed = len(entries) - len(deduped)
+            if genuine_remove > 0 or name_only_remove > 0:
+                print(f"   Genuine duplicates (same content): would remove {genuine_remove}")
+                print(f"   Name-only duplicates (same run_name+agent_id): would remove {name_only_remove}")
+                print(f"   Entries after dedup: {len(deduped)}")
+            else:
+                print(f"   No duplicate entries. {len(deduped)} agents.")
+
+            # Unique run_name: run_name + "-" + agent_id
+            renames: List[Tuple[GlobalHoFEntry, str, str]] = []
+            for entry in deduped:
+                suffix = f"-{entry.agent_id}"
+                if entry.run_name.endswith(suffix):
+                    continue
+                new_run_name = entry.run_name + suffix
+                old_fn = f"{entry.run_name}_{entry.agent_id}.pth"
+                new_fn = f"{new_run_name}_{entry.agent_id}.pth"
+                renames.append((entry, old_fn, new_fn))
+                entry.run_name = new_run_name
+
+            if not dry_run and (total_removed > 0 or renames):
+                self.global_hof.entries = deduped
+                self.global_hof._update_entry_threshold()
+                agents_dir = self.global_hof.local_agents_dir
+                cloud_base = self.global_hof.cloud_base
+                for entry, old_fn, new_fn in renames:
+                    old_json = old_fn.replace(".pth", ".json")
+                    new_json = new_fn.replace(".pth", ".json")
+                    local_old = agents_dir / old_fn
+                    local_new = agents_dir / new_fn
+                    local_old_json = agents_dir / old_json
+                    local_new_json = agents_dir / new_json
+                    cloud_old_pth = f"{cloud_base}/agents/{old_fn}"
+                    cloud_new_pth = f"{cloud_base}/agents/{new_fn}"
+                    cloud_old_json = f"{cloud_base}/agents/{old_json}"
+                    cloud_new_json = f"{cloud_base}/agents/{new_json}"
+                    try:
+                        if local_old.exists():
+                            shutil.move(str(local_old), str(local_new))
+                        if local_old_json.exists():
+                            shutil.move(str(local_old_json), str(local_new_json))
+                            with open(local_new_json, 'r') as f:
+                                meta = json.load(f)
+                            meta['run_name'] = entry.run_name
+                            with open(local_new_json, 'w') as f:
+                                json.dump(meta, f, indent=2)
+                        if self.global_hof.enabled:
+                            if self.cloud_sync.file_exists(cloud_old_pth):
+                                self.cloud_sync.download_file(cloud_old_pth, str(local_new))
+                                self.cloud_sync.upload_file_verified(str(local_new), cloud_new_pth)
+                                self.cloud_sync.delete_file(cloud_old_pth)
+                            if self.cloud_sync.file_exists(cloud_old_json):
+                                self.cloud_sync.download_file(cloud_old_json, str(local_new_json))
+                                with open(local_new_json, 'r') as f:
+                                    meta = json.load(f)
+                                meta['run_name'] = entry.run_name
+                                with open(local_new_json, 'w') as f:
+                                    json.dump(meta, f, indent=2)
+                                self.cloud_sync.upload_file_verified(str(local_new_json), cloud_new_json)
+                                self.cloud_sync.delete_file(cloud_old_json)
+                        print(f"   Renamed: {old_fn} -> {new_fn}")
+                    except Exception as e:
+                        print(f"   ⚠ Error renaming {old_fn}: {e}")
+                self.global_hof._save_local_ledger()
+                if self.global_hof.enabled:
+                    self.global_hof._upload_global_ledger_verified()
+                print(f"   Saved ledger: {len(deduped)} agents ({total_removed} removed, {len(renames)} renamed).")
+            elif dry_run and (total_removed > 0 or renames):
+                print(f"   Would remove {total_removed} duplicate(s), would rename {len(renames)} to unique run_name.")
+
+            valid_filenames = {e.get_filename() for e in deduped}
+        # If we had no entries, valid_filenames is already set above
+
+        # Step 3: Detect and remove broken links (ledger entries whose .pth is missing everywhere)
+        print("\n3. Checking for broken links (missing agent files)...")
+        entries_to_check = deduped if entries else []
+        broken_entries: List[GlobalHoFEntry] = []
+        for entry in entries_to_check:
+            filename = entry.get_filename()
+            local_path = self.global_hof.local_agents_dir / filename
+            cloud_path = f"{self.global_hof.cloud_base}/agents/{filename}"
+            local_ok = local_path.exists()
+            cloud_ok = self.cloud_sync.file_exists(cloud_path) if self.global_hof.enabled else False
+            if not local_ok and not cloud_ok:
+                broken_entries.append(entry)
+
+        if broken_entries:
+            print(f"   Found {len(broken_entries)} broken link(s) (agent file missing locally and on cloud):")
+            for e in broken_entries:
+                print(f"     - {e.get_filename()} ({e.run_name}, Agent {e.agent_id})")
+            if not dry_run:
+                deduped = [e for e in deduped if e not in broken_entries]
+                valid_filenames = {e.get_filename() for e in deduped}
+                self.global_hof.entries = deduped
+                self.global_hof._update_entry_threshold()
+                self.global_hof._save_local_ledger()
+                if self.global_hof.enabled:
+                    self.global_hof._upload_global_ledger_verified()
+                print(f"   Removed {len(broken_entries)} broken link(s) from ledger and saved.")
+            else:
+                print(f"   Would remove {len(broken_entries)} broken link(s) from ledger (run --cleanup to apply).")
+        else:
+            print("   No broken links. All ledger entries have a corresponding agent file.")
+
+        # Step 4: Detect and remove broken links in archive (scoresheets whose .pth is missing)
+        print("\n4. Checking for broken links in archive (missing .pth)...")
+        archive_json_names: List[str] = []
+        if self.global_hof.local_archive_dir.exists():
+            for f in self.global_hof.local_archive_dir.glob("*.json"):
+                archive_json_names.append(f.name)
+        if self.global_hof.enabled and self.cloud_sync.provider != "local":
+            try:
+                cloud_archive_prefix = f"{self.global_hof.cloud_base}/archive/"
+                if self.cloud_sync.provider == "gcs":
+                    blobs = self.cloud_sync.bucket.list_blobs(prefix=cloud_archive_prefix)
+                    for blob in blobs:
+                        if blob.name.endswith(".json"):
+                            archive_json_names.append(blob.name.split("/")[-1])
+                elif self.cloud_sync.provider == "s3":
+                    paginator = self.cloud_sync.client.get_paginator("list_objects_v2")
+                    for page in paginator.paginate(Bucket=self.cloud_sync.bucket_name, Prefix=cloud_archive_prefix):
+                        if "Contents" in page:
+                            for obj in page["Contents"]:
+                                if obj["Key"].endswith(".json"):
+                                    archive_json_names.append(obj["Key"].split("/")[-1])
+                elif self.cloud_sync.provider == "azure":
+                    for blob in self.cloud_sync.container_client.list_blobs(name_starts_with=cloud_archive_prefix):
+                        if blob.name.endswith(".json"):
+                            archive_json_names.append(blob.name.split("/")[-1])
+            except Exception as e:
+                print(f"   ⚠ Error listing cloud archive: {e}")
+        archive_json_names = list(dict.fromkeys(archive_json_names))  # unique, preserve order
+
+        broken_archive_jsons: List[str] = []
+        for json_name in archive_json_names:
+            pth_name = json_name.replace(".json", ".pth")
+            local_pth = self.global_hof.local_archive_dir / pth_name
+            cloud_pth = f"{self.global_hof.cloud_base}/archive/{pth_name}"
+            local_ok = local_pth.exists()
+            cloud_ok = self.cloud_sync.file_exists(cloud_pth) if self.global_hof.enabled else False
+            if not local_ok and not cloud_ok:
+                broken_archive_jsons.append(json_name)
+
+        if broken_archive_jsons:
+            print(f"   Found {len(broken_archive_jsons)} broken archive scoresheet(s) (no .pth file):")
+            for name in broken_archive_jsons:
+                print(f"     - {name}")
+            if not dry_run:
+                for json_name in broken_archive_jsons:
+                    local_json = self.global_hof.local_archive_dir / json_name
+                    cloud_json = f"{self.global_hof.cloud_base}/archive/{json_name}"
+                    try:
+                        if local_json.exists():
+                            local_json.unlink()
+                        if self.global_hof.enabled and self.cloud_sync.file_exists(cloud_json):
+                            self.cloud_sync.delete_file(cloud_json)
+                    except Exception as e:
+                        print(f"   ⚠ Failed to remove {json_name}: {e}")
+                print(f"   Removed {len(broken_archive_jsons)} broken archive scoresheet(s).")
+            else:
+                print(f"   Would remove {len(broken_archive_jsons)} broken archive scoresheet(s) (run --cleanup to apply).")
+        else:
+            print("   No broken links in archive.")
+
+        # Step 5: List all .pth files in cloud agents/ directory
+        print("\n5. Listing agent files in cloud storage...")
         cloud_agents_prefix = f"{self.global_hof.cloud_base}/agents/"
 
         cloud_agent_files = set()
@@ -1794,9 +2031,9 @@ class AgentEvaluator:
 
         print(f"   Found {len(cloud_agent_files)} .pth files in agents/")
 
-        # Step 3: Identify orphans
+        # Step 6: Identify orphans
         orphan_files = cloud_agent_files - valid_filenames
-        print(f"\n3. Identifying orphans...")
+        print(f"\n6. Identifying orphans...")
         print(f"   Valid agents (in JSON):     {len(valid_filenames)}")
         print(f"   Agent files (in storage):   {len(cloud_agent_files)}")
         print(f"   Orphan files:               {len(orphan_files)}")
@@ -1820,8 +2057,10 @@ class AgentEvaluator:
             print(f"\n{'='*70}")
             print("DRY RUN COMPLETE")
             print(f"{'='*70}")
+            print(f"Would remove duplicate entries and assign unique names (step 2).")
+            print(f"Would remove broken links in global50 (step 3) and in archive (step 4) if any.")
             print(f"Found {len(orphan_files)} orphan agent(s) that would be archived.")
-            print(f"\nTo actually archive these orphans, run:")
+            print(f"\nTo apply cleanup, run:")
             print(f"  python global50.py --cleanup")
             return {
                 'success': True,
@@ -1832,8 +2071,8 @@ class AgentEvaluator:
                 'dry_run': True
             }
 
-        # Step 4: Archive orphans (move from agents/ to archive/)
-        print(f"\n4. Archiving orphan agents...")
+        # Step 7: Archive orphans (move from agents/ to archive/)
+        print(f"\n7. Archiving orphan agents...")
         archived_count = 0
         failed_count = 0
 
@@ -1848,7 +2087,6 @@ class AgentEvaluator:
                 if not local_dst.exists():
                     if local_src.exists():
                         # Move locally
-                        import shutil
                         shutil.move(str(local_src), str(local_dst))
                     else:
                         # Download from cloud to archive
@@ -4886,7 +5124,7 @@ Examples:
     parser.add_argument(
         '--cleanup',
         action='store_true',
-        help='Find and archive orphan agents (files in agents/ not in global50.json). Moves orphans to archive/.'
+        help='Dedupe agents, unique run_name, remove broken links (global50 ledger and archive scoresheets with missing .pth), then archive orphan .pth to archive/.'
     )
 
     parser.add_argument(

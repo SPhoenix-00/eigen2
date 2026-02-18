@@ -381,6 +381,8 @@ def run_validation_sweep(manager, loader, stats, holdout_info,
             all_committee_closed_trades.extend(closed_trades)
 
         committee_slices.append({
+            'slice': sl['index'],
+            'slice_type': sl['type'],
             'fitness': metrics.get('fitness', 0.0),
             'win_rate': metrics.get('win_rate', 0.0),
             'quality_ratio': metrics.get('quality_ratio', 0.0),
@@ -406,9 +408,8 @@ def run_validation_sweep(manager, loader, stats, holdout_info,
     all_consensus_stats = [s['consensus_stats'] for s in committee_slices]
     consensus_summary = aggregate_consensus_stats(all_consensus_stats)
 
-    # Cleanup
+    # Cleanup (keep committee_slices for sweep per-slice view)
     del all_committee_closed_trades
-    del committee_slices
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -417,6 +418,7 @@ def run_validation_sweep(manager, loader, stats, holdout_info,
     return {
         'committee_aggregate': committee_aggregate,
         'consensus_summary': consensus_summary,
+        'committee_slices': committee_slices,
     }
 
 
@@ -448,6 +450,7 @@ def run_quorum_sweep(manager, loader, stats, holdout_info,
             all_results[quorum] = {
                 'aggregate': results['committee_aggregate'],
                 'consensus': results['consensus_summary'],
+                'committee_slices': results.get('committee_slices', []),
             }
 
         gc.collect()
@@ -458,6 +461,7 @@ def run_quorum_sweep(manager, loader, stats, holdout_info,
 
     _print_sweep_summary("QUORUM", all_results, key_name="Quorum",
                          format_key=lambda k: f"{k}")
+    _print_sweep_per_slice("QUORUM", all_results, "Quorum", lambda k: f"{k}")
 
     return all_results
 
@@ -501,6 +505,7 @@ def run_conviction_sweep(manager, loader, stats, holdout_info,
             all_results[percentile] = {
                 'aggregate': results['committee_aggregate'],
                 'consensus': results['consensus_summary'],
+                'committee_slices': results.get('committee_slices', []),
             }
 
         gc.collect()
@@ -509,6 +514,7 @@ def run_conviction_sweep(manager, loader, stats, holdout_info,
 
     _print_sweep_summary("CONVICTION", all_results, key_name="Percentile",
                          format_key=lambda k: f"P{k}")
+    _print_sweep_per_slice("CONVICTION", all_results, "Percentile", lambda k: f"P{k}")
 
     return all_results
 
@@ -572,6 +578,7 @@ def run_combined_sweep(manager, loader, stats, holdout_info,
                 all_results[(quorum, percentile)] = {
                     'aggregate': results['committee_aggregate'],
                     'consensus': results['consensus_summary'],
+                    'committee_slices': results.get('committee_slices', []),
                 }
 
             del results
@@ -589,8 +596,9 @@ def run_combined_sweep(manager, loader, stats, holdout_info,
 
     Config.COMMITTEE_QUORUM = original_quorum
 
-    # Print combined summary
+    # Print combined summary and per-slice view
     _print_combined_sweep_summary(all_results)
+    _print_combined_sweep_per_slice(all_results)
 
     return all_results
 
@@ -790,6 +798,33 @@ def _print_sweep_summary(sweep_type, all_results, key_name, format_key):
     print(f"{'='*60}")
 
 
+def _print_sweep_per_slice(sweep_type, all_results, key_name, format_key):
+    """Print ROI and PnL (and fitness) per slice for each sweep configuration."""
+    first = next(iter(all_results.values()), None)
+    slices_list = first.get('committee_slices', []) if first else []
+    if not slices_list:
+        return
+    print(f"\n{'='*60}")
+    print(f"{sweep_type} SWEEP — VIEW SLICE PER SLICE (ROI & PnL)")
+    print(f"{'='*60}")
+    # Table header: key_name, then for each slice we show configs in rows, or one table per slice with configs as rows
+    # Per-slice view: for each slice, one table with columns Config | Fitness | ROI % | Raw PnL
+    for s in slices_list:
+        sl_idx = s['slice']
+        sl_type = s['slice_type']
+        print(f"\n  Slice {sl_idx} ({sl_type})")
+        print(f"  {key_name:<12} {'Fitness':<10} {'ROI %':<10} {'Raw PnL':<14}")
+        print("  " + "-" * 50)
+        for key in sorted(all_results.keys()):
+            sl_data = all_results[key].get('committee_slices', [])
+            row = next((x for x in sl_data if x.get('slice') == sl_idx), None)
+            if row is None:
+                continue
+            pnl = row.get('raw_pnl', 0.0)
+            print(f"  {format_key(key):<12} {row.get('fitness', 0):<10.2f} {row.get('roi', 0):<10.2f}% ${pnl:<12.2f}")
+    print()
+
+
 def _print_combined_sweep_summary(all_results):
     """Print combined sweep comparison summary."""
     print(f"\n{'='*60}")
@@ -837,4 +872,31 @@ def _print_combined_sweep_summary(all_results):
     print(f"  Trades by Quorum: {best_consensus.get('total_trades_by_quorum', 0)}")
     print(f"  Trades by Conviction: {best_consensus.get('total_trades_by_conviction', 0)}")
     print(f"{'='*60}")
+
+
+def _print_combined_sweep_per_slice(all_results):
+    """Print ROI and PnL per slice for each combined (quorum, conviction) configuration."""
+    first = next(iter(all_results.values()), None)
+    slices_list = first.get('committee_slices', []) if first else []
+    if not slices_list:
+        return
+    print(f"\n{'='*60}")
+    print("COMBINED SWEEP — VIEW SLICE PER SLICE (ROI & PnL)")
+    print(f"{'='*60}")
+    sorted_keys = sorted(all_results.keys(), key=lambda x: (x[0], x[1]))
+    for s in slices_list:
+        sl_idx = s['slice']
+        sl_type = s['slice_type']
+        print(f"\n  Slice {sl_idx} ({sl_type})")
+        print(f"  {'Quorum':<8} {'Pct':<8} {'Fitness':<10} {'ROI %':<10} {'Raw PnL':<14}")
+        print("  " + "-" * 54)
+        for key in sorted_keys:
+            quorum, percentile = key
+            sl_data = all_results[key].get('committee_slices', [])
+            row = next((x for x in sl_data if x.get('slice') == sl_idx), None)
+            if row is None:
+                continue
+            pnl = row.get('raw_pnl', 0.0)
+            print(f"  {quorum:<8} P{percentile:<7} {row.get('fitness', 0):<10.2f} {row.get('roi', 0):<10.2f}% ${pnl:<12.2f}")
+    print()
 
