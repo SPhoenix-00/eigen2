@@ -123,10 +123,10 @@ def format_quality_ratio(value) -> str:
 
 def parse_date_input(date_str: str) -> datetime:
     """
-    Parse user input date string in DD-MM-YY format.
+    Parse user input date string in DD-MM-YY or DD-MM-YYYY format.
 
     Args:
-        date_str: Date string like '29-07-22'
+        date_str: Date string like '29-07-22' or '29-07-2022'
 
     Returns:
         datetime object
@@ -134,10 +134,13 @@ def parse_date_input(date_str: str) -> datetime:
     Raises:
         ValueError if format is invalid
     """
-    try:
-        return datetime.strptime(date_str, "%d-%m-%y")
-    except ValueError:
-        raise ValueError(f"Invalid date format '{date_str}'. Expected DD-MM-YY (e.g., 29-07-22)")
+    date_str = date_str.strip()
+    for fmt in ("%d-%m-%y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid date format '{date_str}'. Expected DD-MM-YY or DD-MM-YYYY (e.g., 29-07-22 or 29-07-2022)")
 
 
 def parse_date_flexible(date_value) -> datetime:
@@ -210,10 +213,11 @@ def find_date_index(loader, target_date: datetime) -> int:
         ValueError if date is out of range
     """
     # Convert loader dates to datetime objects for comparison
+    # (dataset may use M/D/YYYY strings; use flexible parsing)
     loader_dates = []
     for d in loader.dates:
         if isinstance(d, str):
-            loader_dates.append(datetime.strptime(d, "%d-%m-%y"))
+            loader_dates.append(parse_date_flexible(d))
         else:
             # numpy datetime64 or pandas Timestamp
             loader_dates.append(pd.Timestamp(d).to_pydatetime())

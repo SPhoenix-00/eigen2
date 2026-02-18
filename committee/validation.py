@@ -550,24 +550,26 @@ def run_combined_sweep(manager, loader, stats, holdout_info,
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    for quorum in quorum_values:
+    # Outer loop: each conviction percentile (threshold calculated once per percentile).
+    # Inner loop: each quorum (no recalculation; just run validation).
+    for percentile in percentile_values:
         print(f"\n{'='*60}")
-        print(f"QUORUM = {quorum}")
+        print(f"CONVICTION P{percentile} — calculating thresholds once, then sweeping quorums")
         print(f"{'='*60}")
 
-        Config.COMMITTEE_QUORUM = quorum
+        print(f"  Recalculating thresholds for {len(roster['members'])} members at P{percentile}...")
+        members_with_new_thresholds = recalculate_conviction_thresholds(
+            roster['members'], loader, stats, holdout_info,
+            context_window_days, percentile, val_tensor_cpu=val_tensor_cpu
+        )
 
-        for percentile in percentile_values:
+        for quorum in quorum_values:
             current_combination += 1
             print(f"\n{'='*60}")
             print(f"COMBINATION {current_combination}/{total_combinations}: Quorum={quorum}, Conviction=P{percentile}")
             print(f"{'='*60}")
 
-            print(f"  Recalculating thresholds for {len(roster['members'])} members at P{percentile}...")
-            members_with_new_thresholds = recalculate_conviction_thresholds(
-                roster['members'], loader, stats, holdout_info,
-                context_window_days, percentile, val_tensor_cpu=val_tensor_cpu
-            )
+            Config.COMMITTEE_QUORUM = quorum
 
             results = run_validation_sweep(
                 manager, loader, stats, holdout_info, context_window_days,
@@ -582,12 +584,17 @@ def run_combined_sweep(manager, loader, stats, holdout_info,
                 }
 
             del results
-            del members_with_new_thresholds
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
+
+        del members_with_new_thresholds
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     # Cleanup pre-loaded tensor
     del val_tensor_cpu

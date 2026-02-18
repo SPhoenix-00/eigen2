@@ -49,6 +49,7 @@ class CommitteeAgent:
                 'total_trades': 0,
                 'trades_by_quorum': 0,
                 'trades_by_conviction': 0,
+                'trades_by_maverick': 0,
                 'trades_vetoed': 0,
                 'avg_votes_per_trade': [],
             }
@@ -109,7 +110,17 @@ class CommitteeAgent:
 
     def _apply_consensus(self, all_coeffs: np.ndarray, held_stock_ids: list = None) -> np.ndarray:
         """
-        Apply committee consensus logic to coefficient predictions.
+        Apply committee consensus logic with maverick validation.
+
+        Maverick agents can never trigger trades alone — they always need validation
+        from non-maverick committee members. The validation threshold depends on
+        whether the maverick has conviction:
+
+        Maverick WITH conviction:  1+ non-maverick with coeff >= threshold
+        Maverick WITHOUT conviction: 1 non-maverick with conviction, OR
+                                     2+ non-mavericks with coeff >= threshold
+
+        Non-maverick agents trade autonomously via standard quorum or conviction.
 
         Args:
             all_coeffs: [num_members, num_stocks] coefficient predictions
@@ -120,105 +131,109 @@ class CommitteeAgent:
         """
         num_members, num_stocks = all_coeffs.shape
 
-        # 1. Standard Voting (Quorum) - coeff >= global threshold
-        votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD
-        vote_counts = np.sum(votes, axis=0)  # [num_stocks]
-        is_quorum = vote_counts >= Config.COMMITTEE_QUORUM
+        maverick_mask = np.array([m.get('is_maverick', False) for m in self.members])  # [num_members]
+        non_maverick_mask = ~maverick_mask
 
-        # 2. Conviction Check (Stock-Specific Override)
+        # Standard votes: coeff >= global threshold
+        votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD  # [num_members, num_stocks]
+
+        # Per-agent conviction thresholds (stock-specific)
         conviction_thresholds = np.array([
             m['stats']['conviction_threshold_vector'] for m in self.members
         ])  # [num_members, num_stocks]
+        agent_convictions = all_coeffs > conviction_thresholds  # [num_members, num_stocks]
 
-        agent_convictions = all_coeffs > conviction_thresholds
-        is_conviction_raw = np.any(agent_convictions, axis=0)  # [num_stocks]
+        # === PATH A: Non-maverick autonomous trading ===
+        non_mav_votes = votes & non_maverick_mask[:, np.newaxis]
+        non_mav_vote_counts = np.sum(non_mav_votes, axis=0)  # [num_stocks]
+        is_non_mav_quorum = non_mav_vote_counts >= Config.COMMITTEE_QUORUM
 
-        # SOCIAL PROOF: Conviction counts as a vote for the social proof check.
-        # An agent with conviction is "voting" even if below global threshold.
-        # This allows a specialist (coeff=0.9, p99=0.8) to count toward social proof.
-        effective_votes = votes | agent_convictions  # [num_members, num_stocks]
-        effective_vote_counts = np.sum(effective_votes, axis=0)  # [num_stocks]
+        non_mav_convictions = agent_convictions & non_maverick_mask[:, np.newaxis]
+        is_non_mav_conviction = np.any(non_mav_convictions, axis=0)  # [num_stocks]
 
-        # A conviction trade requires at least 2 total supporters (votes OR convictions)
-        # This prevents a single hallucinating agent from triggering trades alone.
-        is_conviction = is_conviction_raw & (effective_vote_counts >= 2)
+        # === PATH B: Maverick-initiated trades (require non-maverick validation) ===
+        mav_votes = votes & maverick_mask[:, np.newaxis]
+        maverick_signals = np.any(mav_votes, axis=0)  # [num_stocks]
 
-        # 3. Veto Check (Fixed number of silent members)
+        mav_convictions = agent_convictions & maverick_mask[:, np.newaxis]
+        maverick_has_conviction = np.any(mav_convictions, axis=0)  # [num_stocks]
+
+        # Maverick WITH conviction: 1+ non-maverick supporters validate
+        mav_conviction_validated = maverick_has_conviction & (non_mav_vote_counts >= 1)
+
+        # Maverick WITHOUT conviction: stricter validation required
+        mav_standard_validated = (
+            maverick_signals & ~maverick_has_conviction & (
+                is_non_mav_conviction | (non_mav_vote_counts >= 2)
+            )
+        )
+
+        is_maverick_validated = mav_conviction_validated | mav_standard_validated
+
+        # === Veto check ===
         is_silent = all_coeffs < Config.COMMITTEE_VETO_THRESHOLD
         silent_counts = np.sum(is_silent, axis=0)
         is_vetoed = silent_counts >= Config.COMMITTEE_VETO_COUNT
 
-        # 4. Final Decision Logic
-        # PASS if: (Quorum OR Conviction) AND (NOT Veto)
-        should_trade = (is_quorum | is_conviction) & (~is_vetoed)
+        # === Final decision ===
+        should_trade = (is_non_mav_quorum | is_non_mav_conviction | is_maverick_validated) & (~is_vetoed)
 
-        # FILTER: Mask out stocks we already hold to prevent "Ghost Signals" in stats
         if held_stock_ids:
             held_mask = np.zeros(num_stocks, dtype=bool)
             held_mask[held_stock_ids] = True
-            # If we hold it, we don't "trade" it (prevents stats inflation)
             should_trade = should_trade & (~held_mask)
 
-        # Track consensus stats if enabled
+        # Track consensus stats
         if self.track_consensus:
             self.consensus_history['total_steps'] += 1
 
-            # Filter to only count stocks we haven't signaled before (prevents double-counting)
             stocks_to_count = should_trade.copy()
             for stock_id in range(num_stocks):
                 if should_trade[stock_id] and stock_id in self.signaled_stocks:
-                    stocks_to_count[stock_id] = False  # Already counted this stock
+                    stocks_to_count[stock_id] = False
                 elif should_trade[stock_id]:
-                    self.signaled_stocks.add(stock_id)  # Mark as signaled
+                    self.signaled_stocks.add(stock_id)
 
-            # Count trades approved by each mechanism (only new signals)
             trades_approved = np.sum(stocks_to_count)
             self.consensus_history['total_trades'] += int(trades_approved)
 
-            # Unanimity: all members voted for the trade
-            unanimity = np.sum(vote_counts[stocks_to_count] == num_members)
+            all_vote_counts = np.sum(votes, axis=0)
+            unanimity = np.sum(all_vote_counts[stocks_to_count] == num_members)
             self.consensus_history['unanimity_count'] += int(unanimity)
 
-            # Min consensus: exactly quorum votes
-            min_consensus = np.sum(vote_counts[stocks_to_count] == Config.COMMITTEE_QUORUM)
+            min_consensus = np.sum(non_mav_vote_counts[stocks_to_count] == Config.COMMITTEE_QUORUM)
             self.consensus_history['min_consensus_count'] += int(min_consensus)
 
-            # Trades by Quorum vs Conviction (MUTUALLY EXCLUSIVE)
-            # If quorum was met, credit quorum (even if conviction also triggered)
-            # Only credit conviction for trades where quorum was NOT met (conviction "rescues")
-            is_quorum_trade = is_quorum & stocks_to_count
-            is_conviction_only_trade = (~is_quorum) & is_conviction & stocks_to_count
+            # Trades by mechanism (mutually exclusive, priority: quorum > conviction > maverick)
+            is_quorum_trade = is_non_mav_quorum & stocks_to_count
+            is_conviction_trade = (~is_non_mav_quorum) & is_non_mav_conviction & stocks_to_count
+            is_maverick_trade = (~is_non_mav_quorum) & (~is_non_mav_conviction) & is_maverick_validated & stocks_to_count
 
-            # Verify mathematical correctness: these should sum to total trades
             self.consensus_history['trades_by_quorum'] += int(np.sum(is_quorum_trade))
-            self.consensus_history['trades_by_conviction'] += int(np.sum(is_conviction_only_trade))
+            self.consensus_history['trades_by_conviction'] += int(np.sum(is_conviction_trade))
+            self.consensus_history['trades_by_maverick'] += int(np.sum(is_maverick_trade))
 
-            # Trades vetoed (Only count vetoes on signals that otherwise would have passed)
-            # This filters out "vetoes" on stocks nobody wanted anyway
-            potential_trades = (is_quorum | is_conviction)
+            potential_trades = (is_non_mav_quorum | is_non_mav_conviction | is_maverick_validated)
             if held_stock_ids:
                 potential_trades = potential_trades & (~held_mask)
-
             vetoed_trades = potential_trades & is_vetoed
             self.consensus_history['trades_vetoed'] += int(np.sum(vetoed_trades))
 
-            # Average votes per trade
             if trades_approved > 0:
-                avg_votes = np.mean(vote_counts[stocks_to_count])
+                avg_votes = np.mean(all_vote_counts[stocks_to_count])
                 self.consensus_history['avg_votes_per_trade'].append(float(avg_votes))
 
-        # 5. Signal Aggregation
-        # Quorum trades: average only standard voters (coeff >= threshold).
-        # Conviction-only trades: average all effective supporters (voters + conviction agents).
-        # This prevents sub-threshold conviction agents from diluting quorum trades.
+        # Signal Aggregation
         final_coeffs = np.zeros(num_stocks, dtype=np.float32)
 
         for stock_idx in range(num_stocks):
             if should_trade[stock_idx]:
-                if is_quorum[stock_idx]:
-                    supporting_agents_mask = votes[:, stock_idx]
+                if is_non_mav_quorum[stock_idx]:
+                    supporting_agents_mask = non_mav_votes[:, stock_idx]
+                elif is_non_mav_conviction[stock_idx]:
+                    supporting_agents_mask = non_mav_votes[:, stock_idx] | non_mav_convictions[:, stock_idx]
                 else:
-                    supporting_agents_mask = effective_votes[:, stock_idx]
+                    supporting_agents_mask = votes[:, stock_idx] | agent_convictions[:, stock_idx]
 
                 if np.any(supporting_agents_mask):
                     supporting_coeffs = all_coeffs[supporting_agents_mask, stock_idx]
@@ -253,6 +268,7 @@ class CommitteeAgent:
             'min_consensus_pct': 100.0 * history['min_consensus_count'] / total_trades if total_trades > 0 else 0,
             'trades_by_quorum': history['trades_by_quorum'],
             'trades_by_conviction': history['trades_by_conviction'],
+            'trades_by_maverick': history['trades_by_maverick'],
             'trades_vetoed': history['trades_vetoed'],
             'avg_consensus_votes': float(np.mean(history['avg_votes_per_trade'])) if history['avg_votes_per_trade'] else 0,
         }

@@ -710,7 +710,7 @@ def run_simulation(manager, loader, stats, context_window_days):
 
     # Get first trading day
     print(f"\n" + "-"*60)
-    print("Enter simulation date range (format: DD-MM-YY)")
+    print("Enter simulation date range (format: DD-MM-YY or DD-MM-YYYY)")
     print("-"*60)
 
     earliest_first_idx = Config.CONTEXT_WINDOW_DAYS
@@ -772,6 +772,8 @@ def run_simulation(manager, loader, stats, context_window_days):
     print(f"  Settlement period:  {settlement_days} days")
     print(f"  Total simulation:   {total_days} days")
     print(f"  Committee size:     {len(members)} members")
+    print(f"  Quorum:             {Config.COMMITTEE_QUORUM}")
+    print(f"  Conviction (P):     P{roster.get('conviction_percentile', 95)}")
 
     confirm = input("\n  Proceed with simulation? [Y/n]: ").strip().lower()
     if confirm in ('n', 'no'):
@@ -796,6 +798,7 @@ def run_simulation(manager, loader, stats, context_window_days):
     print(f"\n  Period: {actual_first_display} to {actual_settlement_end_display}")
     print(f"    Trading: {actual_first_display} to {actual_last_trading_display} ({metrics.get('trading_days', trading_days)} days)")
     print(f"    Settlement: {metrics.get('settlement_days', settlement_days)} days")
+    print(f"    Quorum: {Config.COMMITTEE_QUORUM}  |  Conviction: P{roster.get('conviction_percentile', 95)}")
     print(f"\n  Performance Metrics:")
     print(f"    Fitness:       {metrics.get('fitness', 0.0):.2f}")
     print(f"    Win Rate:      {metrics.get('win_rate', 0.0):.2%}")
