@@ -18,11 +18,11 @@ def test_backward_compatible_imports():
     from committee import get_agent_filepath
     from committee import CommitteeManager
     from committee import convert_numpy_types
-    from committee import calculate_agent_stats_vectorized
+    from committee import calculate_conviction_threshold
 
     assert callable(get_agent_filepath), "get_agent_filepath not callable"
     assert callable(convert_numpy_types), "convert_numpy_types not callable"
-    assert callable(calculate_agent_stats_vectorized), "calculate_agent_stats_vectorized not callable"
+    assert callable(calculate_conviction_threshold), "calculate_conviction_threshold not callable"
     assert hasattr(CommitteeManager, "save_roster"), "CommitteeManager missing save_roster"
     assert hasattr(CommitteeManager, "load_roster"), "CommitteeManager missing load_roster"
     assert hasattr(CommitteeManager, "check_mirror_status"), "CommitteeManager missing check_mirror_status"
@@ -49,7 +49,7 @@ def test_full_public_api():
         load_global50_candidates, load_agent_actor_only,
         get_agent_filepath,
         # Agent stats
-        calculate_agent_stats_vectorized, recalculate_conviction_thresholds,
+        calculate_conviction_threshold, recalculate_conviction_thresholds,
         # Utilities
         calculate_expectancy, calculate_max_drawdown,
         parse_date_input, parse_date_flexible, find_date_index,
@@ -162,15 +162,15 @@ def test_utility_functions_behavior():
     assert "note" in empty_result
 
     valid_stats = [
-        {"unanimity_pct": 10, "min_consensus_pct": 50, "avg_consensus_votes": 3.0,
-         "trades_by_quorum": 5, "trades_by_conviction": 2, "trades_vetoed": 1},
-        {"unanimity_pct": 20, "min_consensus_pct": 60, "avg_consensus_votes": 4.0,
-         "trades_by_quorum": 8, "trades_by_conviction": 3, "trades_vetoed": 0},
+        {"unanimity_pct": 10, "avg_consensus_votes": 3.0,
+         "trades_by_quorum": 5, "trades_by_conviction_only": 2},
+        {"unanimity_pct": 20, "avg_consensus_votes": 4.0,
+         "trades_by_quorum": 8, "trades_by_conviction_only": 3},
     ]
     cs = aggregate_consensus_stats(valid_stats)
     assert cs["avg_unanimity_pct"] == 15.0
     assert cs["total_trades_by_quorum"] == 13
-    assert cs["total_trades_vetoed"] == 1
+    assert cs["total_trades_by_conviction_only"] == 5
 
     # build_member_data
     entry = {
@@ -179,10 +179,10 @@ def test_utility_functions_behavior():
         "expectancy": 2.0, "quality_ratio": 3.0,
         "win_ratio": 0.7, "is_maverick": True,
     }
-    member = build_member_data(entry, np.array([1.0, 2.0, 3.0]))
+    member = build_member_data(entry, 1.5)
     assert member["filename"] == "test-run_42.pth"
     assert member["is_maverick"] is True
-    assert member["stats"]["conviction_threshold_vector"] == [1.0, 2.0, 3.0]
+    assert member["stats"]["conviction_threshold"] == 1.5
 
     print("  PASS: utility_functions_behavior")
 

@@ -27,7 +27,7 @@ from committee.utils import (
 )
 from committee.manager import CommitteeManager
 from committee.agent import (
-    CommitteeAgent, calculate_agent_stats_vectorized, recalculate_conviction_thresholds,
+    CommitteeAgent, calculate_conviction_threshold, recalculate_conviction_thresholds,
 )
 from committee.optimization import (
     calculate_coefficient_correlations, committee_objective,
@@ -156,11 +156,11 @@ def run_draft(manager, loader, stats, holdout_info, deep=False, exhaustive=False
             num_stocks = Config.NUM_INVESTABLE_STOCKS
             agent_coeffs_2d = agent_coeffs_1d.reshape(num_days, num_stocks)
 
-            conviction_threshold_vector = calculate_agent_stats_vectorized(agent_coeffs_2d)
-            member_data = build_member_data(e, conviction_threshold_vector)
+            conviction_threshold = calculate_conviction_threshold(agent_coeffs_2d)
+            member_data = build_member_data(e, conviction_threshold)
             members_with_stats.append(member_data)
             print(f"  ✓ {e['run_name']}_{e['agent_id']}: "
-                  f"p95_mean={np.mean(conviction_threshold_vector):.3f}")
+                  f"conviction_threshold={conviction_threshold:.3f}")
         else:
             print(f"  ⚠ {e['run_name']}_{e['agent_id']}: No coefficient data available")
 
@@ -432,8 +432,8 @@ def run_slice_improvement_pass(members_with_stats, entries, coefficients, valid_
         for c in candidates:
             cand_coeffs_1d = coefficients[c['idx']]
             cand_coeffs_2d = cand_coeffs_1d.reshape(num_days, num_stocks)
-            conviction_vec = calculate_agent_stats_vectorized(cand_coeffs_2d)
-            new_member = build_member_data(c['entry'], conviction_vec)
+            conviction_threshold = calculate_conviction_threshold(cand_coeffs_2d)
+            new_member = build_member_data(c['entry'], conviction_threshold)
 
             modified_members = list(current_members)
             modified_members[weak_idx] = new_member
@@ -585,8 +585,8 @@ def run_maverick_rotation(members_with_stats, entries, coefficients, valid_indic
         # Build conviction thresholds for this maverick
         coeffs_1d = coefficients[mav_idx]
         coeffs_2d = coeffs_1d.reshape(num_days, num_stocks)
-        conviction_vec = calculate_agent_stats_vectorized(coeffs_2d)
-        new_member = build_member_data(mav_entry, conviction_vec)
+        conviction_threshold = calculate_conviction_threshold(coeffs_2d)
+        new_member = build_member_data(mav_entry, conviction_threshold)
 
         # Build modified committee
         modified_members = list(current_members)
@@ -813,11 +813,9 @@ def run_simulation(manager, loader, stats, context_window_days):
     if 'avg_consensus_votes' in cs:
         print(f"\n  Consensus Statistics:")
         print(f"    Unanimity Rate:    {cs.get('unanimity_pct', 0):.1f}%")
-        print(f"    Min Consensus:     {cs.get('min_consensus_pct', 0):.1f}%")
         print(f"    Avg Votes/Trade:   {cs.get('avg_consensus_votes', 0):.2f}")
         print(f"    Trades by Quorum:  {cs.get('trades_by_quorum', 0)}")
-        print(f"    Trades by Conviction: {cs.get('trades_by_conviction', 0)}")
-        print(f"    Trades Vetoed:     {cs.get('trades_vetoed', 0)}")
+        print(f"    Trades by Conviction Only: {cs.get('trades_by_conviction_only', 0)}")
 
     # Save trades to CSV
     closed_trades = metrics.get('closed_trades', [])
@@ -1077,9 +1075,9 @@ def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap, focus_sl
         num_days = len(valid_indices)
         num_stocks = Config.NUM_INVESTABLE_STOCKS
         chosen_coeffs_2d = chosen_coeffs.reshape(num_days, num_stocks)
-        conviction_vec = calculate_agent_stats_vectorized(chosen_coeffs_2d)
+        conviction_threshold = calculate_conviction_threshold(chosen_coeffs_2d)
 
-        new_member = build_member_data(e, conviction_vec)
+        new_member = build_member_data(e, conviction_threshold)
 
         modified_members = []
         for m in roster['members']:
@@ -1258,9 +1256,9 @@ def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap, focus_sl
             num_days = len(valid_indices)
             num_stocks = Config.NUM_INVESTABLE_STOCKS
             chosen_coeffs_2d = chosen_coeffs.reshape(num_days, num_stocks)
-            conviction_vec = calculate_agent_stats_vectorized(chosen_coeffs_2d)
+            conviction_threshold = calculate_conviction_threshold(chosen_coeffs_2d)
 
-            new_member = build_member_data(chosen_entry, conviction_vec)
+            new_member = build_member_data(chosen_entry, conviction_threshold)
 
             new_roster_members = []
             for m in roster['members']:
@@ -1398,11 +1396,9 @@ def run_diagnose_slice(manager, loader, stats, holdout_info, focus_slices):
             print(f"  {con['note']}")
         else:
             print(f"  Unanimity Rate:      {con.get('unanimity_pct', 0):.1f}%")
-            print(f"  Min Consensus Rate:  {con.get('min_consensus_pct', 0):.1f}%")
             print(f"  Avg Votes/Trade:     {con.get('avg_consensus_votes', 0):.2f}")
             print(f"  Trades by Quorum:    {con.get('trades_by_quorum', 0)}")
-            print(f"  Trades by Conviction:{con.get('trades_by_conviction', 0)}")
-            print(f"  Trades Vetoed:       {con.get('trades_vetoed', 0)}")
+            print(f"  Trades by Conviction Only: {con.get('trades_by_conviction_only', 0)}")
 
     # === Section 4: Focused quorum/conviction mini-sweep ===
     print(f"\n{'='*70}")

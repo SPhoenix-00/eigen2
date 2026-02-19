@@ -550,8 +550,6 @@ def aggregate_consensus_stats(all_consensus_stats):
     """
     Aggregate consensus stats from multiple slices.
 
-    Replaces the 2× duplicated consensus aggregation logic.
-
     Args:
         all_consensus_stats: List of consensus stat dicts from individual slices
 
@@ -561,11 +559,9 @@ def aggregate_consensus_stats(all_consensus_stats):
     if all(isinstance(cs, dict) and 'avg_consensus_votes' in cs for cs in all_consensus_stats):
         return {
             'avg_unanimity_pct': float(np.mean([cs['unanimity_pct'] for cs in all_consensus_stats])),
-            'avg_min_consensus_pct': float(np.mean([cs['min_consensus_pct'] for cs in all_consensus_stats])),
             'avg_consensus_votes': float(np.mean([cs['avg_consensus_votes'] for cs in all_consensus_stats])),
             'total_trades_by_quorum': int(sum(cs['trades_by_quorum'] for cs in all_consensus_stats)),
-            'total_trades_by_conviction': int(sum(cs['trades_by_conviction'] for cs in all_consensus_stats)),
-            'total_trades_vetoed': int(sum(cs['trades_vetoed'] for cs in all_consensus_stats)),
+            'total_trades_by_conviction_only': int(sum(cs.get('trades_by_conviction_only', cs.get('trades_by_conviction', 0)) for cs in all_consensus_stats)),
         }
     else:
         return {'note': 'Consensus tracking was not enabled or no data available'}
@@ -606,15 +602,13 @@ def build_metrics_result(summary, consensus_stats=None, extra_fields=None):
     return result
 
 
-def build_member_data(entry, conviction_threshold_vector):
+def build_member_data(entry, conviction_threshold):
     """
     Build standardized member dict for roster.
 
-    Replaces the 2× duplicated member dict construction in run_draft and run_swap_agent.
-
     Args:
         entry: Global50 entry dict
-        conviction_threshold_vector: Numpy array or list of conviction thresholds
+        conviction_threshold: Scalar conviction threshold (float or numpy scalar)
 
     Returns:
         Member dict suitable for roster storage
@@ -630,11 +624,7 @@ def build_member_data(entry, conviction_threshold_vector):
         'win_ratio': entry.get('win_ratio', 0.0),
         'is_maverick': entry.get('is_maverick', False),
         'stats': {
-            'conviction_threshold_vector': (
-                conviction_threshold_vector.tolist()
-                if hasattr(conviction_threshold_vector, 'tolist')
-                else conviction_threshold_vector
-            )
+            'conviction_threshold': float(conviction_threshold)
         }
     }
 

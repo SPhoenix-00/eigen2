@@ -48,7 +48,8 @@ from committee.manager import CommitteeManager
 
 from committee.agent import (
     CommitteeAgent,
-    calculate_agent_stats_vectorized,
+    calculate_conviction_threshold,
+    calculate_agent_stats_vectorized,  # backward compat alias
     recalculate_conviction_thresholds,
 )
 

@@ -3045,7 +3045,7 @@ class ERLTrainer:
         # Must include ALL fields required by committee.py for consensus logic:
         # - filename, agent_id, run_name, gauntlet_score (identification)
         # - roi, expectancy, quality_ratio, win_ratio (metrics)
-        # - stats.conviction_threshold_vector (95th percentile thresholds for conviction trades)
+        # - stats.conviction_threshold (scalar 95th percentile threshold for conviction trades)
         old_run_name = member['run_name']
         old_agent_id = member['agent_id']
 
@@ -3069,19 +3069,19 @@ class ERLTrainer:
         # Skip conviction threshold calculation during training - it's only needed for committee inference
         # The thresholds will be recalculated when the committee is loaded for production use
         # This saves ~10-30 seconds per improvement
-        conviction_threshold_vector = member.get('stats', {}).get('conviction_threshold_vector', [0.0] * Config.NUM_INVESTABLE_STOCKS)
+        conviction_threshold = member.get('stats', {}).get('conviction_threshold', 0.0)
 
         self.multi2_roster['members'][member_idx] = {
             'filename': new_filename,
             'run_name': self.run_name,
             'agent_id': improved_agent.agent_id,
-            'gauntlet_score': gauntlet_score,  # Use actual gauntlet score, not validation score
+            'gauntlet_score': gauntlet_score,
             'roi': roi,
             'expectancy': expectancy,
             'quality_ratio': quality_ratio,
             'win_ratio': win_ratio,
             'stats': {
-                'conviction_threshold_vector': conviction_threshold_vector
+                'conviction_threshold': conviction_threshold
             },
             # Preserve original identity for tracking lineage
             'original_run_name': member.get('original_run_name', old_run_name),
@@ -3329,66 +3329,49 @@ class ERLTrainer:
     # calculate_expectancy removed — callers use _calculate_expectancy()
     # from training.fitness directly. External consumers import from training.fitness.
 
-    def calculate_conviction_threshold_vector(self, agent) -> list:
+    def calculate_conviction_threshold_scalar(self, agent) -> float:
         """
-        Calculate the 95th percentile conviction threshold vector for an agent.
+        Calculate the 95th percentile conviction threshold (scalar) for an agent.
 
-        This runs the agent on validation data to collect coefficient predictions,
-        then calculates the 95th percentile for each stock. This is used by the
-        committee consensus logic to determine "conviction trades" - signals where
-        an agent is exceptionally confident.
+        Runs the agent on validation data to collect coefficient predictions,
+        then calculates a single P95 threshold across all stocks and all days.
 
         Args:
-            agent: The DDPGAgent to calculate thresholds for
+            agent: The DDPGAgent to calculate threshold for
 
         Returns:
-            List of per-stock 95th percentile thresholds (length = NUM_INVESTABLE_STOCKS)
+            Scalar conviction threshold (float)
         """
-        from committee import calculate_agent_stats_vectorized
+        from committee import calculate_conviction_threshold
 
-        # Use validation slices to collect coefficient predictions
-        # This gives us a representative sample of the agent's behavior
         if not self.current_generation_val_slices:
-            # Generate validation slices if not available
             self.current_generation_val_slices = self.generate_validation_slices()
 
-        # Collect coefficient predictions across multiple days
         all_coefficients = []
 
         agent.actor.eval()
         with torch.no_grad():
             for start_idx, end_idx, _ in self.current_generation_val_slices:
-                # Iterate through each day in the slice
                 for day_idx in range(start_idx, min(end_idx, start_idx + Config.TRADING_PERIOD_DAYS)):
-                    # Get observation for this day
                     window_start = day_idx - Config.CONTEXT_WINDOW_DAYS
                     if window_start < 0:
                         continue
 
-                    # Build observation
                     window = self.data_loader.data_array[window_start:day_idx]
                     normalized = (window - self.normalization_stats['mean']) / self.normalization_stats['std']
                     obs_tensor = torch.FloatTensor(normalized).unsqueeze(0).to(Config.DEVICE)
 
-                    # Get action from agent
                     action = agent.actor(obs_tensor).cpu().numpy()[0]  # [num_stocks, 2]
-
-                    # Extract coefficients (first dimension)
                     coefficients = action[:, 0]  # [num_stocks]
                     all_coefficients.append(coefficients)
 
         if len(all_coefficients) == 0:
-            # Fallback: return zeros (no conviction trades will trigger)
-            print("  ⚠ No coefficient data collected for conviction threshold calculation")
-            return [0.0] * Config.NUM_INVESTABLE_STOCKS
+            print("  Warning: No coefficient data collected for conviction threshold calculation")
+            return 0.0
 
-        # Stack into [Days, Stocks] array
         coeff_history = np.array(all_coefficients)  # [Days, Stocks]
 
-        # Calculate 95th percentile for each stock
-        p95_vector = calculate_agent_stats_vectorized(coeff_history)
-
-        return p95_vector.tolist()
+        return float(calculate_conviction_threshold(coeff_history))
 
     def validate_agent(self, agent, quality_threshold: float = None) -> Dict:
         """

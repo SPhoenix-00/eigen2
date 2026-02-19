@@ -212,7 +212,6 @@ def run_validation(manager, loader, stats, holdout_info,
         },
         'consensus_summary': {
             'avg_unanimity_pct': 0.0,
-            'avg_min_consensus_pct': 0.0,
             'avg_consensus_votes': 0.0,
         }
     }
@@ -718,11 +717,9 @@ def _print_validation_results(results):
         elif 'avg_consensus_votes' in cs:
             print(f"    Consensus:")
             print(f"      Unanimity: {cs['unanimity_pct']:.1f}%, "
-                  f"Min Quorum: {cs['min_consensus_pct']:.1f}%, "
                   f"Avg Votes: {cs['avg_consensus_votes']:.2f}")
             print(f"      By Quorum: {cs['trades_by_quorum']}, "
-                  f"By Conviction: {cs['trades_by_conviction']}, "
-                  f"Vetoed: {cs['trades_vetoed']}")
+                  f"By Conviction Only: {cs.get('trades_by_conviction_only', 0)}")
 
     print("\n" + "-"*60)
     print("COMMITTEE AGGREGATE PERFORMANCE")
@@ -744,11 +741,9 @@ def _print_validation_results(results):
         print(f"  {cs_sum['note']}")
     else:
         print(f"  Unanimity Rate: {cs_sum['avg_unanimity_pct']:.1f}%")
-        print(f"  Min Consensus Rate: {cs_sum['avg_min_consensus_pct']:.1f}%")
         print(f"  Avg Votes per Trade: {cs_sum['avg_consensus_votes']:.2f}")
         print(f"  Trades by Quorum: {cs_sum['total_trades_by_quorum']}")
-        print(f"  Trades by Conviction: {cs_sum['total_trades_by_conviction']}")
-        print(f"  Trades Vetoed: {cs_sum['total_trades_vetoed']}")
+        print(f"  Trades by Conviction Only: {cs_sum.get('total_trades_by_conviction_only', 0)}")
 
     print("\n" + "-"*60)
     print("COMMITTEE VS INDIVIDUAL COMPARISON")
@@ -783,15 +778,14 @@ def _print_sweep_summary(sweep_type, all_results, key_name, format_key):
               f"{qr_str:<10} {agg['mean_expectancy']:<12.6f} "
               f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
 
-    print(f"\n{key_name:<12} {'By Quorum':<12} {'By Conviction':<14} {'Vetoed':<10} {'Unanimity':<12} {'Avg Votes':<10}")
-    print("-" * 82)
+    print(f"\n{key_name:<12} {'By Quorum':<12} {'By Conviction':<16} {'Unanimity':<12} {'Avg Votes':<10}")
+    print("-" * 72)
 
     for key in sorted(all_results.keys()):
         cs = all_results[key]['consensus']
         if 'note' not in cs:
             print(f"{format_key(key):<12} {cs.get('total_trades_by_quorum', 0):<12} "
-                  f"{cs.get('total_trades_by_conviction', 0):<14} "
-                  f"{cs.get('total_trades_vetoed', 0):<10} "
+                  f"{cs.get('total_trades_by_conviction_only', cs.get('total_trades_by_conviction', 0)):<16} "
                   f"{cs.get('avg_unanimity_pct', 0):<12.1f}% "
                   f"{cs.get('avg_consensus_votes', 0):<10.2f}")
         else:
@@ -851,16 +845,15 @@ def _print_combined_sweep_summary(all_results):
               f"{qr_str:<10} {agg['mean_expectancy']:<12.6f} "
               f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
 
-    print(f"\n{'Quorum':<8} {'Percentile':<12} {'By Quorum':<12} {'By Conviction':<14} {'Vetoed':<10} {'Unanimity':<12} {'Avg Votes':<10}")
-    print("-" * 90)
+    print(f"\n{'Quorum':<8} {'Percentile':<12} {'By Quorum':<12} {'By Conviction':<16} {'Unanimity':<12} {'Avg Votes':<10}")
+    print("-" * 80)
 
     for key in sorted_keys:
         quorum, percentile = key
         cs = all_results[key]['consensus']
         if 'note' not in cs:
             print(f"{quorum:<8} P{percentile:<11} {cs.get('total_trades_by_quorum', 0):<12} "
-                  f"{cs.get('total_trades_by_conviction', 0):<14} "
-                  f"{cs.get('total_trades_vetoed', 0):<10} "
+                  f"{cs.get('total_trades_by_conviction_only', cs.get('total_trades_by_conviction', 0)):<16} "
                   f"{cs.get('avg_unanimity_pct', 0):<12.1f}% "
                   f"{cs.get('avg_consensus_votes', 0):<10.2f}")
         else:
@@ -877,7 +870,7 @@ def _print_combined_sweep_summary(all_results):
     print(f"  Win Rate: {all_results[best_key]['aggregate']['mean_win_rate']*100:.2f}%")
     print(f"  ROI: {all_results[best_key]['aggregate']['mean_roi']:.2f}%")
     print(f"  Trades by Quorum: {best_consensus.get('total_trades_by_quorum', 0)}")
-    print(f"  Trades by Conviction: {best_consensus.get('total_trades_by_conviction', 0)}")
+    print(f"  Trades by Conviction Only: {best_consensus.get('total_trades_by_conviction_only', 0)}")
     print(f"{'='*60}")
 
 
@@ -895,8 +888,8 @@ def _print_combined_sweep_per_slice(all_results):
         sl_idx = s['slice']
         sl_type = s['slice_type']
         print(f"\n  Slice {sl_idx} ({sl_type})")
-        print(f"  {'Quorum':<8} {'Pct':<8} {'Fitness':<10} {'ROI %':<10} {'Raw PnL':<14}")
-        print("  " + "-" * 54)
+        print(f"  {'Quorum':<8} {'Pct':<8} {'Fitness':<10} {'ROI %':<10} {'Raw PnL':<14} {'Trades':<8}")
+        print("  " + "-" * 62)
         for key in sorted_keys:
             quorum, percentile = key
             sl_data = all_results[key].get('committee_slices', [])
@@ -904,6 +897,7 @@ def _print_combined_sweep_per_slice(all_results):
             if row is None:
                 continue
             pnl = row.get('raw_pnl', 0.0)
-            print(f"  {quorum:<8} P{percentile:<7} {row.get('fitness', 0):<10.2f} {row.get('roi', 0):<10.2f}% ${pnl:<12.2f}")
+            trades = row.get('num_wins', 0) + row.get('num_losses', 0)
+            print(f"  {quorum:<8} P{percentile:<7} {row.get('fitness', 0):<10.2f} {row.get('roi', 0):<10.2f}% ${pnl:<12.2f}  {trades}")
     print()
 
