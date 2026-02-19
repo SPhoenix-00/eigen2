@@ -3329,15 +3329,17 @@ class ERLTrainer:
     # calculate_expectancy removed — callers use _calculate_expectancy()
     # from training.fitness directly. External consumers import from training.fitness.
 
-    def calculate_conviction_threshold_scalar(self, agent) -> float:
+    def calculate_conviction_threshold_scalar(self, agent, is_maverick: bool = False) -> float:
         """
         Calculate the 95th percentile conviction threshold (scalar) for an agent.
 
         Runs the agent on validation data to collect coefficient predictions,
         then calculates a single P95 threshold across all stocks and all days.
+        Maverick agents are floored at MAVERICK_CONVICTION_PERCENTILE_FLOOR.
 
         Args:
             agent: The DDPGAgent to calculate threshold for
+            is_maverick: If True, use maverick conviction floor
 
         Returns:
             Scalar conviction threshold (float)
@@ -3371,7 +3373,7 @@ class ERLTrainer:
 
         coeff_history = np.array(all_coefficients)  # [Days, Stocks]
 
-        return float(calculate_conviction_threshold(coeff_history))
+        return float(calculate_conviction_threshold(coeff_history, is_maverick=is_maverick))
 
     def validate_agent(self, agent, quality_threshold: float = None) -> Dict:
         """

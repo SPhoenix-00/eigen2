@@ -37,6 +37,7 @@ from committee.optimization import (
 from committee.validation import (
     run_validation, run_validation_sweep,
     run_quorum_sweep, run_conviction_sweep, run_combined_sweep,
+    run_triple_sweep,
     evaluate_committee_on_slice, evaluate_agent_on_slice,
 )
 
@@ -156,7 +157,9 @@ def run_draft(manager, loader, stats, holdout_info, deep=False, exhaustive=False
             num_stocks = Config.NUM_INVESTABLE_STOCKS
             agent_coeffs_2d = agent_coeffs_1d.reshape(num_days, num_stocks)
 
-            conviction_threshold = calculate_conviction_threshold(agent_coeffs_2d)
+            conviction_threshold = calculate_conviction_threshold(
+                agent_coeffs_2d, is_maverick=e.get('is_maverick', False),
+            )
             member_data = build_member_data(e, conviction_threshold)
             members_with_stats.append(member_data)
             print(f"  ✓ {e['run_name']}_{e['agent_id']}: "
@@ -432,7 +435,9 @@ def run_slice_improvement_pass(members_with_stats, entries, coefficients, valid_
         for c in candidates:
             cand_coeffs_1d = coefficients[c['idx']]
             cand_coeffs_2d = cand_coeffs_1d.reshape(num_days, num_stocks)
-            conviction_threshold = calculate_conviction_threshold(cand_coeffs_2d)
+            conviction_threshold = calculate_conviction_threshold(
+                cand_coeffs_2d, is_maverick=c['entry'].get('is_maverick', False),
+            )
             new_member = build_member_data(c['entry'], conviction_threshold)
 
             modified_members = list(current_members)
@@ -585,7 +590,9 @@ def run_maverick_rotation(members_with_stats, entries, coefficients, valid_indic
         # Build conviction thresholds for this maverick
         coeffs_1d = coefficients[mav_idx]
         coeffs_2d = coeffs_1d.reshape(num_days, num_stocks)
-        conviction_threshold = calculate_conviction_threshold(coeffs_2d)
+        conviction_threshold = calculate_conviction_threshold(
+            coeffs_2d, is_maverick=True,
+        )
         new_member = build_member_data(mav_entry, conviction_threshold)
 
         # Build modified committee
@@ -1075,7 +1082,9 @@ def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap, focus_sl
         num_days = len(valid_indices)
         num_stocks = Config.NUM_INVESTABLE_STOCKS
         chosen_coeffs_2d = chosen_coeffs.reshape(num_days, num_stocks)
-        conviction_threshold = calculate_conviction_threshold(chosen_coeffs_2d)
+        conviction_threshold = calculate_conviction_threshold(
+            chosen_coeffs_2d, is_maverick=e.get('is_maverick', False),
+        )
 
         new_member = build_member_data(e, conviction_threshold)
 
@@ -1256,7 +1265,9 @@ def run_swap_agent(manager, loader, stats, holdout_info, agent_to_swap, focus_sl
             num_days = len(valid_indices)
             num_stocks = Config.NUM_INVESTABLE_STOCKS
             chosen_coeffs_2d = chosen_coeffs.reshape(num_days, num_stocks)
-            conviction_threshold = calculate_conviction_threshold(chosen_coeffs_2d)
+            conviction_threshold = calculate_conviction_threshold(
+                chosen_coeffs_2d, is_maverick=chosen_entry.get('is_maverick', False),
+            )
 
             new_member = build_member_data(chosen_entry, conviction_threshold)
 
@@ -1693,6 +1704,10 @@ def main():
                         help='Sweep multiple conviction percentiles, comma-separated (e.g., "90,95,99,99.9")')
     parser.add_argument('--sweep-both', type=str, default=None,
                         help='Sweep both quorum and conviction (grid search). Format: "quorums:percentiles"')
+    parser.add_argument('--sweep-thrice', type=str, default=None,
+                        help='Sweep quorum, conviction, and maverick floor (3D grid). '
+                             'Format: "quorums:percentiles:maverick_floors" '
+                             '(e.g., "2,3,4:75,90,95:90,95,99")')
     parser.add_argument('--swap-agent', type=str, default=None,
                         help='Evaluate and swap a specific agent (e.g. "run-name_id")')
     parser.add_argument('--focus-slices', type=str, default=None,
@@ -1709,7 +1724,7 @@ def main():
         args.stats, args.mirror, args.update_maverick_flags,
         args.update_conviction is not None, args.simulate,
         args.sweep_quorum, args.sweep_conviction,
-        args.sweep_both, args.swap_agent, args.diagnose_slice,
+        args.sweep_both, args.sweep_thrice, args.swap_agent, args.diagnose_slice,
     ])
 
     if not has_action:
@@ -1818,6 +1833,18 @@ def main():
         quorum_values = [int(q.strip()) for q in parts[0].split(',')]
         percentile_values = [float(p.strip()) for p in parts[1].split(',')]
         run_combined_sweep(manager, loader, stats, holdout_info, context_window_days, quorum_values, percentile_values)
+        exit(0)
+
+    if args.sweep_thrice:
+        parts = args.sweep_thrice.split(':')
+        if len(parts) != 3:
+            print("❌ --sweep-thrice format error. Expected: 'quorums:percentiles:maverick_floors' (e.g., '2,3,4:75,90,95:90,95,99')")
+            exit(1)
+        quorum_values = [int(q.strip()) for q in parts[0].split(',')]
+        percentile_values = [float(p.strip()) for p in parts[1].split(',')]
+        maverick_floor_values = [float(m.strip()) for m in parts[2].split(',')]
+        run_triple_sweep(manager, loader, stats, holdout_info, context_window_days,
+                         quorum_values, percentile_values, maverick_floor_values)
         exit(0)
 
     # Handle --quorum override

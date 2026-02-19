@@ -280,7 +280,7 @@ def verify_data_split(loader):
         'val_end': val_end,
     }
 
-    print("✅ THREE-TIER DATA SPLIT VERIFICATION PASSED")
+    print("[OK] THREE-TIER DATA SPLIT VERIFICATION PASSED")
     print(f"\n  Total Days:     {total_days:,}")
     print(f"  Training:       {train_size:,} days (indices {train_start:,} to {train_end:,})")
     print(f"  Validation:     {val_size:,} days (indices {val_start:,} to {val_end:,})")

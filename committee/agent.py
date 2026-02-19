@@ -46,6 +46,10 @@ class CommitteeAgent:
         self.loaded_agents = []
         self.track_consensus = track_consensus
 
+        # Track which stocks were opened by which mechanism (persists across steps)
+        self.quorum_opened = set()
+        self.conviction_opened = set()
+
         if self.track_consensus:
             self.consensus_history = {
                 'total_steps': 0,
@@ -99,14 +103,19 @@ class CommitteeAgent:
 
     def _apply_consensus(self, all_coeffs: np.ndarray, held_stock_ids: list = None) -> np.ndarray:
         """
-        Apply committee consensus logic.
+        Apply committee consensus logic in two phases.
 
-        Two independent paths to approve a trade (OR):
-          1. Quorum:     >= COMMITTEE_QUORUM agents have coeff >= COEFFICIENT_THRESHOLD
-          2. Conviction: any single agent has coeff > its own scalar conviction threshold
+        Phase 1 — Quorum (evaluated first, independently):
+          >= COMMITTEE_QUORUM agents with coeff >= COEFFICIENT_THRESHOLD.
+          Only blocked by stocks already held from prior quorum trades, so quorum
+          results are identical regardless of conviction percentile.
 
-        Trade coefficient = max of all supporters' coefficients, floored at COEFFICIENT_THRESHOLD.
-        Supporter = agent with coeff >= COEFFICIENT_THRESHOLD OR agent with conviction.
+        Phase 2 — Conviction (additive, never interferes with quorum):
+          Any single agent with coeff > its own scalar conviction threshold.
+          Blocked by ALL held stocks (quorum + conviction) and by stocks already
+          approved by quorum in this step.
+
+        Trade coefficient = max of supporters' coefficients, floored at COEFFICIENT_THRESHOLD.
 
         Args:
             all_coeffs: [num_members, num_stocks] coefficient predictions
@@ -116,27 +125,46 @@ class CommitteeAgent:
             final_coeffs: [num_stocks] consensus coefficients
         """
         num_members, num_stocks = all_coeffs.shape
+        held_set = set(held_stock_ids) if held_stock_ids else set()
 
-        # Path 1: Quorum — standard votes (coeff >= global threshold)
+        # Prune closed positions from tracking
+        self.quorum_opened = self.quorum_opened & held_set
+        self.conviction_opened = self.conviction_opened & held_set
+
+        # === Phase 1: Quorum ===
+        # Quorum is only blocked by quorum-opened positions, NOT conviction-opened ones.
+        # This ensures quorum trades are identical regardless of conviction percentile.
         votes = all_coeffs >= Config.COEFFICIENT_THRESHOLD
         vote_counts = np.sum(votes, axis=0)
         quorum_pass = vote_counts >= Config.COMMITTEE_QUORUM
 
-        # Path 2: Conviction — any agent's coeff > its own scalar threshold
+        quorum_held_mask = np.zeros(num_stocks, dtype=bool)
+        for sid in self.quorum_opened:
+            quorum_held_mask[sid] = True
+        quorum_approved = quorum_pass & (~quorum_held_mask)
+
+        # === Phase 2: Conviction (only for stocks NOT approved by quorum) ===
+        # Conviction is blocked by ALL held stocks (quorum + conviction).
         conviction_thresholds = np.array([
             m['stats']['conviction_threshold'] for m in self.members
         ])  # [num_members]
         agent_convictions = all_coeffs > conviction_thresholds[:, np.newaxis]  # [num_members, num_stocks]
-        conviction_pass = np.any(agent_convictions, axis=0)  # [num_stocks]
+        conviction_any = np.any(agent_convictions, axis=0)  # [num_stocks]
 
-        # Trade approved if either path passes
-        should_trade = quorum_pass | conviction_pass
+        all_held_mask = np.zeros(num_stocks, dtype=bool)
+        for sid in held_set:
+            all_held_mask[sid] = True
+        conviction_approved = conviction_any & (~all_held_mask) & (~quorum_approved)
 
-        # Exclude stocks already held
-        if held_stock_ids:
-            held_mask = np.zeros(num_stocks, dtype=bool)
-            held_mask[held_stock_ids] = True
-            should_trade = should_trade & (~held_mask)
+        # === Combined result ===
+        should_trade = quorum_approved | conviction_approved
+
+        # Update position tracking
+        for stock_id in range(num_stocks):
+            if quorum_approved[stock_id]:
+                self.quorum_opened.add(stock_id)
+            elif conviction_approved[stock_id]:
+                self.conviction_opened.add(stock_id)
 
         # Consensus tracking
         if self.track_consensus:
@@ -155,8 +183,8 @@ class CommitteeAgent:
             unanimity = np.sum(vote_counts[stocks_to_count] == num_members)
             self.consensus_history['unanimity_count'] += int(unanimity)
 
-            is_quorum_trade = quorum_pass & stocks_to_count
-            is_conviction_only_trade = (~quorum_pass) & conviction_pass & stocks_to_count
+            is_quorum_trade = quorum_approved & stocks_to_count
+            is_conviction_only_trade = conviction_approved & stocks_to_count
 
             self.consensus_history['trades_by_quorum'] += int(np.sum(is_quorum_trade))
             self.consensus_history['trades_by_conviction_only'] += int(np.sum(is_conviction_only_trade))
@@ -202,6 +230,8 @@ class CommitteeAgent:
 
     def reset_episode(self):
         """Reset episode-level tracking (call at start of each new episode)."""
+        self.quorum_opened = set()
+        self.conviction_opened = set()
         if self.track_consensus:
             self.signaled_stocks = set()
 
@@ -216,7 +246,8 @@ class CommitteeAgent:
 # --- Conviction Threshold Calculation ---
 
 def calculate_conviction_threshold(agent_coeff_history_2d: np.ndarray,
-                                   percentile: float = 95) -> float:
+                                   percentile: float = 95,
+                                   is_maverick: bool = False) -> float:
     """
     Calculate a single scalar conviction threshold for an agent.
 
@@ -225,17 +256,23 @@ def calculate_conviction_threshold(agent_coeff_history_2d: np.ndarray,
     Conviction means "this agent is unusually confident relative to its own
     trading history."
 
+    Maverick agents use MAVERICK_CONVICTION_PERCENTILE_FLOOR as their
+    percentile, independent of the general conviction percentile.
+
     Args:
         agent_coeff_history_2d: Numpy array [Days, Stocks] for a single agent
         percentile: Percentile to use for conviction threshold (default: 95)
+        is_maverick: If True, uses MAVERICK_CONVICTION_PERCENTILE_FLOOR instead of percentile
 
     Returns:
         Scalar conviction threshold (float)
     """
+    effective_percentile = Config.MAVERICK_CONVICTION_PERCENTILE_FLOOR if is_maverick else percentile
+
     traded_coeffs = agent_coeff_history_2d[agent_coeff_history_2d >= Config.COEFFICIENT_THRESHOLD]
 
     if len(traded_coeffs) >= 20:
-        return float(np.percentile(traded_coeffs, percentile))
+        return float(np.percentile(traded_coeffs, effective_percentile))
     else:
         return 100.0
 
@@ -297,7 +334,8 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
                     agent_coeffs_2d = np.concatenate(all_coefs, axis=0)
 
                 conviction_threshold = calculate_conviction_threshold(
-                    agent_coeffs_2d, percentile=percentile
+                    agent_coeffs_2d, percentile=percentile,
+                    is_maverick=member.get('is_maverick', False),
                 )
                 member['stats']['conviction_threshold'] = float(conviction_threshold)
 
@@ -327,6 +365,20 @@ def recalculate_conviction_thresholds(members: list, loader, stats, holdout_info
         del val_tensor_cpu
         torch.cuda.empty_cache()
     gc.collect()
+
+    mav_members = [m for m in new_members if m.get('is_maverick', False)]
+    non_mav_members = [m for m in new_members if not m.get('is_maverick', False)]
+    eff_mav_pct = Config.MAVERICK_CONVICTION_PERCENTILE_FLOOR if mav_members else percentile
+    if mav_members:
+        mav_thresholds = [m['stats']['conviction_threshold'] for m in mav_members]
+        print(f"  Maverick thresholds (effective P{eff_mav_pct}): "
+              f"min={min(mav_thresholds):.4f}, max={max(mav_thresholds):.4f}, "
+              f"mean={sum(mav_thresholds)/len(mav_thresholds):.4f}  ({len(mav_members)} agents)")
+    if non_mav_members:
+        non_mav_thresholds = [m['stats']['conviction_threshold'] for m in non_mav_members]
+        print(f"  Regular thresholds  (P{percentile}): "
+              f"min={min(non_mav_thresholds):.4f}, max={max(non_mav_thresholds):.4f}, "
+              f"mean={sum(non_mav_thresholds)/len(non_mav_thresholds):.4f}  ({len(non_mav_members)} agents)")
 
     return new_members
 

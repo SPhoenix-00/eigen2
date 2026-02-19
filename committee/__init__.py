@@ -71,5 +71,6 @@ from committee.validation import (
     run_quorum_sweep,
     run_conviction_sweep,
     run_combined_sweep,
+    run_triple_sweep,
 )
 

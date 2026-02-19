@@ -609,7 +609,249 @@ def run_combined_sweep(manager, loader, stats, holdout_info,
     return all_results
 
 
+def run_triple_sweep(manager, loader, stats, holdout_info,
+                     context_window_days: int, quorum_values: list,
+                     percentile_values: list, maverick_floor_values: list) -> dict:
+    """
+    Run validation sweeping quorum, conviction percentile, AND maverick conviction floor.
+
+    Loop order (optimised to minimise threshold recalculations):
+      Outer:  maverick floor  (changes maverick thresholds)
+      Middle: conviction percentile  (changes non-maverick thresholds; maverick = max(pct, floor))
+      Inner:  quorum  (config change only, no recalculation)
+
+    Each (percentile, maverick_floor) pair requires one threshold recalculation pass.
+    """
+    print("\n" + "="*60)
+    print("TRIPLE SWEEP: Grid Search Over Quorum, Conviction & Maverick Floor")
+    print("="*60)
+    print(f"  Quorum values:        {quorum_values}")
+    print(f"  Percentile values:    {percentile_values}")
+    print(f"  Maverick floor values: {maverick_floor_values}")
+    total = len(quorum_values) * len(percentile_values) * len(maverick_floor_values)
+    print(f"  Total combinations:   {total}")
+    print(f"  Committee size:       {Config.COMMITTEE_SIZE}")
+
+    roster = manager.load_roster()
+    if roster is None:
+        print(f"No roster found. Run --draft first.")
+        return None
+
+    original_quorum = Config.COMMITTEE_QUORUM
+    original_mav_floor = Config.MAVERICK_CONVICTION_PERCENTILE_FLOOR
+    all_results = {}
+    current = 0
+
+    print(f"\n  Pre-loading validation tensor...")
+    val_tensor, valid_indices = get_validation_data(loader, stats, holdout_info)
+    val_tensor_cpu = val_tensor.cpu()
+    del val_tensor
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    for mav_floor in maverick_floor_values:
+        Config.MAVERICK_CONVICTION_PERCENTILE_FLOOR = mav_floor
+
+        for percentile in percentile_values:
+            print(f"\n{'='*60}")
+            print(f"Maverick floor=P{mav_floor}, Conviction=P{percentile} — recalculating thresholds")
+            print(f"{'='*60}")
+
+            members_with_new_thresholds = recalculate_conviction_thresholds(
+                roster['members'], loader, stats, holdout_info,
+                context_window_days, percentile, val_tensor_cpu=val_tensor_cpu
+            )
+
+            for quorum in quorum_values:
+                current += 1
+                print(f"\n{'='*60}")
+                print(f"[{current}/{total}] Quorum={quorum}, Conviction=P{percentile}, MavFloor=P{mav_floor}")
+                print(f"{'='*60}")
+
+                Config.COMMITTEE_QUORUM = quorum
+
+                results = run_validation_sweep(
+                    manager, loader, stats, holdout_info, context_window_days,
+                    members_override=members_with_new_thresholds
+                )
+
+                if results:
+                    all_results[(quorum, percentile, mav_floor)] = {
+                        'aggregate': results['committee_aggregate'],
+                        'consensus': results['consensus_summary'],
+                        'committee_slices': results.get('committee_slices', []),
+                    }
+
+                del results
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
+
+            del members_with_new_thresholds
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+    del val_tensor_cpu
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    Config.COMMITTEE_QUORUM = original_quorum
+    Config.MAVERICK_CONVICTION_PERCENTILE_FLOOR = original_mav_floor
+
+    _print_triple_sweep_summary(all_results)
+    _export_triple_sweep_csv(all_results, manager)
+
+    return all_results
+
+
 # --- Private Helpers ---
+
+def _print_triple_sweep_summary(all_results):
+    """Print triple sweep comparison summary as flat tables."""
+    print(f"\n{'='*80}")
+    print("TRIPLE SWEEP COMPARISON SUMMARY")
+    print(f"{'='*80}")
+
+    print(f"\n{'Quorum':<8} {'Pct':<8} {'MavFlr':<8} {'Fitness':<10} {'Win Rate':<10} {'Quality':<10} {'Expectancy':<12} {'ROI':<10} {'Trades':<8}")
+    print("-" * 94)
+
+    sorted_keys = sorted(all_results.keys(), key=lambda x: (x[0], x[1], x[2]))
+
+    for key in sorted_keys:
+        quorum, percentile, mav_floor = key
+        agg = all_results[key]['aggregate']
+        qr_str = format_quality_ratio(agg['mean_quality_ratio'])
+        print(f"{quorum:<8} P{percentile:<7} P{mav_floor:<7} {agg['mean_fitness']:<10.2f} {agg['mean_win_rate']*100:<10.1f}% "
+              f"{qr_str:<10} {agg['mean_expectancy']:<12.6f} "
+              f"{agg['mean_roi']:<10.2f}% {agg['total_trades']:<8}")
+
+    print(f"\n{'Quorum':<8} {'Pct':<8} {'MavFlr':<8} {'By Quorum':<12} {'By Conviction':<16} {'Unanimity':<12} {'Avg Votes':<10}")
+    print("-" * 84)
+
+    for key in sorted_keys:
+        quorum, percentile, mav_floor = key
+        cs = all_results[key]['consensus']
+        if 'note' not in cs:
+            print(f"{quorum:<8} P{percentile:<7} P{mav_floor:<7} {cs.get('total_trades_by_quorum', 0):<12} "
+                  f"{cs.get('total_trades_by_conviction_only', cs.get('total_trades_by_conviction', 0)):<16} "
+                  f"{cs.get('avg_unanimity_pct', 0):<12.1f}% "
+                  f"{cs.get('avg_consensus_votes', 0):<10.2f}")
+        else:
+            print(f"{quorum:<8} P{percentile:<7} P{mav_floor:<7} {cs['note']}")
+
+    # Rank-based recommendation across fitness, win rate, and ROI
+    keys = list(all_results.keys())
+    metrics = {
+        'Fitness':  [all_results[k]['aggregate']['mean_fitness'] for k in keys],
+        'Win Rate': [all_results[k]['aggregate']['mean_win_rate'] for k in keys],
+        'ROI':      [all_results[k]['aggregate']['mean_roi'] for k in keys],
+    }
+
+    def _rank_descending(values):
+        indexed = sorted(enumerate(values), key=lambda x: -x[1])
+        ranks = [0] * len(values)
+        for rank, (idx, _) in enumerate(indexed):
+            ranks[idx] = rank
+        return ranks
+
+    all_ranks = {name: _rank_descending(vals) for name, vals in metrics.items()}
+    avg_ranks = [sum(all_ranks[m][i] for m in all_ranks) / len(all_ranks) for i in range(len(keys))]
+    best_idx = min(range(len(keys)), key=lambda i: avg_ranks[i])
+    best_key = keys[best_idx]
+    best_quorum, best_percentile, best_mav_floor = best_key
+    best = all_results[best_key]
+    best_consensus = best['consensus']
+
+    print(f"\n{'='*80}")
+    print(f"RECOMMENDATION (ranked by Fitness + Win Rate + ROI):")
+    print(f"  Quorum={best_quorum}, Conviction=P{best_percentile}, MavFloor=P{best_mav_floor}")
+    print(f"  Fitness:  {best['aggregate']['mean_fitness']:.2f}  (rank {all_ranks['Fitness'][best_idx]+1}/{len(keys)})")
+    print(f"  Win Rate: {best['aggregate']['mean_win_rate']*100:.2f}%  (rank {all_ranks['Win Rate'][best_idx]+1}/{len(keys)})")
+    print(f"  ROI:      {best['aggregate']['mean_roi']:.2f}%  (rank {all_ranks['ROI'][best_idx]+1}/{len(keys)})")
+    print(f"  Trades:   {best['aggregate']['total_trades']} "
+          f"(Quorum: {best_consensus.get('total_trades_by_quorum', 0)}, "
+          f"Conviction: {best_consensus.get('total_trades_by_conviction_only', 0)})")
+    print(f"{'='*80}")
+
+
+def _export_triple_sweep_csv(all_results, manager):
+    """Export triple sweep results to a CSV file in the committee directory."""
+    csv_path = manager.local_committee_dir / "triple_sweep_results.csv"
+
+    sorted_keys = sorted(all_results.keys(), key=lambda x: (x[0], x[1], x[2]))
+
+    # Collect slice indices from first result
+    first = next(iter(all_results.values()), None)
+    slices_list = first.get('committee_slices', []) if first else []
+    slice_indices = [s['slice'] for s in slices_list]
+
+    # Build header
+    header = [
+        'quorum', 'conviction_pct', 'maverick_floor',
+        'fitness', 'win_rate', 'roi', 'quality_ratio', 'expectancy',
+        'total_trades', 'trades_by_quorum', 'trades_by_conviction',
+        'unanimity_pct', 'avg_votes',
+    ]
+    for sl in slices_list:
+        sl_idx = sl['slice']
+        sl_type = sl['slice_type']
+        tag = f"s{sl_idx}_{sl_type}"
+        header.extend([f"{tag}_fitness", f"{tag}_roi", f"{tag}_pnl", f"{tag}_trades"])
+
+    rows = []
+    for key in sorted_keys:
+        quorum, percentile, mav_floor = key
+        agg = all_results[key]['aggregate']
+        cs = all_results[key]['consensus']
+
+        row = [
+            quorum, percentile, mav_floor,
+            f"{agg['mean_fitness']:.4f}",
+            f"{agg['mean_win_rate']*100:.2f}",
+            f"{agg['mean_roi']:.4f}",
+            f"{agg['mean_quality_ratio']:.4f}" if agg['mean_quality_ratio'] is not None else '',
+            f"{agg['mean_expectancy']:.6f}",
+            agg['total_trades'],
+            cs.get('total_trades_by_quorum', 0),
+            cs.get('total_trades_by_conviction_only', cs.get('total_trades_by_conviction', 0)),
+            f"{cs.get('avg_unanimity_pct', 0):.1f}",
+            f"{cs.get('avg_consensus_votes', 0):.2f}",
+        ]
+
+        sl_data = all_results[key].get('committee_slices', [])
+        for sl_idx in slice_indices:
+            sl_row = next((x for x in sl_data if x.get('slice') == sl_idx), None)
+            if sl_row:
+                trades = sl_row.get('num_wins', 0) + sl_row.get('num_losses', 0)
+                row.extend([
+                    f"{sl_row.get('fitness', 0):.4f}",
+                    f"{sl_row.get('roi', 0):.4f}",
+                    f"{sl_row.get('raw_pnl', 0):.2f}",
+                    trades,
+                ])
+            else:
+                row.extend(['', '', '', ''])
+
+        rows.append(row)
+
+    for attempt in range(5):
+        try:
+            path = csv_path if attempt == 0 else csv_path.with_name(f"triple_sweep_results_{attempt}.csv")
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+            print(f"\n  Triple sweep results exported to: {path}")
+            break
+        except PermissionError:
+            if attempt < 4:
+                continue
+            print(f"\n  Warning: Could not write CSV (file locked?) — tried {csv_path}")
+
 
 def _export_slice_trades(closed_trades, sl, start_date, end_date, manager, loader):
     """Export slice trades to CSV/XLSX and upload to cloud. Returns csv_filename or None."""
@@ -791,11 +1033,29 @@ def _print_sweep_summary(sweep_type, all_results, key_name, format_key):
         else:
             print(f"{format_key(key):<12} {cs['note']}")
 
-    best_key = max(all_results.keys(), key=lambda k: all_results[k]['aggregate']['mean_fitness'])
-    best_fitness = all_results[best_key]['aggregate']['mean_fitness']
+    keys = list(all_results.keys())
+
+    def _rank_desc(values):
+        indexed = sorted(enumerate(values), key=lambda x: -x[1])
+        ranks = [0] * len(values)
+        for rank, (idx, _) in enumerate(indexed):
+            ranks[idx] = rank
+        return ranks
+
+    rank_fitness = _rank_desc([all_results[k]['aggregate']['mean_fitness'] for k in keys])
+    rank_wr = _rank_desc([all_results[k]['aggregate']['mean_win_rate'] for k in keys])
+    rank_roi = _rank_desc([all_results[k]['aggregate']['mean_roi'] for k in keys])
+    avg_ranks = [(rank_fitness[i] + rank_wr[i] + rank_roi[i]) / 3 for i in range(len(keys))]
+    best_idx = min(range(len(keys)), key=lambda i: avg_ranks[i])
+    best_key = keys[best_idx]
+    best_agg = all_results[best_key]['aggregate']
 
     print(f"\n{'='*60}")
-    print(f"RECOMMENDATION: {format_key(best_key)} achieved highest mean fitness ({best_fitness:.2f})")
+    print(f"RECOMMENDATION (ranked by Fitness + Win Rate + ROI):")
+    print(f"  {format_key(best_key)}")
+    print(f"  Fitness:  {best_agg['mean_fitness']:.2f}  (rank {rank_fitness[best_idx]+1}/{len(keys)})")
+    print(f"  Win Rate: {best_agg['mean_win_rate']*100:.2f}%  (rank {rank_wr[best_idx]+1}/{len(keys)})")
+    print(f"  ROI:      {best_agg['mean_roi']:.2f}%  (rank {rank_roi[best_idx]+1}/{len(keys)})")
     print(f"{'='*60}")
 
 
@@ -859,16 +1119,31 @@ def _print_combined_sweep_summary(all_results):
         else:
             print(f"{quorum:<8} P{percentile:<11} {cs['note']}")
 
-    best_key = max(all_results.keys(), key=lambda k: all_results[k]['aggregate']['mean_fitness'])
+    keys = list(all_results.keys())
+
+    def _rank_desc(values):
+        indexed = sorted(enumerate(values), key=lambda x: -x[1])
+        ranks = [0] * len(values)
+        for rank, (idx, _) in enumerate(indexed):
+            ranks[idx] = rank
+        return ranks
+
+    rank_fitness = _rank_desc([all_results[k]['aggregate']['mean_fitness'] for k in keys])
+    rank_wr = _rank_desc([all_results[k]['aggregate']['mean_win_rate'] for k in keys])
+    rank_roi = _rank_desc([all_results[k]['aggregate']['mean_roi'] for k in keys])
+    avg_ranks = [(rank_fitness[i] + rank_wr[i] + rank_roi[i]) / 3 for i in range(len(keys))]
+    best_idx = min(range(len(keys)), key=lambda i: avg_ranks[i])
+    best_key = keys[best_idx]
     best_quorum, best_percentile = best_key
-    best_fitness = all_results[best_key]['aggregate']['mean_fitness']
+    best_agg = all_results[best_key]['aggregate']
     best_consensus = all_results[best_key]['consensus']
 
     print(f"\n{'='*60}")
-    print(f"RECOMMENDATION: Quorum={best_quorum}, Conviction=P{best_percentile}")
-    print(f"  Achieved highest mean fitness: {best_fitness:.2f}")
-    print(f"  Win Rate: {all_results[best_key]['aggregate']['mean_win_rate']*100:.2f}%")
-    print(f"  ROI: {all_results[best_key]['aggregate']['mean_roi']:.2f}%")
+    print(f"RECOMMENDATION (ranked by Fitness + Win Rate + ROI):")
+    print(f"  Quorum={best_quorum}, Conviction=P{best_percentile}")
+    print(f"  Fitness:  {best_agg['mean_fitness']:.2f}  (rank {rank_fitness[best_idx]+1}/{len(keys)})")
+    print(f"  Win Rate: {best_agg['mean_win_rate']*100:.2f}%  (rank {rank_wr[best_idx]+1}/{len(keys)})")
+    print(f"  ROI:      {best_agg['mean_roi']:.2f}%  (rank {rank_roi[best_idx]+1}/{len(keys)})")
     print(f"  Trades by Quorum: {best_consensus.get('total_trades_by_quorum', 0)}")
     print(f"  Trades by Conviction Only: {best_consensus.get('total_trades_by_conviction_only', 0)}")
     print(f"{'='*60}")
