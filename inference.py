@@ -4,6 +4,7 @@ Inference CLI — Daily live trading with committee consensus.
 Usage:
     python inference.py --start [DATE]          Start a new trading episode
     python inference.py --daily UPDATE.json     Run daily inference with new data
+    python inference.py --catchup [DATE]        Run inference up to DATE using pickle data
     python inference.py --status                Show current portfolio status
     python inference.py --history               Show closed trade history
 
@@ -16,6 +17,12 @@ Examples:
 
     # Feed today's data and get orders:
     python inference.py --daily daily_update_20260210.json
+
+    # Run inference on the last day in the pickle (no JSON needed):
+    python inference.py --catchup
+
+    # Run inference up to a specific date already in the pickle:
+    python inference.py --catchup 2026-02-20
 
     # Check portfolio without running inference:
     python inference.py --status
@@ -86,6 +93,16 @@ def main():
              'and outputs actionable buy/sell orders.'
     )
     parser.add_argument(
+        '--catchup',
+        nargs='?',
+        const='__latest__',
+        default=None,
+        metavar='DATE',
+        help='Run inference using data already in the pickle. Starts a fresh '
+             'episode and runs through to DATE (or the last available date). '
+             'No JSON file needed.'
+    )
+    parser.add_argument(
         '--status',
         action='store_true',
         help='Show current portfolio status and open positions.'
@@ -107,9 +124,13 @@ def main():
     args = parser.parse_args()
 
     # Validate: at least one action required
-    if args.start is None and args.daily is None and not args.status and not args.history:
+    has_action = (
+        args.start is not None or args.daily is not None
+        or args.catchup is not None or args.status or args.history
+    )
+    if not has_action:
         parser.print_help()
-        print("\nError: specify one of --start, --daily, --status, or --history")
+        print("\nError: specify one of --start, --daily, --catchup, --status, or --history")
         sys.exit(1)
 
     # Validate --daily file exists
@@ -121,14 +142,17 @@ def main():
     engine = LiveTradingEngine(state_path=args.state_file)
 
     # --- Status/History: load state only (no data/committee needed) ---
-    if args.status and args.start is None and args.daily is None:
+    standalone_query = (
+        args.start is None and args.daily is None and args.catchup is None
+    )
+    if args.status and standalone_query:
         from inference.state import TradingState, DEFAULT_STATE_PATH
         state_path = Path(args.state_file) if args.state_file else DEFAULT_STATE_PATH
         engine.state = TradingState.load(state_path)
         print(engine.get_status())
         return
 
-    if args.history and args.start is None and args.daily is None:
+    if args.history and standalone_query:
         from inference.state import TradingState, DEFAULT_STATE_PATH
         state_path = Path(args.state_file) if args.state_file else DEFAULT_STATE_PATH
         engine.state = TradingState.load(state_path)
@@ -149,11 +173,17 @@ def main():
         report = engine.run_daily(args.daily)
         print(report)
 
-    # Show status after other operations (if requested alongside --start or --daily)
-    if args.status and (args.start is not None or args.daily is not None):
+    # Catch-up: run inference over pickle data up to a target date
+    if args.catchup is not None:
+        target = None if args.catchup == '__latest__' else args.catchup
+        report = engine.run_catchup(target_date=target)
+        print(report)
+
+    # Show status after other operations
+    if args.status and not standalone_query:
         print(engine.get_status())
 
-    if args.history and (args.start is not None or args.daily is not None):
+    if args.history and not standalone_query:
         print(engine.get_history())
 
     # Cleanup committee GPU memory

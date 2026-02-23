@@ -282,6 +282,70 @@ class LiveTradingEngine:
 
         return report
 
+    def run_catchup(self, target_date: str = None, target_idx: int = None) -> str:
+        """
+        Run inference over multiple days already present in the pickle.
+
+        Starts a fresh episode one day before the target, then steps
+        through every trading day up to and including the target date/index,
+        collecting reports along the way.
+
+        Exactly one of target_date or target_idx must be provided.
+        If neither is given, defaults to the last available date.
+
+        Returns:
+            Combined report string for all days processed.
+        """
+        if self.loader is None or self.committee is None:
+            raise RuntimeError("Call initialize() first")
+
+        total_days = len(self.loader.dates)
+
+        if target_idx is not None:
+            if target_idx < 0 or target_idx >= total_days:
+                raise ValueError(
+                    f"Target index {target_idx} out of range (0-{total_days - 1})"
+                )
+            end_idx = target_idx
+        elif target_date is not None:
+            end_idx = self._find_date_index(target_date)
+        else:
+            end_idx = total_days - 1
+
+        # Episode starts one day before the first inference day
+        start_idx = end_idx - 1
+
+        if start_idx < Config.CONTEXT_WINDOW_DAYS - 1:
+            raise ValueError(
+                f"Not enough history for context window. Need index >= "
+                f"{Config.CONTEXT_WINDOW_DAYS} but start would be {start_idx}."
+            )
+
+        start_date = str(self.loader.dates[start_idx])
+        end_date = str(self.loader.dates[end_idx])
+
+        self.state = TradingState(
+            episode_start_date=start_date,
+            episode_start_idx=start_idx,
+            current_day_idx=start_idx,
+            trading_day=0,
+            last_processed_date=start_date,
+        )
+
+        num_days = end_idx - start_idx
+        print(f"\nCatch-up inference:")
+        print(f"  Anchor (day 0):  {start_date} (index {start_idx})")
+        print(f"  Target:          {end_date} (index {end_idx})")
+        print(f"  Days to process: {num_days}")
+        print()
+
+        reports = []
+        for _ in range(num_days):
+            report = self.run_daily()
+            reports.append(report)
+
+        return "\n\n".join(reports)
+
     # ------------------------------------------------------------------
     # Position management
     # ------------------------------------------------------------------
